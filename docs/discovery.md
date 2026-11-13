@@ -567,11 +567,14 @@ logout --yes` to remove local authentication while preserving history.
 ## How eBird enrichment works
 
 eBird returns recent public sightings and an eBird species code. The controller
-searches iNaturalist for the exact active species-rank scientific name and uses
-the resulting iNaturalist taxon ID as the canonical catalog identity. Ambiguous,
-inactive, hybrid, subspecies, domestic, and unmatched records are deferred. A
-seven-day negative cache prevents one mismatch from generating requests every
-15 minutes.
+searches iNaturalist for a single active bird species with an exact scientific
+name or synonym. Its iNaturalist taxon ID becomes the canonical catalog identity.
+The same lookup recognizes the [Winter Wren rename](https://doi.org/10.1093/ornithology/ukag037)
+from `Troglodytes hiemalis` to `Nannus hiemalis` (iNaturalist taxon `1720022`).
+Existing deferrals for the old name can retry on the next refresh after
+upgrading. Ambiguous, inactive, hybrid, subspecies, domestic, and unmatched
+records still defer. A seven-day negative cache prevents repeated refreshes from
+retrying the same miss.
 
 iNaturalist remains the source for taxonomy and research-grade CC0/CC-BY
 reference photographs. eBird and Macaulay Library media are not copied into the

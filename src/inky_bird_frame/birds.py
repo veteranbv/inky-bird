@@ -118,6 +118,11 @@ EBIRD_MAX_RADIUS_KM: Final = 50
 EBIRD_HTTP_TIMEOUT_SECONDS: Final = 90.0
 EBIRD_UNRESOLVED_RETRY_DAYS: Final = 7
 TAXONOMY_MATCH_STRATEGY: Final = "scientific-name-or-exact-synonym-v1"
+# AOS moved Winter Wren to Nannus (doi:10.1093/ornithology/ukag037).
+# iNaturalist can return a trinomial as the matched term for the old binomial.
+INATURALIST_TAXON_ALIASES: Final[dict[str, tuple[int, str]]] = {
+    "Troglodytes hiemalis": (1720022, "Nannus hiemalis"),
+}
 BIRDWEATHER_MAX_SPECIES: Final = 100
 # iNaturalist asks API clients to stay near one request per second. Taxonomy
 # lookups cannot be batched because every source name needs an exact-match check.
@@ -480,6 +485,7 @@ def parse_inaturalist_taxon_match(payload: object, scientific_name: str) -> Bird
     if not isinstance(results, list):
         raise DataSourceError("iNaturalist taxon search response did not include results")
 
+    alias = INATURALIST_TAXON_ALIASES.get(scientific_name)
     matches: list[BirdSpecies] = []
     for item in results:
         if not isinstance(item, dict):
@@ -494,9 +500,13 @@ def parse_inaturalist_taxon_match(payload: object, scientific_name: str) -> Bird
             and item.get("iconic_taxon_name") == "Aves"
             and isinstance(name, str)
             and name
-            and (name == scientific_name or matched_term == scientific_name)
             and isinstance(taxon_id, int)
             and not isinstance(taxon_id, bool)
+            and (
+                name == scientific_name
+                or matched_term == scientific_name
+                or ((taxon_id, name) == alias and item.get("is_active") is True)
+            )
             and isinstance(common_name, str)
             and common_name
         ):
@@ -577,6 +587,11 @@ def _resolve_external_species_locked(
     changed = False
 
     for observation in observations:
+        alias = INATURALIST_TAXON_ALIASES.get(observation.scientific_name)
+        # Recheck old misses for this alias only. A new miss is cached normally.
+        match_strategy = TAXONOMY_MATCH_STRATEGY
+        if alias is not None:
+            match_strategy = f"{match_strategy}+alias:{alias[0]}:{alias[1]}"
         cached = cache.get(observation.species_code)
         cached_source_name = (
             cached.get("source_scientific_name", cached.get("scientific_name"))
@@ -604,7 +619,7 @@ def _resolve_external_species_locked(
                 continue
             retry_at = _parse_cache_datetime(cached.get("retry_at"))
             if (
-                cached.get("match_strategy") == TAXONOMY_MATCH_STRATEGY
+                cached.get("match_strategy") == match_strategy
                 and retry_at is not None
                 and current < retry_at
             ):
@@ -617,7 +632,7 @@ def _resolve_external_species_locked(
             )
         except TaxonomyMatchError:
             cache[observation.species_code] = {
-                "match_strategy": TAXONOMY_MATCH_STRATEGY,
+                "match_strategy": match_strategy,
                 "scientific_name": observation.scientific_name,
                 "retry_at": (current + timedelta(days=EBIRD_UNRESOLVED_RETRY_DAYS)).isoformat(),
             }

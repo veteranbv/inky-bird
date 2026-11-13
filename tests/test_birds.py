@@ -41,6 +41,18 @@ from inky_bird_frame.birds import (
 from inky_bird_frame.errors import DataSourceError, TaxonomyMatchError
 
 
+def _winter_wren_taxon() -> dict[str, object]:
+    return {
+        "id": 1720022,
+        "preferred_common_name": "Winter Wren",
+        "name": "Nannus hiemalis",
+        "matched_term": "Troglodytes troglodytes hiemalis",
+        "rank": "species",
+        "is_active": True,
+        "iconic_taxon_name": "Aves",
+    }
+
+
 class InaturalistParsingTests(unittest.TestCase):
     def test_parse_species_counts_keeps_usable_species(self) -> None:
         payload = {
@@ -349,6 +361,37 @@ class EbirdTests(unittest.TestCase):
         self.assertEqual(species.taxon_id, 1579017)
         self.assertEqual(species.scientific_name, "Astur cooperii")
 
+    def test_taxon_match_accepts_verified_winter_wren_alias(self) -> None:
+        species = parse_inaturalist_taxon_match(
+            {"results": [_winter_wren_taxon()]}, "Troglodytes hiemalis"
+        )
+
+        self.assertEqual(species.taxon_id, 1720022)
+        self.assertEqual(species.scientific_name, "Nannus hiemalis")
+
+    def test_winter_wren_alias_still_requires_the_exact_active_bird_species(self) -> None:
+        for changes in (
+            {"id": 12345},
+            {"name": "Nannus pacificus"},
+            {"rank": "subspecies"},
+            {"is_active": False},
+            {"is_active": None},
+            {"iconic_taxon_name": "Mammalia"},
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(TaxonomyMatchError, "found 0"),
+            ):
+                parse_inaturalist_taxon_match(
+                    {"results": [_winter_wren_taxon() | changes]}, "Troglodytes hiemalis"
+                )
+
+        exact = _winter_wren_taxon() | {"id": 12345, "name": "Troglodytes hiemalis"}
+        with self.assertRaisesRegex(TaxonomyMatchError, "found 2"):
+            parse_inaturalist_taxon_match(
+                {"results": [_winter_wren_taxon(), exact]}, "Troglodytes hiemalis"
+            )
+
     def test_taxon_match_rejects_a_nonexact_search_result(self) -> None:
         payload = {
             "results": [
@@ -430,6 +473,79 @@ class EbirdTests(unittest.TestCase):
         self.assertEqual(result.unresolved, [])
         self.assertEqual(result.species[0].taxon_id, 1579017)
         self.assertEqual(result.species[0].scientific_name, "Astur cooperii")
+
+    @patch("inky_bird_frame.birds.sleep")
+    @patch("inky_bird_frame.birds.get_json")
+    def test_winter_wren_alias_rechecks_only_its_existing_deferral(
+        self, get_json: MagicMock, sleep: MagicMock
+    ) -> None:
+        old_name = "Troglodytes hiemalis"
+        other_name = "Nannus pacificus"
+        now = datetime(2026, 11, 12, tzinfo=UTC)
+        observed_at = "2026-11-12T00:00:00Z"
+        birdnet_wren = BirdNetGoSpecies("Winter Wren", old_name, 2, observed_at)
+        other = BirdNetGoSpecies("Pacific Wren", other_name, 3, observed_at)
+        weather_wren = BirdWeatherSpecies(42, "Winter Wren", old_name, 4, observed_at)
+        old_miss = {
+            "match_strategy": "scientific-name-or-exact-synonym-v1",
+            "scientific_name": old_name,
+            "retry_at": "2026-11-18T00:00:00+00:00",
+        }
+        get_json.return_value = {"results": [_winter_wren_taxon()]}
+
+        with TemporaryDirectory() as temporary:
+            birdnet_cache = Path(temporary) / "birdnet.json"
+            weather_cache = Path(temporary) / "birdweather.json"
+            other_miss = old_miss | {"scientific_name": other_name}
+            birdnet_cache.write_text(
+                json.dumps(
+                    {"schema_version": 1, "entries": {old_name: old_miss, other_name: other_miss}}
+                )
+            )
+            weather_cache.write_text(json.dumps({"schema_version": 1, "entries": {"42": old_miss}}))
+
+            birdnet, birdnet_unresolved = resolve_birdnet_go_species(
+                [birdnet_wren, other], birdnet_cache, now=now
+            )
+            weather, weather_unresolved = resolve_birdweather_species(
+                [weather_wren], weather_cache, now=now
+            )
+            cached, cached_unresolved = resolve_birdnet_go_species(
+                [birdnet_wren, other], birdnet_cache, now=now
+            )
+            stored = json.loads(birdnet_cache.read_text())["entries"]
+
+        self.assertEqual(get_json.call_count, 2)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(birdnet_unresolved, [other])
+        self.assertEqual(weather_unresolved, [])
+        self.assertEqual(cached_unresolved, [other])
+        self.assertEqual(cached, birdnet)
+        self.assertEqual(stored[other_name], other_miss)
+        self.assertEqual(stored[old_name]["source_scientific_name"], old_name)
+        for result, source, count in ((birdnet, "BirdNET-Go", 2), (weather, "BirdWeather", 4)):
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].taxon_id, 1720022)
+            self.assertEqual(result[0].scientific_name, "Nannus hiemalis")
+            self.assertEqual(result[0].source, source)
+            self.assertEqual(result[0].observation_count, count)
+
+    @patch("inky_bird_frame.birds.sleep")
+    @patch("inky_bird_frame.birds.get_json", return_value={"results": []})
+    def test_winter_wren_alias_still_caches_a_new_miss(
+        self, get_json: MagicMock, sleep: MagicMock
+    ) -> None:
+        observation = EbirdSpecies("winwre", "Winter Wren", "Troglodytes hiemalis", "2026-11-12")
+        now = datetime(2026, 11, 12, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "crosswalk.json"
+            first = resolve_ebird_species([observation], cache, now=now)
+            second = resolve_ebird_species([observation], cache, now=now)
+
+        self.assertEqual(first.unresolved, [observation])
+        self.assertEqual(second, first)
+        get_json.assert_called_once()
+        sleep.assert_called_once_with(1.0)
 
     def test_non_persistent_resolution_does_not_create_cache_state(self) -> None:
         observation = EbirdSpecies("easblu", "Eastern Bluebird", "Sialia sialis", "2026-07-12")
