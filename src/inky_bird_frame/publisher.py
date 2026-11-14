@@ -100,6 +100,7 @@ _COMMAND_TIMEOUT_SECONDS = 180
 _TRANSFER_TIMEOUT_SECONDS = 3600
 _CHECKOUT_TIMEOUT_SECONDS = 900
 _PUBLICATION_BRANCH = re.compile(r"catalog/publish-[0-9a-f]{8}-[0-9a-f]{8}")
+_BRANCH_PULL_REQUEST_LIMIT = 100
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_IMAGE_CHUNKS = frozenset({b"IHDR", b"PLTE", b"IDAT", b"IEND"})
 _FINDER_METADATA = ".DS_Store"
@@ -1368,10 +1369,44 @@ def _published_directory_names(remote_species: list[dict[str, object]] | None) -
     }
 
 
+def _remote_species_match(
+    checkout: Path, remote_ref: str, catalog_dir: Path, directories: set[str]
+) -> bool:
+    """Return whether the remote holds byte-identical files for these local species."""
+    object_format = _git(checkout, "rev-parse", "--show-object-format").stdout.strip()
+    if object_format not in {"sha1", "sha256"}:
+        return False
+    listing = _git(
+        checkout, "ls-tree", "-r", "-z", "--full-tree", remote_ref, "--", "catalog/species"
+    ).stdout
+    remote: dict[str, tuple[str, str, str]] = {}
+    for record in listing.split("\0"):
+        if not record:
+            continue
+        metadata, _, path = record.partition("\t")
+        fields = metadata.split()
+        if len(fields) != 3:
+            return False
+        remote[path] = (fields[0], fields[1], fields[2])
+    local: dict[str, tuple[str, str, str]] = {}
+    for name in directories:
+        for file in (catalog_dir / "species" / name).iterdir():
+            data = file.read_bytes()
+            blob = hashlib.new(object_format, usedforsecurity=False)
+            blob.update(f"blob {len(data)}\0".encode())
+            blob.update(data)
+            local[f"catalog/species/{name}/{file.name}"] = ("100644", "blob", blob.hexdigest())
+    remote_paths = {path for path in remote if path.split("/")[2] in directories}
+    return remote_paths == set(local) and all(remote[path] == local[path] for path in local)
+
+
 def _already_published_taxa(
-    catalog_dir: Path, remote_species: list[dict[str, object]] | None
+    checkout: Path,
+    remote_ref: str,
+    catalog_dir: Path,
+    remote_species: list[dict[str, object]] | None,
 ) -> list[int] | None:
-    """Return the local taxa when the remote index already holds every local approval."""
+    """Return the local taxa when the remote already holds every local approval unchanged."""
     if remote_species is None:
         return None
     try:
@@ -1379,14 +1414,17 @@ def _already_published_taxa(
         validate_public_catalog(catalog_dir)
         local_index = read_json(catalog_dir / "index.json")
         directories = {path.name for path in _species_directories(catalog_dir / "species")}
+        local_species = local_index.get("species") if isinstance(local_index, dict) else None
+        if not isinstance(local_species, list):
+            return None
+        if not directories <= _published_directory_names(remote_species) or any(
+            item not in remote_species for item in local_species
+        ):
+            return None
+        # A damaged remote copy must take the worktree path, which validates and reports it.
+        if not _remote_species_match(checkout, remote_ref, catalog_dir, directories):
+            return None
     except (CatalogError, CatalogPublishError, OSError):
-        return None
-    local_species = local_index.get("species") if isinstance(local_index, dict) else None
-    if not isinstance(local_species, list):
-        return None
-    if not directories <= _published_directory_names(remote_species) or any(
-        item not in remote_species for item in local_species
-    ):
         return None
     taxa = [item.get("taxon_id") for item in local_species if isinstance(item, dict)]
     if len(taxa) != len(local_species) or any(
@@ -1445,66 +1483,64 @@ def _cleanup_stale_publications(
         if _PUBLICATION_BRANCH.fullmatch(name) is not None and name != keep:
             branches.add(name)
 
-    raw = _gh(
-        publication,
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--state",
-        "open",
-        "--limit",
-        "200",
-        "--json",
-        "url,headRefName,isCrossRepository,author",
-    ).stdout
-    try:
-        pull_requests = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise CatalogPublishError("GitHub CLI returned invalid pull request data") from exc
-    if not isinstance(pull_requests, list) or any(
-        not isinstance(item, dict) for item in pull_requests
-    ):
-        raise CatalogPublishError("GitHub CLI returned invalid pull request data")
-
     owner = repository.split("/", maxsplit=1)[0].casefold()
-    owner_pull_requests: list[tuple[str, str]] = []
-    protected: set[str] = set()
-    for item in cast(list[dict[str, object]], pull_requests):
-        head = item.get("headRefName")
-        if (
-            not isinstance(head, str)
-            or _PUBLICATION_BRANCH.fullmatch(head) is None
-            or head == keep
-            or item.get("isCrossRepository") is not False
+    cleaned: list[str] = []
+    for name in sorted(branches):
+        raw = _gh(
+            publication,
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--head",
+            name,
+            "--state",
+            "open",
+            "--limit",
+            str(_BRANCH_PULL_REQUEST_LIMIT),
+            "--json",
+            "url,headRefName,isCrossRepository,author",
+        ).stdout
+        try:
+            pull_requests = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CatalogPublishError("GitHub CLI returned invalid pull request data") from exc
+        if not isinstance(pull_requests, list) or any(
+            not isinstance(item, dict) for item in pull_requests
         ):
+            raise CatalogPublishError("GitHub CLI returned invalid pull request data")
+        # A full page may hide another author's pull request; keep the branch.
+        if len(pull_requests) >= _BRANCH_PULL_REQUEST_LIMIT:
             continue
-        author = item.get("author")
-        login = author.get("login") if isinstance(author, dict) else None
-        url = item.get("url")
-        if isinstance(login, str) and login.casefold() == owner and isinstance(url, str):
-            owner_pull_requests.append((head, url))
-        else:
-            protected.add(head)
-
-    cleaned: set[str] = set()
-    for head, url in owner_pull_requests:
-        if head in protected:
+        owner_urls: list[str] = []
+        for item in cast(list[dict[str, object]], pull_requests):
+            author = item.get("author")
+            login = author.get("login") if isinstance(author, dict) else None
+            url = item.get("url")
+            if (
+                item.get("headRefName") == name
+                and item.get("isCrossRepository") is False
+                and isinstance(login, str)
+                and login.casefold() == owner
+                and isinstance(url, str)
+            ):
+                owner_urls.append(url)
+        if len(owner_urls) != len(pull_requests):
             continue
-        _gh(publication, "pr", "close", url, "--repo", repository, "--delete-branch")
-        cleaned.add(head)
-    for name in sorted(branches - protected - cleaned):
-        _git(
-            checkout,
-            "push",
-            "--no-verify",
-            publication.remote,
-            "--delete",
-            f"refs/heads/{name}",
-            timeout=_TRANSFER_TIMEOUT_SECONDS,
-        )
-        cleaned.add(name)
-    return sorted(cleaned)
+        for url in owner_urls:
+            _gh(publication, "pr", "close", url, "--repo", repository, "--delete-branch")
+        if not owner_urls:
+            _git(
+                checkout,
+                "push",
+                "--no-verify",
+                publication.remote,
+                "--delete",
+                f"refs/heads/{name}",
+                timeout=_TRANSFER_TIMEOUT_SECONDS,
+            )
+        cleaned.append(name)
+    return cleaned
 
 
 def _pull_request(
@@ -1629,7 +1665,7 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
         }
         with catalog_state_lock(config.controller.state_dir):
             already_published = _already_published_taxa(
-                config.controller.catalog_dir, remote_species
+                checkout, remote_ref, config.controller.catalog_dir, remote_species
             )
         if already_published is not None:
             result["already_present"] = already_published
@@ -1658,6 +1694,8 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                 publication_privacy_patterns(config),
             )
             validate_public_catalog(source_snapshot)
+            if not _species_directories(source_snapshot / "species"):
+                return result
 
             worktree = Path(temporary) / "checkout"
             _git(

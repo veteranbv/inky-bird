@@ -315,8 +315,9 @@ class _FakeGitHub:
             if "--head" in arguments:
                 head = arguments[arguments.index("--head") + 1]
                 matches = [item for item in matches if item["headRefName"] == head]
-            # Like gh, list the newest pull request first.
-            stdout = json.dumps(matches[::-1])
+            # Like gh, list the newest pull request first and stop at --limit.
+            limit = int(arguments[arguments.index("--limit") + 1])
+            stdout = json.dumps(matches[::-1][:limit])
         elif arguments[:2] == ("pr", "create"):
             branch = arguments[arguments.index("--head") + 1]
             self.test.assertEqual(arguments[arguments.index("--base") + 1], "main")
@@ -2207,6 +2208,76 @@ class PublicationRunTests(unittest.TestCase):
             "display checksum",
         )
 
+    def _assert_damaged_remote_species_is_not_reported_published(
+        self, damage: Callable[[Path], None]
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _, config, fake = self._environment(root)
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            with _github(fake):
+                run_catalog_publish(config)
+            editor = root / "editor"
+            subprocess.run(
+                ["git", "clone", "--branch", "main", str(remote), str(editor)],
+                check=True,
+                capture_output=True,
+            )
+            species = editor / "catalog/species/1-example-bird"
+            damage(species)
+            _run_git(editor, "add", "-A", "catalog")
+            _run_git(
+                editor,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-m",
+                "Damage the published species",
+            )
+            _run_git(editor, "push", "origin", "main")
+
+            with (
+                _github(fake),
+                self.assertRaisesRegex(CatalogPublishError, "1-example-bird"),
+            ):
+                run_catalog_publish(config)
+
+    def test_does_not_report_a_species_whose_remote_image_was_deleted(self) -> None:
+        self._assert_damaged_remote_species_is_not_reported_published(
+            lambda species: (species / "display.png").unlink()
+        )
+
+    def test_does_not_report_a_species_whose_remote_manifest_was_deleted(self) -> None:
+        self._assert_damaged_remote_species_is_not_reported_published(
+            lambda species: (species / "manifest.json").unlink()
+        )
+
+    def test_does_not_report_a_species_whose_remote_image_was_replaced(self) -> None:
+        self._assert_damaged_remote_species_is_not_reported_published(
+            lambda species: Image.new("RGB", (1600, 1200), "black").save(species / "display.png")
+        )
+
+    def test_reports_skipped_species_when_nothing_can_be_published(self) -> None:
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), TemporaryDirectory() as temporary:
+                remote, _, config, fake = self._environment(Path(temporary))
+                broken = _create_species(config.controller.catalog_dir, 1, "Broken Bird")
+                Image.new("RGB", (1600, 1200), "black").save(broken / "display.png")
+
+                with _github(fake):
+                    result = run_catalog_publish(config, dry_run=dry_run)
+
+                self.assertFalse(result["changed"])
+                self.assertFalse(result["pushed"])
+                self.assertEqual(result["published"], [])
+                skipped = _result_items(result, "skipped")
+                self.assertEqual([item["species"] for item in skipped], ["1-broken-bird"])
+                self.assertIn("display checksum", str(skipped[0]["reason"]))
+                self.assertFalse(any(path.startswith("catalog/") for path in _remote_files(remote)))
+                self.assertEqual(_remote_branches(remote), ["main"])
+
     def test_cleans_stale_owner_publication_branches_and_pull_requests(self) -> None:
         with TemporaryDirectory() as temporary:
             remote, _, config, fake = self._environment(Path(temporary))
@@ -2230,6 +2301,51 @@ class PublicationRunTests(unittest.TestCase):
             self.assertEqual(
                 sorted(_remote_branches(remote)), sorted([foreign_pull, "feature/keep", "main"])
             )
+
+    def test_keeps_a_contributor_branch_beyond_the_pull_request_listing_limit(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            contributor_branch = "catalog/publish-aaaaaaaa-bbbbbbbb"
+            _run_git(remote, "update-ref", f"refs/heads/{contributor_branch}", "refs/heads/main")
+            contributor_pull = fake.add_pull_request(contributor_branch, author="contributor")
+            for number in range(2, 252):
+                fake.pull_requests.append(
+                    {
+                        "number": number,
+                        "url": f"https://github.com/{_REPOSITORY}/pull/{number}",
+                        "state": "OPEN",
+                        "headRefName": f"feature/change-{number}",
+                        "headRefOid": "0" * 40,
+                        "isCrossRepository": True,
+                        "author": {"login": "contributor"},
+                    }
+                )
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["cleaned_publication_branches"], [])
+            self.assertIn(contributor_branch, _remote_branches(remote))
+            self.assertEqual(contributor_pull["state"], "OPEN")
+
+    def test_keeps_a_branch_whose_pull_requests_cannot_all_be_listed(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            crowded = "catalog/publish-aaaaaaaa-bbbbbbbb"
+            _run_git(remote, "update-ref", f"refs/heads/{crowded}", "refs/heads/main")
+            for _ in range(120):
+                fake.add_pull_request(crowded)
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["cleaned_publication_branches"], [])
+            self.assertIn(crowded, _remote_branches(remote))
+            self.assertNotIn(("pr", "close"), [call_[:2] for call_ in fake.calls])
 
     def test_dry_run_does_not_clean_stale_publications(self) -> None:
         with TemporaryDirectory() as temporary:
