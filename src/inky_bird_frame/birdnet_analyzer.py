@@ -11,7 +11,7 @@ import re
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -39,6 +39,7 @@ class BirdNetAnalyzerImportStats:
     dated: int
     undated: int
     dry_run: bool
+    removed: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -46,6 +47,7 @@ class BirdNetAnalyzerImportStats:
             "imported": self.imported,
             "updated": self.updated,
             "duplicates": self.duplicates,
+            "removed": self.removed,
             "dated": self.dated,
             "undated": self.undated,
             "dry_run": self.dry_run,
@@ -80,13 +82,28 @@ class _StoredDetection:
     common_name: str
     scientific_name: str
     observed_on: date | None
+    # One-way segment fingerprint. Rows written before per-species rows have
+    # none: their own key is the segment fingerprint.
+    segment: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
             "common_name": self.common_name,
             "scientific_name": self.scientific_name,
             "observed_on": self.observed_on.isoformat() if self.observed_on is not None else None,
+            **({"segment": self.segment} if self.segment is not None else {}),
         }
+
+    def same_record(self, other: _StoredDetection) -> bool:
+        return (self.common_name, self.scientific_name, self.observed_on) == (
+            other.common_name,
+            other.scientific_name,
+            other.observed_on,
+        )
+
+
+def _is_fingerprint(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 @contextmanager
@@ -129,12 +146,14 @@ def _parse_detection(value: object) -> _StoredDetection:
     common_name = value.get("common_name")
     scientific_name = value.get("scientific_name")
     raw_observed_on = value.get("observed_on")
+    segment = value.get("segment")
     if (
         not isinstance(common_name, str)
         or not common_name.strip()
         or not isinstance(scientific_name, str)
         or not scientific_name.strip()
         or (raw_observed_on is not None and not isinstance(raw_observed_on, str))
+        or (segment is not None and not _is_fingerprint(segment))
     ):
         raise DataSourceError("Invalid BirdNET Analyzer detection state")
     try:
@@ -143,7 +162,12 @@ def _parse_detection(value: object) -> _StoredDetection:
         raise DataSourceError("Invalid BirdNET Analyzer detection date") from exc
     if observed_on is not None and observed_on.isoformat() != raw_observed_on:
         raise DataSourceError("Invalid BirdNET Analyzer detection date")
-    return _StoredDetection(common_name.strip(), scientific_name.strip(), observed_on)
+    return _StoredDetection(
+        common_name.strip(),
+        scientific_name.strip(),
+        observed_on,
+        segment if isinstance(segment, str) else None,
+    )
 
 
 def _read_state(
@@ -169,11 +193,7 @@ def _read_state(
         raise DataSourceError(f"Invalid BirdNET Analyzer state: {path}")
     detections: dict[str, _StoredDetection] = {}
     for fingerprint, raw_detection in raw_detections.items():
-        if (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
-        ):
+        if not _is_fingerprint(fingerprint):
             raise DataSourceError("Invalid BirdNET Analyzer detection fingerprint")
         detections[fingerprint] = _parse_detection(raw_detection)
     history_started_at = _timestamp(payload.get("history_started_at"), "history start")
@@ -192,9 +212,14 @@ def _parse_number(row: dict[str, str | None], name: str, line: int) -> float:
     return parsed
 
 
+def _fingerprint(*parts: str) -> str:
+    identity = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":")).encode()
+    return hashlib.sha256(identity).hexdigest()
+
+
 def _parse_csv_row(
     row: dict[str, str | None], line: int, observed_on: date | None
-) -> tuple[str, _StoredDetection]:
+) -> tuple[str, str, _StoredDetection]:
     start = _parse_number(row, "Start (s)", line)
     end = _parse_number(row, "End (s)", line)
     confidence = _parse_number(row, "Confidence", line)
@@ -213,13 +238,52 @@ def _parse_csv_row(
         or not source_file.strip()
     ):
         raise DataSourceError(f"Invalid BirdNET Analyzer CSV row {line}")
-    identity = json.dumps(
-        [source_file.strip(), start.hex(), end.hex()],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode()
-    fingerprint = hashlib.sha256(identity).hexdigest()
-    return fingerprint, _StoredDetection(common_name.strip(), scientific_name.strip(), observed_on)
+    # The segment fingerprint keeps the pre-1.0 formula so retained rows still
+    # match their segment; each species in the segment is its own row.
+    segment = _fingerprint(source_file.strip(), start.hex(), end.hex())
+    fingerprint = _fingerprint(source_file.strip(), start.hex(), end.hex(), scientific_name.strip())
+    return (
+        segment,
+        fingerprint,
+        _StoredDetection(common_name.strip(), scientific_name.strip(), observed_on, segment),
+    )
+
+
+def _merge_segment(
+    detections: dict[str, _StoredDetection],
+    previous_keys: list[str],
+    incoming: dict[str, _StoredDetection],
+    observed_on: date | None,
+) -> tuple[int, int, int, int]:
+    """Replace one segment's species list; return imported, updated, duplicate, removed."""
+    previous = {key: detections[key] for key in previous_keys}
+    stored_dates = {item.observed_on for item in previous.values() if item.observed_on is not None}
+    if len(stored_dates) > 1 or (
+        observed_on is not None and stored_dates and stored_dates != {observed_on}
+    ):
+        raise DataSourceError("BirdNET Analyzer segment was already imported with a different date")
+    segment_date = observed_on if observed_on is not None else next(iter(stored_dates), None)
+    by_species = {item.scientific_name: key for key, item in previous.items()}
+    unmatched = set(previous)
+    added = updated = duplicates = 0
+    for fingerprint, detection in incoming.items():
+        detection = replace(detection, observed_on=segment_date)
+        match = by_species.get(detection.scientific_name)
+        if match is None:
+            added += 1
+        else:
+            unmatched.discard(match)
+            if previous[match].same_record(detection):
+                duplicates += 1
+            else:
+                updated += 1
+            del detections[match]
+        detections[fingerprint] = detection
+    for key in unmatched:
+        del detections[key]
+    # A changed species in a segment reads as one changed detection.
+    reclassified = min(added, len(unmatched))
+    return added - reclassified, updated + reclassified, duplicates, len(unmatched) - reclassified
 
 
 def import_birdnet_analyzer_csv(
@@ -239,7 +303,8 @@ def import_birdnet_analyzer_csv(
             raise DataSourceError("Analyzer history changed. Preview the CSV again.")
         if operation_id is not None and not re.fullmatch(r"[0-9a-f]{64}", operation_id):
             raise ValueError("Invalid import operation identity")
-        rows = imported = updated = duplicates = 0
+        rows = imported = updated = duplicates = removed = 0
+        upload: dict[str, dict[str, _StoredDetection]] = {}
         try:
             handle = csv_path.open("r", encoding="utf-8-sig", newline="")
         except OSError as exc:
@@ -256,39 +321,31 @@ def import_birdnet_analyzer_csv(
                     )
                 for line, row in enumerate(reader, start=2):
                     rows += 1
-                    fingerprint, detection = _parse_csv_row(row, line, observed_on)
-                    existing = detections.get(fingerprint)
-                    if (
-                        existing is not None
-                        and existing.observed_on is not None
-                        and detection.observed_on is not None
-                        and existing.observed_on != detection.observed_on
-                    ):
-                        raise DataSourceError(
-                            "BirdNET Analyzer segment was already imported with a different date"
-                        )
-                    if existing is not None and detection.observed_on is None:
-                        detection = _StoredDetection(
-                            detection.common_name,
-                            detection.scientific_name,
-                            existing.observed_on,
-                        )
-                    if existing == detection:
+                    segment, fingerprint, detection = _parse_csv_row(row, line, observed_on)
+                    segment_rows = upload.setdefault(segment, {})
+                    if fingerprint in segment_rows:
                         duplicates += 1
                         continue
-                    detections[fingerprint] = detection
-                    if existing is None:
-                        imported += 1
-                    else:
-                        updated += 1
+                    segment_rows[fingerprint] = detection
             except csv.Error as exc:
                 raise DataSourceError("Invalid BirdNET Analyzer CSV") from exc
         if rows == 0:
             raise DataSourceError("BirdNET Analyzer CSV contains no detection rows")
+        stored_by_segment: dict[str, list[str]] = {}
+        for key, stored in detections.items():
+            stored_by_segment.setdefault(stored.segment or key, []).append(key)
+        for segment, incoming in upload.items():
+            counts = _merge_segment(
+                detections, stored_by_segment.get(segment, []), incoming, observed_on
+            )
+            imported += counts[0]
+            updated += counts[1]
+            duplicates += counts[2]
+            removed += counts[3]
         dated = sum(item.observed_on is not None for item in detections.values())
         undated = len(detections) - dated
         stats = BirdNetAnalyzerImportStats(
-            rows, imported, updated, duplicates, dated, undated, dry_run
+            rows, imported, updated, duplicates, dated, undated, dry_run, removed
         )
         if not dry_run:
             path = _state_path(state_dir)
