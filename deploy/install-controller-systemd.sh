@@ -112,10 +112,13 @@ current_runtime() {
   fi
 }
 
+# Link order matters if interrupted: a pre-1.0 venv imports ${app_dir}/src, so
+# switch .venv first going forward and src first going back.
 point_runtime() {
   local target=$1
   local name
-  for name in src .venv; do
+  shift
+  for name in "$@"; do
     # A directory that was never moved aside is still the live one; keep it.
     if [ -e "${app_dir}/${name}" ] && [ ! -L "${app_dir}/${name}" ]; then
       continue
@@ -142,12 +145,12 @@ activate_runtime() {
       mv "${app_dir}/${name}" "${legacy}/${name}"
     fi
   done
-  point_runtime "${new_runtime}"
+  point_runtime "${new_runtime}" .venv src
 }
 
 deactivate_runtime() {
   if [ -n "${previous_runtime}" ]; then
-    point_runtime "${previous_runtime}"
+    point_runtime "${previous_runtime}" src .venv
   else
     rm -f "${app_dir}/.venv" "${app_dir}/src"
   fi
