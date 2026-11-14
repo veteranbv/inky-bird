@@ -834,6 +834,71 @@ class CarryForwardTests(unittest.TestCase):
         self.assertEqual(inaturalist["status"], "ok")
         self.assertNotIn("carried_species_count", inaturalist)
 
+    def test_renamed_and_current_names_of_one_bird_carry_their_combined_values(self) -> None:
+        now = datetime.now(UTC).replace(microsecond=0)
+        older, newer = (now - timedelta(hours=2)).isoformat(), now.isoformat()
+        seen = BirdSpecies(
+            YARD_BIRD.taxon_id, YARD_BIRD.common_name, YARD_BIRD.scientific_name, 1, "iNaturalist"
+        )
+        # A provider reporting a bird under its old and its current scientific
+        # name resolves both to the same taxon.
+        old_name = BirdSpecies(
+            YARD_BIRD.taxon_id,
+            YARD_BIRD.common_name,
+            YARD_BIRD.scientific_name,
+            9,
+            "BirdNET-Go",
+            latest_detection_at=older,
+        )
+        new_name = BirdSpecies(
+            YARD_BIRD.taxon_id,
+            YARD_BIRD.common_name,
+            YARD_BIRD.scientific_name,
+            2,
+            "BirdNET-Go",
+            latest_detection_at=newer,
+        )
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            with (
+                patch(
+                    "inky_bird_frame.controller.resolve_discovery_location",
+                    return_value=LOCATION,
+                ),
+                patch(
+                    "inky_bird_frame.controller.fetch_inaturalist_birds",
+                    return_value=[seen],
+                ),
+                patch("inky_bird_frame.controller.fetch_birdnet_go_species", return_value=[]),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdnet_go_species",
+                    side_effect=[([old_name, new_name], []), DataSourceError("timed out")],
+                ),
+                patch(
+                    "inky_bird_frame.controller.rebuild_catalog_index",
+                    return_value=[approved(YARD_BIRD)],
+                ),
+            ):
+                run_refresh_cycle(config)
+                saved = json.loads((config.controller.state_dir / "discovery.json").read_text())
+                run_refresh_cycle(config)
+                final = json.loads((config.controller.state_dir / "discovery.json").read_text())
+            (carried,) = final["species"]
+
+        self.assertEqual(
+            saved["provider_species"]["birdnet-go"],
+            [
+                {
+                    "taxon_id": YARD_BIRD.taxon_id,
+                    "observation_count": 9,
+                    "latest_detection_at": newer,
+                }
+            ],
+        )
+        self.assertEqual(sorted(carried["sources"]), ["BirdNET-Go", "iNaturalist"])
+        self.assertEqual(carried["observation_count"], 9)
+        self.assertEqual(carried["latest_detection_at"], newer)
+
 
 class GeocodeCacheRefreshTests(unittest.TestCase):
     def refresh(self, config: AppConfig) -> dict[str, object]:

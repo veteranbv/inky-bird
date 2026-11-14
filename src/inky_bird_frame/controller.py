@@ -1552,7 +1552,9 @@ def _provider_species_payload(
     payload: dict[str, list[dict[str, object]]] = {}
     for name, species_list in own_species.items():
         rows: list[dict[str, object]] = []
-        for species in species_list:
+        # A provider can report a renamed bird under both names; the reader
+        # rejects duplicate taxa, so store one merged row per taxon.
+        for species in _merge_provider_species([species_list]):
             row: dict[str, object] = {
                 "taxon_id": species.taxon_id,
                 "observation_count": species.observation_count,
