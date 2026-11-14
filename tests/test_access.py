@@ -872,3 +872,23 @@ def test_anonymous_sign_in_starts_cannot_lock_out_the_owner(tmp_path: Path) -> N
 
 def expired_at(created_at: float) -> datetime:
     return datetime.fromtimestamp(created_at + OIDC_TRANSACTION_SECONDS, UTC)
+
+
+def test_anonymous_sign_in_starts_never_displace_signed_in_ones(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    signed_in = [
+        store.begin_oidc(link_secret=local.secret, now=NOW + timedelta(seconds=index))
+        if index % 2
+        else store.begin_oidc(
+            confirm_secret=local.secret,
+            return_to_access=True,
+            now=NOW + timedelta(seconds=index),
+        )
+        for index in range(MAX_OIDC_TRANSACTIONS)
+    ]
+    later = NOW + timedelta(seconds=MAX_OIDC_TRANSACTIONS)
+    with pytest.raises(AccessRateLimitError):
+        store.begin_oidc(now=later)
+    for tx, browser in signed_in:
+        assert store.consume_oidc(tx.state, browser, now=later) == tx
