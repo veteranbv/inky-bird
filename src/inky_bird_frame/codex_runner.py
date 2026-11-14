@@ -403,7 +403,12 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     except OSError:
         _signal_group(group, signal.SIGKILL)
     else:
-        _stop_group_members(group)
+        try:
+            _stop_group_members(group)
+        except Exception as exc:
+            _signal_group(group, signal.SIGKILL)
+            process.wait()
+            raise GenerationError("Codex could not be supervised after it started") from exc
     process.wait()
 
 

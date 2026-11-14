@@ -420,6 +420,46 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
         self.assertEqual([result.returncode for result in results], [0])
         self.assertFalse(running, "a background tool survived the agent's clean exit")
 
+    def test_failure_to_list_group_members_still_kills_tools_and_reaps_the_agent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            agent_file = root / "agent.pid"
+            tool_file = root / "tool.pid"
+            stub = _stub_executable(
+                root,
+                f'echo $$ > "{agent_file}"\n'
+                f'sleep 600 </dev/null >/dev/null 2>&1 &\necho $! > "{tool_file}"\nexit 0',
+            )
+            runner = CodexRunner(stub, root)
+            errors: list[BaseException] = []
+            try:
+                with (
+                    patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5),
+                    patch.object(
+                        codex_runner, "_group_members", side_effect=ValueError("synthetic")
+                    ),
+                ):
+                    try:
+                        runner._run([str(stub)], "prompt", root / "run.log")
+                    except BaseException as exc:
+                        errors.append(exc)
+                agent = int(agent_file.read_text())
+                tool_stopped = _wait_for_exit(int(tool_file.read_text()), 5.0)
+                try:
+                    unreaped = os.waitpid(agent, os.WNOHANG)[0] == agent
+                except ChildProcessError:
+                    unreaped = False
+            finally:
+                if tool_file.is_file() and tool_file.read_text().strip():
+                    _kill_if_running(int(tool_file.read_text()))
+                if agent_file.is_file() and agent_file.read_text().strip():
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(int(agent_file.read_text()), 0)
+        self.assertTrue(tool_stopped, "a background tool survived a failed group listing")
+        self.assertFalse(unreaped, "the agent was left unreaped")
+        self.assertEqual([type(error) for error in errors], [GenerationError])
+        self.assertIsInstance(errors[0].__cause__, ValueError)
+
     def test_clean_exit_without_leftover_tools_does_not_wait_for_grace(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
