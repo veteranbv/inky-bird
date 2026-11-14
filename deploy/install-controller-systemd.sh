@@ -100,6 +100,9 @@ unit_backup_dir="${work_dir}/previous-units"
 mkdir "${unit_dir}" "${unit_backup_dir}"
 new_runtime=""
 previous_runtime=""
+legacy_runtime=""
+venv_before=""
+src_before=""
 runtime_activated=false
 units_replaced=false
 controller_was_active=false
@@ -132,50 +135,67 @@ current_runtime() {
   fi
 }
 
-# Link order matters if interrupted: a pre-1.0 venv imports ${app_dir}/src, so
-# switch .venv first going forward and src first going back.
-point_runtime() {
-  local target=$1
-  local name
-  shift
-  for name in "$@"; do
-    # A directory that was never moved aside is still the live one; keep it.
-    if [ -e "${app_dir}/${name}" ] && [ ! -L "${app_dir}/${name}" ]; then
-      continue
-    fi
-    rm -f "${app_dir}/.runtime-link.next"
-    ln -s "${target}/${name}" "${app_dir}/.runtime-link.next"
-    python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
-      "${app_dir}/.runtime-link.next" "${app_dir}/${name}"
-  done
+replace_link() {
+  rm -f "${app_dir}/.runtime-link.next"
+  ln -s "$1" "${app_dir}/.runtime-link.next"
+  python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
+    "${app_dir}/.runtime-link.next" "${app_dir}/$2"
 }
 
+# How ${app_dir}/<name> looked before this run: a link (and its target), the
+# single-directory layout's real directory, or nothing.
+describe_path() {
+  if [ -L "${app_dir}/$1" ]; then
+    printf 'link:%s' "$(readlink "${app_dir}/$1")"
+  elif [ -e "${app_dir}/$1" ]; then
+    printf 'directory'
+  else
+    printf 'absent'
+  fi
+}
+
+restore_path() {
+  case "$2" in
+    link:*) replace_link "${2#link:}" "$1" ;;
+    directory)
+      # A directory that was never moved aside is still the live one; keep it.
+      if [ -L "${app_dir}/$1" ] || [ ! -e "${app_dir}/$1" ]; then
+        replace_link "${legacy_runtime}/$1" "$1"
+      fi
+      ;;
+    *) rm -f "${app_dir}/$1" ;;
+  esac
+}
+
+# Link order matters if interrupted: a pre-1.0 venv imports ${app_dir}/src, so
+# switch .venv first going forward and src first going back.
 activate_runtime() {
-  local legacy=""
   local name
   previous_runtime=$(current_runtime)
+  # On a Pi that also runs the display, src may link to the display's runtime;
+  # rollback restores exactly what was there.
+  venv_before=$(describe_path .venv)
+  src_before=$(describe_path src)
   runtime_activated=true
   # The single-directory layout becomes the previous runtime on first upgrade.
   for name in .venv src; do
     if [ -e "${app_dir}/${name}" ] && [ ! -L "${app_dir}/${name}" ]; then
-      if [ -z "${legacy}" ]; then
-        legacy=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
-        previous_runtime=${previous_runtime:-${legacy}}
+      if [ -z "${legacy_runtime}" ]; then
+        legacy_runtime=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
+        previous_runtime=${previous_runtime:-${legacy_runtime}}
       fi
-      mv "${app_dir}/${name}" "${legacy}/${name}"
+      mv "${app_dir}/${name}" "${legacy_runtime}/${name}"
     fi
   done
-  point_runtime "${new_runtime}" .venv src
+  replace_link "${new_runtime}/.venv" .venv
+  replace_link "${new_runtime}/src" src
 }
 
 deactivate_runtime() {
-  if [ -n "${previous_runtime}" ]; then
-    point_runtime "${previous_runtime}" src .venv
-  else
-    rm -f "${app_dir}/.venv" "${app_dir}/src"
-  fi
+  restore_path src "${src_before}" && restore_path .venv "${venv_before}"
 }
 
+# Only ${app_dir}/.runtimes is pruned; the display keeps its own directory.
 prune_runtimes() {
   local runtime
   for runtime in "${runtimes_dir}"/*; do
@@ -282,6 +302,20 @@ cleanup() {
     runtime_restored=true
     if [ "${units_replaced}" = true ] && ! restore_units; then
       echo "Could not put back every previous service file in ${unit_root}." >&2
+    fi
+    # A stopped service this run started again runs the new runtime; stop it
+    # before switching back so it starts below on the restored one.
+    if [ "${runtime_activated}" = true ]; then
+      for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
+        case "${unit}" in
+          *.service)
+            if systemctl is-active --quiet "${unit}" && ! sudo systemctl stop "${unit}"; then
+              runtime_restored=false
+              echo "Could not stop ${unit}; it still runs the new version, kept in ${new_runtime}." >&2
+            fi
+            ;;
+        esac
+      done
     fi
     if [ "${runtime_activated}" = true ] && ! deactivate_runtime; then
       runtime_restored=false

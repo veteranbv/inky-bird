@@ -15,7 +15,9 @@ venv=${INKY_BIRD_DISPLAY_VENV:-"${HOME}/.virtualenvs/pimoroni"}
 run_initial_display=${INKY_BIRD_RUN_INITIAL_DISPLAY:-false}
 noninteractive_sudo=${INKY_BIRD_NONINTERACTIVE_SUDO:-false}
 unit_root="/etc/systemd/system"
-runtimes_dir="${app_dir}/.runtimes"
+# The controller keeps its runtimes in ${app_dir}/.runtimes; one Pi can run both
+# roles, so each role prunes only its own directory.
+runtimes_dir="${app_dir}/.display-runtimes"
 timer="${service_prefix}-display.timer"
 
 # Remove one distribution's files, except those the other one also owns.
@@ -43,6 +45,16 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[2])
 from inky_bird_frame.config import load_config
 load_config(Path(sys.argv[1]))
+'
+# The project an editable install was made from (a regular install has none).
+installed_source_program='
+import importlib.util
+from pathlib import Path
+spec = importlib.util.find_spec("inky_bird_frame")
+if spec is not None and spec.origin:
+    project = Path(spec.origin).parents[2]
+    if (project / "pyproject.toml").is_file():
+        print(project)
 '
 
 if [ ! -f "${config_path}" ]; then
@@ -100,6 +112,9 @@ unit_backup_dir="${work_dir}/previous-units"
 mkdir "${unit_dir}" "${unit_backup_dir}"
 new_runtime=""
 previous_runtime=""
+installed_source=""
+source_link=""
+moved_runtime=""
 timer_was_enabled=false
 package_installed=false
 old_package_removed=false
@@ -136,26 +151,40 @@ restore_units() {
   [ "${restored}" = true ]
 }
 
-point_source() {
+link_source() {
   rm -f "${app_dir}/.runtime-link.next"
-  ln -s "$1/src" "${app_dir}/.runtime-link.next"
+  ln -s "$1" "${app_dir}/.runtime-link.next"
   python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
     "${app_dir}/.runtime-link.next" "${app_dir}/src"
 }
 
+# Put ${app_dir}/src back exactly as it was; on a Pi that also runs the
+# controller it may have linked to the controller's runtime.
+restore_source() {
+  if [ -n "${source_link}" ]; then
+    link_source "${source_link}"
+  elif [ -n "${moved_runtime}" ]; then
+    link_source "${moved_runtime}/src"
+  else
+    rm -f "${app_dir}/src"
+  fi
+}
+
+same_directory() {
+  [ "$(cd -P "$1" 2>/dev/null && pwd -P)" = "$(cd -P "$2" 2>/dev/null && pwd -P)" ]
+}
+
 # Reinstall the same-named previous version from the source it was built from.
 reinstall_previous() {
-  local source
+  local source=${installed_source}
   if [ "${runtime_linked}" = true ]; then
-    source=${previous_runtime}
-    if [ -z "${source}" ]; then
-      return 1
+    restore_source || return 1
+    if [ -n "${moved_runtime}" ] && [ -n "${source}" ] && same_directory "${source}" "${app_dir}"; then
+      source=${moved_runtime}
     fi
-    point_source "${source}" || return 1
-  elif [ -L "${app_dir}/src" ]; then
-    source=$(cd -P "${app_dir}/src" && dirname "$(pwd -P)") || return 1
-  else
-    source=${app_dir}
+  fi
+  if [ -z "${source}" ]; then
+    return 1
   fi
   "${venv}/bin/python" -m pip install --disable-pip-version-check -e "${source}[inky]"
 }
@@ -184,8 +213,13 @@ cleanup() {
     if [ "${previous_kept}" = true ] && [ -n "${new_runtime}" ]; then
       rm -rf "${new_runtime}"
     fi
+    # A timer this run restarted keeps its new schedule until it is restarted.
+    timer_action=start
+    if [ "${units_replaced}" = true ]; then
+      timer_action=restart
+    fi
     if [ -n "${installed}" ] && [ "${timer_was_enabled}" = true ]; then
-      if ! "${sudo_command[@]}" systemctl start "${timer}"; then
+      if ! "${sudo_command[@]}" systemctl "${timer_action}" "${timer}"; then
         echo "The display timer is stopped. Start it with: sudo systemctl start ${timer}" >&2
       fi
     fi
@@ -203,6 +237,9 @@ trap cleanup EXIT
 chmod 600 "${config_path}"
 mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}" "${support_dir}"
 runtimes_dir=$(cd -P "${runtimes_dir}" && pwd)
+if [ -n "${installed}" ]; then
+  installed_source=$("${venv}/bin/python" -I -c "${installed_source_program}") || installed_source=""
+fi
 
 # Stage and check the new runtime beside the live one; nothing running changes.
 new_runtime=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
@@ -231,12 +268,15 @@ done
 "${venv}/bin/python" -m pip install --disable-pip-version-check -e "${new_runtime}[inky]"
 package_installed=true
 
-"${venv}/bin/python" - \
-  "${unit_dir}" "${app_dir}" "${config_path}" "${venv}" "$(id -un)" <<'PY'
+"${venv}/bin/python" -I - \
+  "${unit_dir}" "${app_dir}" "${config_path}" "${venv}" "$(id -un)" "${new_runtime}/src" <<'PY'
 import os
 import sys
 from pathlib import Path
 
+# Until the renamed distribution is removed below, its regular install can
+# shadow the staged editable one; render the units with the staged code.
+sys.path.insert(0, sys.argv[6])
 from inky_bird_frame.config import load_config
 from inky_bird_frame.installation import display_systemd_units
 
@@ -267,18 +307,23 @@ fi
 # layout becomes the previous runtime, complete enough to reinstall from.
 runtime_linked=true
 if [ -L "${app_dir}/src" ]; then
-  previous_runtime=$(cd -P "${app_dir}/src" 2>/dev/null && dirname "$(pwd -P)") || true
+  source_link=$(readlink "${app_dir}/src")
 elif [ -e "${app_dir}/src" ]; then
-  previous_runtime=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
-  mkdir -p "${previous_runtime}/docs"
+  moved_runtime=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
+  mkdir -p "${moved_runtime}/docs"
   for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
     if [ -f "${app_dir}/${file}" ]; then
-      cp -p "${app_dir}/${file}" "${previous_runtime}/${file}"
+      cp -p "${app_dir}/${file}" "${moved_runtime}/${file}"
     fi
   done
-  mv "${app_dir}/src" "${previous_runtime}/src"
+  mv "${app_dir}/src" "${moved_runtime}/src"
 fi
-point_source "${new_runtime}"
+if [ -n "${installed_source}" ] && [ "$(dirname "${installed_source}")" = "${runtimes_dir}" ]; then
+  previous_runtime=${installed_source}
+else
+  previous_runtime=${moved_runtime}
+fi
+link_source "${new_runtime}/src"
 
 if [ "${root}" != "${app_dir}" ]; then
   mkdir -p "${app_dir}/docs"

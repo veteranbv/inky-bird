@@ -165,6 +165,23 @@ def _units_dir() -> Path:
     return Path(os.environ["FAKE_UNIT_DIR"])
 
 
+def _record_process(unit: str, running: bool) -> None:
+    """Remember which runtime a started service's executable resolved to."""
+    processes = _state("processes")
+    path = _units_dir() / unit
+    executable = ""
+    if running and path.exists():
+        for line in path.read_text().splitlines():
+            if line.startswith("ExecStart="):
+                executable = line.partition("=")[2].split()[0]
+    if executable:
+        runtime = Path(os.path.realpath(executable)).parent.parent.parent
+        processes[unit] = {"runtime": runtime_tag(executable), "directory": str(runtime)}
+    else:
+        processes.pop(unit, None)
+    _save("processes", processes)
+
+
 def systemctl(arguments: list[str]) -> int:
     units = _state("systemd")
     verb = arguments[0]
@@ -202,17 +219,22 @@ def systemctl(arguments: list[str]) -> int:
     if verb == "disable" and not exists:
         return 1
     if verb in ("start", "restart"):
+        # start leaves an already running process, and its runtime, alone.
+        if verb == "restart" or not record["active"]:
+            _record_process(unit, running=True)
         record["active"] = True
     elif verb == "stop":
         if unit.endswith("scheduler.service") or unit.endswith("generate.service"):
             _log("lock-at-stop", unit, "lock-held" if _cycle_lock_held() else "lock-free")
         record["active"] = False
+        _record_process(unit, running=False)
     elif verb == "enable":
         record["enabled"] = True
     elif verb == "disable":
         record["enabled"] = False
         if "--now" in arguments:
             record["active"] = False
+            _record_process(unit, running=False)
     _save("systemd", units)
     return 0
 
@@ -281,7 +303,32 @@ def ssh(arguments: list[str]) -> int:
     return result.returncode
 
 
-def _pip(arguments: list[str]) -> int:
+def site_packages(venv: Path) -> Path:
+    return venv / "lib/python3/site-packages"
+
+
+def _python_path(venv: Path, runtime: Path) -> str:
+    """Order imports the way a venv does: site-packages, then .pth entries."""
+    entries: list[str] = []
+    site = site_packages(venv)
+    if site.is_dir():
+        entries.append(str(site))
+        for pth in sorted(site.glob("*.pth")):
+            entries.extend(line for line in pth.read_text().splitlines() if line)
+    if (runtime / "src").is_dir():
+        entries.append(str(runtime / "src"))
+    return os.pathsep.join(entries)
+
+
+def _remove(venv: Path, name: str) -> None:
+    site = site_packages(venv)
+    if name == "inky-bird-frame":
+        shutil.rmtree(site / "inky_bird_frame", ignore_errors=True)
+    else:
+        (site / "_inky_bird.pth").unlink(missing_ok=True)
+
+
+def _pip(venv: Path, arguments: list[str]) -> int:
     dists = _state("pip")
     _log("pip", *arguments)
     verb = arguments[0]
@@ -294,27 +341,37 @@ def _pip(arguments: list[str]) -> int:
         source = arguments[-1].split("[", 1)[0]
         dists["inky-bird"] = {"source": source}
         _save("pip", dists)
+        site = site_packages(venv)
+        site.mkdir(parents=True, exist_ok=True)
+        (site / "_inky_bird.pth").write_text(f"{source}/src\n")
         return 0
     if verb == "uninstall":
         dists.pop(arguments[-1], None)
         _save("pip", dists)
+        _remove(venv, arguments[-1])
         return 0
     return 0
 
 
 def venv_python(executable: str, arguments: list[str]) -> int:
+    venv = Path(executable).parent.parent
     runtime = Path(os.path.realpath(executable)).parent.parent.parent
     tag = runtime_tag(executable)
     rules = _rules()
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("PYTHON")
+    }
+    environment["PYTHONPATH"] = _python_path(venv, runtime)
     if arguments[:2] == ["-m", "pip"]:
-        return _pip(arguments[2:])
+        return _pip(venv, arguments[2:])
     if arguments[:1] == ["-c"]:
         # Inline programs must run isolated (-I) so the caller's directory and
         # PYTHON* variables cannot shadow the installed package.
         print("inline program run without -I", file=sys.stderr)
         return 64
-    if arguments[:2] == ["-I", "-c"]:
+    if arguments[:1] == ["-I"]:
         arguments = arguments[1:]
+    if arguments[:1] == ["-c"]:
         program = arguments[1]
         if "distribution(" in program:
             removed, kept = arguments[2:4]
@@ -322,17 +379,12 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             dists = _state("pip")
             dists.pop(removed, None)
             _save("pip", dists)
+            _remove(venv, removed)
             return 0
-        environment = {
-            name: value for name, value in os.environ.items() if not name.startswith("PYTHON")
-        }
-        if (runtime / "src").is_dir():
-            environment["PYTHONPATH"] = os.pathsep.join(
-                filter(None, [str(runtime / "src"), environment.get("PYTHONPATH")])
-            )
         _log("python-c", tag)
+        # -S keeps the test interpreter's own site-packages out of the import path.
         return subprocess.run(
-            [sys.executable, "-c", program, *arguments[2:]], env=environment, check=False
+            [sys.executable, "-S", "-c", program, *arguments[2:]], env=environment, check=False
         ).returncode
     if arguments[:1] == ["-"]:
         source = sys.stdin.read()
@@ -372,8 +424,14 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                     content += f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/inky-bird\n"
                 (unit_dir / f"{prefix}-{name}").write_text(content)
         elif "display_systemd_units" in source:
-            for suffix in ("service", "timer"):
-                (Path(arguments[1]) / f"{prefix}-display.{suffix}").write_text("# new\n")
+            # Render with whichever package the venv's import order selects.
+            return subprocess.run(
+                [sys.executable, "-S", "-", *arguments[1:]],
+                input=source,
+                env=environment,
+                text=True,
+                check=False,
+            ).returncode
         return 0
     return 0
 

@@ -40,6 +40,22 @@ def load_config(path, load_secrets=True):
     state_dir = Path(os.environ["FAKE_STATE_DIR"])
     return SimpleNamespace(controller=SimpleNamespace(state_dir=state_dir))
 """
+FAKE_INSTALLATION_MODULE = """from pathlib import Path
+
+TAG = (Path(__file__).resolve().parents[1] / "runtime-tag").read_text().strip()
+
+
+def display_systemd_units(config, *, executable, app_dir, config_path, user, service_prefix):
+    service = f"# new\\n# rendered by {TAG}\\n[Service]\\nUser={user}\\nExecStart={executable}\\n"
+    timer = "# new\\n"
+    return {f"{service_prefix}-display.service": service, f"{service_prefix}-display.timer": timer}
+"""
+# 0.9.x rendered display units without a service prefix argument.
+OLD_INSTALLATION_MODULE = """
+def display_systemd_units(config, *, executable, app_dir, config_path, user):
+    names = ("inky-bird-frame-display.service", "inky-bird-frame-display.timer")
+    return {name: "# old\\n" for name in names}
+"""
 SYSTEM_PATHS = {
     "install-controller.sh": ("/Library/LaunchDaemons", "/usr/bin/plutil"),
     "uninstall-controller.sh": (),
@@ -101,6 +117,7 @@ class Host:
         (package / "__init__.py").write_text("")
         (package / "native_names.py").write_text("# replaced by the synthetic python3\n")
         (package / "config.py").write_text(FAKE_CONFIG_MODULE)
+        (package / "installation.py").write_text(FAKE_INSTALLATION_MODULE)
         (directory / "src/runtime-tag").write_text(f"{tag}\n")
         (directory / "catalog").mkdir(exist_ok=True)
         (directory / "deploy").mkdir(exist_ok=True)
@@ -196,8 +213,8 @@ class Host:
         tag = Path(os.path.realpath(self.app / ".venv")) / "tag"
         return tag.read_text().strip()
 
-    def runtime_dirs(self) -> list[Path]:
-        runtimes = self.app / ".runtimes"
+    def runtime_dirs(self, name: str = ".runtimes") -> list[Path]:
+        runtimes = self.app / name
         return sorted(runtimes.iterdir()) if runtimes.exists() else []
 
     # macOS
@@ -706,9 +723,7 @@ def test_linux_app_owned_upgrade_refuses_while_a_plate_is_being_made(tmp_path: P
 # Display node installer -----------------------------------------------------
 
 
-def display_host(tmp_path: Path, installed: str | None) -> Host:
-    """A Pimoroni venv with the old distribution installed and its timer stopped."""
-    host = Host(tmp_path, "Linux")
+def add_display_venv(host: Host) -> None:
     python = host.venv / "bin/python"
     python.parent.mkdir(parents=True)
     python.write_text(
@@ -716,9 +731,25 @@ def display_host(tmp_path: Path, installed: str | None) -> Host:
         'venv-python "$0" "$@"\n'
     )
     python.chmod(0o755)
+
+
+def display_host(tmp_path: Path, installed: str | None) -> Host:
+    """A Pimoroni venv with the old distribution installed and its timer stopped."""
+    host = Host(tmp_path, "Linux")
+    add_display_venv(host)
     if installed is not None:
         Host.write_source(host.app, "old")
         host.save_state("pip", {installed: {"source": str(host.app)}})
+        site = host.venv / "lib/python3/site-packages"
+        site.mkdir(parents=True)
+        if installed == "inky-bird-frame":
+            # The renamed distribution was a regular, non-editable install.
+            package = site / "inky_bird_frame"
+            shutil.copytree(host.app / "src/inky_bird_frame", package)
+            (package / "installation.py").write_text(OLD_INSTALLATION_MODULE)
+            (site / "runtime-tag").write_text("old\n")
+        else:
+            (site / "_inky_bird.pth").write_text(f"{host.app}/src\n")
         host.install_units(display_service="inactive", display_timer="inactive")
     return host
 
@@ -736,7 +767,7 @@ def test_display_upgrade_installs_new_before_removing_old_distribution(tmp_path:
     installed = host.state_of("pip")
     assert set(installed) == {"inky-bird"}
     source = Path(str(installed["inky-bird"]["source"]))
-    assert source.parent == (host.app / ".runtimes").resolve()
+    assert source.parent == (host.app / ".display-runtimes").resolve()
     assert (source / "src/runtime-tag").read_text() == "new\n"
     assert (host.app / "src").is_symlink()
     assert host.unit_state("display.timer") == {"active": True, "enabled": True}
@@ -755,7 +786,7 @@ def test_display_failed_package_install_keeps_old_runtime_and_restarts_timer(
     assert not (host.app / "src").is_symlink()
     assert host.unit_state("display.timer")["active"] is True
     assert "# old" in host.unit_text("display.timer")
-    assert host.runtime_dirs() == []
+    assert host.runtime_dirs(".display-runtimes") == []
     assert "previous version" in result.stderr
 
 
@@ -773,7 +804,7 @@ def test_display_failure_after_install_reinstalls_the_same_named_previous_versio
     assert host.state_of("pip") == {"inky-bird": {"source": str(host.app)}}
     assert (host.app / "src/runtime-tag").read_text() == "old\n"
     assert host.unit_state("display.timer")["active"] is True
-    assert host.runtime_dirs() == []
+    assert host.runtime_dirs(".display-runtimes") == []
     assert "previous version is unchanged" in result.stderr
 
 
@@ -793,7 +824,143 @@ def test_display_rejected_configuration_changes_nothing(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert not any(call[:2] == ["pip", "install"] for call in host.calls())
     assert host.state_of("pip") == {"inky-bird": {"source": str(host.app)}}
-    assert host.runtime_dirs() == []
+    assert host.runtime_dirs(".display-runtimes") == []
+
+
+def test_display_name_migration_renders_units_with_the_new_package(tmp_path: Path) -> None:
+    host = display_host(tmp_path, "inky-bird-frame")
+    result = host.run("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    assert result.returncode == 0, result.stderr
+    # The old package shadowed the new one until it was removed; units come from the new one.
+    assert "# rendered by new" in host.unit_text("display.service")
+    assert not (host.venv / "lib/python3/site-packages/inky_bird_frame").exists()
+
+
+def test_display_failure_after_timer_restart_rearms_the_previous_timer(tmp_path: Path) -> None:
+    host = display_host(tmp_path, "inky-bird")
+    timer = f"{host.family}-display.timer"
+    host.fail(f"systemctl:start:{host.family}-display.service")
+
+    result = host.run(
+        "install-display-local.sh",
+        INKY_BIRD_NONINTERACTIVE_SUDO="true",
+        INKY_BIRD_RUN_INITIAL_DISPLAY="true",
+    )
+
+    assert result.returncode == 1
+    calls = host.calls()
+    restored = max(
+        index
+        for index, call in enumerate(calls)
+        if call[:2] == ["sudo", "install"] and call[-1] == str(host.units / timer)
+    )
+    # Started again after its previous definition is back, not left on the new one.
+    assert ["systemctl", "restart", timer] in calls[restored:]
+    assert "# old" in host.unit_text("display.timer")
+    assert host.unit_state("display.timer")["active"] is True
+    assert (host.app / "src/runtime-tag").read_text() == "old\n"
+    assert (display_source(host) / "src/runtime-tag").read_text() == "old\n"
+    assert "previous version is unchanged" in result.stderr
+
+
+def test_app_owned_rollback_restarts_the_scheduler_on_the_restored_runtime(
+    tmp_path: Path,
+) -> None:
+    host = linux_host(tmp_path, mode="app")
+    host.fail(f"systemctl:restart:{host.family}-notifications.timer")
+
+    result = run_linux(host, f"{APP_UNITS} notifications.service notifications.timer")
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    assert host.unit_state("scheduler.service")["active"] is True
+    scheduler = host.state_of("processes")[f"{host.family}-scheduler.service"]
+    assert scheduler["runtime"] == "old"
+    assert Path(str(scheduler["directory"])).is_dir()
+    assert "previous version is running again" in result.stderr
+
+
+# One Pi running both roles -----------------------------------------------------
+
+
+def let_display_finish(host: Host) -> None:
+    """Stop the display timer the way the operator does before the next upgrade."""
+    systemd = host.state_of("systemd")
+    for suffix in ("service", "timer"):
+        systemd[f"{host.family}-display.{suffix}"] = {"active": False, "enabled": True}
+    host.save_state("systemd", systemd)
+
+
+def run_display(host: Host) -> subprocess.CompletedProcess[str]:
+    result = host.run("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    let_display_finish(host)
+    return result
+
+
+def display_source(host: Host) -> Path:
+    return Path(str(host.state_of("pip")["inky-bird"]["source"]))
+
+
+def test_display_upgrades_keep_the_controller_runtime(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    result = run_linux(host)
+    assert result.returncode == 0, result.stderr
+    controller_runtimes = host.runtime_dirs()
+    add_display_venv(host)
+
+    for tag in ("new", "newer"):
+        Host.write_source(host.source, tag)
+        result = run_display(host)
+        assert result.returncode == 0, result.stderr
+
+    python = host.app / ".venv/bin/python"
+    assert python.exists()
+    check = subprocess.run(
+        [str(python), "-I", "-c", "print('ok')"],
+        env=host.environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.stdout == "ok\n", check.stderr
+    assert host.active_runtime() == "new"
+    # The controller's own rollback runtime is kept as well.
+    assert all(path.is_dir() for path in controller_runtimes)
+    assert (display_source(host) / "src/runtime-tag").read_text() == "newer\n"
+
+
+def test_controller_upgrades_keep_the_display_source(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    add_display_venv(host)
+    result = run_display(host)
+    assert result.returncode == 0, result.stderr
+    source = display_source(host)
+
+    for tag in ("newer", "newest"):
+        Host.write_source(host.source, tag)
+        result = run_linux(host)
+        assert result.returncode == 0, result.stderr
+
+    assert host.active_runtime() == "newest"
+    assert display_source(host) == source
+    assert (source / "src/runtime-tag").read_text() == "new\n"
+
+
+def test_controller_rollback_restores_the_display_source_link(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    add_display_venv(host)
+    result = run_display(host)
+    assert result.returncode == 0, result.stderr
+    linked = os.path.realpath(host.app / "src")
+    Host.write_source(host.source, "newer")
+    host.fail(f"systemctl:restart:{host.family}-generate.timer")
+
+    result = run_linux(host)
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    assert os.path.realpath(host.app / "src") == linked
+    assert (host.app / "src/runtime-tag").read_text() == "new\n"
 
 
 # Uninstallers ----------------------------------------------------------------
