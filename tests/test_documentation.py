@@ -496,6 +496,65 @@ def test_native_backup_refuses_launch_agents_of_another_family(tmp_path: Path) -
     assert "No installed com.inky-bird-frame.serve LaunchAgent" in result.stderr
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_bootout_stops_at_the_first_agent_that_fails(tmp_path: Path) -> None:
+    (_, _, _, bootout), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "scheduler", loaded=("scheduler",))
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
+
+    result = host.run(bootout)
+
+    assert host.status(result) != 0
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_foreign_unit_and_starts_nothing(tmp_path: Path) -> None:
+    _, (start, _) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "inactive", "other.service": "inactive"})
+    (host.backup / "native-active-systemd-units.txt").write_text(
+        "inky-bird-controller.service\ninky-bird-other.service\n"
+    )
+
+    result = host.run(start)
+
+    assert host.status(result) != 0
+    assert "Unexpected unit in" in result.stderr
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_foreign_label_and_bootstraps_nothing(tmp_path: Path) -> None:
+    _, (_, bootstrap) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "other", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nother\n")
+
+    result = host.run(bootstrap)
+
+    assert host.status(result) != 0
+    assert "Unexpected label in" in result.stderr
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_missing_launch_agent_and_bootstraps_nothing(
+    tmp_path: Path,
+) -> None:
+    _, (_, bootstrap) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
+
+    result = host.run(bootstrap)
+
+    assert host.status(result) != 0
+    assert "Recorded LaunchAgent is missing" in result.stderr
+    assert host.calls() == []
+
+
 def test_backup_snippets_that_can_fail_run_in_a_subshell() -> None:
     guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
     blocks = re.findall(r"^( *)```bash\n(.*?)^\1```$", guide, re.MULTILINE | re.DOTALL)
