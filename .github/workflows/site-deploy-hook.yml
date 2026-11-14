@@ -15,6 +15,7 @@ permissions: {}
 jobs:
   trigger-site-rebuild:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Trigger henrysowell.com rebuild
         env:
@@ -24,5 +25,5 @@ jobs:
             echo "HENRYSOWELL_COM_DEPLOY_HOOK secret is not set; skipping." >&2
             exit 0
           fi
-          curl -fsS -X POST "$DEPLOY_HOOK_URL" > /dev/null
+          curl -fsS --connect-timeout 10 --max-time 60 -X POST "$DEPLOY_HOOK_URL" > /dev/null
           echo "Deploy hook fired."

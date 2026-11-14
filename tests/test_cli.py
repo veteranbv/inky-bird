@@ -261,7 +261,15 @@ class CliTests(unittest.TestCase):
                 observation_window=SimpleNamespace(value="last-30-days"),
                 radius_km=8,
             ),
+            controller=SimpleNamespace(
+                configuration_ownership="managed",
+                generation_enabled=True,
+                workspace_dir=Path("workspace"),
+                catalog_dir=Path("catalog"),
+                state_dir=Path("state"),
+            ),
             notifications=SimpleNamespace(enabled=False),
+            unknown_keys=(),
         )
         output = io.StringIO()
         args = Namespace(config=Path("instance.toml"))
@@ -1471,7 +1479,8 @@ controller_url = "http://controller.test:8793"
 state_dir = "display-state"
 rotation_mode = "shuffle_bag"
 """
-            with patch("sys.stdin", io.StringIO(config)), redirect_stdout(io.StringIO()):
+            stdin = io.TextIOWrapper(io.BytesIO(config.encode()), encoding="utf-8")
+            with patch("sys.stdin", stdin), redirect_stdout(io.StringIO()):
                 config_install_command(Namespace(destination=destination))
 
             installed = destination.read_text()
@@ -1481,19 +1490,25 @@ rotation_mode = "shuffle_bag"
         self.assertEqual(mode, 0o600)
 
     def test_config_install_does_not_replace_destination_with_invalid_toml(self) -> None:
+        # The destination must be a valid config: a damaged one would raise on read
+        # and hide whether the candidate itself is validated before replacement.
         with TemporaryDirectory() as temporary:
             destination = Path(temporary) / "config.toml"
-            destination.write_text("existing")
+            existing = (Path(__file__).resolve().parents[1] / "config.example.toml").read_text()
+            destination.write_text(existing)
+            stdin = io.TextIOWrapper(io.BytesIO(b"not = [valid"), encoding="utf-8")
             with (
-                patch("sys.stdin", io.StringIO("not = [valid")),
+                patch("sys.stdin", stdin),
                 redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(ConfigurationError, "Invalid TOML"),
+                self.assertRaisesRegex(ConfigurationError, "Invalid TOML in standard input"),
             ):
                 config_install_command(Namespace(destination=destination))
 
             installed = destination.read_text()
+            leftovers = sorted(path.name for path in Path(temporary).iterdir())
 
-        self.assertEqual(installed, "existing")
+        self.assertEqual(installed, existing)
+        self.assertEqual(leftovers, ["config.toml"])
 
     def test_setup_and_doctor_have_role_specific_commands(self) -> None:
         setup = build_parser().parse_args(
