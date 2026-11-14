@@ -509,6 +509,33 @@ def _retry_species_identity(
     return identity
 
 
+def _invalid_approved_identity(directory: Path, taxon_id: int) -> tuple[str, str, Path] | None:
+    # The approval is already invalid and is archived regardless, so an
+    # unreadable or mismatched manifest only means it cannot name the bird.
+    manifest_path = directory / "manifest.json"
+    try:
+        manifest = read_json(manifest_path)
+    except CatalogError:
+        return None
+    retained_taxon_id = manifest.get("taxon_id") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or isinstance(retained_taxon_id, bool)
+        or retained_taxon_id != taxon_id
+    ):
+        return None
+    common_name = manifest.get("common_name")
+    scientific_name = manifest.get("scientific_name")
+    if (
+        not isinstance(common_name, str)
+        or not common_name.strip()
+        or not isinstance(scientific_name, str)
+        or not scientific_name.strip()
+    ):
+        return None
+    return common_name, scientific_name, manifest_path
+
+
 def _retry_archive_plan(
     state_dir: Path,
     sources: list[Path],
@@ -737,11 +764,7 @@ def retry_species(
         if identity is None:
             identity = terminal_identity
         if identity is None and invalid_approved is not None:
-            identity = _retry_species_identity(
-                taxon_id,
-                [invalid_approved],
-                deferred_malformed_errors=deferred_identity_errors,
-            )
+            identity = _invalid_approved_identity(invalid_approved, taxon_id)
         if identity is None and queued is not None:
             identity = (
                 queued.common_name,
