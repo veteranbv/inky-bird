@@ -22,9 +22,17 @@ from typing import TextIO
 from .birds import DateRange, EbirdArchiveSpecies, ObservationWindow, date_range_for_window
 from .catalog import catalog_state_lock
 from .errors import DataSourceError
+from .history_summary import (
+    SpeciesSummary,
+    load_summary,
+    parse_species_rows,
+    summarize,
+    write_summary,
+)
 from .http import write_bytes_atomic, write_json_atomic
 
 STATE_FILENAME = "ebird-archive-observations.json"
+SUMMARY_SOURCE = "ebird-archive"
 CSV_FILENAME = "MyEBirdData.csv"
 # Only the columns import reads; Location labels trips while choosing them.
 REQUIRED_COLUMNS = ("Submission ID", "Common Name", "Scientific Name", "Date", "Location")
@@ -329,6 +337,30 @@ def _read_state(
     return checklists, history_started_at, last_imported_at, earliest, latest
 
 
+def _summary_body(checklists: dict[str, _StoredChecklist]) -> dict[str, object]:
+    records = [
+        (species.common_name, species.scientific_name, checklist.observed_on)
+        for _, checklist in sorted(checklists.items())
+        for species in checklist.species
+    ]
+    return {
+        "unit": "checklists",
+        "species": [row.as_dict() for row in summarize(records, name_from_latest=True)],
+    }
+
+
+def read_ebird_archive_summary(state_dir: Path) -> list[SpeciesSummary]:
+    """All retained species with checklist counts and dates; no place data."""
+    path = _state_path(state_dir)
+    with _history_lock(state_dir):
+        return load_summary(
+            path,
+            SUMMARY_SOURCE,
+            lambda payload: parse_species_rows(payload.get("species")),
+            lambda: _summary_body(_read_state(path, required=True)[0]),
+        )
+
+
 def _validate_input_size(size: int) -> None:
     if size > MAX_UNCOMPRESSED_BYTES:
         raise DataSourceError("eBird archive exceeds the safe uncompressed size limit")
@@ -559,6 +591,7 @@ def import_ebird_archive(
                 },
                 mode=0o600,
             )
+            write_summary(path, SUMMARY_SOURCE, _summary_body(incoming))
         return stats
 
 

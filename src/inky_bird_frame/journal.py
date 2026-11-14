@@ -21,7 +21,7 @@ from typing import cast
 from uuid import uuid4
 
 from .activity import read_activity
-from .birds import BirdSpecies, ObservationWindow, cached_species_identities
+from .birds import BirdSpecies, cached_species_identities
 from .catalog import catalog_state_lock, read_collection, read_json
 from .codex_runner import parse_species_profile
 from .config import AppConfig, ControllerConfig, DiscoveryProvider
@@ -671,6 +671,9 @@ class JournalService:
     def __init__(self, config: ControllerConfig, *, app_config: AppConfig | None = None) -> None:
         self.config = config
         self.app_config = app_config
+        # Trip evidence status, keyed by the eBird history file's identity and
+        # the journal content, so page loads do not re-parse the whole archive.
+        self._evidence_cache: tuple[object, list[list[dict[str, object]]]] | None = None
 
     def catalog(self) -> list[dict[str, object]]:
         path = self.config.catalog_dir / "index.json"
@@ -1093,29 +1096,58 @@ class JournalService:
     def snapshot(self) -> dict[str, object]:
         if self.app_config is not None:
             self.app_config = current_config(self.app_config)
-        retained, evidence, coverage, unresolved = self._retained_history()
+        retained, evidence, coverage, unresolved, recent = self._retained_history()
+        # Parts the page can show without; one unreadable file must not hide the journal.
+        notices: list[dict[str, str]] = []
         with catalog_state_lock(self.config.state_dir):
             state = read_journal(self.config.state_dir)
             saved = [entry.taxon_id for entry in read_collection(self.config.state_dir)]
             active_path = self.config.state_dir / "active-catalog.json"
-            active, _ = (
-                project_catalog(read_json(active_path))
-                if active_path.exists()
-                else ({"species": []}, {})
-            )
-            active_species = cast(list[dict[str, object]], active["species"])
-            featured = featured_plate_entry(active)
+            try:
+                active, _ = (
+                    project_catalog(read_json(active_path))
+                    if active_path.exists()
+                    else ({"species": []}, {})
+                )
+                active_species = cast(list[dict[str, object]], active["species"])
+                featured = featured_plate_entry(active)
+            except (CatalogError, OSError, ValueError):
+                active_species, featured = [], None
+                notices.append(
+                    {
+                        "part": "current-birds",
+                        "message": "The current wall birds could not be read. "
+                        "The next refresh writes them again.",
+                    }
+                )
             active_ids = [cast(int, entry["taxon_id"]) for entry in active_species]
             observed = current_discovery_species(self.app_config) if self.app_config else []
-            queued = read_generation_queue(self.app_config) if self.app_config else []
+            try:
+                queued = read_generation_queue(self.app_config) if self.app_config else []
+            except (CatalogError, OSError, ValueError):
+                queued = []
+                notices.append(
+                    {
+                        "part": "plate-queue",
+                        "message": "The list of birds waiting for plates could not be read.",
+                    }
+                )
             identities = {bird.taxon_id: bird for bird in [*retained, *queued, *observed]}
             from .recovery import pending_inventory
 
-            pending: dict[str, object] = (
-                pending_inventory(self.app_config)
-                if self.app_config
-                else {"status": "unavailable", "candidates": []}
-            )
+            unavailable: dict[str, object] = {"status": "unavailable", "candidates": []}
+            try:
+                pending: dict[str, object] = (
+                    pending_inventory(self.app_config) if self.app_config else unavailable
+                )
+            except (CatalogError, JournalError, OSError, ValueError):
+                pending = unavailable
+                notices.append(
+                    {
+                        "part": "plates-in-review",
+                        "message": "Plates waiting for review could not be read.",
+                    }
+                )
             for candidate in cast(list[dict[str, object]], pending["candidates"]):
                 id = cast(int, candidate["taxon_id"])
                 if candidate["inspect_available"] and id not in identities:
@@ -1188,6 +1220,17 @@ class JournalService:
                 )
             for bird in birds:
                 bird["retained_evidence"] = evidence.get(cast(int, bird["taxon_id"]), [])
+            try:
+                management = self.management(approved=approved_ids, pending=pending)
+            except (CatalogError, JournalError, OSError, ValueError):
+                management = {"available": False}
+                notices.append(
+                    {
+                        "part": "plate-work",
+                        "message": "Plate work could not be read. Manage shows it again "
+                        "once its files are readable.",
+                    }
+                )
             result = {
                 "revision": state.revision,
                 "collections": state.owner_dict()["collections"],
@@ -1197,39 +1240,64 @@ class JournalService:
                 "birds": birds,
                 "history_coverage": coverage,
                 "unresolved_history": unresolved,
-                "management": self.management(approved=approved_ids, pending=pending),
+                "recent_species": recent,
+                "notices": notices,
+                "management": management,
             }
         # Do not hold the catalog lock while taking the history lock: trip saves
         # take history first, then catalog. Keep the curated membership unchanged.
         if any(member.evidence for group in state.collections for member in group.members):
-            from .ebird_archive import STATE_FILENAME, read_ebird_checklists
-
-            try:
-                _, records = read_ebird_checklists(self.config.state_dir)
-                available = (self.config.state_dir / STATE_FILENAME).is_file()
-                links = {
-                    (record.checklist_hash, species.scientific_name): record.observed_on
-                    for record in records
-                    for species in record.species
-                }
-            except DataSourceError:
-                available, links = False, {}
             projected = cast(list[dict[str, object]], result["collections"])
-            for group, projection in zip(state.collections, projected, strict=True):
-                projection["evidence"] = [
-                    {
-                        "taxon_id": member.taxon_id,
-                        "scientific_name": member.scientific_name,
-                        "status": "unavailable"
-                        if not available
-                        else "linked"
-                        if member_evidence_matches(group, member, links)
-                        else "source-changed",
-                    }
-                    for member in group.members
-                    if member.evidence
-                ]
+            for projection, rows in zip(projected, self._trip_evidence(state), strict=True):
+                projection["evidence"] = rows
         return result
+
+    def _trip_evidence(self, state: JournalState) -> list[list[dict[str, object]]]:
+        from .ebird_archive import STATE_FILENAME, read_ebird_checklists
+
+        path = self.config.state_dir / STATE_FILENAME
+        try:
+            info = path.lstat()
+            identity: object = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+        except FileNotFoundError:
+            identity = None
+        except OSError:
+            identity = object()  # Never matches: read and report below.
+        key = (
+            identity,
+            hashlib.sha256(json.dumps(state.as_dict(), sort_keys=True).encode()).hexdigest(),
+        )
+        cached = self._evidence_cache
+        if cached is not None and cached[0] == key:
+            return [[dict(row) for row in rows] for rows in cached[1]]
+        try:
+            _, records = read_ebird_checklists(self.config.state_dir)
+            available = path.is_file()
+            links = {
+                (record.checklist_hash, species.scientific_name): record.observed_on
+                for record in records
+                for species in record.species
+            }
+        except DataSourceError:
+            available, links = False, {}
+        evidence: list[list[dict[str, object]]] = [
+            [
+                {
+                    "taxon_id": member.taxon_id,
+                    "scientific_name": member.scientific_name,
+                    "status": "unavailable"
+                    if not available
+                    else "linked"
+                    if member_evidence_matches(group, member, links)
+                    else "source-changed",
+                }
+                for member in group.members
+                if member.evidence
+            ]
+            for group in state.collections
+        ]
+        self._evidence_cache = (key, evidence)
+        return [[dict(row) for row in rows] for rows in evidence]
 
     def _retained_history(
         self,
@@ -1238,17 +1306,21 @@ class JournalService:
         dict[int, list[dict[str, object]]],
         list[dict[str, object]],
         list[dict[str, object]],
+        list[dict[str, object]],
     ]:
         # History locks precede the catalog lock. Rendering never calls a provider
         # or resolves new taxonomy, and a provider limit must not truncate a library.
-        from .birdbuddy import read_birdbuddy_history_species
-        from .birdnet_analyzer import read_birdnet_analyzer_history
-        from .ebird_archive import read_ebird_archive_history
+        # Small per-species summaries stand in for the complete histories.
+        from .birdbuddy import read_birdbuddy_history_summary
+        from .birdnet_analyzer import read_birdnet_analyzer_summary
+        from .ebird_archive import read_ebird_archive_summary
+        from .history_summary import SpeciesSummary
 
         birds: list[BirdSpecies] = []
         evidence: dict[int, list[dict[str, object]]] = {}
         coverage: list[dict[str, object]] = []
         unresolved: list[dict[str, object]] = []
+        latest: dict[int, tuple[str, str]] = {}
         canonical = {
             cast(str, entry["scientific_name"]): (
                 cast(int, entry["taxon_id"]),
@@ -1265,53 +1337,49 @@ class JournalService:
             if not (self.config.state_dir / filename).exists():
                 continue
             try:
-                records: list[tuple[str, str, int]]
+                records: list[SpeciesSummary]
                 if source == "ebird-archive":
-                    archive = read_ebird_archive_history(
-                        self.config.state_dir, window=ObservationWindow.ALL_TIME, limit=None
-                    )
-                    records = [
-                        (item.common_name, item.scientific_name, item.observation_count)
-                        for item in archive.species
-                    ]
+                    records = read_ebird_archive_summary(self.config.state_dir)
                     description = "Complete retained archive; checklist dates, not event instants"
                 elif source == "birdnet-analyzer":
-                    analyzer = read_birdnet_analyzer_history(
-                        self.config.state_dir, window=ObservationWindow.ALL_TIME, limit=None
-                    )
-                    records = [
-                        (item.common_name, item.scientific_name, item.detection_count)
-                        for item in analyzer.species
-                    ]
-                    description = (
-                        f"Retained imports; {analyzer.undated_detections} undated segments"
-                    )
+                    records, undated = read_birdnet_analyzer_summary(self.config.state_dir)
+                    description = f"Retained imports; {undated} undated segments"
                 else:
-                    feeder, description = read_birdbuddy_history_species(
+                    records, description = read_birdbuddy_history_summary(
                         self.config.state_dir,
                         include_manual_sightings=bool(
                             self.app_config
                             and self.app_config.discovery.birdbuddy_include_manual_sightings
                         ),
                     )
-                    records = [
-                        (item.common_name, item.scientific_name, item.detection_count)
-                        for item in feeder
-                    ]
-                identities = cached_species_identities(
-                    self.config.state_dir / f"{source}-taxonomy-crosswalk.json"
-                )
+                try:
+                    identities = cached_species_identities(
+                        self.config.state_dir / f"{source}-taxonomy-crosswalk.json"
+                    )
+                except (DataSourceError, OSError, ValueError):
+                    coverage.append(
+                        {
+                            "source": source,
+                            "status": "unavailable",
+                            "coverage": "Saved species matches for this history could not "
+                            "be read. Inspect the controller state before importing again.",
+                        }
+                    )
+                    continue
                 source_birds: list[BirdSpecies] = []
                 source_unresolved: list[dict[str, object]] = []
                 source_evidence: dict[int, list[dict[str, object]]] = {}
-                for common, scientific, count in records:
-                    identity = identities.get(scientific) or canonical.get(scientific)
+                for record in records:
+                    count = record.count
+                    identity = identities.get(record.scientific_name) or canonical.get(
+                        record.scientific_name
+                    )
                     if identity is None:
                         source_unresolved.append(
                             {
                                 "source": source,
-                                "common_name": _visible_text(common),
-                                "scientific_name": _visible_text(scientific),
+                                "common_name": _visible_text(record.common_name),
+                                "scientific_name": _visible_text(record.scientific_name),
                                 "count": count,
                                 "unit": unit,
                             }
@@ -1324,7 +1392,13 @@ class JournalService:
                         )
                     )
                     source_evidence.setdefault(id, []).append(
-                        {"source": source, "count": count, "unit": unit}
+                        {
+                            "source": source,
+                            "count": count,
+                            "unit": unit,
+                            "first_noted": record.first_noted,
+                            "last_noted": record.last_noted,
+                        }
                     )
                 # A malformed later identity must not leave a partly complete
                 # source marked available. Publish this source projection once.
@@ -1332,6 +1406,10 @@ class JournalService:
                 unresolved.extend(source_unresolved)
                 for id, rows in source_evidence.items():
                     evidence.setdefault(id, []).extend(rows)
+                    for row in rows:
+                        noted = row["last_noted"]
+                        if isinstance(noted, str) and (id not in latest or noted > latest[id][0]):
+                            latest[id] = (noted, source)
                 coverage.append(
                     {
                         "source": source,
@@ -1350,7 +1428,13 @@ class JournalService:
                         "Inspect this source before importing or restoring.",
                     }
                 )
-        return birds, evidence, coverage, unresolved
+        recent = [
+            {"taxon_id": id, "last_noted": noted, "source": source}
+            for id, (noted, source) in sorted(
+                latest.items(), key=lambda item: (item[1][0], -item[0]), reverse=True
+            )[:10]
+        ]
+        return birds, evidence, coverage, unresolved, recent
 
     def management_snapshot(self) -> dict[str, object]:
         """Small polling projection; never scan or join imported source histories."""
