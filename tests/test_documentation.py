@@ -700,3 +700,16 @@ def test_documented_configuration_examples_load_or_say_they_are_fragments(
         except ConfigurationError as exc:
             failures.append(f"{where}: {exc}")
     assert not failures, "\n" + "\n".join(failures)
+
+
+def test_architecture_describes_the_fields_the_request_log_actually_writes() -> None:
+    server = (ROOT / "src/inky_bird_frame/server.py").read_text(encoding="utf-8")
+    dispatch = server.split("async def dispatch(", 1)[1].split("\n    def ", 1)[0]
+    logged = re.search(r'"event": "http_request",(.*?)\}', dispatch, re.DOTALL)
+    assert logged
+    assert set(re.findall(r'"(\w+)":', logged.group(1))) == {"method", "route", "status"}
+
+    guide = " ".join((ROOT / "docs/architecture.md").read_text(encoding="utf-8").split())
+    assert "with source IP address, path and query" not in guide
+    assert "It never logs the source address, query, cookies" in guide
+    assert "Owner, screen, wall and status routes are not logged per request" in guide

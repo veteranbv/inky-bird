@@ -243,8 +243,12 @@ private and do not use these heartbeats as an identity or authorization check.
 
 Catalog `GET` and `HEAD` requests are side-effect free, including requests with
 query parameters. Display health changes only through the two bounded POST
-routes. The service logs each request locally with source IP address, path and
-query, and status. It does not log headers or send external browser telemetry.
+routes. For these legacy routes the service logs one local line per request
+with the time, method, a fixed route label (an unknown path is logged as
+`/not-found`, every asset as `/v1/assets/{asset}`) and the status. It never logs
+the source address, query, cookies, headers, asset identity or an arbitrary
+path. Owner, screen, wall and status routes are not logged per request. Nothing
+is sent as external browser telemetry.
 
 Native installations use launchd or systemd to schedule the controller's
 one-shot commands. Generated systemd serve and display units carry basic
