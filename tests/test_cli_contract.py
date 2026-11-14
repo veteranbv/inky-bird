@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -244,3 +246,31 @@ def test_doctor_ready_exits_zero(tmp_path: Path) -> None:
         redirect_stdout(io.StringIO()),
     ):
         assert main(["doctor", "controller", "--config", str(tmp_path / "config.toml")]) == 0
+
+
+@pytest.mark.parametrize(
+    ("arguments", "exit_code", "code"),
+    [
+        (["status", "--config", "{missing}"], 1, "configuration"),
+        (["birdbuddy", "logout", "--config", "{missing}"], 2, "usage"),
+    ],
+)
+def test_module_entry_point_returns_the_contract_exit_code(
+    arguments: list[str], exit_code: int, code: str, tmp_path: Path
+) -> None:
+    missing = str(tmp_path / "missing.toml")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "inky_bird_frame.cli",
+            *(item.replace("{missing}", missing) for item in arguments),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == exit_code
+    assert json.loads(result.stdout)["error"]["type"] == code
+    assert "Traceback" not in result.stderr
