@@ -34,7 +34,7 @@ from .catalog import (
 )
 from .codex_runner import parse_species_profile
 from .config import AppConfig, PublicCatalogConfig
-from .errors import CatalogError, CatalogPublishError, GenerationError
+from .errors import BusyError, CatalogError, CatalogPublishError, GenerationError
 from .http import write_json_atomic
 from .timeutil import parse_utc_timestamp
 
@@ -109,6 +109,10 @@ _MINIMUM_PRIVATE_TERM_LENGTH = 3
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+class CatalogPublishBusyError(CatalogPublishError, BusyError):
+    """Raised when another catalog publication already holds the publish lock."""
+
+
 @contextmanager
 def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -116,7 +120,7 @@ def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise CatalogPublishError("Another catalog publication is running") from exc
+            raise CatalogPublishBusyError("Another catalog publication is running") from exc
         try:
             yield
         finally:

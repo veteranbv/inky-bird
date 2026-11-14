@@ -22,7 +22,7 @@ from PIL import Image, PngImagePlugin
 from inky_bird_frame.catalog import rebuild_catalog_index, sha256_file
 from inky_bird_frame.cli import build_parser, catalog_sync_command
 from inky_bird_frame.config import AppConfig, PublicCatalogConfig, load_config
-from inky_bird_frame.errors import CatalogPublishError
+from inky_bird_frame.errors import BusyError, CatalogPublishError
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.publisher import (
     _COMMAND_TIMEOUT_SECONDS,
@@ -38,6 +38,7 @@ from inky_bird_frame.publisher import (
     _snapshot_catalog,
     _validate_checkout,
     _validate_image,
+    exclusive_publish_lock,
     publication_privacy_patterns,
     replace_public_catalog_taxon,
     run_catalog_publish,
@@ -415,6 +416,19 @@ def _github(fake: _FakeGitHub) -> Iterator[None]:
 
 
 class PublisherTests(unittest.TestCase):
+    def test_a_second_publication_reports_busy(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            with (
+                exclusive_publish_lock(state),
+                self.assertRaises(BusyError) as raised,
+                exclusive_publish_lock(state),
+            ):
+                pass
+
+        self.assertIsInstance(raised.exception, CatalogPublishError)
+        self.assertIn("Another catalog publication is running", str(raised.exception))
+
     def test_cleans_only_abandoned_publish_directories(self) -> None:
         with TemporaryDirectory() as temporary, TemporaryDirectory() as external:
             work_parent = Path(temporary)
