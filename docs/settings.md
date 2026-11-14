@@ -31,7 +31,9 @@ for operating-system prerequisites and service-account behavior.
 New configurations have no selected sources and generation off. You can create
 your owner account, browse approved artwork, save selections and open Frame
 without Codex authentication or a paid generation. A refresh with no sources
-is healthy and makes no requests to observation services.
+is healthy and makes no requests to observation services. To make new plates
+later, turn generation on in Settings. It uses your own Codex account, and that
+provider's charges apply.
 
 Open the controller's actual home-network address followed by `:8793/app`.
 `http://127.0.0.1:8793/app` works only on the controller itself. A phone needs
@@ -51,18 +53,25 @@ same configuration file. Inky checks the complete candidate before an atomic
 replacement. The file's content hash is its revision: a stale tab cannot replace
 a newer save. A private `config.toml.previous` holds the exact previous bytes.
 Each successful save replaces that one previous-file backup; it is not a backup
-history or a substitute for a complete controller backup.
+history or a substitute for a complete controller backup. Browser saves drop
+comments and rewrite the formatting; unknown keys and tables are kept.
 
 In Manage → Settings and backups, adoption has a separate preview and confirm
-step. It preserves existing source choices and generation policy. Then re-run
+step. It preserves existing source choices and generation policy. The first
+save that adopts an operator-written file also keeps that file, unchanged, as
+`config.toml.original` (mode `0600`). It is written only if absent and never
+overwritten. If an earlier copy already exists, the preview says so, and the
+current file is kept only in `config.toml.previous` until the next save. In the
+settings status, `original_backup` names the copy that is or will be kept and
+`original_backup_available` says whether it exists yet. Then re-run
 native setup and restart the services. App-managed native installations use one
 dynamic scheduler instead of fixed per-job timers. Edits stay locked until that
 restart. Adoption in Docker makes `config-sync` preserve the app-managed runtime
 file on subsequent starts, rather than overwrite it from the original host seed.
 Back up the persistent runtime volume, not only that seed.
 
-To return to file management, stop Inky, restore the matching previous
-configuration or deliberately set `configuration_ownership = "managed"`, run
+To return to file management, stop Inky, restore `config.toml.original` or the
+matching `config.toml.previous`, or deliberately set `configuration_ownership = "managed"`, run
 native setup again and restart. Validate the complete file first. Restore an
 older application only with its matching complete backup.
 
