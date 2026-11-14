@@ -501,8 +501,11 @@ let browser,
     await target.getByRole('button', { name: 'Fit whole plate', exact: true }).click();
     assert(Math.abs((await plateScale(target)) - fit) < 0.001);
   };
-  // With More closed, the control bar sits fully below the bird name.
+  // With More closed and the page unscrolled, the control bar sits fully
+  // below the bird name and the owner's note under it, and every control is
+  // a full-size tap target.
   const captionClear = async (target) => {
+    await target.evaluate(() => scrollTo(0, 0));
     await target.keyboard.press('Shift');
     await target.locator('.frame-controls:not(.quiet)').waitFor();
     assert.equal(await target.locator('.frame-controls.expanded').count(), 0);
@@ -510,6 +513,23 @@ let browser,
     const bar = await target.locator('.frame-controls').boundingBox();
     // Half-pixel tolerance for subpixel layout.
     assert(caption && bar && caption.y + caption.height <= bar.y + 0.5, 'the bar covers the bird name');
+    const note = target.locator('main > p.hint', { hasText: 'Plates change once a minute' });
+    if (await note.count()) {
+      const box = await note.boundingBox();
+      assert(box && box.y + box.height <= bar.y + 0.5, 'the bar covers the note');
+    }
+    for (const control of await target.locator('.frame-controls').locator('button:visible, a:visible').all()) {
+      const box = await control.boundingBox();
+      assert(box && box.width >= 44 && box.height >= 44, 'a Frame control is under 44 px');
+    }
+  };
+  // The small phone sizes the bar must also clear.
+  const captionClearSmall = async (target) => {
+    for (const viewport of [{ width: 320, height: 568 }, { width: 375, height: 667 }]) {
+      await target.setViewportSize(viewport);
+      await captionClear(target);
+    }
+    await target.setViewportSize({ width: 390, height: 844 });
   };
   await page.goto(origin + '/app?page=displays');
   await heading('Displays');
@@ -559,6 +579,7 @@ let browser,
   await screen.locator('.frame-art').waitFor();
   await screen.locator('.frame-art').evaluate((image) => image.decode());
   await captionClear(screen);
+  await captionClearSmall(screen);
   await zoomEnlarges(screen);
   await screen.keyboard.press('Escape');
   await screen.setViewportSize({ width: 844, height: 390 });
@@ -926,6 +947,7 @@ let browser,
     'false',
   );
   await captionClear(page);
+  await captionClearSmall(page);
   const previousControl = page.getByRole('button', { name: 'Previous', exact: true });
   await previousControl.click();
   const clearanceNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);

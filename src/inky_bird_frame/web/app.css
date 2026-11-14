@@ -529,9 +529,20 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 /* Lights-out is deliberate in both themes, so presenting text colors are
    fixed here rather than inherited from the light or dark token set. */
 .presenting, body.presenting { background: #16120c; }
+.presenting {
+  --frame-control: 44px;
+  /* The bar's offset from the bottom edge, its height (one control row plus
+     its padding and border) and a gap above it. */
+  --frame-bar-room: calc(max(14px, env(safe-area-inset-bottom)) + var(--frame-control) + 20px);
+}
+/* One screen tall: the plate takes whatever height the title, bird name and
+   note leave above the room kept for the control bar. */
 .presenting main {
+  display: flex;
+  flex-direction: column;
+  height: 100svh;
   max-width: none;
-  padding: 0 max(10px, env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 185px) max(10px, env(safe-area-inset-left));
+  padding: 0 max(10px, env(safe-area-inset-right)) var(--frame-bar-room) max(10px, env(safe-area-inset-left));
   text-align: center;
 }
 /* The focus ring sits on the dark presenting background in both themes. */
@@ -550,11 +561,9 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 }
 .presenting h1::after { display: none; }
 .presenting .intro { font-size: 13px; margin: 3px 0 10px; color: #9b8f7a; }
-/* Room below the plate for the bird name and the control bar; the owner
-   Frame also keeps its title above the plate. Only the viewport is sized:
-   the plate fills it, so Zoom can still enlarge the plate. */
-.presenting .frame-viewport { height: min(80svh, calc(100svh - 180px)); }
-.presenting h1 ~ .frame-viewport { height: min(80svh, calc(100svh - 216px)); }
+/* Only the viewport is sized: the plate fills it, so Zoom can still enlarge
+   the plate. */
+.presenting .frame-viewport { flex: 1 1 0; height: auto; min-height: 40svh; max-height: 80svh; }
 .presenting .frame-art { background: transparent; border: 0; border-radius: 0; }
 /* The notice and the control bar share one bottom dock, so the notice
    always sits above the bar however many rows the bar needs. The dock
@@ -588,7 +597,7 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 .presenting .frame-controls.expanded .frame-more { padding-bottom: 6px; border-bottom: 1px solid #4e4638; }
 .presenting .frame-confirm-ask span { padding: 4px 8px; color: #e9e2d2; font-size: 14px; }
 .presenting .frame-controls button, .presenting .frame-controls a {
-  min-height: 42px;
+  min-height: var(--frame-control);
   padding: 8px 10px;
   font-size: 14px;
   background: transparent;
@@ -641,7 +650,7 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 :root:fullscreen .presenting .intro,
 :root:fullscreen .presenting p.hint:not([role="status"]) { display: none; }
 :root:fullscreen .presenting main { padding: 0; }
-:root:fullscreen .presenting .frame-viewport { height: 100svh; }
+:root:fullscreen .presenting .frame-viewport { flex: none; height: 100svh; max-height: none; }
 :root:fullscreen .presenting .frame-caption {
   position: fixed;
   left: max(16px, env(safe-area-inset-left));
