@@ -276,6 +276,8 @@ class BirdBuddyPostcard:
     species: tuple[PostcardSpecies, ...]
     media_ids: tuple[str, ...] = ()
     complete: bool = True
+    # Species set from the owner's confirmed history rather than the feed.
+    owner_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -324,6 +326,7 @@ class FeederHistory:
     # included manual sightings. Absent in history from earlier releases.
     confirmed_history_checked_at: str | None = None
     confirmed_history_manual_sightings: bool | None = None
+    confirmed_history_complete: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -843,8 +846,8 @@ def _access_refused(exc: DataSourceError) -> bool:
     )
 
 
-def _backoff_until(state_dir: Path) -> tuple[datetime | None, int]:
-    """Read the saved throttling wait; an unreadable record means no wait."""
+def _backoff_until(state_dir: Path, current: datetime) -> tuple[datetime | None, int]:
+    """Read the saved throttling wait; an unreadable or implausible record means no wait."""
     path = _backoff_path(state_dir)
     if not path.exists() and not path.is_symlink():
         return None, 0
@@ -856,7 +859,12 @@ def _backoff_until(state_dir: Path) -> tuple[datetime | None, int]:
         return None, 0
     until = parse_utc_timestamp(value.get("not_before"))
     failures = value.get("failures")
-    if until is None or not isinstance(failures, int) or isinstance(failures, bool):
+    if (
+        until is None
+        or until > current + THROTTLE_HINT_LIMIT
+        or not isinstance(failures, int)
+        or isinstance(failures, bool)
+    ):
         return None, 0
     return until, max(failures, 0)
 
@@ -864,7 +872,7 @@ def _backoff_until(state_dir: Path) -> tuple[datetime | None, int]:
 def _record_throttling(
     state_dir: Path, current: datetime, hint: datetime | timedelta | None
 ) -> datetime:
-    _, failures = _backoff_until(state_dir)
+    _, failures = _backoff_until(state_dir, current)
     failures += 1
     default = min(THROTTLE_FIRST_WAIT * 2 ** min(failures - 1, 16), THROTTLE_MAX_WAIT)
     if isinstance(hint, timedelta):
@@ -1405,6 +1413,7 @@ def _parse_postcard_state(value: object) -> BirdBuddyPostcard:
         observed_at,
         tuple(species),
         media_ids=tuple(sorted(media_ids)),
+        owner_confirmed=value.get("owner_confirmed") is True,
     )
 
 
@@ -1589,8 +1598,9 @@ def _parse_feeder_history(value: object) -> FeederHistory:
     # Read cadence only: an unreadable value just means history is read again.
     checked_at = value.get("confirmed_history_checked_at")
     checked_manual = value.get("confirmed_history_manual_sightings")
+    checked_complete = value.get("confirmed_history_complete")
     if parse_utc_timestamp(checked_at) is None or not isinstance(checked_manual, bool):
-        checked_at = checked_manual = None
+        checked_at = checked_manual = checked_complete = None
     return FeederHistory(
         history_started_at,
         earliest if isinstance(earliest, str) else None,
@@ -1602,6 +1612,7 @@ def _parse_feeder_history(value: object) -> FeederHistory:
         archived_unlinked_latest,
         checked_at if isinstance(checked_at, str) else None,
         checked_manual if isinstance(checked_manual, bool) else None,
+        checked_complete if isinstance(checked_complete, bool) else None,
     )
 
 
@@ -1640,6 +1651,7 @@ def _postcard_payload(postcard: BirdBuddyPostcard) -> dict[str, object]:
             }
             for species in postcard.species
         ],
+        **({"owner_confirmed": True} if postcard.owner_confirmed else {}),
     }
 
 
@@ -1651,6 +1663,7 @@ def _history_content(histories: dict[str, FeederHistory]) -> dict[str, object]:
                 last_successful_sync_at=None,
                 confirmed_history_checked_at=None,
                 confirmed_history_manual_sightings=None,
+                confirmed_history_complete=None,
             )
             for feeder_id, history in histories.items()
         }
@@ -1711,6 +1724,11 @@ def _history_payload(histories: dict[str, FeederHistory]) -> dict[str, object]:
                         "confirmed_history_checked_at": history.confirmed_history_checked_at,
                         "confirmed_history_manual_sightings": (
                             history.confirmed_history_manual_sightings
+                        ),
+                        **(
+                            {"confirmed_history_complete": history.confirmed_history_complete}
+                            if history.confirmed_history_complete is not None
+                            else {}
                         ),
                     }
                     if history.confirmed_history_checked_at is not None
@@ -2002,6 +2020,18 @@ def _update_history(
             existing = history.postcards.get(postcard.postcard_id)
             if (
                 existing is not None
+                and existing.owner_confirmed
+                and not confirmed_complete
+                and existing.observed_at == postcard.observed_at
+                and existing.media_ids == postcard.media_ids
+                and _confirmed_species_for_media(postcard.media_ids, confirmed_species_by_media)
+                is None
+            ):
+                # Keep the owner's correction until a complete confirmed read drops it.
+                duplicates += 1
+                continue
+            if (
+                existing is not None
                 and existing.observed_at == postcard.observed_at
                 and existing.species == postcard.species
             ):
@@ -2021,6 +2051,7 @@ def _update_history(
                 postcard.observed_at,
                 confirmed_species,
                 media_ids=postcard.media_ids,
+                owner_confirmed=True,
             )
             reclassified_postcard_ids.add(postcard_id)
         archived_reclassifications = _reconcile_archived_postcards(
@@ -2074,6 +2105,7 @@ def _update_history(
         if confirmed_checked:
             history.confirmed_history_checked_at = current_iso
             history.confirmed_history_manual_sightings = replace_manual_evidence
+            history.confirmed_history_complete = confirmed_complete
         histories[feeder_id] = history
         if persist:
             path = _history_path(state_dir)
@@ -2124,14 +2156,17 @@ def sync_birdbuddy_detections(
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
     sync_lock = _sync_lock(state_dir) if persist_history else nullcontext()
     with _state_errors(), sync_lock:
-        waiting_until, _ = _backoff_until(state_dir)
+        waiting_until, _ = _backoff_until(state_dir, current)
         if waiting_until is not None and current < waiting_until:
             raise _slow_down(waiting_until)
         try:
             fetched = _fetch_remote(state_dir, current, include_manual_sightings)
         except _ThrottledError as exc:
             raise _slow_down(_record_throttling(state_dir, current, exc.retry_after)) from exc
-        _backoff_path(state_dir).unlink(missing_ok=True)
+        # A preview holds no sync lock, so it leaves any wait a sync recorded.
+        if persist_history:
+            with suppress(OSError):
+                _backoff_path(state_dir).unlink(missing_ok=True)
         feeder, incoming, pages, processed, ignored, confirmed, checked = fetched
         current_iso = current.isoformat()
         update = _update_history(
@@ -2169,7 +2204,12 @@ def sync_birdbuddy_detections(
         manual_records_accepted=confirmed.manual_records_accepted,
         confirmed_records_ignored=confirmed.records_ignored,
         confirmed_records_skipped=confirmed.records_skipped,
-        confirmed_history_complete=confirmed.complete,
+        # Between full reads, report how complete the last one was.
+        confirmed_history_complete=(
+            confirmed.complete
+            if checked
+            else update.history.confirmed_history_complete is not False
+        ),
         confirmed_history_checked=checked,
         confirmed_history_checked_at=update.history.confirmed_history_checked_at,
     )

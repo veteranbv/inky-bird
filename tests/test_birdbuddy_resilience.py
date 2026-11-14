@@ -1322,6 +1322,70 @@ class ConfirmedHistoryCadenceTests(unittest.TestCase):
 
         self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
 
+    def test_an_owner_correction_survives_syncs_that_skip_the_full_history(self) -> None:
+        confirms = {"media": True}
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _CONFIRMED_HISTORY:
+                records = [confirmed_record("media-p1")] if confirms["media"] else []
+                return {"data": confirmed_page(*records)}
+            if query == _FEED_QUERIES[1]:
+                return {"data": page(node("p1", variant="SightingRecognizedBirdUnlocked"))}
+            if query in _FEED_QUERIES:
+                return {"data": page(node("p1", species=BLUEBIRD))}
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        names: list[list[str]] = []
+        reclassified: list[int] = []
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            for hours in (0, 1, 2):
+                result = sync_at(state_dir, NOW + timedelta(hours=hours), transport)
+                names.append([item.common_name for item in result.species])
+                reclassified.append(result.stats.reclassified_postcards)
+            stored = json.loads((state_dir / "birdbuddy-detections.json").read_text())
+            postcards = stored["feeders"]["feeder-1"]["postcards"]
+            # The owner withdraws the correction; the next full read follows it.
+            confirms["media"] = False
+            withdrawn = sync_at(state_dir, NOW + timedelta(hours=25), transport)
+
+        self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
+        self.assertEqual(names, [[HUMMINGBIRD.common_name]] * 3)
+        self.assertEqual(reclassified[1:], [0, 0])
+        self.assertEqual(
+            [species["common_name"] for species in postcards[0]["species"]],
+            [HUMMINGBIRD.common_name],
+        )
+        self.assertEqual([item.common_name for item in withdrawn.species], ["Eastern Bluebird"])
+
+    def test_skipped_days_report_the_completeness_of_the_last_full_read(self) -> None:
+        for records, complete in (
+            ([confirmed_record("media-1")], True),
+            ([confirmed_record("media-1"), confirmed_record("media-2", origin="NEW")], False),
+        ):
+
+            def answer(
+                query: str,
+                variables: dict[str, object],
+                token: str | None,
+                records: list[dict[str, object]] = records,
+            ) -> object:
+                if query == _CONFIRMED_HISTORY:
+                    return {"data": confirmed_page(*records)}
+                return feed_and_history(query, variables, token)
+
+            transport = ScriptedTransport(answer)
+            with TemporaryDirectory() as temporary, self.subTest(complete=complete):
+                state_dir = Path(temporary)
+                logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+                first = sync_at(state_dir, NOW, transport)
+                later = sync_at(state_dir, NOW + timedelta(hours=1), transport)
+                self.assertIs(first.stats.confirmed_history_complete, complete)
+                self.assertIs(later.stats.confirmed_history_checked, False)
+                self.assertIs(later.stats.confirmed_history_complete, complete)
+
 
 class RateLimitTests(unittest.TestCase):
     def throttled_once(self, retry_after: str | None) -> Callable[..., object]:
@@ -1393,6 +1457,67 @@ class RateLimitTests(unittest.TestCase):
                 with self.assertRaises(DataSourceError) as raised:
                     sync_at(state_dir, NOW, transport)
                 self.assertIn(expected, str(raised.exception))
+
+    def test_a_wait_beyond_the_longest_allowed_is_ignored(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            backoff = state_dir / "birdbuddy-backoff.json"
+            # Written while the clock read far ahead of the real time.
+            backoff.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "not_before": (NOW + timedelta(days=366)).isoformat(),
+                        "failures": 1,
+                    }
+                )
+            )
+            backoff.chmod(0o600)
+            sync_at(state_dir, NOW, transport)
+            cleared = not backoff.exists()
+
+        self.assertGreater(len(transport.calls), 0)
+        self.assertTrue(cleared)
+
+    def test_a_backoff_path_that_cannot_be_removed_does_not_fail_the_sync(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            (state_dir / "birdbuddy-backoff.json").mkdir()
+            result = sync_at(state_dir, NOW, transport)
+
+        self.assertEqual(
+            [item.scientific_name for item in result.species], [HUMMINGBIRD.scientific_name]
+        )
+
+    def test_a_preview_does_not_clear_a_wait_recorded_while_it_ran(self) -> None:
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _CONFIRMED_HISTORY and not backoff.exists():
+                # A scheduled sync is throttled while the preview is reading.
+                backoff.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "not_before": (NOW + timedelta(minutes=15)).isoformat(),
+                            "failures": 1,
+                        }
+                    )
+                )
+                backoff.chmod(0o600)
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            backoff = state_dir / "birdbuddy-backoff.json"
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            sync_at(state_dir, NOW, transport, persist_history=False)
+            kept = backoff.exists()
+
+        self.assertTrue(kept)
 
     def test_an_unreadable_backoff_record_does_not_stop_the_sync(self) -> None:
         transport = ScriptedTransport(feed_and_history)
