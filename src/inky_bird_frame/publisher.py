@@ -1411,12 +1411,12 @@ def _cleanup_stale_publications(
         publication.remote,
         "refs/heads/catalog/publish-*",
     ).stdout
-    branches: set[str] = set()
+    branches: dict[str, str] = {}
     for line in heads.splitlines():
-        _, _, ref = line.partition("\t")
+        head, _, ref = line.partition("\t")
         name = ref.removeprefix("refs/heads/")
         if _PUBLICATION_BRANCH.fullmatch(name) is not None and name != keep:
-            branches.add(name)
+            branches[name] = head
 
     owner = repository.split("/", maxsplit=1)[0].casefold()
     cleaned: list[str] = []
@@ -1465,10 +1465,26 @@ def _cleanup_stale_publications(
         for url in owner_urls:
             _gh(publication, "pr", "close", url, "--repo", repository, "--delete-branch")
         if not owner_urls:
+            # Only a branch whose head this publisher committed is its own to delete.
+            head = branches[name]
+            cleanup_ref = f"refs/remotes/{publication.remote}/catalog-publication-cleanup"
+            _git(
+                checkout,
+                "fetch",
+                "--no-tags",
+                publication.remote,
+                f"+refs/heads/{name}:{cleanup_ref}",
+                timeout=_TRANSFER_TIMEOUT_SECONDS,
+            )
+            fetched = _git(checkout, "rev-parse", f"{cleanup_ref}^{{commit}}").stdout.strip()
+            committer = _git(checkout, "show", "-s", "--format=%ce", fetched).stdout.strip()
+            if fetched != head or committer != publication.commit_email:
+                continue
             _git(
                 checkout,
                 "push",
                 "--no-verify",
+                f"--force-with-lease=refs/heads/{name}:{head}",
                 publication.remote,
                 "--delete",
                 f"refs/heads/{name}",
@@ -1618,6 +1634,10 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             )
             validate_public_catalog(source_snapshot)
             if not _species_directories(source_snapshot / "species"):
+                if not dry_run:
+                    result["cleaned_publication_branches"] = _cleanup_stale_publications(
+                        checkout, publication, repository, keep=None
+                    )
                 return result
 
             worktree = Path(temporary) / "checkout"
@@ -1666,7 +1686,14 @@ def _publish_from_worktree(
     *,
     dry_run: bool,
 ) -> dict[str, object]:
-    sync = sync_public_catalog(source_snapshot, worktree / "catalog")
+    try:
+        sync = sync_public_catalog(source_snapshot, worktree / "catalog")
+    except (CatalogError, CatalogPublishError) as exc:
+        message = str(exc)
+        safe = message.replace(f"{worktree}{os.sep}", "")
+        if safe == message:
+            raise
+        raise type(exc)(safe) from exc
     published = sync["published"]
     if not isinstance(published, list) or any(not isinstance(item, dict) for item in published):
         raise CatalogPublishError("Publisher produced an invalid change summary")
@@ -1684,6 +1711,10 @@ def _publish_from_worktree(
     result.update(sync)
     result["changed"] = changed
     if not changed:
+        if not dry_run:
+            result["cleaned_publication_branches"] = _cleanup_stale_publications(
+                checkout, publication, repository, keep=None
+            )
         return result
     if not typed_published:
         raise CatalogPublishError("Catalog changed without adding an approved species")
