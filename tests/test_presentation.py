@@ -21,7 +21,7 @@ from inky_bird_frame.journal import (
     remove_collection,
     save_collection,
 )
-from inky_bird_frame.presentation import PresentationAccess
+from inky_bird_frame.presentation import MAX_GRANTS, MAX_PENDING, PresentationAccess
 from inky_bird_frame.server import project_catalog
 from inky_bird_frame.web import create_app
 
@@ -448,3 +448,37 @@ def test_screen_plate_replaced_after_authorization_is_not_cached_as_the_old_revi
         )
         assert current.content == replacement
         assert current.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+
+def test_other_clients_cannot_block_or_hold_pairing(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    flood = [access.request_pair("", client=f"192.0.2.{index}") for index in range(20)]
+    status = cast(dict[str, Any], access.status())
+    pending = [g for g in status["grants"] if g["kind"] == "pending"]
+    # Requests beyond the pending allowance replace the oldest ones instead of
+    # refusing everyone else.
+    assert {g["pairing_code"] for g in pending} == {
+        result["pairing_code"] for _, result in flood[-MAX_PENDING:]
+    }
+    assert len(pending) == MAX_PENDING
+    secret, result = access.request_pair("", client="198.51.100.7")
+    assert result["status"] == "pending"
+    resumed = access.request_pair(secret, client="198.51.100.7")[1]
+    assert resumed["pairing_code"] == result["pairing_code"]
+    # One client still cannot start another request at once.
+    with pytest.raises(AccessRateLimitError):
+        access.request_pair("", client="198.51.100.7")
+
+
+def test_a_full_screen_list_still_refuses_new_pairing(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    for index in range(MAX_GRANTS):
+        access.update(
+            revision=access.status()["revision"],
+            action="status",
+            name=f"Credential {index}",
+            view="all",
+            confirm=True,
+        )
+    with pytest.raises(AccessRateLimitError):
+        access.request_pair("", client="198.51.100.7")
