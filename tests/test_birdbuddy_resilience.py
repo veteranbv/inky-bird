@@ -20,6 +20,7 @@ from inky_bird_frame.birdbuddy import (
     ArchivedPostcardLink,
     ArchivedSpecies,
     BirdBuddyFeeder,
+    BirdBuddyPostcard,
     ConfirmedSpeciesEvidence,
     FeederHistory,
     PostcardSpecies,
@@ -27,6 +28,7 @@ from inky_bird_frame.birdbuddy import (
     _fetch_confirmed_history,
     _fetch_postcards,
     _reconcile_archived_postcards,
+    _update_history,
     birdbuddy_status,
     login_birdbuddy,
     logout_birdbuddy,
@@ -448,6 +450,74 @@ class ConfirmedHistoryTests(unittest.TestCase):
         self.assertEqual(list(history.archived_postcards), [media_ids])
         _reconcile_archived_postcards(history, {})
         self.assertEqual(history.archived_postcards, {})
+
+    def test_partial_snapshot_keeps_the_link_of_a_postcard_it_archives(self) -> None:
+        old = BirdBuddyPostcard(
+            "postcard-old",
+            "2025-07-01T10:00:00+00:00",
+            (HUMMINGBIRD,),
+            media_ids=("media-old",),
+        )
+        bluebird = PostcardSpecies("species-bluebird", "Eastern Bluebird", "Sialia sialis")
+
+        def update(
+            state_dir: Path,
+            incoming: list[BirdBuddyPostcard],
+            species_by_media: dict[str, tuple[PostcardSpecies, ...]],
+            *,
+            complete: bool,
+        ) -> FeederHistory:
+            return _update_history(
+                state_dir,
+                "feeder-1",
+                incoming,
+                [],
+                NOW,
+                persist=True,
+                replace_manual_evidence=False,
+                confirmed_species_by_media=species_by_media,
+                confirmed_complete=complete,
+            ).history
+
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            partial = update(state_dir, [old], {}, complete=False)
+            linked = dict(partial.archived_postcards)
+            unlinked = dict(partial.archived_unlinked_latest)
+            corrected = update(state_dir, [], {"media-old": (bluebird,)}, complete=True)
+
+        self.assertEqual(partial.postcards, {})
+        self.assertEqual(list(linked), [("media-old",)])
+        self.assertEqual(unlinked, {})
+        # A later complete snapshot can still apply the confirmed correction.
+        self.assertEqual(list(corrected.archived_species), ["species-bluebird"])
+        self.assertEqual(
+            corrected.archived_postcards[("media-old",)].species_ids, ("species-bluebird",)
+        )
+
+    def test_complete_snapshot_archives_an_unconfirmed_postcard_as_unlinked(self) -> None:
+        old = BirdBuddyPostcard(
+            "postcard-old",
+            "2025-07-01T10:00:00+00:00",
+            (HUMMINGBIRD,),
+            media_ids=("media-old",),
+        )
+        with TemporaryDirectory() as temporary:
+            history = _update_history(
+                Path(temporary),
+                "feeder-1",
+                [old],
+                [],
+                NOW,
+                persist=False,
+                replace_manual_evidence=False,
+                confirmed_species_by_media={},
+            ).history
+
+        self.assertEqual(history.archived_postcards, {})
+        self.assertEqual(
+            history.archived_unlinked_latest, {HUMMINGBIRD.species_id: old.observed_at}
+        )
 
 
 class PartialConfirmedSyncTests(unittest.TestCase):

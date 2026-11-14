@@ -1842,7 +1842,11 @@ def _update_history(
                     postcard.media_ids,
                     confirmed_species_by_media,
                 )
-                linked = bool(postcard.media_ids) and confirmed_species is not None
+                # A partial snapshot may simply not have seen this media; keep
+                # the link so a later complete snapshot reconciles or drops it.
+                linked = bool(postcard.media_ids) and (
+                    confirmed_species is not None or not confirmed_complete
+                )
                 _archive_postcard(history, postcard, linked=linked)
                 if linked:
                     history.archived_postcards[postcard.media_ids] = ArchivedPostcardLink(
