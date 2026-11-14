@@ -85,6 +85,63 @@ class SelectionTests(unittest.TestCase):
 
         self.assertEqual(selected.taxon_id, 2)
 
+    def test_weighted_selection_follows_observation_counts_across_many_draws(self) -> None:
+        entries = [catalog_entry(1, 80), catalog_entry(2, 15), catalog_entry(3, 5)]
+        rng = random.Random(11)
+        counts = {1: 0, 2: 0, 3: 0}
+        for _ in range(2000):
+            selected, _, _ = select_catalog_entry(
+                entries,
+                RotationMode.WEIGHTED,
+                next_index=0,
+                last_taxon_id=None,
+                shuffle_remaining=[],
+                rng=rng,
+            )
+            counts[selected.taxon_id] += 1
+
+        self.assertGreater(counts[1], 1500)
+        self.assertLess(counts[3], 200)
+        self.assertGreater(counts[2], counts[3])
+
+    def test_weighted_selection_weights_the_birds_left_after_excluding_a_repeat(self) -> None:
+        entries = [catalog_entry(1, 1), catalog_entry(2, 90), catalog_entry(3, 10)]
+        rng = random.Random(5)
+        counts = {1: 0, 2: 0, 3: 0}
+        for _ in range(1000):
+            selected, _, _ = select_catalog_entry(
+                entries,
+                RotationMode.WEIGHTED,
+                next_index=0,
+                last_taxon_id=2,
+                shuffle_remaining=[],
+                rng=rng,
+            )
+            counts[selected.taxon_id] += 1
+
+        self.assertEqual(counts[2], 0)
+        self.assertGreater(counts[3], counts[1] * 3)
+
+    def test_shuffle_never_repeats_a_bird_from_a_remaining_list_with_duplicates(self) -> None:
+        entries = [catalog_entry(1, 1), catalog_entry(2, 1), catalog_entry(3, 1)]
+        remaining = [2, 2, 3, 2]
+        selected_ids: list[int] = []
+        last_taxon_id: int | None = 1
+        for _ in range(2):
+            selected, _, remaining = select_catalog_entry(
+                entries,
+                RotationMode.SHUFFLE,
+                next_index=0,
+                last_taxon_id=last_taxon_id,
+                shuffle_remaining=remaining,
+                rng=random.Random(4),
+            )
+            selected_ids.append(selected.taxon_id)
+            last_taxon_id = selected.taxon_id
+
+        self.assertEqual(selected_ids, [2, 3])
+        self.assertEqual(remaining, [])
+
     def test_shuffle_bag_visits_each_entry_without_replacement_before_refill(self) -> None:
         entries = [catalog_entry(1, 10), catalog_entry(2, 5), catalog_entry(3, 1)]
         rng = random.Random(7)
