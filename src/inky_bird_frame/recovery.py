@@ -7,7 +7,8 @@ import json
 import os
 import shutil
 import stat
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -32,12 +33,35 @@ from .controller import (
     read_generation_queue,
     retry_approved_candidate,
 )
-from .errors import CatalogError, CatalogPublishError, GenerationError, SpeciesStateError
+from .errors import (
+    BusyError,
+    CatalogError,
+    CatalogPublishError,
+    GenerationError,
+    SpeciesStateError,
+)
 from .http import MAX_ASSET_BYTES
 from .journal import MAX_JOURNAL_BYTES, JournalConflictError, JournalError
 from .models import ProfileConflict, SpeciesProfileData
 from .publisher import publication_privacy_patterns, validate_pending_candidate
 from .retry import RetryStore, parse_retry_profile_conflicts
+
+# Plate review reads run in the web worker pool; a long catalog change must not pin a worker.
+PLATE_REVIEW_LOCK_SECONDS = 10.0
+
+
+@contextmanager
+def _plate_review_read_lock(config: AppConfig) -> Iterator[None]:
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                catalog_state_lock(
+                    config.controller.state_dir, shared=True, timeout=PLATE_REVIEW_LOCK_SECONDS
+                )
+            )
+        except BusyError as exc:
+            raise JournalError("Plate work is busy. Try again in a moment.") from exc
+        yield
 
 
 def _candidate_bytes(path: Path, maximum: int) -> bytes:
@@ -154,7 +178,7 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
 
 def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
     """Owner-only allowlist; generated candidates are never approved/public art."""
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         path, manifest, _, revision = _pending_candidate(config, taxon_id)
         ready = True
         try:
@@ -219,7 +243,7 @@ def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
 
 
 def pending_portrait(config: AppConfig, taxon_id: int, *, revision: str) -> bytes:
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         _, _, body, current = _pending_candidate(config, taxon_id)
         if current != revision:
             raise JournalConflictError("This candidate changed. Reload its review before viewing.")

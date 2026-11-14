@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ from starlette.testclient import TestClient
 
 from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.catalog import (
+    catalog_state_lock,
     has_valid_approved_candidate,
     read_collection,
     write_candidate_manifest,
@@ -443,3 +445,30 @@ def test_generation_completion_keeps_owner_requests_added_during_the_cycle(tmp_p
         run_generation_cycle(enabled)
     assert read_generation_queue(application) == [bird]
     assert read_collection(application.controller.state_dir) == []
+
+
+def test_plate_review_reads_give_up_while_the_catalog_is_being_changed(tmp_path: Path) -> None:
+    application = config(tmp_path)
+    candidate(application)
+    revision = str(pending_candidate(application, 10)["candidate_revision"])
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with catalog_state_lock(application.controller.state_dir):
+            held.set()
+            release.wait(10)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        assert held.wait(5)
+        with patch("inky_bird_frame.recovery.PLATE_REVIEW_LOCK_SECONDS", 0.1):
+            with pytest.raises(JournalError, match="busy"):
+                pending_candidate(application, 10)
+            with pytest.raises(JournalError, match="busy"):
+                pending_portrait(application, 10, revision=revision)
+    finally:
+        release.set()
+        worker.join()
+    assert pending_candidate(application, 10)["candidate_revision"] == revision

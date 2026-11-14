@@ -14,10 +14,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic, sleep
 from typing import cast
 
 from .birds import BirdSpecies
-from .errors import CatalogError, MissingDependencyError
+from .errors import BusyError, CatalogError, MissingDependencyError
 from .http import write_json_atomic
 from .images import slugify
 from .models import QualityReview, ReferencePhoto, SpeciesProfileData
@@ -67,11 +68,33 @@ class CollectionState:
     legacy_seed_queue_migrated_at: str | None
 
 
+def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
+    deadline = monotonic() + timeout
+    delay = 0.01
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise BusyError("The catalog is busy; try again in a moment") from exc
+            sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.25)
+
+
 @contextmanager
-def catalog_state_lock(state_dir: Path) -> Iterator[None]:
+def catalog_state_lock(
+    state_dir: Path, *, shared: bool = False, timeout: float | None = None
+) -> Iterator[None]:
+    """Hold the catalog state lock; ``shared`` is for pure reads, ``timeout`` raises BusyError."""
     state_dir.mkdir(parents=True, exist_ok=True)
+    operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     with (state_dir / "catalog-state.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(handle.fileno(), operation)
+        else:
+            _flock_within(handle.fileno(), operation, timeout)
         try:
             yield
         finally:
