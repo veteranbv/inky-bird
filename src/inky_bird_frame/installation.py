@@ -156,10 +156,10 @@ def controller_executable_path(codex_path: Path, *, generation_enabled: bool = T
     return ":".join(executable_paths)
 
 
-def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, str]:
-    """Persist only the configured OIDC secret for restart-safe native serving."""
+def _native_oidc_secret(config: AppConfig, config_path: Path) -> tuple[str, str, Path] | None:
+    """Return the OIDC secret native serving would retain, without writing anything."""
     if config.controller.oidc is None:
-        return {}
+        return None
     name = config.controller.oidc.client_secret_env
     path = config_path.resolve().parent / "native-access.env"
     cached: object = None
@@ -182,6 +182,18 @@ def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, s
                 "Supply the configured OIDC client secret when running native setup; "
                 "use one nonempty printable value"
             )
+    except (OSError, UnicodeError, ValueError):
+        raise InstallationError("Native access cache is invalid or cannot be written") from None
+    return name, secret, path
+
+
+def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, str]:
+    """Persist only the configured OIDC secret for restart-safe native serving."""
+    resolved = _native_oidc_secret(config, config_path)
+    if resolved is None:
+        return {}
+    name, secret, path = resolved
+    try:
         # JSON's printable UTF-8 string form is also a systemd EnvironmentFile
         # double-quoted value. No shell is used and no expansion is performed.
         content = f"{name}={json.dumps(secret, ensure_ascii=False)}\n".encode()
@@ -901,6 +913,42 @@ def _authorize_linux_setup() -> None:
         raise InstallationError("Administrator authorization failed; run sudo -v and try again")
 
 
+def validate_native_controller_setup(config: AppConfig, config_path: Path) -> None:
+    """Refuse, before any change, what the native controller installers would refuse."""
+    environment_credentials: list[str] = []
+    if config.discovery.geoapify_api_key_env is not None:
+        environment_credentials.append("geoapify_api_key_env")
+    if (
+        DiscoveryProvider.EBIRD in config.discovery.sources
+        and config.discovery.ebird_api_key_env is not None
+    ):
+        environment_credentials.append("ebird_api_key_env")
+    if (
+        DiscoveryProvider.BIRDWEATHER in config.discovery.sources
+        and config.discovery.birdweather_token_env is not None
+    ):
+        environment_credentials.append("birdweather_token_env")
+    if environment_credentials:
+        names = ", ".join(environment_credentials)
+        raise InstallationError(
+            f"Managed controller services cannot use {names}; store the corresponding "
+            "credential directly in the private mode-0600 configuration file"
+        )
+    environment_destinations = [
+        destination.name
+        for destination in config.notifications.destinations
+        if config.notifications.enabled and destination.url_env is not None
+    ]
+    if environment_destinations:
+        names = ", ".join(environment_destinations)
+        raise InstallationError(
+            "Managed controller services require direct notification URLs in the private "
+            f"configuration file; replace url_env for: {names}"
+        )
+    _native_oidc_secret(config, config_path)
+    native_tls_environment(config_path)
+
+
 def setup(
     role: InstallationRole,
     config_path: Path,
@@ -916,25 +964,7 @@ def setup(
     config_path = config_path.expanduser().resolve()
     config = load_config(config_path)
     if role is InstallationRole.CONTROLLER:
-        environment_credentials: list[str] = []
-        if config.discovery.geoapify_api_key_env is not None:
-            environment_credentials.append("geoapify_api_key_env")
-        if (
-            DiscoveryProvider.EBIRD in config.discovery.sources
-            and config.discovery.ebird_api_key_env is not None
-        ):
-            environment_credentials.append("ebird_api_key_env")
-        if (
-            DiscoveryProvider.BIRDWEATHER in config.discovery.sources
-            and config.discovery.birdweather_token_env is not None
-        ):
-            environment_credentials.append("birdweather_token_env")
-        if environment_credentials:
-            names = ", ".join(environment_credentials)
-            raise InstallationError(
-                f"Managed controller services cannot use {names}; store the corresponding "
-                "credential directly in the private mode-0600 configuration file"
-            )
+        validate_native_controller_setup(config, config_path)
     script = _setup_script(role, source_dir)
     if not script.is_file():
         raise InstallationError(f"Installer is missing: {script}")
@@ -953,6 +983,13 @@ def setup(
         "applied": False,
         "changes": changes,
     }
+    if role is InstallationRole.CONTROLLER:
+        result["generation_enabled"] = config.controller.generation_enabled
+        if not config.controller.generation_enabled:
+            result["generation"] = (
+                "New artwork is off. To turn it on, set generation_enabled = true "
+                "under [controller] in the configuration, then run setup again."
+            )
     if not apply:
         result["confirmation"] = "Repeat the same command with --yes to apply these changes."
         return result
