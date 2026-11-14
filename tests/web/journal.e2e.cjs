@@ -474,6 +474,16 @@ let browser,
     if ((await more.isVisible()) && (await more.getAttribute('aria-expanded')) !== 'true')
       await more.click();
   };
+  // With More closed, the control bar sits fully below the bird name.
+  const captionClear = async (target) => {
+    await target.keyboard.press('Shift');
+    await target.locator('.frame-controls:not(.quiet)').waitFor();
+    assert.equal(await target.locator('.frame-controls.expanded').count(), 0);
+    const caption = await target.locator('.frame-caption').boundingBox();
+    const bar = await target.locator('.frame-controls').boundingBox();
+    // Half-pixel tolerance for subpixel layout.
+    assert(caption && bar && caption.y + caption.height <= bar.y + 0.5, 'the bar covers the bird name');
+  };
   await page.goto(origin + '/app?page=displays');
   await heading('Displays');
   const screenContext = await browser.newContext({
@@ -506,6 +516,10 @@ let browser,
   await screen.clock.runFor(15100);
   await screen.locator('.frame-art').waitFor();
   await screen.locator('.frame-art').evaluate((image) => image.decode());
+  await captionClear(screen);
+  await screen.setViewportSize({ width: 844, height: 390 });
+  await captionClear(screen);
+  await screen.setViewportSize({ width: 390, height: 844 });
   assert.equal((await screenContext.request.get(origin + '/v1/owner/journal')).status(), 401);
   const screenView = (await (await screenContext.request.get(origin + '/v1/screen/view')).json())
     .data;
@@ -865,6 +879,7 @@ let browser,
     await page.getByRole('button', { name: 'More', exact: true }).getAttribute('aria-expanded'),
     'false',
   );
+  await captionClear(page);
   const previousControl = page.getByRole('button', { name: 'Previous', exact: true });
   await previousControl.click();
   const clearanceNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
@@ -931,6 +946,9 @@ let browser,
   assert(await page.locator('.frame-controls').evaluate((bar) => bar.scrollWidth <= bar.clientWidth + 1));
   const wideBar = await page.locator('.frame-controls').boundingBox();
   assert(wideBar.y + wideBar.height <= 800);
+  await captionClear(page);
+  await page.setViewportSize({ width: 844, height: 390 });
+  await captionClear(page);
   await page.setViewportSize({ width: 390, height: 844 });
   phase = 'sso-error-visibility';
   // Frontend contract only: the provider state and start failure are stubbed,

@@ -550,8 +550,10 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 }
 .presenting h1::after { display: none; }
 .presenting .intro { font-size: 13px; margin: 3px 0 10px; color: #9b8f7a; }
-/* Room below the plate for the title, the bird name and the control bar. */
+/* Room below the plate for the bird name and the control bar; the owner
+   Frame also keeps its title above the plate. */
 .presenting .frame-art, .presenting .frame-viewport { height: min(80svh, calc(100svh - 180px)); }
+.presenting h1 ~ .frame-viewport, .presenting h1 ~ .frame-viewport .frame-art { height: min(80svh, calc(100svh - 216px)); }
 .presenting .frame-art { background: transparent; border: 0; border-radius: 0; }
 /* The notice and the control bar share one bottom dock, so the notice
    always sits above the bar however many rows the bar needs. The dock
