@@ -55,10 +55,23 @@ from .controller import (
 from .display import show_on_inky
 from .display_node import run_display_cycle
 from .ebird_archive import import_ebird_archive, read_ebird_archive_history
-from .errors import ConfigurationError, DataSourceError, InkyBirdFrameError
+from .errors import (
+    BusyError,
+    CatalogError,
+    CatalogPublishError,
+    ConfigurationError,
+    DataSourceError,
+    GenerationError,
+    InkyBirdFrameError,
+    InstallationError,
+    MissingDependencyError,
+    UnsupportedSpeciesError,
+    UsageError,
+)
 from .http import _fsync_directory, write_bytes_atomic
 from .images import prepare_uploaded_image
 from .installation import InstallationRole, doctor, native_tls_environment, setup
+from .journal import JournalError
 from .notifications import (
     check_display_heartbeat,
     dispatch_notifications,
@@ -81,7 +94,7 @@ from .recovery import retry_species
 from .retry import RetryStore
 from .scheduler import ScheduledJob, SubprocessCommandRunner, run_scheduler
 from .server import serve_catalog
-from .settings import initialize_config
+from .settings import SettingsError, initialize_config
 
 CATALOG_SYNC_REVIEWED_MIGRATIONS_ENV = "INKY_CATALOG_SYNC_APPLY_REVIEWED_MIGRATIONS"
 CATALOG_SYNC_RETAIN_INDEPENDENT_ENV = "INKY_CATALOG_SYNC_RETAIN_INDEPENDENT_APPROVALS"
@@ -91,18 +104,88 @@ def print_result(data: object) -> None:
     print(json.dumps({"ok": True, "data": data, "schema_version": 1}, indent=2, sort_keys=True))
 
 
-def print_error(exc: Exception) -> None:
+# The closed set of error.type values in the 1.x JSON contract.
+ERROR_CODES = (
+    "configuration",
+    "usage",
+    "busy",
+    "data_source",
+    "catalog",
+    "generation",
+    "publication",
+    "installation",
+    "access",
+    "storage",
+    "internal",
+)
+EXIT_CODES = {"usage": 2, "busy": 3}
+UNEXPECTED_ERROR_MESSAGE = "The command stopped on an unexpected error. Check the service log."
+
+
+def _is_busy(exc: BaseException) -> bool:
+    from .owner_operations import OwnerOperationBusyError
+
+    if isinstance(exc, BusyError | OwnerOperationBusyError):
+        return True
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, BlockingIOError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
+def error_code(exc: BaseException) -> str:
+    """Map an exception to its stable error.type; subclasses precede their bases."""
+
+    from .access import AccessError
+    from .owner_operations import OwnerOperationError
+
+    if _is_busy(exc):
+        return "busy"
+    classes: tuple[tuple[tuple[type[BaseException], ...], str], ...] = (
+        ((UsageError,), "usage"),
+        ((ConfigurationError, SettingsError), "configuration"),
+        ((InstallationError, MissingDependencyError), "installation"),
+        ((AccessError,), "access"),
+        ((CatalogPublishError,), "publication"),
+        ((GenerationError, UnsupportedSpeciesError), "generation"),
+        ((DataSourceError,), "data_source"),
+        ((CatalogError, JournalError), "catalog"),
+        ((OwnerOperationError, OSError), "storage"),
+        ((InkyBirdFrameError, UnicodeError, json.JSONDecodeError), "internal"),
+        ((ValueError,), "usage"),
+    )
+    for kinds, code in classes:
+        if isinstance(exc, kinds):
+            return code
+    return "internal"
+
+
+def print_error(exc: Exception) -> int:
+    """Print the error envelope and return the command's exit code."""
+
+    code = error_code(exc)
+    message = str(exc)
+    if code == "internal" and not isinstance(exc, InkyBirdFrameError):
+        # Unexpected exceptions may carry anything; keep their text out of
+        # stdout but leave one diagnostic line for the service log.
+        print(f"inky-bird: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
+        message = UNEXPECTED_ERROR_MESSAGE
     print(
         json.dumps(
             {
                 "ok": False,
-                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "error": {"type": code, "message": message},
                 "schema_version": 1,
             },
             indent=2,
             sort_keys=True,
         )
     )
+    return EXIT_CODES.get(code, 1)
 
 
 def species_to_dict(species: BirdSpecies) -> dict[str, object]:
@@ -124,7 +207,8 @@ def _config(args: argparse.Namespace, *, load_secrets: bool = True) -> AppConfig
 
 
 def _failure_notification(operation: str, exc: Exception) -> str:
-    return f"{operation} failed ({type(exc).__name__}). Check controller logs for details."
+    label = error_code(exc).replace("_", " ")
+    return f"{operation} failed ({label} error). Check controller logs for details."
 
 
 def discover_command(args: argparse.Namespace) -> int:
@@ -177,13 +261,14 @@ def generate_command(args: argparse.Namespace) -> int:
         return 0
     try:
         result = run_generation_cycle(config)
-    except (InkyBirdFrameError, OSError) as exc:
-        safe_record_degradation(
-            config,
-            key="generation-cycle",
-            title="Bird generation is degraded",
-            body=_failure_notification("Generation cycle", exc),
-        )
+    except Exception as exc:
+        if not _is_busy(exc):
+            safe_record_degradation(
+                config,
+                key="generation-cycle",
+                title="Bird generation is degraded",
+                body=_failure_notification("Generation cycle", exc),
+            )
         raise
     notified_taxa: set[int] = set()
     for result_key in ("published_pending", "generated"):
@@ -282,22 +367,22 @@ def generate_command(args: argparse.Namespace) -> int:
 def seed_command(args: argparse.Namespace) -> int:
     source_values = args.source
     if source_values is not None and len(source_values) != len(set(source_values)):
-        raise ValueError("--source must not repeat a provider")
+        raise UsageError("--source must not repeat a provider")
     if (args.latitude is None) != (args.longitude is None):
-        raise ValueError("--latitude and --longitude must be provided together")
+        raise UsageError("--latitude and --longitude must be provided together")
     if args.window is not None and args.end_date is not None:
-        raise ValueError("--end-date cannot be combined with --window")
+        raise UsageError("--end-date cannot be combined with --window")
     date_range = None
     if args.start_date is not None:
         if args.end_date is None:
-            raise ValueError("--start-date and --end-date must be provided together")
+            raise UsageError("--start-date and --end-date must be provided together")
         try:
             date_range = DateRange(
                 start=date.fromisoformat(args.start_date),
                 end=date.fromisoformat(args.end_date),
             )
         except ValueError as exc:
-            raise ValueError(f"invalid ISO date range: {exc}") from exc
+            raise UsageError(f"invalid ISO date range: {exc}") from exc
     print_result(
         enqueue_seed_species(
             _config(args),
@@ -416,7 +501,7 @@ def access_bootstrap_command(args: argparse.Namespace) -> int:
     from .access import BOOTSTRAP_SECONDS, AccessStore
 
     if args.show_code and not (sys.stdout.isatty() and sys.stderr.isatty()):
-        raise ValueError("--show-code requires a private interactive terminal, not a pipe or log")
+        raise UsageError("--show-code requires a private interactive terminal, not a pipe or log")
     store = AccessStore(_config(args, load_secrets=False).controller.state_dir)
     path = store.bootstrap()
     if args.show_code:
@@ -453,10 +538,10 @@ def access_prepare_command(args: argparse.Namespace) -> int:
     from .access import prepare_browser_registration
 
     if not args.new_installation:
-        raise ValueError("access prepare requires --new-installation for an empty installation")
+        raise UsageError("access prepare requires --new-installation for an empty installation")
     config = _config(args, load_secrets=False)
     if not prepare_browser_registration(args.config, config.controller):
-        raise ValueError(
+        raise UsageError(
             "This installation is not empty; browser registration stays closed. "
             "Use access setup to create the first owner locally. Do not delete bird data."
         )
@@ -476,9 +561,9 @@ def _prompt_owner_credentials() -> tuple[str, str]:
             password = getpass.getpass("Inky password: ")
             confirmation = getpass.getpass("Confirm Inky password: ")
         except getpass.GetPassWarning as exc:
-            raise ValueError("A private terminal with hidden password entry is required") from exc
+            raise UsageError("A private terminal with hidden password entry is required") from exc
     if password != confirmation:
-        raise ValueError("Passwords do not match; owner access is unchanged")
+        raise UsageError("Passwords do not match; owner access is unchanged")
     return username, password
 
 
@@ -495,7 +580,7 @@ def access_setup_command(args: argparse.Namespace) -> int:
         return 0
     if not sys.stdin.isatty():
         if not args.if_needed:
-            raise ValueError("access setup requires a private interactive terminal")
+            raise UsageError("access setup requires a private interactive terminal")
         print(
             "Owner browser controls stay locked. Run inky-bird-frame access setup "
             "with this configuration in a private terminal. Display and scheduled work continue.",
@@ -513,7 +598,7 @@ def access_recover_command(args: argparse.Namespace) -> int:
     from .access import AccessStore
 
     if not sys.stdin.isatty():
-        raise ValueError("access recover requires a private interactive terminal")
+        raise UsageError("access recover requires a private interactive terminal")
     if not args.yes:
         print(
             "Recovery signs out every device and clears the stored single-sign-on link. "
@@ -523,7 +608,7 @@ def access_recover_command(args: argparse.Namespace) -> int:
             flush=True,
         )
         if input().strip().casefold() != "yes":
-            raise ValueError("Recovery cancelled; owner access is unchanged")
+            raise UsageError("Recovery cancelled; owner access is unchanged")
     username, password = _prompt_owner_credentials()
     store = AccessStore(_config(args, load_secrets=False).controller.state_dir)
     store.recover_owner(username, password)
@@ -547,8 +632,8 @@ def catalog_publish_command(args: argparse.Namespace) -> int:
     config = _config(args)
     try:
         result = run_catalog_publish(config, dry_run=args.dry_run)
-    except (InkyBirdFrameError, OSError) as exc:
-        if not args.dry_run:
+    except Exception as exc:
+        if not args.dry_run and not _is_busy(exc):
             safe_record_degradation(
                 config,
                 key="catalog-publication",
@@ -575,7 +660,7 @@ def catalog_prepare_command(args: argparse.Namespace) -> int:
     reason = raw_reason.strip() if isinstance(raw_reason, str) else None
     if replace_approved:
         if not reason:
-            raise ValueError("--replace-approved requires a non-empty --reason")
+            raise UsageError("--replace-approved requires a non-empty --reason")
         result = replace_public_catalog_taxon(
             args.source_catalog,
             args.catalog,
@@ -584,7 +669,7 @@ def catalog_prepare_command(args: argparse.Namespace) -> int:
         )
     else:
         if raw_reason is not None:
-            raise ValueError("--reason requires --replace-approved")
+            raise UsageError("--reason requires --replace-approved")
         result = sync_public_catalog(
             args.source_catalog,
             args.catalog,
@@ -801,7 +886,7 @@ def _confirm_birdbuddy_authorization(explicit_confirmation: bool) -> bool:
     if explicit_confirmation:
         return True
     if not sys.stdin.isatty():
-        raise DataSourceError(
+        raise UsageError(
             "Bird Buddy authorized-access confirmation is required; "
             "use --confirm-authorized-access after obtaining permission"
         )
@@ -815,12 +900,12 @@ def _birdbuddy_login_credentials() -> tuple[str, str]:
     password = os.environ.get("INKY_BIRDBUDDY_PASSWORD", "")
     if not email:
         if not sys.stdin.isatty():
-            raise DataSourceError("INKY_BIRDBUDDY_EMAIL is required for noninteractive login")
+            raise UsageError("INKY_BIRDBUDDY_EMAIL is required for noninteractive login")
         print("Bird Buddy email: ", end="", file=sys.stderr, flush=True)
         email = sys.stdin.readline().strip()
     if not password:
         if not sys.stdin.isatty():
-            raise DataSourceError("INKY_BIRDBUDDY_PASSWORD is required for noninteractive login")
+            raise UsageError("INKY_BIRDBUDDY_PASSWORD is required for noninteractive login")
         password = getpass.getpass("Bird Buddy password: ")
     return email, password
 
@@ -829,7 +914,7 @@ def birdbuddy_login_command(args: argparse.Namespace) -> int:
     config = _config(args, load_secrets=False)
     confirmed = _confirm_birdbuddy_authorization(args.confirm_authorized_access)
     if not confirmed:
-        raise DataSourceError("Bird Buddy authorized-access confirmation was declined")
+        raise UsageError("Bird Buddy authorized-access confirmation was declined")
     email, password = _birdbuddy_login_credentials()
     print_result(
         login_birdbuddy(
@@ -856,7 +941,7 @@ def birdbuddy_status_command(args: argparse.Namespace) -> int:
 
 def birdbuddy_logout_command(args: argparse.Namespace) -> int:
     if not args.yes:
-        raise DataSourceError("birdbuddy logout requires --yes")
+        raise UsageError("birdbuddy logout requires --yes")
     config = _config(args, load_secrets=False)
     print_result(logout_birdbuddy(config.controller.state_dir))
     return 0
@@ -868,9 +953,9 @@ def birdnet_analyzer_import_command(args: argparse.Namespace) -> int:
         try:
             observed_on = date.fromisoformat(args.observed_on)
         except ValueError as exc:
-            raise ValueError(f"invalid --observed-on ISO date: {exc}") from exc
+            raise UsageError(f"invalid --observed-on ISO date: {exc}") from exc
         if observed_on.isoformat() != args.observed_on:
-            raise ValueError("invalid --observed-on ISO date: expected YYYY-MM-DD")
+            raise UsageError("invalid --observed-on ISO date: expected YYYY-MM-DD")
     config = _config(args, load_secrets=False)
     result = import_birdnet_analyzer_csv(
         args.csv,
@@ -917,7 +1002,7 @@ def notifications_test_command(args: argparse.Namespace) -> int:
     if failures:
         failed = failures if isinstance(failures, list) else []
         names = ", ".join(str(item["name"]) for item in failed if isinstance(item, dict))
-        raise ValueError(
+        raise DataSourceError(
             "Notification test was not delivered to every configured destination"
             + (f": {names}" if names else "")
         )
@@ -1552,9 +1637,8 @@ def main(argv: list[str] | None = None) -> int:
             tls_environment = native_tls_environment(config_path)
             os.environ.update(tls_environment)
         return int(args.func(args))
-    except (InkyBirdFrameError, OSError, ValueError) as exc:
-        print_error(exc)
-        return 1
+    except Exception as exc:  # Every failure must reach the caller as the JSON envelope.
+        return print_error(exc)
     finally:
         if tls_environment:
             if previous_ca is None:
