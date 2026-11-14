@@ -374,6 +374,27 @@ class CatalogTests(unittest.TestCase):
 
                 self.assertEqual(index_after, index_before)
 
+    def test_approval_refuses_a_taxon_another_directory_already_holds(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            (catalog / "species/7513-carolina-wren").rename(catalog / "species/1-renamed-bird")
+            rebuild_catalog_index(catalog)
+            candidate = make_candidate(state, species, review)
+
+            with self.assertRaisesRegex(CandidateApprovalError, "already has a catalog entry"):
+                approve_candidate(state, catalog, species.taxon_id)
+            entries = read_catalog_entries(catalog)
+            pending_kept = (candidate / "manifest.json").is_file()
+
+        self.assertEqual([entry.slug for entry in entries], ["carolina-wren"])
+        self.assertTrue(pending_kept)
+
     def test_unchanged_assets_are_hashed_once_and_changed_ones_again(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
         review = QualityReview(True, 4, 4, 4, 4, True, ())

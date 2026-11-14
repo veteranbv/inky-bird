@@ -817,6 +817,20 @@ def _discard_pending(source: Path) -> None:
     fsync_directory(source.parent)
 
 
+def _directory_claiming_taxon(species_root: Path, taxon_id: int, other_than: Path) -> Path | None:
+    for manifest_path in sorted(species_root.glob("*/manifest.json")):
+        if manifest_path.parent == other_than:
+            continue
+        try:
+            manifest = read_json(manifest_path)
+        except CatalogError:
+            continue
+        claimed = manifest.get("taxon_id") if isinstance(manifest, dict) else None
+        if type(claimed) is int and claimed == taxon_id:
+            return manifest_path.parent
+    return None
+
+
 def approve_candidate(
     state_dir: Path,
     catalog_dir: Path,
@@ -844,6 +858,12 @@ def approve_candidate(
         raise CandidateApprovalError("Candidate manifest has no slug")
     destination = catalog_dir / "species" / f"{taxon_id}-{slug}"
     existing_approval = find_taxon_directory(catalog_dir / "species", taxon_id)
+    if existing_approval is None or existing_approval == destination:
+        # A directory named for another bird can still hold this one's manifest; a second
+        # entry would make every catalog reader refuse the catalog.
+        existing_approval = _directory_claiming_taxon(
+            catalog_dir / "species", taxon_id, destination
+        )
     if existing_approval is not None and existing_approval != destination:
         raise CandidateApprovalError(
             f"Taxon {taxon_id} already has a catalog entry; run retry for this bird first"
