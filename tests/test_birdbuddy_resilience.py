@@ -17,9 +17,16 @@ from urllib.error import HTTPError
 from inky_bird_frame.birdbuddy import (
     _FEED_QUERIES,
     _REFRESH_TOKEN,
+    ArchivedPostcardLink,
+    ArchivedSpecies,
     BirdBuddyFeeder,
+    ConfirmedSpeciesEvidence,
+    FeederHistory,
+    PostcardSpecies,
     _ConfirmedHistoryFetch,
+    _fetch_confirmed_history,
     _fetch_postcards,
+    _reconcile_archived_postcards,
     birdbuddy_status,
     login_birdbuddy,
     logout_birdbuddy,
@@ -314,6 +321,157 @@ class MixedFeederSyncTests(BirdBuddyResilienceTestCase):
             self.assertRaisesRegex(DataSourceError, "feed response was incomplete"),
         ):
             _fetch_postcards("access", "feeder-1")
+
+
+HUMMINGBIRD = PostcardSpecies(
+    "species-hummingbird", "Ruby-throated Hummingbird", "Archilochus colubris"
+)
+
+
+def confirmed_record(media_id: str, *, origin: object = "POSTCARD") -> dict[str, object]:
+    return {
+        "origin": origin,
+        "feeder": {"__typename": "FeederForMember", "id": "feeder-1"},
+        "media": {
+            "__typename": "MediaImage",
+            "id": media_id,
+            "createdAt": "2026-08-03T10:00:00Z",
+        },
+        "species": [
+            {
+                "__typename": "SpeciesBird",
+                "id": HUMMINGBIRD.species_id,
+                "name": HUMMINGBIRD.common_name,
+                "scientificName": HUMMINGBIRD.scientific_name,
+            }
+        ],
+    }
+
+
+def confirmed_page(*records: object, next_cursor: str | None = None) -> dict[str, object]:
+    return {
+        "me": {
+            "mediasOwned": {
+                "edges": [{"node": item} for item in records],
+                "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
+            }
+        }
+    }
+
+
+class ConfirmedHistoryTests(unittest.TestCase):
+    def test_unrecognised_records_are_skipped_and_counted(self) -> None:
+        missing_date = confirmed_record("media-2")
+        assert isinstance(missing_date["media"], dict)
+        missing_date["media"]["createdAt"] = None
+        response = confirmed_page(
+            confirmed_record("media-1"),
+            missing_date,
+            confirmed_record("media-3", origin="SOMETHING_NEW"),
+            {"origin": "POSTCARD", "feeder": None},
+            None,
+        )
+        with patch("inky_bird_frame.birdbuddy._graphql_request", return_value=response):
+            fetched = _fetch_confirmed_history("access", "feeder-1", include_manual_sightings=False)
+
+        self.assertEqual(fetched.records_processed, 5)
+        self.assertEqual(fetched.records_accepted, 1)
+        self.assertEqual(fetched.records_skipped, 4)
+        self.assertFalse(fetched.complete)
+        self.assertEqual(list(fetched.species_by_media), ["media-1"])
+        self.assertEqual([item.species for item in fetched.evidence], [HUMMINGBIRD])
+
+    def test_recognised_snapshot_is_complete(self) -> None:
+        with patch(
+            "inky_bird_frame.birdbuddy._graphql_request",
+            return_value=confirmed_page(confirmed_record("media-1")),
+        ):
+            fetched = _fetch_confirmed_history("access", "feeder-1", include_manual_sightings=False)
+
+        self.assertEqual(fetched.records_skipped, 0)
+        self.assertTrue(fetched.complete)
+
+    def test_large_history_stops_at_the_page_bound_instead_of_failing(self) -> None:
+        pages = [
+            confirmed_page(confirmed_record(f"media-{index}"), next_cursor=f"cursor-{index}")
+            for index in range(3)
+        ]
+        with (
+            patch("inky_bird_frame.birdbuddy.BIRDBUDDY_MAX_CONFIRMED_PAGES", 2),
+            patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=pages) as request,
+        ):
+            fetched = _fetch_confirmed_history("access", "feeder-1", include_manual_sightings=False)
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(fetched.pages, 2)
+        self.assertFalse(fetched.complete)
+        self.assertEqual(sorted(fetched.species_by_media), ["media-0", "media-1"])
+
+    def test_partial_snapshot_keeps_archived_links_it_did_not_see(self) -> None:
+        observed_at = "2025-08-01T10:00:00+00:00"
+        media_ids = ("media-1",)
+        history = FeederHistory(
+            "2025-01-01T00:00:00+00:00",
+            None,
+            None,
+            {},
+            {
+                HUMMINGBIRD.species_id: ArchivedSpecies(
+                    HUMMINGBIRD.species_id,
+                    HUMMINGBIRD.common_name,
+                    HUMMINGBIRD.scientific_name,
+                    1,
+                    observed_at,
+                )
+            },
+            {},
+            {media_ids: ArchivedPostcardLink(observed_at, media_ids, (HUMMINGBIRD.species_id,))},
+        )
+
+        _reconcile_archived_postcards(history, {}, complete=False)
+        self.assertEqual(list(history.archived_postcards), [media_ids])
+        _reconcile_archived_postcards(history, {})
+        self.assertEqual(history.archived_postcards, {})
+
+
+class PartialConfirmedSyncTests(unittest.TestCase):
+    def test_partial_snapshot_keeps_retained_confirmed_evidence_and_reports_it(self) -> None:
+        evidence = ConfirmedSpeciesEvidence(
+            HUMMINGBIRD, "2026-08-03T10:00:00+00:00", "selected_feeder"
+        )
+        snapshots = [
+            _ConfirmedHistoryFetch([evidence], 1, 1, 1, 0, 0),
+            _ConfirmedHistoryFetch([], 1, 1, 0, 0, 1, records_skipped=1, complete=False),
+            _ConfirmedHistoryFetch([], 1, 0, 0, 0, 0),
+        ]
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in(state_dir)
+            with (
+                patch(
+                    "inky_bird_frame.birdbuddy._graphql_request",
+                    side_effect=FakeBirdBuddyApi(page(), page()),
+                ),
+                patch(
+                    "inky_bird_frame.birdbuddy._fetch_confirmed_history",
+                    side_effect=snapshots,
+                ),
+            ):
+                sync(state_dir)
+                partial = sync_birdbuddy_detections(
+                    state_dir, window=ObservationWindow.ALL_TIME, limit=20, now=NOW
+                )
+                complete = sync_birdbuddy_detections(
+                    state_dir, window=ObservationWindow.ALL_TIME, limit=20, now=NOW
+                )
+
+        self.assertEqual(
+            [item.scientific_name for item in partial.species], ["Archilochus colubris"]
+        )
+        self.assertEqual(partial.stats.as_dict()["confirmed_records_skipped"], 1)
+        self.assertIs(partial.stats.as_dict()["confirmed_history_complete"], False)
+        self.assertEqual(complete.species, [])
+        self.assertIs(complete.stats.as_dict()["confirmed_history_complete"], True)
 
 
 class HttpStatusOpener:

@@ -24,7 +24,8 @@ BIRDBUDDY_PAGE_SIZE: Final = 50
 BIRDBUDDY_MAX_FEED_PAGES: Final = 100
 # Confirmed history is normally far smaller than this 5,000-record bound. The
 # cap prevents an undocumented pagination change from creating an unbounded
-# controller cycle while still failing visibly instead of truncating history.
+# controller cycle. A longer history is read as a partial snapshot, which can
+# add evidence but never removes what it did not see.
 BIRDBUDDY_MAX_CONFIRMED_PAGES: Final = 100
 BIRDBUDDY_HISTORY_DAYS: Final = 366
 AUTH_SCHEMA_VERSION: Final = 1
@@ -306,6 +307,8 @@ class BirdBuddySyncStats:
     confirmed_records_accepted: int = 0
     manual_records_accepted: int = 0
     confirmed_records_ignored: int = 0
+    confirmed_records_skipped: int = 0
+    confirmed_history_complete: bool = True
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -323,6 +326,8 @@ class BirdBuddySyncStats:
             "confirmed_records_accepted": self.confirmed_records_accepted,
             "manual_records_accepted": self.manual_records_accepted,
             "confirmed_records_ignored": self.confirmed_records_ignored,
+            "confirmed_records_skipped": self.confirmed_records_skipped,
+            "confirmed_history_complete": self.confirmed_history_complete,
         }
 
 
@@ -348,6 +353,10 @@ class _ConfirmedHistoryFetch:
     manual_records_accepted: int
     records_ignored: int
     species_by_media: dict[str, tuple[PostcardSpecies, ...]] = field(default_factory=dict)
+    # Unrecognised records, or a history longer than the page bound, make the
+    # snapshot partial: it may add or correct evidence but not remove any.
+    records_skipped: int = 0
+    complete: bool = True
 
 
 def _auth_path(state_dir: Path) -> Path:
@@ -1076,9 +1085,12 @@ def _fetch_confirmed_history(
     processed = 0
     accepted_records = 0
     accepted_manual_records = 0
+    skipped_records = 0
+    complete = True
     while True:
         if pages >= BIRDBUDDY_MAX_CONFIRMED_PAGES:
-            raise DataSourceError("Bird Buddy confirmed history exceeded the safe pagination limit")
+            complete = False
+            break
         variables: dict[str, object] = {"first": BIRDBUDDY_PAGE_SIZE}
         if after is not None:
             variables["after"] = after
@@ -1098,11 +1110,16 @@ def _fetch_confirmed_history(
         for edge in edges:
             processed += 1
             node = edge.get("node") if isinstance(edge, dict) else None
-            parsed = _parse_confirmed_evidence(
-                node,
-                feeder_id,
-                include_manual_sightings=include_manual_sightings,
-            )
+            try:
+                parsed = _parse_confirmed_evidence(
+                    node,
+                    feeder_id,
+                    include_manual_sightings=include_manual_sightings,
+                )
+            except DataSourceError:
+                skipped_records += 1
+                complete = False
+                continue
             if parsed is None:
                 continue
             accepted_records += 1
@@ -1153,12 +1170,14 @@ def _fetch_confirmed_history(
         processed,
         accepted_records,
         accepted_manual_records,
-        processed - accepted_records,
+        processed - accepted_records - skipped_records,
         {
             media_id: record.species
             for media_id, record in records_by_media.items()
             if record.source == _CONFIRMED_FEEDER_SOURCE
         },
+        skipped_records,
+        complete,
     )
 
 
@@ -1632,10 +1651,14 @@ def _archived_latest_timestamp(history: FeederHistory, species_id: str) -> str:
 def _reconcile_archived_postcards(
     history: FeederHistory,
     species_by_media: dict[str, tuple[PostcardSpecies, ...]],
+    *,
+    complete: bool = True,
 ) -> int:
     reclassified = 0
     for media_ids, archived_postcard in list(history.archived_postcards.items()):
         confirmed_species = _confirmed_species_for_media(media_ids, species_by_media)
+        if confirmed_species is None and not complete:
+            continue
         if confirmed_species is None:
             for species_id in archived_postcard.species_ids:
                 current = history.archived_unlinked_latest.get(species_id)
@@ -1715,6 +1738,7 @@ def _update_history(
     persist: bool,
     replace_manual_evidence: bool,
     confirmed_species_by_media: dict[str, tuple[PostcardSpecies, ...]],
+    confirmed_complete: bool = True,
 ) -> _HistoryUpdate:
     current_iso = current.isoformat()
     lock = _history_lock(state_dir) if persist else nullcontext()
@@ -1765,10 +1789,13 @@ def _update_history(
         archived_reclassifications = _reconcile_archived_postcards(
             history,
             confirmed_species_by_media,
+            complete=confirmed_complete,
         )
-        replaced_sources = {_CONFIRMED_FEEDER_SOURCE}
-        if replace_manual_evidence:
-            replaced_sources.add(_CONFIRMED_MANUAL_SOURCE)
+        replaced_sources: set[str] = set()
+        if confirmed_complete:
+            replaced_sources.add(_CONFIRMED_FEEDER_SOURCE)
+            if replace_manual_evidence:
+                replaced_sources.add(_CONFIRMED_MANUAL_SOURCE)
         for key in list(history.confirmed_species):
             if key[0] in replaced_sources:
                 del history.confirmed_species[key]
@@ -1844,6 +1871,7 @@ def sync_birdbuddy_detections(
             persist=persist_history,
             replace_manual_evidence=include_manual_sightings,
             confirmed_species_by_media=confirmed.species_by_media,
+            confirmed_complete=confirmed.complete,
         )
     species = _aggregate_species(
         update.history,
@@ -1867,6 +1895,8 @@ def sync_birdbuddy_detections(
         confirmed_records_accepted=confirmed.records_accepted,
         manual_records_accepted=confirmed.manual_records_accepted,
         confirmed_records_ignored=confirmed.records_ignored,
+        confirmed_records_skipped=confirmed.records_skipped,
+        confirmed_history_complete=confirmed.complete,
     )
     return BirdBuddySyncResult(species, stats)
 

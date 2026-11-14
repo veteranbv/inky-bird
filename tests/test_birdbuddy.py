@@ -942,7 +942,7 @@ class BirdBuddyTests(unittest.TestCase):
                 include_manual_sightings=True,
             )
 
-    def test_confirmed_history_rejects_malformed_selected_feeder_record(self) -> None:
+    def test_confirmed_history_skips_malformed_selected_feeder_record(self) -> None:
         malformed = confirmed_node(origin="POSTCARD", feeder_id="feeder-1")
         malformed["species"] = [{"__typename": "SpeciesBird", "id": None}]
         page = {
@@ -953,15 +953,15 @@ class BirdBuddyTests(unittest.TestCase):
                 }
             }
         }
-        with (
-            patch("inky_bird_frame.birdbuddy._graphql_request", return_value=page),
-            self.assertRaisesRegex(DataSourceError, "record was incomplete"),
-        ):
-            _fetch_confirmed_history(
+        with patch("inky_bird_frame.birdbuddy._graphql_request", return_value=page):
+            fetched = _fetch_confirmed_history(
                 "access-secret",
                 "feeder-1",
                 include_manual_sightings=False,
             )
+
+        self.assertEqual((fetched.records_accepted, fetched.records_skipped), (0, 1))
+        self.assertFalse(fetched.complete)
 
     def test_confirmed_history_rejects_repeated_pagination_cursor(self) -> None:
         page = {
