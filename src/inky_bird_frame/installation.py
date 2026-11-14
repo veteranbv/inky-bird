@@ -24,6 +24,7 @@ from .errors import ConfigurationError, InkyBirdFrameError, InstallationError
 from .http import get_json, write_bytes_atomic
 from .images import SUPPORTED_HARDWARE_SIZES
 from .native_names import LEGACY_NAME, resolve_native_layout, service_family
+from .notifications import notification_state_path, notification_status
 
 SUDO_AUTHORIZATION_TIMEOUT_SECONDS = 300
 INSTALLER_TIMEOUT_SECONDS = 3600
@@ -493,6 +494,41 @@ def _config_permissions(path: Path) -> DiagnosticCheck:
     return _pass("config_permissions", "Private configuration permissions are restricted")
 
 
+def _unknown_keys_check(config: AppConfig) -> DiagnosticCheck:
+    # Names only: an unknown key may still hold a private value.
+    return _warn(
+        "config_unknown_keys",
+        "The configuration has settings this version does not use",
+        detail=", ".join(config.unknown_keys),
+        remediation="Check these names for typos, and remove settings you no longer need.",
+    )
+
+
+def _notification_dead_letter_check(config: AppConfig, config_path: Path) -> DiagnosticCheck:
+    check_id = "notification_dead_letters"
+    if not notification_state_path(config).is_file():
+        return _pass(check_id, "No notifications are waiting to be retried")
+    try:
+        status = notification_status(config)
+    except (InkyBirdFrameError, OSError) as exc:
+        return _warn(
+            check_id,
+            "Notification delivery state could not be read",
+            detail=str(exc),
+            remediation="Inspect the controller state directory permissions.",
+        )
+    count = status.get("dead_letters")
+    if not isinstance(count, int) or count <= 0:
+        return _pass(check_id, "No notifications are waiting to be retried")
+    return _warn(
+        check_id,
+        f"{count} notification(s) stopped retrying and were not delivered",
+        remediation=(
+            f"Fix the destination, then run: inky-bird notifications retry --config {config_path}"
+        ),
+    )
+
+
 def _birdbuddy_auth_check(config: AppConfig) -> DiagnosticCheck:
     try:
         status = birdbuddy_status(
@@ -653,6 +689,53 @@ def _launchd_target(label: str, uid: int) -> tuple[str, str]:
     return f"system/{label}", "LaunchDaemon"
 
 
+LAUNCHD_PERIODIC_JOBS = {
+    "refresh": "observation refresh",
+    "generate": "generation cycle",
+    "catalog-publish": "catalog publication",
+    "notifications": "notification dispatch",
+}
+
+
+def _launchd_last_run_check(job: str, printed: str) -> DiagnosticCheck:
+    """Judge a periodic job by the exit launchd recorded for its most recent run."""
+    check_id = f"job_{job.replace('-', '_')}"
+    description = LAUNCHD_PERIODIC_JOBS[job]
+    fields: dict[str, str] = {}
+    for line in printed.splitlines():
+        key, separator, value = line.strip().partition(" = ")
+        if separator:
+            fields.setdefault(key, value.strip())
+    remediation = "Inspect the controller logs, then run doctor again after the next run."
+    signal_name = fields.get("last terminating signal")
+    if signal_name:
+        return _fail(
+            check_id,
+            f"The most recent {description} was stopped before it finished",
+            detail=f"Stopped by signal: {signal_name}",
+            remediation=remediation,
+        )
+    exit_code = fields.get("last exit code")
+    if exit_code is None or exit_code.startswith("(never exited)"):
+        return _pass(check_id, f"The {description} has not finished a run yet")
+    number = exit_code.split(":", 1)[0].strip()
+    if number == "0":
+        return _pass(check_id, f"The most recent {description} succeeded")
+    if number.isdigit():
+        return _fail(
+            check_id,
+            f"The most recent {description} failed",
+            detail=f"Last run ended with exit code {exit_code}",
+            remediation=remediation,
+        )
+    return _fail(
+        check_id,
+        f"The {description} result could not be determined",
+        detail=f"launchctl reported: {exit_code}",
+        remediation=remediation,
+    )
+
+
 def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
     try:
         prefix = resolve_native_layout().family
@@ -686,7 +769,10 @@ def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
             continue
         result = _run(["launchctl", "print", target])
         if result.returncode == 0:
-            yield _pass(f"service_{label.rsplit('.', 1)[-1]}", f"{kind} is loaded: {label}")
+            job = label.rsplit(".", 1)[-1]
+            yield _pass(f"service_{job}", f"{kind} is loaded: {label}")
+            if job in LAUNCHD_PERIODIC_JOBS:
+                yield _launchd_last_run_check(job, result.stdout)
         else:
             yield _fail(
                 f"service_{label.rsplit('.', 1)[-1]}",
@@ -843,6 +929,8 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
         return DoctorReport(role, tuple(checks))
     checks.append(_pass("config", f"Configuration is valid: {config_path}"))
     checks.append(_config_permissions(config_path))
+    if config.unknown_keys:
+        checks.append(_unknown_keys_check(config))
 
     if role is InstallationRole.CONTROLLER:
         checks.extend(
@@ -860,6 +948,8 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
             checks.append(_pass("generation", "Generation is off; Codex is not required"))
         if DiscoveryProvider.BIRDBUDDY in config.discovery.sources:
             checks.append(_birdbuddy_auth_check(config))
+        if config.notifications.enabled:
+            checks.append(_notification_dead_letter_check(config, config_path))
         if platform.system() == "Darwin":
             checks.extend(_launchd_checks(config))
         elif shutil.which("systemctl") is not None:
