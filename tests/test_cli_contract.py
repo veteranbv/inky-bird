@@ -163,6 +163,13 @@ def test_unexpected_error_is_an_internal_envelope_without_traceback(exc: Excepti
     assert "Traceback" not in stdout + stderr
 
 
+def test_error_code_set_is_the_documented_closed_set() -> None:
+    from inky_bird_frame import cli
+
+    assert set(cli.ERROR_CODES) == ERROR_CODES
+    assert len(cli.ERROR_CODES) == len(ERROR_CODES)
+
+
 def test_error_type_never_names_a_python_class() -> None:
     for exc in (ValueError("x"), RuntimeError("x"), ConfigurationError("x"), OSError("x")):
         _, stdout, _ = _run(_raising(exc))
