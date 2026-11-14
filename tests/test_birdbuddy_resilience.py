@@ -210,6 +210,22 @@ class FeedParsingTests(BirdBuddyResilienceTestCase):
         self.assertEqual(postcards, [])
         self.assertEqual((processed, ignored), (1, 1))
 
+    def test_postcards_without_media_never_reach_history(self) -> None:
+        for medias in ([], None, [{"__typename": "MediaImage", "id": None}]):
+            recognized = node("postcard-1", confidence="LOW_CONFIDENCE", species=BLUEBIRD)
+            unlocked = node(
+                "postcard-1", confidence="LOW_CONFIDENCE", variant="SightingRecognizedBirdUnlocked"
+            )
+            recognized["medias"] = medias
+            unlocked["medias"] = medias
+            api = FakeBirdBuddyApi(page(recognized), page(unlocked))
+            with (
+                self.subTest(medias=medias),
+                patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=api),
+            ):
+                postcards, _, _, _ = _fetch_postcards("access", "feeder-1")
+                self.assertEqual(postcards, [])
+
     def test_unknown_confidence_level_does_not_withdraw_a_retained_postcard(self) -> None:
         with TemporaryDirectory() as temporary:
             state_dir = Path(temporary)

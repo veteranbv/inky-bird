@@ -1783,11 +1783,6 @@ def _update_history(
         reclassified_postcard_ids: set[str] = set()
         for postcard in incoming:
             existing = history.postcards.get(postcard.postcard_id)
-            if not postcard.species and not postcard.media_ids:
-                if existing is not None:
-                    del history.postcards[postcard.postcard_id]
-                    reclassified_postcard_ids.add(postcard.postcard_id)
-                continue
             if (
                 existing is not None
                 and existing.observed_at == postcard.observed_at

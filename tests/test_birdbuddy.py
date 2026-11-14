@@ -1945,7 +1945,10 @@ class BirdBuddyTests(unittest.TestCase):
         feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")
         now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
         original = postcard("postcard-1", now - timedelta(hours=1))
-        withdrawn = BirdBuddyPostcard(original.postcard_id, original.observed_at, ())
+        # A complete feed postcard always carries its media identifiers.
+        withdrawn = BirdBuddyPostcard(
+            original.postcard_id, original.observed_at, (), media_ids=original.media_ids
+        )
         with TemporaryDirectory() as temporary:
             state_dir = Path(temporary)
             with patch(
@@ -1988,7 +1991,9 @@ class BirdBuddyTests(unittest.TestCase):
         self.assertEqual(len(first.species), 1)
         self.assertEqual(removed.species, [])
         self.assertEqual(removed.stats.reclassified_postcards, 1)
-        self.assertEqual(history["feeders"]["feeder-1"]["postcards"], [])
+        self.assertEqual(
+            [item["species"] for item in history["feeders"]["feeder-1"]["postcards"]], [[]]
+        )
 
     def test_sync_preserves_detection_when_postcard_preview_is_incomplete(self) -> None:
         feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")
