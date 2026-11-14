@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import TypedDict
 from unittest.mock import patch
@@ -203,3 +204,86 @@ def test_ambiguous_native_scripts_stop_before_sudo_or_package_mutation(
     assert all(
         path.read_text() == "private-state-sentinel" for path in home.glob(".config/*/config.toml")
     )
+
+
+def _support(home: Path, system: str, family: str) -> Path:
+    if system == "Darwin":
+        name = "Inky Bird" if family == CANONICAL_NAME else "Inky Bird Frame"
+        return home / "Library/Application Support" / name
+    return home / ".config" / family
+
+
+def _service(home: Path, root: Path, system: str, family: str) -> Path:
+    if system == "Darwin":
+        return home / "Library/LaunchAgents" / f"com.{family}.serve.plist"
+    return root / "etc/systemd/system" / f"{family}-controller.service"
+
+
+def _touch(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    return path
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_ambiguity_refusal_names_what_it_found_and_how_to_clear_it(
+    tmp_path: Path, system: str
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    _touch(_support(home, system, CANONICAL_NAME) / "config.toml")
+    _touch(home / "Services" / LEGACY_NAME / ".venv" / "pyvenv.cfg")
+    _touch(_service(home, root, system, LEGACY_NAME))
+    _touch(_service(home, root, system, CANONICAL_NAME))
+    with pytest.raises(ValueError, match="Both inky-bird") as raised:
+        resolve_native_layout(home=home, system=system, system_root=root, check_services=False)
+    message = str(raised.value)
+    assert f"~/{_support(home, system, CANONICAL_NAME).relative_to(home)}" in message
+    assert f"~/Services/{LEGACY_NAME}/.venv" in message
+    assert str(_service(home, root, system, LEGACY_NAME).name) in message
+    assert str(home) not in message
+    assert "move its folders aside" in message
+    assert "Uninstall" in message
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_uninstall_then_fresh_install_does_not_stay_ambiguous(tmp_path: Path, system: str) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    # A documented uninstall removes services and keeps runtime, config and state.
+    _touch(_support(home, system, LEGACY_NAME) / "config.toml")
+    _touch(home / "Services" / LEGACY_NAME / ".venv" / "pyvenv.cfg")
+    fresh_config = _touch(_support(home, system, CANONICAL_NAME) / "config.toml")
+    resolve = partial(
+        resolve_native_layout, home=home, system=system, system_root=root, check_services=False
+    )
+
+    with pytest.raises(ValueError, match="Both inky-bird"):
+        resolve()
+    layout = resolve(config_path=fresh_config)
+    assert layout.family == CANONICAL_NAME
+    assert layout.config_path == fresh_config
+
+    # After the fresh install its services exist; the old leftovers stay put
+    # and no longer block setup, doctor or uninstall.
+    _touch(_service(home, root, system, CANONICAL_NAME))
+    assert resolve().family == CANONICAL_NAME
+    assert resolve(config_path=fresh_config).family == CANONICAL_NAME
+    assert (_support(home, system, LEGACY_NAME) / "config.toml").exists()
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_config_of_one_family_never_redirects_the_other_familys_services(
+    tmp_path: Path, system: str
+) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    _touch(_support(home, system, LEGACY_NAME) / "config.toml")
+    _touch(_service(home, root, system, LEGACY_NAME))
+    fresh_config = _touch(_support(home, system, CANONICAL_NAME) / "config.toml")
+    resolve = partial(
+        resolve_native_layout, home=home, system=system, system_root=root, check_services=False
+    )
+    assert resolve().family == LEGACY_NAME
+    with pytest.raises(ValueError, match="Both inky-bird"):
+        resolve(config_path=fresh_config)
