@@ -43,6 +43,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             note(
               'Inky will back up this private file, then mark it app-managed. Your source choices, generation policy, credentials and history stay unchanged. Future browser saves update this same file. Environment credentials stay locked.',
             ),
+            ...(settings.adoption_notice ? [note(settings.adoption_notice)] : []),
             note(
               'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. To undo adoption, stop Inky and restore the matching previous file, then run setup again.',
             ),
