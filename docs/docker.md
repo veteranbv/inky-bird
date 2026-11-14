@@ -456,9 +456,12 @@ generation off.
 
 Open `http://CONTROLLER_ADDRESS:8793/app` from an address listed in
 `owner_allowed_origins`, and create your username and password (or sign in with
-the account from `access setup`). The approved artwork is under
-**Birds → Available artwork**; Home stays empty until a bird is observed or
-saved.
+the account from `access setup`). The examples above list only
+`http://localhost:8793`, which works from the Docker host itself. To sign in
+from a phone, add its address as described above, or for an app-managed
+configuration follow the [app-managed edit under Update](#update). The approved
+artwork is under **Birds → Available artwork**; Home stays empty until a bird
+is observed or saved.
 
 To add a display, continue with
 [Prepare the display Pi](installation.md#2-prepare-the-display-pi).
@@ -572,10 +575,10 @@ LAN address, edit the runtime copy directly while both services are stopped:
 
 ```bash
 docker compose stop scheduler controller
-umask 077
-docker compose run --rm --no-deps -T --entrypoint cat controller \
-  /data/config.toml > config.runtime.toml
-# Edit owner_allowed_origins in config.runtime.toml, then:
+(umask 077; docker compose run --rm --no-deps -T --entrypoint cat controller \
+  /data/config.toml > config.runtime.toml)
+# Edit owner_allowed_origins in config.runtime.toml. An http:// origin also
+# needs owner_access_mode = "local" in the same [controller] table. Then:
 docker compose run --rm --no-deps -T --entrypoint sh controller -c \
   'umask 077 && cat > /data/config.edit.toml &&
    inky-bird config validate --config /data/config.edit.toml &&
@@ -584,7 +587,8 @@ docker compose up --detach --force-recreate controller scheduler
 ```
 
 The `mv` runs only after validation passes, so an invalid edit leaves the
-running configuration unchanged. Delete `config.runtime.toml` afterwards or
+running configuration unchanged; the leftover `/data/config.edit.toml` is
+replaced on the next attempt. Delete `config.runtime.toml` afterwards or
 keep it as private as `config.toml`.
 
 Changing the image tag rolls back application code only; it does not roll back

@@ -380,6 +380,9 @@ first scheduled generation runs one `schedule.generation_minutes` interval
 after setup (six hours with the example value), then at that interval. To keep
 it off, set `generation_enabled = false` under `[controller]` before setup; if
 setup already ran, change it and run setup again to remove the generation job.
+With an app-managed configuration, generation is off until you turn it on; when
+it is on, the scheduler starts generation right after its first successful
+refresh.
 
 LaunchAgents begin when this macOS user logs in. They survive application
 updates and restart after logout/login or reboot. For unattended recovery, the

@@ -233,10 +233,12 @@ use your existing proxy; Inky does not require one for ordinary local setup.
 | Nginx Proxy Manager | Do not use a location-only logging override for OIDC. | Version 2.16.0 passed sign-in, but a malformed request retained synthetic callback query values in its server error log. It does not pass this candidate's privacy gate. |
 
 These checks used a disposable identity service, synthetic accounts and verified
-TLS in Chromium. The `/wall/*` routes were added to all three recipes after
-these checks and have not been tested through a proxy. They qualify the access checkpoint, not the finished journal,
+TLS in Chromium. They qualify the access checkpoint, not the finished journal,
 every phone's certificate trust or your installation. Repeat the checks after
-changing proxy versions, routes or logging policy.
+changing proxy versions, routes or logging policy. The `/wall/*` routes were
+added to all three recipes later and have not been tested through a proxy.
+Owner sign-in does not protect `/wall/*`, so keep the proxy's private address
+allowlist on this route.
 
 These are proxy setups, not separate Inky providers or login systems. Your
 proxy supplies HTTPS. Inky still owns account setup, sign-in and optional OIDC.
