@@ -720,3 +720,28 @@ def test_display_uninstaller_reports_a_unit_it_could_not_remove(tmp_path: Path) 
     assert result.returncode == 1
     assert f"{host.family}-display" in result.stderr
     assert "Display node services uninstalled." not in result.stdout
+
+
+# Remote display deployment ---------------------------------------------------
+
+
+@pytest.mark.parametrize("failure", ["ssh-stage-noise", "rsync"])
+def test_remote_display_staging_is_removed_on_every_exit(tmp_path: Path, failure: str) -> None:
+    host = Host(tmp_path, "Linux")
+    key = tmp_path / "synthetic-key"
+    key.write_text("")
+    shutil.copyfile(
+        ROOT / "deploy/install-display-local.sh", host.source / "deploy/install-display-local.sh"
+    )
+    host.fail(failure)
+    result = host.run(
+        "install-display-node.sh",
+        INKY_BIRD_DISPLAY_HOST="display.example.test",
+        INKY_BIRD_DISPLAY_USER="fixture",
+        INKY_BIRD_DISPLAY_SSH_KEY=str(key),
+        INKY_BIRD_DISPLAY_APP_DIR=str(host.app),
+        INKY_BIRD_DISPLAY_CONFIG_PATH=str(host.config),
+    )
+    assert result.returncode != 0
+    assert any(call[0] == "ssh" for call in host.calls())
+    assert not list(host.app.parent.glob(".inky-bird-stage.*"))

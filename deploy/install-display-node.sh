@@ -45,8 +45,32 @@ source_kib=$(du -sk "${root}/src" "${root}/catalog" "${root}/deploy" \
   "${root}/README.md" "${root}/LICENSE" | awk '{sum += $1} END {printf "%.0f", sum}')
 # Cover the stage and a complete fresh managed copy, plus modest headroom.
 required_kib=$((source_kib * 2 + 65536))
-remote_stage=$(remote_command bash -s -- "${remote_parent}" "${stage_prefix}" \
-  "${required_kib}" <<'REMOTE'
+# Name the stage here so cleanup knows it even if the reply is lost.
+stage_suffix=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+if [[ ! "${stage_suffix}" =~ ^[0-9a-f]{12}$ ]]; then
+  echo "Could not choose a private staging name. No changes made." >&2
+  exit 1
+fi
+remote_stage="${stage_prefix}${stage_suffix}"
+reply_dir=$(mktemp -d)
+stage_requested=false
+stage_foreign=false
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf "${reply_dir}"
+  # Only the exact path this invocation asked to create, never one that existed.
+  if [ "${stage_requested}" = true ] && [ "${stage_foreign}" != true ] && \
+      ! remote_command rm -rf -- "${remote_stage}"; then
+    echo "Could not remove isolated public-source staging; remove it after reconnecting: ${remote_stage}" >&2
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+stage_requested=true
+stage_status=0
+remote_command bash -s -- "${remote_parent}" "${remote_stage}" \
+  "${required_kib}" >"${reply_dir}/stage" <<'REMOTE' || stage_status=$?
 set -euo pipefail
 parent=$1
 probe=${parent}
@@ -55,32 +79,33 @@ while [ ! -d "${probe}" ]; do
   probe=${probe:-/}
 done
 available=$(df -Pk "${probe}" | awk 'NR == 2 {print $4}')
-case "${available}" in
-  '' | *[!0-9]*) echo "Cannot determine remote staging capacity." >&2; exit 1 ;;
-esac
+if [ -z "${available}" ] || [ -n "${available//[0-9]/}" ]; then
+  echo "Cannot determine remote staging capacity." >&2
+  exit 1
+fi
 if [ "${available}" -lt "$3" ]; then
   echo "Not enough remote capacity for isolated source staging and the managed copy: need $3 KiB, have ${available} KiB. No live runtime changes made." >&2
   exit 1
 fi
 mkdir -p "${parent}"
-mktemp -d "$2"XXXXXXXX
+if [ -e "$2" ] || [ -L "$2" ]; then
+  exit 17
+fi
+mkdir -m 700 "$2"
+printf '%s\n' "$2"
 REMOTE
-)
-stage_suffix=${remote_stage#"${stage_prefix}"}
-if [[ "${remote_stage}" != "${stage_prefix}"* || ! "${stage_suffix}" =~ ^[A-Za-z0-9]{8}$ ]]; then
+if [ "${stage_status}" -eq 17 ]; then
+  stage_foreign=true
+  echo "Remote staging path already exists; run the deployment again. No changes made." >&2
+  exit 1
+fi
+if [ "${stage_status}" -ne 0 ]; then
+  exit "${stage_status}"
+fi
+if [ "$(cat "${reply_dir}/stage")" != "${remote_stage}" ]; then
   echo "Remote staging did not return a recognized private temporary directory." >&2
   exit 1
 fi
-cleanup() {
-  status=$?
-  trap - EXIT
-  # The exact path was created by this invocation and validated above.
-  if ! remote_command rm -rf -- "${remote_stage}"; then
-    echo "Could not remove isolated public-source staging; remove it after reconnecting: ${remote_stage}" >&2
-  fi
-  exit "${status}"
-}
-trap cleanup EXIT
 remote_command mkdir -p "${remote_stage}/src" "${remote_stage}/catalog" \
   "${remote_stage}/deploy" "${remote_stage}/docs"
 # rsync parses -e itself: quotes group spaces, doubled quotes escape a quote,
