@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import unicodedata
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -140,7 +141,7 @@ def _fresh_payload(history_path: Path, source: str) -> dict[str, object] | None:
             return None
         payload: object = json.loads(encoded)
         history = history_path.lstat()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     # The complete readers refuse a shared or linked history file; so must this.
     if not stat.S_ISREG(history.st_mode) or stat.S_IMODE(history.st_mode) & 0o077:
@@ -191,6 +192,14 @@ def _count(value: object, *, minimum: int) -> int:
     return value
 
 
+def _showable(value: object) -> bool:
+    # The journal's own name rule; a summary it would refuse is rebuilt instead.
+    if not isinstance(value, str):
+        return False
+    text = unicodedata.normalize("NFC", value.strip())
+    return len(text) <= 256 and not any(unicodedata.category(char).startswith("C") for char in text)
+
+
 def parse_species_rows(value: object) -> list[SpeciesSummary]:
     if not isinstance(value, list):
         raise DataSourceError("Invalid history summary")
@@ -207,6 +216,8 @@ def parse_species_rows(value: object) -> list[SpeciesSummary]:
             not isinstance(common, str)
             or not isinstance(scientific, str)
             or not scientific
+            or not _showable(common)
+            or not _showable(scientific)
             or undated > count
             or first is not None
             and (not _is_iso_date(first) or last is None)

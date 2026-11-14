@@ -37,7 +37,7 @@ from inky_bird_frame.birdnet_analyzer import (
 from inky_bird_frame.birds import ObservationWindow
 from inky_bird_frame.config import ControllerConfig
 from inky_bird_frame.ebird_archive import (
-    REQUIRED_COLUMNS,
+    EXPORT_COLUMNS,
     import_ebird_archive,
     read_ebird_archive_history,
     read_ebird_archive_summary,
@@ -107,7 +107,7 @@ def approved_catalog(config: ControllerConfig) -> None:
 def ebird_import(state_dir: Path, root: Path, rows: list[tuple[str, str, str, str]]) -> None:
     path = root / "MyEBirdData.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=EXPORT_COLUMNS, restval="")
         writer.writeheader()
         for submission, common, scientific, observed in rows:
             writer.writerow(
@@ -607,7 +607,7 @@ def test_trip_evidence_status_is_parsed_once_per_history_and_journal_change(
         ebird_import_reduced = [("S2", "Robin", "Turdus migratorius", "2019-03-13")]
         path = tmp_path / "MyEBirdData.csv"
         with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS)
+            writer = csv.DictWriter(handle, fieldnames=EXPORT_COLUMNS, restval="")
             writer.writeheader()
             for submission, common, scientific, observed in ebird_import_reduced:
                 writer.writerow(
@@ -623,3 +623,67 @@ def test_trip_evidence_status_is_parsed_once_per_history_and_journal_change(
         calls = reader.call_count
         assert status() == "source-changed"
         assert reader.call_count == calls + 1
+
+
+def test_deeply_nested_summary_is_rebuilt(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    ebird_import(state, tmp_path, [("S1", "Robin", "Turdus migratorius", "2019-03-12")])
+    expected = read_ebird_archive_summary(state)
+    path = summary_path(state / EBIRD)
+    path.write_text("[" * 200_000)
+    path.chmod(0o600)
+    assert read_ebird_archive_summary(state) == expected
+
+
+def test_analyzer_name_is_the_last_one_stored_even_from_an_older_dated_batch(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    analyzer_import(
+        state, tmp_path, [("Turdus migratorius", "Newer name", "a.wav")], date(2026, 5, 2)
+    )
+    analyzer_import(
+        state, tmp_path, [("Turdus migratorius", "Older name", "b.wav")], date(2026, 5, 1)
+    )
+    full = read_birdnet_analyzer_history(state, window=ObservationWindow.ALL_TIME, limit=None)
+    assert [item.common_name for item in full.species] == ["Older name"]
+    assert [row.common_name for row in read_birdnet_analyzer_summary(state)[0]] == ["Older name"]
+    summary_path(state / ANALYZER).unlink()
+    assert [row.common_name for row in read_birdnet_analyzer_summary(state)[0]] == ["Older name"]
+
+
+def test_a_failed_trip_evidence_read_is_retried_on_the_next_snapshot(tmp_path: Path) -> None:
+    from inky_bird_frame.errors import DataSourceError
+
+    config = controller(tmp_path)
+    approved_catalog(config)
+    state = config.state_dir
+    ebird_import(state, tmp_path, [("S1", "Robin", "Turdus migratorius", "2019-03-12")])
+    trip = JournalCollection(
+        "b" * 32,
+        "Fixture trip",
+        (
+            JournalMember(
+                1,
+                "Robin",
+                "Turdus migratorius",
+                MemberOrigin.EBIRD,
+                (ChecklistEvidence(hashlib.sha256(b"S1").hexdigest(), "Turdus migratorius"),),
+            ),
+        ),
+        CollectionKind.TRIP,
+        "2019-03-01",
+        "2019-03-31",
+        1,
+        1,
+    )
+    save_imported_collection(state, revision=0, collection=trip)
+    service = JournalService(config)
+
+    def status() -> object:
+        collections = cast(list[dict[str, object]], service.snapshot()["collections"])
+        return cast(list[dict[str, object]], collections[0]["evidence"])[0]["status"]
+
+    with patch.object(ebird_archive, "read_ebird_checklists", side_effect=DataSourceError("busy")):
+        assert status() == "unavailable"
+    assert status() == "linked"
