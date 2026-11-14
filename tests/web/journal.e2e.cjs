@@ -934,6 +934,29 @@ let browser,
     (before) => document.querySelector('.frame-caption')?.innerText !== before,
     swipeCaption,
   );
+  if (engine === 'chromium') {
+    // A finger swipe on the plate while the controls are faded steps too:
+    // the touch that wakes the bar must not swallow the step.
+    await page.clock.runFor(5100);
+    await page.locator('.frame-controls.quiet').waitFor();
+    const touchCaption = await page.locator('.frame-caption').innerText();
+    const y = plateBox.y + plateBox.height / 2;
+    const touch = await page.context().newCDPSession(page);
+    const finger = (type, x) =>
+      touch.send('Input.dispatchTouchEvent', {
+        type,
+        touchPoints: type === 'touchEnd' ? [] : [{ x, y, id: 1 }],
+      });
+    await finger('touchStart', plateBox.x + plateBox.width * 0.8);
+    for (const share of [0.65, 0.5, 0.35, 0.2])
+      await finger('touchMove', plateBox.x + plateBox.width * share);
+    await finger('touchEnd');
+    await touch.detach();
+    await page.waitForFunction(
+      (before) => document.querySelector('.frame-caption')?.innerText !== before,
+      touchCaption,
+    );
+  }
   phase = 'frame-resilience';
   // A network outage fails both the periodic check and the next plate, yet
   // playback continues; an emptied view recovers without a reload once its
@@ -957,7 +980,19 @@ let browser,
   await page.clock.runFor(60100);
   await page.getByText(/This view has no approved plates or was removed\./).waitFor();
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
+  // Playback stays on, but an emptied view has nothing left to step to.
+  const emptiedSteps = [];
+  const countStep = (request) => {
+    if (/\/v1\/owner\/journal\/birds\/\d+\/portrait$/.test(request.url()))
+      emptiedSteps.push(request);
+  };
+  page.on('request', countStep);
   await page.keyboard.press('ArrowRight');
+  await page.clock.runFor(120100);
+  await page.waitForTimeout(100);
+  page.off('request', countStep);
+  assert.equal(emptiedSteps.length, 0, 'an emptied view stops stepping');
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
   await page.unroute('**/v1/owner/journal');
   await page.unroute('**/v1/owner/journal/birds/*/portrait');
