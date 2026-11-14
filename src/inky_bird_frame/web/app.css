@@ -356,6 +356,8 @@ h1::after {
   box-shadow: var(--shadow-soft);
 }
 .bird-grid .bird-card, .bird-grid .journal-card { margin-block: 0; }
+/* Off-screen cards skip layout and paint; the size is a typical card. */
+.bird-card { content-visibility: auto; contain-intrinsic-size: auto 400px; }
 .bird-card h2 { font-size: 20px; margin: 12px 0 2px; }
 .bird-card p { margin-block: 4px; }
 .bird-card .hint { margin-block: 6px 0; font-size: 13.5px; }
@@ -403,7 +405,7 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   box-shadow: var(--shadow);
 }
 .featured-art:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
-.featured-art img { display: block; max-width: 100%; max-height: 62svh; object-fit: contain; }
+.featured-art img { display: block; width: min(1200px, 62svh * 3 / 4); max-width: 100%; height: auto; object-fit: contain; }
 .featured-caption { text-align: center; }
 .featured-caption h2 { margin: 18px 0 2px; font-size: clamp(24px, 6vw, 30px); }
 .featured-caption .hint { margin-top: 4px; }
@@ -412,6 +414,7 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 
 .detail-art {
   width: 100%;
+  height: auto;
   max-height: 76svh;
   object-fit: contain;
   margin-block: 20px;
