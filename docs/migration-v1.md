@@ -9,7 +9,10 @@ or e-paper frame to migrate.
 ## What stays the same
 
 - Existing source choices, credentials, location, windows and schedules remain.
-- Existing generation policy remains. Upgrade never enables AI generation.
+- Existing generation policy remains. Upgrade never enables AI generation. A
+  file without a `generation_enabled` line keeps generation on, as before,
+  unless it is app-managed; only new files from `config.example.toml` or
+  `config init` start with it off.
 - Saved birds keeps its current membership and CLI meaning.
 - Approved plates remain immutable unless an explicit reviewed catalog migration
   already accompanies the release.
@@ -25,7 +28,10 @@ public artwork does not claim a sighting or join your Saved birds.
 ## Before updating
 
 1. Record the running release, configuration ownership and active services.
-2. Check controller and display doctor. Resolve storage trouble first.
+2. Check controller and display doctor. Resolve storage trouble first. Run
+   `config validate` and fix anything under `unknown_keys`: unknown keys are
+   deprecated, warned in 1.x and rejected in 2.0 (see
+   [Deprecations](operations.md#deprecations)).
 3. Follow [Backup and restore](backup.md). Stop serving and scheduled writers
    before the consistent copy; do not back up a live state folder as a ZIP.
 4. Keep configuration, catalog, private state and working data with the matching
@@ -117,8 +123,9 @@ Use real saved state, not just a green HTTP response:
 
 Journal schema 1 is read without rewriting it. Its first deliberate edit keeps
 an exact mode-`0600` `journal-v1-backup.json`, then writes schema 2. Schema 2
-retains explicit member origins and the minimum hashed checklist evidence needed
-to detect later source changes. Reading old manual choices never turns them into
+retains explicit member origins and the minimum checklist evidence needed to
+detect later source changes: unsalted SHA-256 hashes of eBird submission IDs,
+which are private at rest but not anonymous. Reading old manual choices never turns them into
 personal trips.
 
 Newer state and older runtimes are not interchangeable. For a failed trial,
