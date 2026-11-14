@@ -11,9 +11,8 @@ import sys
 import threading
 import warnings
 from contextlib import nullcontext
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from . import __version__
 from .birdbuddy import (
@@ -36,6 +35,8 @@ from .config import (
     NotificationEvent,
     discovery_source_label,
     load_config,
+    overlapping_controller_directories,
+    parse_config_bytes,
 )
 from .controller import (
     add_collection_member,
@@ -53,7 +54,8 @@ from .controller import (
 from .display import show_on_inky
 from .display_node import run_display_cycle
 from .ebird_archive import import_ebird_archive, read_ebird_archive_history
-from .errors import DataSourceError, InkyBirdFrameError
+from .errors import ConfigurationError, DataSourceError, InkyBirdFrameError
+from .http import write_bytes_atomic
 from .images import prepare_uploaded_image
 from .installation import InstallationRole, doctor, native_tls_environment, setup
 from .notifications import (
@@ -511,17 +513,16 @@ def access_recover_command(args: argparse.Namespace) -> int:
 
     if not sys.stdin.isatty():
         raise ValueError("access recover requires a private interactive terminal")
-    if (
-        not args.yes
-        and input(
+    if not args.yes:
+        print(
             "Recovery signs out every device and clears the stored single-sign-on link. "
-            "Bird data stays unchanged. Type yes to continue: "
+            "Bird data stays unchanged. Type yes to continue: ",
+            file=sys.stderr,
+            end="",
+            flush=True,
         )
-        .strip()
-        .casefold()
-        != "yes"
-    ):
-        raise ValueError("Recovery cancelled; owner access is unchanged")
+        if input().strip().casefold() != "yes":
+            raise ValueError("Recovery cancelled; owner access is unchanged")
     username, password = _prompt_owner_credentials()
     store = AccessStore(_config(args, load_secrets=False).controller.state_dir)
     store.recover_owner(username, password)
@@ -653,11 +654,24 @@ def config_validate_command(args: argparse.Namespace) -> int:
         location_mode = "zippopotam"
     else:
         location_mode = None
+    config_warnings = [
+        {
+            "code": "overlapping_directories",
+            "settings": [f"controller.{first}", f"controller.{second}"],
+            "message": f"controller.{first} and controller.{second} overlap; keep the "
+            "workspace, catalog and state directories separate.",
+        }
+        for first, second in overlapping_controller_directories(config.controller)
+    ]
     print_result(
         {
             "config": str(args.config),
             "valid": True,
             "deprecations": deprecations,
+            "unknown_keys": list(config.unknown_keys),
+            "warnings": config_warnings,
+            "configuration_ownership": config.controller.configuration_ownership,
+            "generation_enabled": config.controller.generation_enabled,
             "discovery": {
                 "source": discovery_source_label(config.discovery.sources),
                 "sources": [provider.value for provider in config.discovery.sources],
@@ -680,34 +694,64 @@ def config_validate_command(args: argparse.Namespace) -> int:
 
 def config_install_command(args: argparse.Namespace) -> int:
     destination = args.destination
+    invalid_existing: bytes | None = None
     if destination.exists():
-        existing = load_config(destination, load_secrets=False)
-        if existing.controller.configuration_ownership == "app":
-            print_result({"installed": False, "preserved": True, "ownership": "app"})
-            return 0
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            os.chmod(temporary_path, 0o600)
-            handle.write(sys.stdin.read())
+        existing = destination.read_bytes()
+        try:
+            current = parse_config_bytes(existing, path=destination, load_secrets=False)
+        except ConfigurationError:
+            invalid_existing = existing
+        else:
+            if current.controller.configuration_ownership == "app":
+                print_result(
+                    {
+                        "config": str(destination),
+                        "installed": False,
+                        "preserved": True,
+                        "ownership": "app",
+                        "message": "Kept the configuration the app manages; change "
+                        "settings in the browser. The supplied file was not installed.",
+                    }
+                )
+                return 0
+    candidate = sys.stdin.buffer.read()
+    parse_config_bytes(candidate, path=destination, source="standard input")
+    kept_as = (
+        _keep_invalid_config(destination, invalid_existing)
+        if invalid_existing is not None
+        else None
+    )
+    write_bytes_atomic(destination, candidate, mode=0o600)
+    print_result(
+        {
+            "config": str(destination),
+            "installed": True,
+            "valid": True,
+            "previous_config_kept_as": kept_as,
+        }
+    )
+    return 0
+
+
+def _keep_invalid_config(destination: Path, content: bytes) -> str:
+    """Copy an unreadable config beside the destination under a new name."""
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{destination.name}.invalid-{stamp}"
+    for attempt in range(1000):
+        name = base if attempt == 0 else f"{base}-{attempt}"
+        try:
+            descriptor = os.open(
+                destination.parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        load_config(temporary_path)
-        os.replace(temporary_path, destination)
-    except Exception:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        raise
-    print_result({"config": str(destination), "installed": True, "valid": True})
-    return 0
+        return name
+    raise ConfigurationError("Could not choose a name to keep the previous configuration")
 
 
 def config_init_command(args: argparse.Namespace) -> int:
@@ -841,8 +885,14 @@ def notifications_status_command(args: argparse.Namespace) -> int:
 def notifications_test_command(args: argparse.Namespace) -> int:
     config = _config(args)
     result = send_notification_test(config)
-    if result["failures"]:
-        raise ValueError("Notification test was not delivered to every configured destination")
+    failures = result["failures"]
+    if failures:
+        failed = failures if isinstance(failures, list) else []
+        names = ", ".join(str(item["name"]) for item in failed if isinstance(item, dict))
+        raise ValueError(
+            "Notification test was not delivered to every configured destination"
+            + (f": {names}" if names else "")
+        )
     print_result(result)
     return 0
 
