@@ -7,7 +7,7 @@ import json
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -172,6 +172,9 @@ query InkyBirdBuddyConfirmedHistory($first: Int!, $after: String) {
   }
 }
 """.strip()
+
+_HIGH_CONFIDENCE: Final = "HIGH_CONFIDENCE"
+_KNOWN_CONFIDENCE_LEVELS: Final = {_HIGH_CONFIDENCE, "LOW_CONFIDENCE"}
 
 _CONFIRMED_FEEDER_SOURCE: Final = "selected_feeder"
 _CONFIRMED_MANUAL_SOURCE: Final = "manual"
@@ -629,6 +632,13 @@ def _feeder_id(value: object) -> str | None:
     return _nonempty_string(value.get("id"))
 
 
+def _is_other_feeder_postcard(value: object, selected_feeder_id: str) -> bool:
+    if not isinstance(value, dict) or value.get("__typename") != "FeedItemNewPostcard":
+        return False
+    feeder_id = _feeder_id(value.get("feeder"))
+    return feeder_id is not None and feeder_id != selected_feeder_id
+
+
 def _parse_postcard(
     value: object,
     selected_feeder_id: str,
@@ -683,10 +693,20 @@ def _parse_postcard(
             media_ids=sorted_media_ids,
             complete=False,
         )
+    if confidence_level not in _KNOWN_CONFIDENCE_LEVELS:
+        # An unrecognised level may be a server-side rename of a confident
+        # result; it must not withdraw a retained classification.
+        return BirdBuddyPostcard(
+            postcard_id,
+            observed_at,
+            (),
+            media_ids=sorted_media_ids,
+            complete=False,
+        )
     # An empty species tuple is a reconciliation tombstone. It lets a complete
     # feed refresh remove a previously accepted classification without storing
     # low-confidence or non-bird results in detection history.
-    if confidence_level != "HIGH_CONFIDENCE":
+    if confidence_level != _HIGH_CONFIDENCE:
         return BirdBuddyPostcard(
             postcard_id,
             observed_at,
@@ -757,6 +777,7 @@ def _fetch_postcard_variant(
 ) -> tuple[list[BirdBuddyPostcard], int, int, int]:
     postcards: dict[str, BirdBuddyPostcard] = {}
     raw_records = raw_postcards if raw_postcards is not None else {}
+    malformed_ids: set[str] = set()
     after: str | None = None
     seen_cursors: set[str] = set()
     pages = 0
@@ -784,6 +805,11 @@ def _fetch_postcard_variant(
         for edge in edges:
             processed += 1
             node = edge.get("node") if isinstance(edge, dict) else None
+            # Accounts can see several feeders; another feeder's postcard is
+            # outside this integration, not a malformed response.
+            if _is_other_feeder_postcard(node, feeder_id):
+                ignored += 1
+                continue
             postcard = _parse_postcard(node, feeder_id, sighting_type)
             raw_id = _nonempty_string(node.get("id")) if isinstance(node, dict) else None
             confidence = (
@@ -792,12 +818,9 @@ def _fetch_postcard_variant(
                 else None
             )
             if raw_id is not None:
-                if raw_id in raw_records:
-                    previous_variant, previous_postcard, previous_confidence = raw_records[raw_id]
-                    if postcard is None or previous_postcard is None:
-                        raise DataSourceError(
-                            "Bird Buddy feed returned an invalid duplicate postcard"
-                        )
+                previous = raw_records.get(raw_id)
+                if previous is not None and postcard is not None and previous[1] is not None:
+                    previous_variant, previous_postcard, previous_confidence = previous
                     if previous_confidence != confidence:
                         raise DataSourceError(
                             "Bird Buddy returned inconsistent postcard confidence levels"
@@ -806,7 +829,12 @@ def _fetch_postcard_variant(
                         raise DataSourceError(
                             "Bird Buddy feed returned conflicting duplicate postcards"
                         )
-                raw_records[raw_id] = (sighting_type, postcard, confidence)
+                # A postcard that is malformed in any copy stays incomplete for
+                # this sync, so it can neither add nor withdraw a detection.
+                malformed = postcard is None or (previous is not None and previous[1] is None)
+                if malformed:
+                    malformed_ids.add(raw_id)
+                raw_records[raw_id] = (sighting_type, None if malformed else postcard, confidence)
             if postcard is None:
                 ignored += 1
             else:
@@ -828,7 +856,15 @@ def _fetch_postcard_variant(
             raise DataSourceError("Bird Buddy feed returned a repeated pagination cursor")
         seen_cursors.add(cursor)
         after = cursor
-    return list(postcards.values()), pages, processed, ignored
+    return (
+        [
+            replace(postcard, complete=False) if postcard.postcard_id in malformed_ids else postcard
+            for postcard in postcards.values()
+        ],
+        pages,
+        processed,
+        ignored,
+    )
 
 
 def _merge_postcard_variants(
@@ -883,10 +919,13 @@ def _fetch_postcards(
             _merge_postcard_variants(postcards, postcard)
             variant_counts[postcard.postcard_id] = variant_counts.get(postcard.postcard_id, 0) + 1
     processed = max(processed_per_variant, default=0)
+    malformed_ids = {raw_id for raw_id, (_, parsed, _) in raw_postcards.items() if parsed is None}
     complete_postcards = [
         postcard
         for postcard in postcards.values()
-        if postcard.complete and variant_counts[postcard.postcard_id] == len(_FEED_QUERIES)
+        if postcard.complete
+        and postcard.postcard_id not in malformed_ids
+        and variant_counts[postcard.postcard_id] == len(_FEED_QUERIES)
     ]
     accepted_postcards = sum(bool(postcard.species) for postcard in complete_postcards)
     ignored = max(0, processed - accepted_postcards)

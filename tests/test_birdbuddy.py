@@ -398,7 +398,7 @@ class BirdBuddyTests(unittest.TestCase):
                 "SightingRecognizedBird",
             )
 
-    def test_feed_rejects_malformed_duplicate_across_query_variants(self) -> None:
+    def test_feed_excludes_postcard_malformed_in_one_query_variant(self) -> None:
         sighting = {
             "__typename": "SightingRecognizedBird",
             "species": {
@@ -428,11 +428,11 @@ class BirdBuddyTests(unittest.TestCase):
                 }
             },
         ]
-        with (
-            patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=responses),
-            self.assertRaisesRegex(DataSourceError, "invalid duplicate postcard"),
-        ):
-            _fetch_postcards("access-secret", "feeder-1")
+        with patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=responses):
+            postcards, _, processed, ignored = _fetch_postcards("access-secret", "feeder-1")
+
+        self.assertEqual(postcards, [])
+        self.assertEqual((processed, ignored), (1, 1))
 
     def test_feed_rejects_confidence_mismatch_across_query_variants(self) -> None:
         sighting = {
