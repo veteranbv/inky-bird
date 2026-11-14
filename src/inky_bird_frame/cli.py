@@ -76,6 +76,7 @@ from .journal import JournalError
 from .notifications import (
     check_display_heartbeat,
     dispatch_notifications,
+    notification_state_path,
     notification_status,
     requeue_dead_letters,
     safe_notify,
@@ -485,6 +486,29 @@ def status_command(args: argparse.Namespace) -> int:
                     }
                 )
         failed = [str(path) for path in sorted((config.controller.state_dir / "failed").glob("*"))]
+    notifications: dict[str, object]
+    try:
+        # Without an outbox there is nothing to count; do not create its lock.
+        delivery = (
+            notification_status(config)
+            if notification_state_path(config).exists()
+            else {
+                "enabled": config.notifications.enabled,
+                "pending": 0,
+                "dead_letters": 0,
+                "next_attempt_at": None,
+            }
+        )
+    except (InkyBirdFrameError, OSError):
+        notifications = {"available": False}
+    else:
+        notifications = {
+            "available": True,
+            **{
+                key: delivery[key]
+                for key in ("enabled", "pending", "dead_letters", "next_attempt_at")
+            },
+        }
     print_result(
         {
             "approved": [entry.as_dict() for entry in entries],
@@ -495,6 +519,7 @@ def status_command(args: argparse.Namespace) -> int:
             "deferred": [record.as_dict() for record in retries],
             "failed": failed,
             "generation": generation.as_dict(),
+            "notifications": notifications,
         }
     )
     return 0

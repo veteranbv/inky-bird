@@ -111,6 +111,112 @@ events = ["display_stale", "display_recovered"]
 """
 
 
+def _retry_config(temporary: str, retry_settings: str) -> AppConfig:
+    path = Path(temporary) / "config.toml"
+    path.write_text(
+        CONFIG.replace("delivery_retry_minutes = 5\nmax_delivery_attempts = 3\n", retry_settings)
+    )
+    return load_config(path)
+
+
+def _delays_until_dead_letter(config: AppConfig, now: datetime) -> list[int]:
+    """Attempt each delivery exactly when due and return the waits in minutes."""
+
+    enqueue_notification(
+        config, NotificationEvent.DEGRADED, dedupe_key="outage", title="Down", body="Down", now=now
+    )
+    delays: list[int] = []
+    current = now
+    with patch("inky_bird_frame.notifications._deliver", side_effect=RuntimeError("down")):
+        while True:
+            dispatch_notifications(config, now=current)
+            state = json.loads((config.controller.state_dir / "notifications.json").read_text())
+            if state["dead_letters"]:
+                assert state["pending"] == []
+                return delays
+            following = datetime.fromisoformat(state["pending"][0]["next_attempt_at"])
+            delays.append(int((following - current).total_seconds() // 60))
+            current = following
+
+
+def test_delivery_retries_double_up_to_a_six_hour_cap() -> None:
+    now = datetime(2026, 7, 10, tzinfo=UTC)
+    with TemporaryDirectory() as temporary:
+        config = _retry_config(
+            temporary, "delivery_retry_minutes = 5\nmax_delivery_attempts = 12\n"
+        )
+        delays = _delays_until_dead_letter(config, now)
+
+    assert delays == [5, 10, 20, 40, 80, 160, 320, 360, 360, 360, 360]
+
+
+def test_default_retries_last_at_least_seventy_two_hours_before_dead_letter() -> None:
+    now = datetime(2026, 7, 10, tzinfo=UTC)
+    with TemporaryDirectory() as temporary:
+        config = _retry_config(temporary, "")
+        delays = _delays_until_dead_letter(config, now)
+        status = notification_status(config)
+
+    assert config.notifications.delivery_retry_minutes == 5
+    assert config.notifications.max_delivery_attempts == 20
+    assert delays == [5, 10, 20, 40, 80, 160, 320, *([360] * 12)]
+    assert sum(delays) >= 72 * 60
+    assert status["dead_letters"] == 1
+    assert status["retry"] == {
+        "first_delay_minutes": 5,
+        "max_delay_minutes": 360,
+        "max_delivery_attempts": 20,
+        "dead_letter_after_minutes": sum(delays),
+    }
+
+
+def test_a_retry_interval_above_the_cap_stays_constant() -> None:
+    now = datetime(2026, 7, 10, tzinfo=UTC)
+    with TemporaryDirectory() as temporary:
+        config = _retry_config(
+            temporary, "delivery_retry_minutes = 400\nmax_delivery_attempts = 4\n"
+        )
+        delays = _delays_until_dead_letter(config, now)
+
+    assert delays == [400, 400, 400]
+
+
+def test_status_reports_the_next_retry_and_dead_letters() -> None:
+    now = datetime(2026, 7, 10, tzinfo=UTC)
+    with TemporaryDirectory() as temporary:
+        config = _retry_config(temporary, "delivery_retry_minutes = 5\nmax_delivery_attempts = 2\n")
+        empty = notification_status(config)
+        for key in ("first", "second"):
+            enqueue_notification(
+                config,
+                NotificationEvent.DEGRADED,
+                dedupe_key=key,
+                title="Down",
+                body="Down",
+                now=now,
+            )
+        with patch("inky_bird_frame.notifications._deliver", side_effect=RuntimeError("down")):
+            dispatch_notifications(config, now=now)
+        retrying = notification_status(config)
+        with patch("inky_bird_frame.notifications._deliver", side_effect=RuntimeError("down")):
+            dispatch_notifications(config, now=now + timedelta(minutes=5))
+        dead = notification_status(config)
+
+    assert empty["next_attempt_at"] is None
+    assert retrying["pending"] == 2
+    assert retrying["dead_letters"] == 0
+    assert retrying["next_attempt_at"] == (now + timedelta(minutes=5)).isoformat()
+    assert dead["pending"] == 0
+    assert dead["dead_letters"] == 2
+    assert dead["next_attempt_at"] is None
+    assert dead["retry"] == {
+        "first_delay_minutes": 5,
+        "max_delay_minutes": 360,
+        "max_delivery_attempts": 2,
+        "dead_letter_after_minutes": 5,
+    }
+
+
 class NotificationTests(unittest.TestCase):
     def _config(self, temporary: str) -> AppConfig:
         path = Path(temporary) / "config.toml"
@@ -290,12 +396,12 @@ class NotificationTests(unittest.TestCase):
                 now=now,
             )
             with patch("inky_bird_frame.notifications._deliver", side_effect=RuntimeError("down")):
-                for offset in (0, 5, 10):
+                for offset in (0, 5, 15):
                     dispatch_notifications(config, now=now + timedelta(minutes=offset))
             before = notification_status(config)
-            requeued = requeue_dead_letters(config, now=now + timedelta(minutes=15))
+            requeued = requeue_dead_letters(config, now=now + timedelta(minutes=20))
             with patch("inky_bird_frame.notifications._deliver"):
-                dispatch_notifications(config, now=now + timedelta(minutes=15))
+                dispatch_notifications(config, now=now + timedelta(minutes=20))
             after = notification_status(config)
 
         self.assertEqual(before["dead_letters"], 1)

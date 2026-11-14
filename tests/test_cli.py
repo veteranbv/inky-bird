@@ -55,7 +55,13 @@ from inky_bird_frame.cli import (
     species_to_dict,
     status_command,
 )
-from inky_bird_frame.config import AppConfig, DiscoveryProvider, NotificationEvent
+from inky_bird_frame.config import (
+    AppConfig,
+    DiscoveryProvider,
+    NotificationEvent,
+    NotificationsConfig,
+    load_config,
+)
 from inky_bird_frame.controller import (
     HUMAN_REVIEW_SOURCE,
     REVIEW_FAILURE_FALLBACK,
@@ -996,7 +1002,8 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             state = Path(temporary)
             config = SimpleNamespace(
-                controller=SimpleNamespace(catalog_dir=state / "catalog", state_dir=state)
+                controller=SimpleNamespace(catalog_dir=state / "catalog", state_dir=state),
+                notifications=NotificationsConfig(),
             )
             output = io.StringIO()
             with (
@@ -1040,6 +1047,7 @@ class CliTests(unittest.TestCase):
                     catalog_dir=catalog, state_dir=state, configuration_ownership="managed"
                 ),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
                 discovery_revision=None,
             )
             output = io.StringIO()
@@ -1068,6 +1076,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=catalog, state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
 
             with (
@@ -1087,6 +1096,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             lock_held = False
             retained_retries = [SimpleNamespace(as_dict=lambda: {"taxon_id": 42})]
@@ -1166,6 +1176,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             output = io.StringIO()
 
@@ -1220,6 +1231,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             generation_payload = {
                 "terminal_blocked": [
@@ -3878,6 +3890,85 @@ def test_catalog_publish_success_records_recovery_except_for_dry_run() -> None:
             assert recover.call_args.kwargs["key"] == "catalog-publication"
             assert recover.call_args.kwargs["event"] is NotificationEvent.PUBLICATION_RECOVERED
         assert json.loads(output.getvalue())["data"] == {"published": 1}
+
+
+def _status_fixture(tmp_path: Path) -> Path:
+    from inky_bird_frame.settings import initialize_config
+
+    path = tmp_path / "config.toml"
+    initialize_config(path)
+    catalog = tmp_path / "catalog"
+    (catalog / "species").mkdir(parents=True)
+    (catalog / "index.json").write_text(
+        json.dumps({"schema_version": 1, "generated_at": None, "species": []})
+    )
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "notifications.json").write_text("{}")
+    return path
+
+
+def test_status_reports_notification_retries_and_dead_letters(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    output = io.StringIO()
+    with (
+        patch(
+            "inky_bird_frame.cli.notification_status",
+            return_value={
+                "enabled": True,
+                "destinations": [{"name": "first", "scheme": "ntfy", "events": []}],
+                "pending": 2,
+                "dead_letters": 1,
+                "oldest_pending_at": "2026-07-10T00:00:00+00:00",
+                "next_attempt_at": "2026-07-10T00:05:00+00:00",
+                "retry": {"dead_letter_after_minutes": 4955},
+            },
+        ) as status,
+        redirect_stdout(output),
+    ):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert status.call_count == 1
+    assert json.loads(output.getvalue())["data"]["notifications"] == {
+        "available": True,
+        "enabled": True,
+        "pending": 2,
+        "dead_letters": 1,
+        "next_attempt_at": "2026-07-10T00:05:00+00:00",
+    }
+
+
+def test_status_without_an_outbox_reports_nothing_waiting(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    (state_dir / "notifications.json").unlink()
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {
+        "available": True,
+        "enabled": False,
+        "pending": 0,
+        "dead_letters": 0,
+        "next_attempt_at": None,
+    }
+    assert not (state_dir / "notifications.lock").exists()
+
+
+def test_status_survives_unreadable_notification_state(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    output = io.StringIO()
+    with (
+        patch(
+            "inky_bird_frame.cli.notification_status",
+            side_effect=CatalogError("Invalid notification state"),
+        ),
+        redirect_stdout(output),
+    ):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {"available": False}
 
 
 if __name__ == "__main__":
