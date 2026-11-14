@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 
 from .birds import BirdBuddySpecies, ObservationWindow
 from .errors import DataSourceError
-from .http import post_json, write_json_atomic
+from .http import post_json, write_bytes_atomic, write_json_atomic
 from .timeutil import parse_utc_timestamp
 
 BIRDBUDDY_GRAPHQL_URL: Final = "https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql"
@@ -365,6 +365,10 @@ def _auth_path(state_dir: Path) -> Path:
 
 def _history_path(state_dir: Path) -> Path:
     return state_dir / "birdbuddy-detections.json"
+
+
+def _previous_history_path(state_dir: Path) -> Path:
+    return state_dir / "birdbuddy-detections.json.previous"
 
 
 @contextmanager
@@ -1306,6 +1310,14 @@ def _parse_confirmed_species(value: object) -> ConfirmedSpeciesEvidence:
     )
 
 
+@contextmanager
+def _history_section(section: str) -> Iterator[None]:
+    try:
+        yield
+    except DataSourceError as exc:
+        raise DataSourceError(f"Invalid Bird Buddy detection history in {section}") from exc
+
+
 def _parse_feeder_history(value: object) -> FeederHistory:
     if not isinstance(value, dict):
         raise DataSourceError("Invalid Bird Buddy detection history")
@@ -1317,68 +1329,81 @@ def _parse_feeder_history(value: object) -> FeederHistory:
     archived_postcard_values = value.get("archived_postcards", [])
     archived_unlinked_values = value.get("archived_unlinked_latest")
     confirmed_values = value.get("confirmed_species", [])
-    if (
-        history_started_at is None
-        or parse_utc_timestamp(history_started_at) is None
-        or (earliest is not None and parse_utc_timestamp(earliest) is None)
-        or (last_sync is not None and parse_utc_timestamp(last_sync) is None)
-        or not isinstance(postcard_values, list)
-        or not isinstance(archived_values, dict)
-        or not isinstance(archived_postcard_values, list)
-        or (archived_unlinked_values is not None and not isinstance(archived_unlinked_values, dict))
-        or not isinstance(confirmed_values, list)
-    ):
-        raise DataSourceError("Invalid Bird Buddy detection history")
-    parsed_postcards = [_parse_postcard_state(item) for item in postcard_values]
-    postcards = {postcard.postcard_id: postcard for postcard in parsed_postcards}
-    archived = {
-        species_id: _parse_archived_species(item, species_id)
-        for species_id, item in archived_values.items()
-        if isinstance(species_id, str)
-    }
-    if len(archived) != len(archived_values):
-        raise DataSourceError("Invalid Bird Buddy detection history")
-    archived_postcard_items = [_parse_archived_postcard(item) for item in archived_postcard_values]
-    archived_postcards = {item.media_ids: item for item in archived_postcard_items}
-    if len(archived_postcards) != len(archived_postcard_items):
-        raise DataSourceError("Invalid Bird Buddy detection history")
-    linked_counts: dict[str, int] = {}
-    for item in archived_postcards.values():
-        for species_id in item.species_ids:
-            linked_counts[species_id] = linked_counts.get(species_id, 0) + 1
-    if any(
-        species_id not in archived or count > archived[species_id].detection_count
-        for species_id, count in linked_counts.items()
-    ):
-        raise DataSourceError("Invalid Bird Buddy detection history")
-    if archived_unlinked_values is None:
-        archived_unlinked_latest = {
-            species_id: item.latest_detection_at
-            for species_id, item in archived.items()
-            if linked_counts.get(species_id, 0) < item.detection_count
-        }
-    else:
-        archived_unlinked_latest = {
-            species_id: timestamp
-            for species_id, value in archived_unlinked_values.items()
-            if isinstance(species_id, str)
-            for timestamp in [_nonempty_string(value)]
-            if timestamp is not None and parse_utc_timestamp(timestamp) is not None
-        }
-        expected_unlinked = {
-            species_id
-            for species_id, item in archived.items()
-            if linked_counts.get(species_id, 0) < item.detection_count
-        }
+    with _history_section("sync dates"):
         if (
-            len(archived_unlinked_latest) != len(archived_unlinked_values)
-            or set(archived_unlinked_latest) != expected_unlinked
+            history_started_at is None
+            or parse_utc_timestamp(history_started_at) is None
+            or (earliest is not None and parse_utc_timestamp(earliest) is None)
+            or (last_sync is not None and parse_utc_timestamp(last_sync) is None)
         ):
             raise DataSourceError("Invalid Bird Buddy detection history")
-    confirmed_items = [_parse_confirmed_species(item) for item in confirmed_values]
-    confirmed = {(item.source, item.species.species_id): item for item in confirmed_items}
-    if len(confirmed) != len(confirmed_items):
-        raise DataSourceError("Invalid Bird Buddy detection history")
+    with _history_section("postcards"):
+        if not isinstance(postcard_values, list):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+        parsed_postcards = [_parse_postcard_state(item) for item in postcard_values]
+        postcards = {postcard.postcard_id: postcard for postcard in parsed_postcards}
+    with _history_section("archived_species"):
+        if not isinstance(archived_values, dict):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+        archived = {
+            species_id: _parse_archived_species(item, species_id)
+            for species_id, item in archived_values.items()
+            if isinstance(species_id, str)
+        }
+        if len(archived) != len(archived_values):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+    with _history_section("archived_postcards"):
+        if not isinstance(archived_postcard_values, list):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+        archived_postcard_items = [
+            _parse_archived_postcard(item) for item in archived_postcard_values
+        ]
+        archived_postcards = {item.media_ids: item for item in archived_postcard_items}
+        if len(archived_postcards) != len(archived_postcard_items):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+        linked_counts: dict[str, int] = {}
+        for item in archived_postcards.values():
+            for species_id in item.species_ids:
+                linked_counts[species_id] = linked_counts.get(species_id, 0) + 1
+        if any(
+            species_id not in archived or count > archived[species_id].detection_count
+            for species_id, count in linked_counts.items()
+        ):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+    with _history_section("archived_unlinked_latest"):
+        if archived_unlinked_values is None:
+            archived_unlinked_latest = {
+                species_id: item.latest_detection_at
+                for species_id, item in archived.items()
+                if linked_counts.get(species_id, 0) < item.detection_count
+            }
+        else:
+            if not isinstance(archived_unlinked_values, dict):
+                raise DataSourceError("Invalid Bird Buddy detection history")
+            archived_unlinked_latest = {
+                species_id: timestamp
+                for species_id, value in archived_unlinked_values.items()
+                if isinstance(species_id, str)
+                for timestamp in [_nonempty_string(value)]
+                if timestamp is not None and parse_utc_timestamp(timestamp) is not None
+            }
+            expected_unlinked = {
+                species_id
+                for species_id, item in archived.items()
+                if linked_counts.get(species_id, 0) < item.detection_count
+            }
+            if (
+                len(archived_unlinked_latest) != len(archived_unlinked_values)
+                or set(archived_unlinked_latest) != expected_unlinked
+            ):
+                raise DataSourceError("Invalid Bird Buddy detection history")
+    with _history_section("confirmed_species"):
+        if not isinstance(confirmed_values, list):
+            raise DataSourceError("Invalid Bird Buddy detection history")
+        confirmed_items = [_parse_confirmed_species(item) for item in confirmed_values]
+        confirmed = {(item.source, item.species.species_id): item for item in confirmed_items}
+        if len(confirmed) != len(confirmed_items):
+            raise DataSourceError("Invalid Bird Buddy detection history")
     return FeederHistory(
         history_started_at,
         earliest if isinstance(earliest, str) else None,
@@ -1832,7 +1857,12 @@ def _update_history(
         history.last_successful_sync_at = current_iso
         histories[feeder_id] = history
         if persist:
-            write_json_atomic(_history_path(state_dir), _history_payload(histories), mode=0o600)
+            path = _history_path(state_dir)
+            # The feed is short-lived, so archived counts cannot be rebuilt;
+            # keep the last readable version beside the new one.
+            if path.exists():
+                write_bytes_atomic(_previous_history_path(state_dir), path.read_bytes(), mode=0o600)
+            write_json_atomic(path, _history_payload(histories), mode=0o600)
     return _HistoryUpdate(
         history,
         duplicates,

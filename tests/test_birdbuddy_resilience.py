@@ -474,6 +474,79 @@ class PartialConfirmedSyncTests(unittest.TestCase):
         self.assertIs(complete.stats.as_dict()["confirmed_history_complete"], True)
 
 
+class HistoryFileTests(BirdBuddyResilienceTestCase):
+    def test_each_write_keeps_the_previous_history_privately(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in(state_dir)
+            first_feed = FakeBirdBuddyApi(
+                page(node("postcard-1", species=BLUEBIRD)),
+                page(node("postcard-1", variant="SightingRecognizedBirdUnlocked")),
+            )
+            with patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=first_feed):
+                sync(state_dir)
+            history = state_dir / "birdbuddy-detections.json"
+            previous = state_dir / "birdbuddy-detections.json.previous"
+            self.assertFalse(previous.exists())
+            first = history.read_bytes()
+            with patch(
+                "inky_bird_frame.birdbuddy._graphql_request",
+                side_effect=FakeBirdBuddyApi(page(), page()),
+            ):
+                sync_birdbuddy_detections(
+                    state_dir,
+                    window=ObservationWindow.ALL_TIME,
+                    limit=20,
+                    now=datetime(2026, 8, 3, 12, 15, tzinfo=UTC),
+                )
+                kept = previous.read_bytes()
+                mode = stat.S_IMODE(previous.stat().st_mode)
+                second = history.read_bytes()
+                sync_birdbuddy_detections(
+                    state_dir,
+                    window=ObservationWindow.ALL_TIME,
+                    limit=20,
+                    persist_history=False,
+                )
+                after_preview = previous.read_bytes()
+
+        self.assertEqual(kept, first)
+        self.assertNotEqual(second, first)
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(after_preview, first)
+
+    def test_invalid_history_names_the_failing_section(self) -> None:
+        valid_feeder: dict[str, object] = {
+            "history_started_at": "2026-08-01T00:00:00+00:00",
+            "earliest_initial_feed_at": None,
+            "last_successful_sync_at": None,
+            "postcards": [],
+            "archived_species": {},
+            "archived_postcards": [],
+            "archived_unlinked_latest": {},
+            "confirmed_species": [],
+        }
+        for section, broken in (
+            ("postcards", {"postcards": [{"id": "postcard-1"}]}),
+            ("confirmed_species", {"confirmed_species": [{"id": "species-1"}]}),
+            ("archived_species", {"archived_species": {"species-1": {"detection_count": 0}}}),
+            ("sync dates", {"last_successful_sync_at": "yesterday"}),
+        ):
+            with TemporaryDirectory() as temporary, self.subTest(section=section):
+                state_dir = Path(temporary)
+                path = state_dir / "birdbuddy-detections.json"
+                path.write_text(
+                    json.dumps(
+                        {"schema_version": 1, "feeders": {"feeder-1": valid_feeder | broken}}
+                    )
+                )
+                path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    DataSourceError, f"Invalid Bird Buddy detection history in {section}$"
+                ):
+                    read_birdbuddy_history_species(state_dir)
+
+
 class HttpStatusOpener:
     """Stand-in for urllib's opener that answers every request with one HTTP status."""
 
