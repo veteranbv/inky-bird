@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import time
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,14 +16,35 @@ from urllib.error import HTTPError
 from urllib.request import Request
 
 import inky_bird_frame.http
+from inky_bird_frame import __version__
 from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.http import get_bytes, get_json, post_json, write_json_atomic
 
 
 class _RedirectingHandler(BaseHTTPRequestHandler):
     last_post_body = b""
+    last_user_agent = ""
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        type(self).last_user_agent = self.headers.get("User-Agent", "")
+        if self.path in {"/slow-body", "/slow-headers"}:
+            self._trickle(headers=self.path == "/slow-headers")
+            return
+        if self.path == "/short-body":
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"truncated")
+            self.close_connection = True
+            return
+        if self.path in {"/declared-large", "/undeclared-large"}:
+            body = b'"' + b"x" * 64 + b'"'
+            self.send_response(200)
+            if self.path == "/declared-large":
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/ftp-redirect":
             self.send_response(302)
             self.send_header("Location", "ftp://127.0.0.1/pub/file.bin")
@@ -39,7 +61,27 @@ class _RedirectingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _trickle(self, *, headers: bool) -> None:
+        # Every write arrives well inside the per-read timeout, so only a total
+        # deadline can stop the exchange before the server gives up (4 s).
+        try:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            if not headers:
+                self.wfile.write(b"Content-Length: 1000\r\n\r\n")
+            for _ in range(80):
+                self.wfile.write(b"X-Slow: 1\r\n" if headers else b" ")
+                self.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+        self.close_connection = True
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        type(self).last_user_agent = self.headers.get("User-Agent", "")
+        if self.path == "/slow-body":
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self._trickle(headers=False)
+            return
         if self.path == "/external-redirect":
             self.send_response(307)
             self.send_header("Location", "https://other.example.test/graphql")
@@ -227,6 +269,70 @@ class JsonHttpTests(unittest.TestCase):
                 self.assertIsNotNone(redirected)
                 assert redirected is not None
                 self.assertEqual(redirected.full_url, "https://example.test/end")
+
+
+class DeadlineAndLimitTests(unittest.TestCase):
+    def test_trickling_upstream_is_stopped_by_the_total_deadline(self) -> None:
+        for path in ("/slow-body", "/slow-headers"):
+            for fetch in (get_json, get_bytes):
+                with self.subTest(path=path, fetch=fetch.__name__), _serving() as port:
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(DataSourceError, "^Timed out reading "):
+                        fetch(f"http://127.0.0.1:{port}{path}", 0.4)
+                    self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_post_has_the_same_total_deadline(self) -> None:
+        with _serving() as port:
+            started = time.monotonic()
+            with self.assertRaisesRegex(DataSourceError, "^Timed out reading Fixture API$"):
+                post_json(
+                    f"http://127.0.0.1:{port}/slow-body",
+                    {},
+                    0.4,
+                    error_label="Fixture API",
+                    deadline_seconds=0.6,
+                )
+            self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_an_explicit_deadline_shorter_than_one_read_is_honoured(self) -> None:
+        with _serving() as port:
+            started = time.monotonic()
+            with self.assertRaisesRegex(DataSourceError, "Timed out"):
+                get_bytes(f"http://127.0.0.1:{port}/slow-body", 10.0, deadline_seconds=0.5)
+            self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_response_size_limits_are_enforced_with_and_without_a_length(self) -> None:
+        for path in ("/declared-large", "/undeclared-large"):
+            with self.subTest(path=path), _serving() as port:
+                url = f"http://127.0.0.1:{port}{path}"
+                self.assertEqual(get_json(url), "x" * 64)
+                with (
+                    patch("inky_bird_frame.http.MAX_JSON_BYTES", 65),
+                    self.assertRaisesRegex(DataSourceError, "exceeds 65 bytes"),
+                ):
+                    get_json(url)
+                with (
+                    patch("inky_bird_frame.http.MAX_ASSET_BYTES", 65),
+                    self.assertRaisesRegex(DataSourceError, "exceeds 65 bytes"),
+                ):
+                    get_bytes(url)
+                with patch("inky_bird_frame.http.MAX_ASSET_BYTES", 66):
+                    self.assertEqual(len(get_bytes(url)), 66)
+
+    def test_a_body_shorter_than_its_declared_length_is_not_returned(self) -> None:
+        with (
+            _serving() as port,
+            self.assertRaisesRegex(DataSourceError, "^Invalid HTTP response from "),
+        ):
+            get_bytes(f"http://127.0.0.1:{port}/short-body")
+
+    def test_requests_identify_this_release(self) -> None:
+        expected = f"inky-bird/{__version__}"
+        with _serving() as port:
+            get_bytes(f"http://127.0.0.1:{port}/payload")
+            self.assertEqual(_RedirectingHandler.last_user_agent, expected)
+            post_json(f"http://127.0.0.1:{port}/graphql", {})
+            self.assertEqual(_RedirectingHandler.last_user_agent, expected)
 
 
 if __name__ == "__main__":
