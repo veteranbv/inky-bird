@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import threading
+import tomllib
 import warnings
 from contextlib import nullcontext
 from datetime import UTC, date, datetime
@@ -55,7 +56,7 @@ from .display import show_on_inky
 from .display_node import run_display_cycle
 from .ebird_archive import import_ebird_archive, read_ebird_archive_history
 from .errors import ConfigurationError, DataSourceError, InkyBirdFrameError
-from .http import write_bytes_atomic
+from .http import _fsync_directory, write_bytes_atomic
 from .images import prepare_uploaded_image
 from .installation import InstallationRole, doctor, native_tls_environment, setup
 from .notifications import (
@@ -722,15 +723,35 @@ def config_install_command(args: argparse.Namespace) -> int:
         else None
     )
     write_bytes_atomic(destination, candidate, mode=0o600)
-    print_result(
-        {
-            "config": str(destination),
-            "installed": True,
-            "valid": True,
-            "previous_config_kept_as": kept_as,
-        }
-    )
+    result: dict[str, object] = {
+        "config": str(destination),
+        "installed": True,
+        "valid": True,
+        "previous_config_kept_as": kept_as,
+    }
+    if invalid_existing is not None:
+        message = (
+            f"The previous configuration could not be used and was kept as {kept_as}; "
+            "the supplied file was installed."
+        )
+        if _may_hold_browser_settings(invalid_existing):
+            message += " Settings changed in the browser need to be entered again."
+        result["message"] = message
+    print_result(result)
     return 0
+
+
+def _may_hold_browser_settings(content: bytes) -> bool:
+    """Whether an unusable config was, or may have been, managed in the browser."""
+
+    try:
+        raw = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        return False
+    return controller.get("configuration_ownership") == "app"
 
 
 def _keep_invalid_config(destination: Path, content: bytes) -> str:
@@ -746,10 +767,17 @@ def _keep_invalid_config(destination: Path, content: bytes) -> str:
             )
         except FileExistsError:
             continue
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+        kept = destination.parent / name
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            kept.unlink(missing_ok=True)
+            raise
+        # The kept name must be durable before the rename over the destination.
+        _fsync_directory(destination.parent)
         return name
     raise ConfigurationError("Could not choose a name to keep the previous configuration")
 

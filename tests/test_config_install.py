@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
+import os
 import stat
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
@@ -18,6 +20,7 @@ from inky_bird_frame.cli import (
     notifications_test_command,
 )
 from inky_bird_frame.errors import ConfigurationError
+from inky_bird_frame.http import write_bytes_atomic
 
 VALID = """
 [discovery]
@@ -141,6 +144,79 @@ def test_unreadable_destination_is_kept_aside_and_replaced(tmp_path: Path, exist
     assert stat.S_IMODE((tmp_path / kept).stat().st_mode) == 0o600
     assert sorted(path.name for path in tmp_path.iterdir()) == sorted(["config.toml", kept])
     assert result["installed"] is True
+
+
+@pytest.mark.parametrize(
+    ("existing", "browser_note"),
+    [
+        (APP_OWNED.replace("port = 8793", "port = 0").encode(), True),
+        (b"damaged = [", True),
+        (VALID.replace("port = 8793", "port = 0").encode(), False),
+    ],
+)
+def test_repair_explains_what_was_kept_and_replaced(
+    tmp_path: Path, existing: bytes, browser_note: bool
+) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_bytes(existing)
+
+    result = _install(destination, VALID.encode())
+
+    message = result["message"]
+    assert isinstance(message, str)
+    assert "could not be used" in message
+    assert str(result["previous_config_kept_as"]) in message
+    assert "supplied file was installed" in message
+    assert ("browser" in message) is browser_note
+
+
+def test_install_without_repair_has_no_repair_message(tmp_path: Path) -> None:
+    result = _install(tmp_path / "config.toml", VALID.encode())
+
+    assert "message" not in result
+
+
+def test_kept_copy_is_durable_before_the_destination_is_replaced(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_bytes(b"damaged = [")
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            events.append("directory synced")
+        real_fsync(descriptor)
+
+    def recording_write(path: Path, content: bytes, *, mode: int | None = None) -> None:
+        events.append("destination replaced")
+        write_bytes_atomic(path, content, mode=mode)
+
+    with (
+        patch("inky_bird_frame.cli.os.fsync", recording_fsync),
+        patch("inky_bird_frame.cli.write_bytes_atomic", recording_write),
+    ):
+        _install(destination, VALID.encode())
+
+    assert events[:2] == ["directory synced", "destination replaced"]
+
+
+def test_failed_kept_copy_leaves_no_partial_file(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_bytes(b"damaged = [")
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with (
+        patch("sys.stdin", _stdin(VALID.encode())),
+        patch("inky_bird_frame.cli.os.fsync", failing_fsync),
+        redirect_stdout(io.StringIO()),
+        pytest.raises(OSError, match="No space left"),
+    ):
+        config_install_command(build_parser().parse_args(_arguments(destination)))
+
+    assert destination.read_bytes() == b"damaged = ["
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["config.toml"]
 
 
 def test_repeated_repairs_keep_every_previous_copy(tmp_path: Path) -> None:
