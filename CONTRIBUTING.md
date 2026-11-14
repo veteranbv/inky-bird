@@ -138,6 +138,31 @@ CSV. Never supply personal history. These journeys complement unit tests;
 they do not prove live provider contracts, physical hardware or real-phone
 certificate trust.
 
+The test covers normal tasks, stale edits, interrupted responses, explicit
+work, scope withdrawal and revocation. Its community query is mocked, so it is
+not a live iNaturalist contract test.
+
+
+Chromium, Firefox and WebKit journeys and automated accessibility checks are
+separate from physical-phone, hardware and live-provider qualification. A narrow
+viewport is not proof of a particular phone. The README screenshots use two
+public approved plates and manual selections in a fresh art-only demo, not
+personal history. Refresh those images from the actual interface; never use
+private controller screenshots as convenient documentation fixtures.
+
+The following remain release gates, not automatic claims from a passing test:
+
+- complete live qualification of generation-optional installation and ownership
+  migration across native and Docker service restarts;
+- final large-file, mobile and live qualification of history import paths;
+- live qualification of source/work/notification actions, paired screens,
+  selected wall routing and scoped dashboard permissions;
+- complete new-install and upgrade journeys, final mobile/browser qualification,
+  independent security review and repository review on the final exact head.
+
+No release or production deployment is implied by these test results.
+Provider access remains subject to each service's permissions and limits.
+
 ### Refresh the README screenshots
 
 With the same controller dependencies and Chromium installed, run:

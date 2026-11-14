@@ -15,6 +15,12 @@ also start from **Collections → Make a trip from your eBird checklists**.
    upload**. That path has no original location labels.
 2. Check the file. Inky validates all rows and shows additions, corrections,
    removals and affected collections. Checking does not update history.
+   The export needs only the `Submission ID`, `Common Name`, `Scientific Name`,
+   `Date` and `Location` columns; other columns may be renamed or removed. A
+   species name longer than 200 characters, or one with control or invisible
+   characters, is refused with its row number. A damaged file is reported
+   plainly, for example "This file is not an eBird export: it is not UTF-8
+   text" or "This eBird export is damaged near row N; download it again".
 3. Review the history changes and generation policy. Confirm the history update
    separately. An unchanged archive needs no history write. Removing records or
    invalidating a trip's evidence requires explicit acknowledgment.
@@ -22,8 +28,13 @@ also start from **Collections → Make a trip from your eBird checklists**.
    selected for you on a new trip. Location names come from the private staged
    file; Inky does not save them in the collection. Review matched, ready and
    unresolved species. The discovery species limit does not truncate this trip.
-5. Save the trip. It has fixed membership. Saving does not add Saved birds,
-   queue plates, enable generation or change the wall.
+   Species names not matched before are sent to iNaturalist to match them. One
+   check looks up at most 30 new names, within about 60 seconds; the rest are
+   listed as not looked up yet. The trip cannot be saved until a later check
+   has looked them all up, so check again after editing the selection. A trip
+   too large for the journal is refused at this step, before anything is saved.
+5. Save the trip. It has fixed membership. Saving makes no new lookups and does
+   not add Saved birds, queue plates, enable generation or change the wall.
 
 Inky labels personal evidence only when a retained checklist still supports the
 species inside the trip's original dates. A later removal, reclassification or
@@ -43,8 +54,10 @@ Open **Manage → Sources → BirdNET Analyzer → Import or review history**. C
 an Analyzer CSV file. If you know the recording date, provide it for that batch.
 Otherwise leave it blank. Unknown dates stay unknown and cannot enter finite
 date windows. Review new, changed, duplicate, dated and undated records before
-confirming. Imports preserve the existing segment deduplication and conflict
-rules. They do not control the detector or download recordings.
+confirming. Each species listed for a segment is kept as its own record.
+Re-importing an analysis replaces the species list of each segment in the
+upload, so a re-analysis can add, change or remove detections; the review step
+counts removals. Imports do not control the detector or download recordings.
 
 ## Interrupted work
 
@@ -97,9 +110,22 @@ Preview retention defaults to 24 hours. Set `owner_import_retention_hours` in
 `[controller]` to 1–168 hours; restart after changing it. The maximum matches the
 seven-day receipt recovery period. While the service runs, cleanup removes
 expired temporary files within one minute, unless an operation is using them.
+An upload still receiving after an hour, or a raw file with no preview record,
+is removed at startup and by that cleanup.
 It retries after that operation. If the service is stopped, cleanup runs at its
 next start. It never removes committed history or saved collections. Signing
 out removes uncommitted staging; an already confirmed commit can finish.
+
+Each history has a summary file beside it, mode `0600`:
+`ebird-archive-observations-summary.json`,
+`birdnet-analyzer-detections-summary.json` and
+`birdbuddy-detections-summary.json`. It holds each species' names, record count,
+first and last noted dates (dated records only) and an undated count, plus the
+identity of the history file it was made from. It holds no places or checklist
+identifiers. A missing, out-of-date or invalid summary is rebuilt automatically
+on the next journal read, so it is safe to delete. Bird Buddy rewrites its
+summary on every sync, using the controller's local time zone for its dates;
+after a time-zone change, dates update at the next sync.
 
 Before replacing existing history, browser imports save one exact private
 `.json.previous` backup. That file is not a full controller rollback. Follow

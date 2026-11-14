@@ -55,8 +55,9 @@ work nor the wall selection.
 
 For a place you want to explore, use **Birds reported near this place**. The
 search sends the location and dates to iNaturalist. Review the species before
-saving; if the search finds over 500 species, narrow it and try again. These
-community reports stay separate from your own sightings.
+saving; if the search finds over 500 species, narrow it and try again. Species
+without an English common name are left out, and the preview says how many.
+These community reports stay separate from your own sightings.
 
 ### Playing plates and managing your setup
 
@@ -86,8 +87,11 @@ screens have separate expiry and revocation; they never renew owner authority.
 
 Named selections live in `state_dir/journal.json`, schema version 2. The file
 contains a revision and groups with opaque IDs, names, kinds, inclusive dates
-and typed members. Personal trip members retain hashed checklist links and
-their original source scientific names. Source corrections can mark evidence
+and typed members. Personal trip members keep checklist links as unsalted
+SHA-256 hashes of eBird submission IDs, plus their original source scientific
+names. Submission IDs are short numbers, so the hashes can be reversed by trying
+every ID: they keep raw IDs out of the file, but the file is private owner data,
+not anonymous. Source corrections can mark evidence
 as changed without silently editing your curated membership.
 Its mode must be `0600`. Inky rejects a symlink, insecure permissions, invalid
 state or a file larger than 1 MiB. Individual edit requests retain the existing
@@ -106,39 +110,41 @@ Reading them does not migrate or write state. The first edit creates an exact
 private `journal-v1-backup.json`, then atomically writes version 2. Do not feed
 that new schema to an older candidate. Use its matching backup and runtime.
 
+When a file the journal reads cannot be read, the page stays up. That part is
+left out and a notice explains it: the current wall birds
+(`active-catalog.json`), the list of birds waiting for plates, plates waiting
+for review, or plate work (Manage then says plate work cannot be read). An
+unreadable species-match file marks only its own source unavailable. A damaged
+`journal.json` still stops the page. Bookmarks and saved selections keep
+working while an unrelated part is unreadable. A change that names a bird
+missing because of the unreadable part is refused with its notice, and
+collection import preview and apply are refused while a history or bird-listing
+part is unreadable (never because of plate work). Fix the file, or let the next
+refresh rewrite it, and reload.
+
+The journal reads each retained history through its summary file
+(`*-summary.json` beside the history; species names, counts and dates, no
+places). Summaries are rebuilt automatically when missing or out of date, so
+they are safe to delete. See [history imports](history-imports.md#private-files-retention-and-backup).
+
+The owner journal response (`/v1/owner/journal`) has optional owner-only fields:
+
+- each `retained_evidence` row has `first_noted` and `last_noted`
+  (`YYYY-MM-DD`, or `null` when unknown). Analyzer dates come from dated
+  segments only. Bird Buddy dates are the controller's local calendar dates when
+  the history was last written, and `first_noted` is `null` once a species has
+  postcards older than the 366-day window;
+- `recent_species` lists at most 10 birds (`taxon_id`, `last_noted`,
+  `source`), one per bird, newest first, from retained histories only, never
+  from live sources;
+- `notices` lists `{part, message}` for each part that could not be read; and
+- `management` may be `{"available": false, "reason": "unreadable"}` when plate
+  work cannot be read, which differs from plate work not being set up.
+
+Paired screens, `/v1/screen/view` and `/wall` responses do not include these
+fields.
+
 Use a stopped, consistent [controller backup](backup.md), not a live ZIP of
 the state folder. An older release ignores this new file, but that does not
 prove every newer state file is backward compatible. Roll back with the old
 runtime and its matching complete backup.
-
-## Verification and release boundary
-
-For contributors: browser tests cover the flows below. Release qualification
-also needs evidence from real phones, providers and hardware.
-
-The maintained browser acceptance test is
-[`tests/web/journal.e2e.cjs`](../tests/web/journal.e2e.cjs). It runs a temporary
-controller with random credentials, synthetic history and public approved art.
-It covers normal tasks, stale edits, interrupted responses, explicit work,
-scope withdrawal and revocation. Its community query is deliberately mocked;
-it is not a live iNaturalist contract test. See [Contributing](../CONTRIBUTING.md#full-browser-acceptance).
-
-Chromium, Firefox and WebKit journeys and automated accessibility checks are
-separate from physical-phone, hardware and live-provider qualification. A narrow
-viewport is not proof of a particular phone. The README screenshots use two
-public approved plates and manual selections in a fresh art-only demo, not
-personal history. Refresh those images from the actual interface; never use
-private controller screenshots as convenient documentation fixtures.
-
-The following remain release gates, not automatic claims from a passing test:
-
-- complete live qualification of generation-optional installation and ownership
-  migration across native and Docker service restarts;
-- final large-file, mobile and live qualification of history import paths;
-- live qualification of source/work/notification actions, paired screens,
-  selected wall routing and scoped dashboard permissions;
-- complete new-install and upgrade journeys, final mobile/browser qualification,
-  independent security review and repository review on the final exact head.
-
-No release or production deployment is implied by these implementation notes.
-Provider access remains subject to each service's permissions and limits.
