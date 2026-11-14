@@ -98,7 +98,7 @@ def test_success_envelope_is_exact() -> None:
         (ConfigurationError("Configuration example failed"), "configuration", 1),
         (SettingsError("Settings example failed"), "configuration", 1),
         (UsageError("--example requires --other"), "usage", 2),
-        (ValueError("--example must be positive"), "usage", 2),
+        (ValueError("Unsupported display size example"), "internal", 1),
         (BusyError("Another scheduler is already running"), "busy", 3),
         (_busy(GenerationError("Another controller cycle is already running")), "busy", 3),
         (_busy(DataSourceError("Another observation refresh is already running")), "busy", 3),
@@ -161,6 +161,56 @@ def test_unexpected_error_is_an_internal_envelope_without_traceback(exc: Excepti
     assert "PRIVATE_DETAIL" not in payload["error"]["message"]
     assert payload["error"]["message"]
     assert "Traceback" not in stdout + stderr
+
+
+def test_runtime_value_error_is_a_failure_not_a_usage_error(tmp_path: Path) -> None:
+    output = io.StringIO()
+    with (
+        patch(
+            "inky_bird_frame.cli.native_tls_environment",
+            side_effect=ValueError("Unsafe native trust file"),
+        ),
+        redirect_stdout(output),
+        redirect_stderr(io.StringIO()),
+    ):
+        result = main(["status", "--config", str(tmp_path / "config.toml")])
+
+    assert result == 1
+    assert json.loads(output.getvalue()) == {
+        "ok": False,
+        "error": {"type": "internal", "message": "Unsafe native trust file"},
+        "schema_version": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--latitude", "91.0", "--longitude", "2.0"],
+        ["--latitude", "1.0", "--longitude", "-181.0"],
+        ["--latitude", "nan", "--longitude", "2.0"],
+        ["--radius-km", "0"],
+        ["--species-limit", "0"],
+    ],
+)
+def test_seed_argument_ranges_exit_two_before_loading_config(
+    extra: list[str], tmp_path: Path
+) -> None:
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = main(
+            [
+                "seed",
+                "--config",
+                str(tmp_path / "missing.toml"),
+                "--window",
+                "last-week",
+                *extra,
+            ]
+        )
+
+    assert result == 2
+    assert json.loads(output.getvalue())["error"]["type"] == "usage"
 
 
 def test_error_code_set_is_the_documented_closed_set() -> None:

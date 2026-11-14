@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
 import signal
 import sys
@@ -160,7 +161,6 @@ def error_code(exc: BaseException) -> str:
         ((CatalogError, JournalError), "catalog"),
         ((OwnerOperationError, OSError), "storage"),
         ((InkyBirdFrameError, UnicodeError, json.JSONDecodeError), "internal"),
-        ((ValueError,), "usage"),
     )
     for kinds, code in classes:
         if isinstance(exc, kinds):
@@ -173,9 +173,14 @@ def print_error(exc: Exception) -> int:
 
     code = error_code(exc)
     message = str(exc)
-    if code == "internal" and not isinstance(exc, InkyBirdFrameError):
-        # Unexpected exceptions may carry anything; keep their text out of
-        # stdout but leave one diagnostic line for the service log.
+    # Project code reports runtime faults as bare ValueError with readable text;
+    # decoding errors and other unexpected exceptions may carry anything.
+    readable = isinstance(exc, InkyBirdFrameError) or (
+        isinstance(exc, ValueError) and not isinstance(exc, UnicodeError | json.JSONDecodeError)
+    )
+    if code == "internal" and not readable:
+        # Keep unexpected text out of stdout but leave one diagnostic line for
+        # the service log.
         print(f"inky-bird: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
         message = UNEXPECTED_ERROR_MESSAGE
     print(
@@ -387,6 +392,18 @@ def seed_command(args: argparse.Namespace) -> int:
             )
         except ValueError as exc:
             raise UsageError(f"invalid ISO date range: {exc}") from exc
+    if args.latitude is not None and not (
+        math.isfinite(args.latitude) and -90 <= args.latitude <= 90
+    ):
+        raise UsageError("--latitude must be between -90 and 90")
+    if args.longitude is not None and not (
+        math.isfinite(args.longitude) and -180 <= args.longitude <= 180
+    ):
+        raise UsageError("--longitude must be between -180 and 180")
+    if args.radius_km is not None and args.radius_km <= 0:
+        raise UsageError("--radius-km must be greater than zero")
+    if args.species_limit is not None and args.species_limit <= 0:
+        raise UsageError("--species-limit must be greater than zero")
     print_result(
         enqueue_seed_species(
             _config(args),

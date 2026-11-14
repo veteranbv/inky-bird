@@ -3826,7 +3826,7 @@ def test_generate_clears_item_alert_when_nothing_is_outstanding() -> None:
         (CatalogPublishError("PRIVATE_DETAIL"), "publication error"),
         (CatalogError("PRIVATE_DETAIL"), "catalog error"),
         (OSError(28, "PRIVATE_DETAIL"), "storage error"),
-        (ValueError("PRIVATE_DETAIL"), "usage error"),
+        (ValueError("PRIVATE_DETAIL"), "internal error"),
         (RuntimeError("PRIVATE_DETAIL"), "internal error"),
     ],
 )
