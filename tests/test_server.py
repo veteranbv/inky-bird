@@ -1190,6 +1190,25 @@ class ServerTests(unittest.TestCase):
         self.assertIn("fetched_at", fetched)
         self.assertIn("succeeded_at", succeeded)
 
+    def test_post_display_telemetry_records_the_route_it_arrived_on(self) -> None:
+        with (
+            self._environment() as (_, catalog_dir, state_dir),
+            _serving(catalog_dir, state_dir / "active-catalog.json", state_dir) as port,
+        ):
+            legacy_status, _, _ = _post(port, "/v1/display-fetch")
+            legacy = json.loads((state_dir / "display-last-fetch.json").read_text())
+            wall_status, _, _ = _post(port, "/wall/v1/display-fetch")
+            wall = json.loads((state_dir / "display-last-fetch.json").read_text())
+            success_status, _, _ = _post(port, "/wall/v1/display-success")
+            succeeded = json.loads((state_dir / "display-last-success.json").read_text())
+
+        self.assertEqual((legacy_status, wall_status, success_status), (200, 200, 200))
+        self.assertEqual(set(legacy), {"schema_version", "fetched_at", "route"})
+        self.assertEqual(legacy["schema_version"], 1)
+        self.assertEqual(legacy["route"], "catalog")
+        self.assertEqual(wall["route"], "wall")
+        self.assertEqual(succeeded["route"], "wall")
+
     def test_post_display_telemetry_reports_persistence_failure(self) -> None:
         with (
             self._environment() as (_, catalog_dir, state_dir),
