@@ -368,11 +368,11 @@ environment, creates LaunchAgents, loads them, and verifies them with
 At the end of `--yes`, setup asks for `Inky username:` and then a hidden
 password when the controller has no browser owner yet. These create the owner
 account you use to sign in at `/app`. Cancelling leaves the controller running
-with owner controls locked; run `access setup --config "$CONFIG"` later in a
-private terminal.
+with owner controls locked; run `uv run inky-bird access setup --config "$CONFIG"`
+later in a private terminal.
 
 Paid plate generation is on with `config.example.toml`: `generation_enabled`
-defaults to true for a file you edit yourself. Each generation cycle uses Codex,
+defaults to true unless the file sets `configuration_ownership = "app"`. Each generation cycle uses Codex,
 through your ChatGPT plan's Codex allowance or a billed API key. On macOS, the
 first scheduled generation runs one `schedule.generation_minutes` interval
 after setup (six hours with the example value), then at that interval. To keep
