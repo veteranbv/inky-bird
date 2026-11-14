@@ -16,8 +16,8 @@ zip_code = "00000"
 # postal_code = "YOUR_POSTAL_CODE"
 # country_code = "XX"
 # geoapify_api_key = "YOUR_PRIVATE_GEOAPIFY_API_KEY"
-# The *_env forms below work for Docker (controller.env) and for commands you run
-# yourself. The native setup command refuses them: put the value in this file.
+# The discovery *_env keys in this section work for Docker (controller.env) and for
+# commands you run yourself. Native setup refuses them: put the value in this file.
 # geoapify_api_key_env = "GEOAPIFY_API_KEY"
 # Eight kilometers is approximately five miles: local enough to feel relevant while
 # usually covering enough observations for variety. Increase it in sparsely observed areas.
