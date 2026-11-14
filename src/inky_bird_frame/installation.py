@@ -148,7 +148,8 @@ def _systemd_quote(value: str) -> str:
 
 
 def _systemd_argument(value: str) -> str:
-    # ExecStart expands $NAME and ${NAME}; other directives used here do not.
+    # ExecStart expands $NAME and ${NAME} in arguments after the executable;
+    # the executable token and other directives used here are not expanded.
     return _systemd_quote(value).replace("$", "$$")
 
 
@@ -317,7 +318,9 @@ def controller_systemd_units(
     )
 
     def command(*arguments: str) -> str:
-        return " ".join(_systemd_argument(argument) for argument in (str(executable), *arguments))
+        return " ".join(
+            (_systemd_quote(str(executable)), *(_systemd_argument(item) for item in arguments))
+        )
 
     serving = common + owner_environment + SYSTEMD_SERVICE_HARDENING
     units = {
@@ -413,7 +416,7 @@ def display_systemd_units(
     """Render the display service and timer from validated configuration."""
     service_prefix = service_family(service_prefix)
     exec_start = (
-        f"{_systemd_argument(str(executable))} display-cycle "
+        f"{_systemd_quote(str(executable))} display-cycle "
         f"--config {_systemd_argument(str(config_path))}"
     )
     tls_environment = "".join(
@@ -525,9 +528,14 @@ def _unknown_keys_check(config: AppConfig) -> DiagnosticCheck:
 
 def _notification_dead_letter_check(config: AppConfig, config_path: Path) -> DiagnosticCheck:
     check_id = "notification_dead_letters"
-    if not notification_state_path(config).is_file():
-        return _pass(check_id, "No notifications are waiting to be retried")
     try:
+        # stat, not is_file: a denied lookup must be reported, not read as absent.
+        try:
+            recorded = stat.S_ISREG(notification_state_path(config).stat().st_mode)
+        except FileNotFoundError:
+            recorded = False
+        if not recorded:
+            return _pass(check_id, "No notifications are waiting to be retried")
         status = notification_status(config)
     except (InkyBirdFrameError, OSError) as exc:
         return _warn(
@@ -755,11 +763,25 @@ def _launchd_last_run_check(job: str, printed: str) -> DiagnosticCheck:
     )
 
 
-def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
+def _native_family(config: AppConfig) -> str | DiagnosticCheck:
+    """Return the installed service family, or the check explaining why it is unknown."""
     try:
-        prefix = resolve_native_layout(config_path=config.configuration_path).family
+        return resolve_native_layout(config_path=config.configuration_path).family
     except ValueError as exc:
-        yield _fail("native_identity", str(exc))
+        return _fail("native_identity", str(exc))
+    except OSError as exc:
+        return _fail(
+            "native_identity",
+            "The installed services could not be identified",
+            detail=str(exc),
+            remediation="Run doctor as the service account, or check its folder permissions.",
+        )
+
+
+def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
+    prefix = _native_family(config)
+    if isinstance(prefix, DiagnosticCheck):
+        yield prefix
         return
     labels = [
         "com.inky-bird-frame.serve",
@@ -845,10 +867,9 @@ def _systemd_last_run_check(
 
 
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
-    try:
-        prefix = resolve_native_layout(config_path=config.configuration_path).family
-    except ValueError as exc:
-        yield _fail("native_identity", str(exc))
+    prefix = _native_family(config)
+    if isinstance(prefix, DiagnosticCheck):
+        yield prefix
         return
     yield _systemd_unit_check(f"{prefix}-controller.service")
     if config.controller.configuration_ownership == "app":
@@ -979,10 +1000,9 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
         checks.append(_display_boot_config_check())
         checks.append(_display_hardware_check())
         if platform.system() == "Linux" and shutil.which("systemctl") is not None:
-            try:
-                prefix = resolve_native_layout(config_path=config.configuration_path).family
-            except ValueError as exc:
-                checks.append(_fail("native_identity", str(exc)))
+            prefix = _native_family(config)
+            if isinstance(prefix, DiagnosticCheck):
+                checks.append(prefix)
             else:
                 checks.append(_systemd_unit_check(f"{prefix}-display.timer"))
                 checks.append(

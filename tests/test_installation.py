@@ -544,11 +544,14 @@ def test_dollar_signs_in_service_commands_stay_literal(tmp_path: Path) -> None:
     )
     commands = [_exec_start(unit) for name, unit in units.items() if name.endswith(".service")]
     assert len(commands) == 4
+    executable_token = 'ExecStart="/opt/a$HOME/${USER}/inky-bird" '
     for command in commands:
-        # systemd expands $NAME and ${NAME} in ExecStart; $$ is one literal dollar.
-        assert '"/opt/a$$HOME/$${USER}/inky-bird"' in command
-        assert '"/etc/inky/$$config.toml"' in command
-        assert command.replace("$$", "").count("$") == 0
+        # systemd runs the first ExecStart token as written, but expands $NAME
+        # and ${NAME} in later arguments, where $$ is one literal dollar.
+        assert command.startswith(executable_token)
+        arguments = command.removeprefix(executable_token)
+        assert '"/etc/inky/$$config.toml"' in arguments
+        assert arguments.replace("$$", "").count("$") == 0
     # Other directives do not expand variables, so they keep the path unchanged.
     assert "WorkingDirectory=/opt/app$dir\n" in units["inky-bird-frame-controller.service"]
 
@@ -591,6 +594,79 @@ def test_generate_unit_budget_matches_the_agent_call_limit() -> None:
 
     default = inspect.signature(CodexRunner).parameters["timeout_seconds"].default
     assert default == CODEX_CALL_TIMEOUT_SECONDS
+
+
+NOTIFICATIONS_ENABLED = """
+[notifications]
+enabled = true
+
+[[notifications.destinations]]
+name = "synthetic"
+url = "json://example.test/hook"
+events = ["terminal_error"]
+"""
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_doctor_reports_inaccessible_notification_state(tmp_path: Path) -> None:
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = write_config(tmp_path, codex)
+    config.write_text(config.read_text() + NOTIFICATIONS_ENABLED)
+    (tmp_path / "workspace").mkdir()
+    state = tmp_path / "controller-state"
+    state.mkdir()
+    (state / "notifications.json").write_text("{}")
+    passing = DiagnosticCheck("mock", CheckStatus.PASS, "ready")
+    state.chmod(0)
+    try:
+        with (
+            patch("inky_bird_frame.installation.platform.system", return_value="Darwin"),
+            patch("inky_bird_frame.installation._codex_auth_check", return_value=passing),
+            patch("inky_bird_frame.installation._launchd_checks", return_value=[passing]),
+            patch("inky_bird_frame.installation._controller_health_check", return_value=passing),
+        ):
+            report = doctor(InstallationRole.CONTROLLER, config)
+    finally:
+        state.chmod(0o700)
+    checks = {check.check_id: check for check in report.checks}
+    assert checks["controller_state"].status is CheckStatus.FAIL
+    assert checks["notification_dead_letters"].status is CheckStatus.WARN
+    assert checks["notification_dead_letters"].summary == (
+        "Notification delivery state could not be read"
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "system"),
+    [
+        (InstallationRole.CONTROLLER, "Darwin"),
+        (InstallationRole.CONTROLLER, "Linux"),
+        (InstallationRole.DISPLAY, "Linux"),
+    ],
+)
+def test_doctor_reports_uninspectable_native_identity(
+    tmp_path: Path, role: InstallationRole, system: str
+) -> None:
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = write_config(tmp_path, codex)
+    passing = DiagnosticCheck("mock", CheckStatus.PASS, "ready")
+    denied = PermissionError(13, "Permission denied", "synthetic-service-folder")
+    with (
+        patch("inky_bird_frame.installation.resolve_native_layout", side_effect=denied),
+        patch("inky_bird_frame.installation.platform.system", return_value=system),
+        patch("inky_bird_frame.installation.shutil.which", return_value="/bin/systemctl"),
+        patch("inky_bird_frame.installation._codex_auth_check", return_value=passing),
+        patch("inky_bird_frame.installation._display_boot_config_check", return_value=passing),
+        patch("inky_bird_frame.installation._display_hardware_check", return_value=passing),
+        patch("inky_bird_frame.installation._controller_health_check", return_value=passing),
+    ):
+        report = doctor(role, config)
+    check = next(item for item in report.checks if item.check_id == "native_identity")
+    assert check.status is CheckStatus.FAIL
+    assert check.summary == "The installed services could not be identified"
+    assert report.checks[-1] == passing
 
 
 class InstallationTests(unittest.TestCase):
@@ -736,7 +812,7 @@ class InstallationTests(unittest.TestCase):
             units["inky-bird-frame-controller.service"],
         )
         self.assertIn(
-            '"/opt/inky bird/$$bin/inky-bird-frame"',
+            '"/opt/inky bird/$bin/inky-bird-frame"',
             units["inky-bird-frame-controller.service"],
         )
         self.assertIn(
@@ -807,7 +883,7 @@ display_startup_delay_seconds = 30
         timer = units["inky-bird-frame-display.timer"]
         self.assertEqual(len(units), 2)
         self.assertIn("WorkingDirectory=/home/frame/Inky Bird Frame", service)
-        self.assertIn('"/home/frame/Pimoroni $$Env/bin/inky-bird-frame"', service)
+        self.assertIn('"/home/frame/Pimoroni $Env/bin/inky-bird-frame"', service)
         self.assertIn('"/home/frame/$$config.toml"', service)
         self.assertIn("OnActiveSec=30s", timer)
         self.assertIn("OnUnitActiveSec=180s", timer)
