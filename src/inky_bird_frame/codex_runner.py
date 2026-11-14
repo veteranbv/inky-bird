@@ -8,8 +8,10 @@ import os
 import signal
 import subprocess
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import FrameType
 from typing import IO, Final, cast
 from urllib.parse import urlsplit
 
@@ -254,6 +256,56 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
+
+
+class _StopSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _StopSignalForwarding:
+    """Turn the job's stop signals into an exception while the agent runs.
+
+    The agent leads its own session, so a stop sent to the job's process group
+    does not reach it. Raising lets the caller stop the agent's group before the
+    signal takes its previous effect.
+    """
+
+    def __init__(self) -> None:
+        self._previous: dict[int, Callable[[int, FrameType | None], object] | int] = {}
+        self._received = False
+
+    def __enter__(self) -> _StopSignalForwarding:
+        # Python delivers signals only to the main thread.
+        if threading.current_thread() is threading.main_thread():
+            for stop_signal in STOP_SIGNALS:
+                current = signal.getsignal(stop_signal)
+                if current is None or current == signal.SIG_IGN:
+                    continue
+                self._previous[stop_signal] = current
+                signal.signal(stop_signal, self._handle)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        for stop_signal, handler in self._previous.items():
+            signal.signal(stop_signal, handler)
+
+    def _handle(self, signum: int, _frame: FrameType | None) -> None:
+        # Later signals arrive while the agent is already being stopped.
+        if not self._received:
+            self._received = True
+            raise _StopSignal(signum)
+
+    def redeliver(self, signum: int) -> None:
+        handler = self._previous[signum]
+        if handler == signal.SIG_DFL:
+            os.kill(os.getpid(), signum)
+        elif callable(handler):
+            handler(signum, None)
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -322,23 +374,32 @@ class CodexRunner:
         for thread in (stdout, stderr, writer):
             thread.start()
         timed_out = False
+        forwarding = _StopSignalForwarding()
         try:
-            process.wait(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _stop_process_group(process)
-        except BaseException:
-            _stop_process_group(process)
-            raise
-        # Tool processes that outlive the agent would otherwise hold its output
-        # pipes open and keep running unsupervised.
-        for stop_signal in (None, signal.SIGTERM, signal.SIGKILL):
-            if stop_signal is not None:
-                _signal_group(process.pid, stop_signal)
-            stdout.join(TERMINATE_GRACE_SECONDS)
-            stderr.join(TERMINATE_GRACE_SECONDS)
-            if not stdout.is_alive() and not stderr.is_alive():
-                break
+            with forwarding:
+                try:
+                    try:
+                        process.wait(timeout=self.timeout_seconds)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        _stop_process_group(process)
+                    # Tool processes that outlive the agent would otherwise hold
+                    # its output pipes open and keep running unsupervised.
+                    for stop_signal in (None, signal.SIGTERM, signal.SIGKILL):
+                        if stop_signal is not None:
+                            _signal_group(process.pid, stop_signal)
+                        stdout.join(TERMINATE_GRACE_SECONDS)
+                        stderr.join(TERMINATE_GRACE_SECONDS)
+                        if not stdout.is_alive() and not stderr.is_alive():
+                            break
+                except BaseException:
+                    _stop_process_group(process)
+                    raise
+        except _StopSignal as stopped:
+            forwarding.redeliver(stopped.signum)
+            raise GenerationError(
+                f"Codex was stopped because the job received {signal.Signals(stopped.signum).name}"
+            ) from None
         writer.join(TERMINATE_GRACE_SECONDS)
         stdout_text = stdout.text()
         stderr_text = stderr.text()
@@ -352,13 +413,22 @@ class CodexRunner:
                 ).encode("utf-8", errors="replace"),
             )
         except OSError as exc:
-            raise GenerationError(f"Codex log could not be written: {log_path}") from exc
+            outcome = (
+                f"Codex timed out after {self.timeout_seconds} seconds"
+                if timed_out
+                else f"Codex finished with {status}"
+            )
+            raise GenerationError(
+                f"{outcome} and its log {log_path.name} could not be written"
+            ) from exc
         if timed_out:
             raise GenerationError(
-                f"Codex timed out after {self.timeout_seconds} seconds; see {log_path}"
+                f"Codex timed out after {self.timeout_seconds} seconds; see {log_path.name}"
             )
         if process.returncode != 0:
-            raise GenerationError(f"Codex exited with status {process.returncode}; see {log_path}")
+            raise GenerationError(
+                f"Codex exited with status {process.returncode}; see {log_path.name}"
+            )
         return subprocess.CompletedProcess(command, process.returncode, stdout_text, stderr_text)
 
     def _structured(
@@ -376,7 +446,7 @@ class CodexRunner:
             output_path.unlink(missing_ok=True)
         except OSError as exc:
             raise GenerationError(
-                f"Previous Codex structured output could not be removed: {output_path}"
+                f"Previous Codex structured output could not be removed: {output_path.name}"
             ) from exc
         with TemporaryDirectory(dir=output_path.parent) as temporary:
             schema_path = Path(temporary) / "schema.json"
@@ -390,11 +460,11 @@ class CodexRunner:
             with output_path.open("rb") as handle:
                 content = handle.read(MAX_STRUCTURED_OUTPUT_BYTES + 1)
             if len(content) > MAX_STRUCTURED_OUTPUT_BYTES:
-                raise GenerationError(f"Codex structured output is too large: {output_path}")
+                raise GenerationError(f"Codex structured output is too large: {output_path.name}")
             return cast(object, json.loads(content.decode("utf-8")))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GenerationError(
-                f"Codex did not write valid structured output: {output_path}"
+                f"Codex did not write valid structured output: {output_path.name}"
             ) from exc
 
     def create_profile(
@@ -468,7 +538,7 @@ class CodexRunner:
             log_path,
         )
         if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise GenerationError(f"Codex did not create the requested plate: {output_path}")
+            raise GenerationError(f"Codex did not create the requested plate: {output_path.name}")
         return output_path
 
     def review_plate(

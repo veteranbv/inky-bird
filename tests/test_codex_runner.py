@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
+import subprocess
+import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -308,21 +313,124 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
             pid_file = root / "grandchild.pid"
             stub = _stub_executable(
                 root,
-                f"(trap '' TERM; exec sleep 60) &\necho $! > \"{pid_file}\"\nwait",
+                f"(trap '' TERM; exec sleep 600) &\necho $! > \"{pid_file}\"\nwait",
             )
             runner = CodexRunner(stub, root, timeout_seconds=1)
+            errors: list[BaseException] = []
 
-            with (
-                patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5),
-                self.assertRaisesRegex(GenerationError, "Codex timed out after 1 seconds"),
-            ):
-                runner._run([str(stub)], "prompt", root / "run.log")
+            def run() -> None:
+                try:
+                    runner._run([str(stub)], "prompt", root / "run.log")
+                except BaseException as exc:
+                    errors.append(exc)
 
-            grandchild = int(pid_file.read_text())
-            survived = not _wait_for_exit(grandchild, 5.0)
-            if survived:
-                os.kill(grandchild, 9)
+            # A worker thread keeps a missed group kill from blocking the suite
+            # until the grandchild's sleep ends.
+            worker = threading.Thread(target=run, daemon=True)
+            started = time.monotonic()
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5):
+                worker.start()
+                worker.join(15.0)
+                elapsed = time.monotonic() - started
+                returned = not worker.is_alive()
+                grandchild = int(pid_file.read_text())
+                survived = not _wait_for_exit(grandchild, 5.0)
+                if survived:
+                    os.kill(grandchild, signal.SIGKILL)
+                worker.join(15.0)
+        self.assertTrue(returned, "the Codex run did not return after its timeout")
+        self.assertLess(elapsed, 15.0)
         self.assertFalse(survived, "a grandchild of the Codex process survived its timeout")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], GenerationError)
+        self.assertIn("Codex timed out after 1 seconds", str(errors[0]))
+
+    def test_job_stop_signal_stops_the_agent(self) -> None:
+        # The scheduler stops a job by signalling the job's own process group;
+        # the agent runs in a separate session, so the job must pass the stop on.
+        for stop_signal in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=stop_signal.name), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pid_file = root / "agent.pid"
+                _stub_executable(root, f'echo $$ > "{pid_file}"\nexec sleep 600')
+                job_script = root / "job.py"
+                job_script.write_text(
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "from inky_bird_frame.codex_runner import CodexRunner\n"
+                    "root = Path(sys.argv[1])\n"
+                    "runner = CodexRunner(root / 'codex', root, timeout_seconds=600)\n"
+                    "runner._run([str(root / 'codex')], 'prompt', root / 'run.log')\n"
+                )
+                job = subprocess.Popen(
+                    [sys.executable, str(job_script), str(root)], start_new_session=True
+                )
+                agent: int | None = None
+                try:
+                    deadline = time.monotonic() + 15.0
+                    while time.monotonic() < deadline and agent is None:
+                        if pid_file.is_file() and pid_file.read_text().strip():
+                            agent = int(pid_file.read_text())
+                        else:
+                            time.sleep(0.05)
+                    self.assertIsNotNone(agent, "the agent did not start")
+                    assert agent is not None
+                    os.killpg(job.pid, stop_signal)
+                    returncode = job.wait(timeout=15.0)
+                    survived = not _wait_for_exit(agent, 5.0)
+                finally:
+                    if job.poll() is None:
+                        job.kill()
+                        job.wait()
+                    if agent is not None and _process_exists(agent):
+                        os.kill(agent, signal.SIGKILL)
+                self.assertFalse(survived, "the agent kept running after the job was stopped")
+                self.assertEqual(returncode, -stop_signal)
+
+    def test_stop_signal_chains_to_the_previous_handler(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "agent.pid"
+            stub = _stub_executable(root, f'echo $$ > "{pid_file}"\nexec sleep 600')
+            runner = CodexRunner(stub, root, timeout_seconds=600)
+            received: list[int] = []
+            finished = threading.Event()
+
+            def previous(signum: int, _frame: object) -> None:
+                received.append(signum)
+
+            def send_stop() -> None:
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline and not pid_file.is_file():
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                os.kill(os.getpid(), signal.SIGTERM)
+                # Without forwarding the run would wait for the agent's sleep;
+                # end the agent so the failure shows up promptly.
+                if not finished.wait(15.0) and pid_file.is_file():
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+            original = signal.signal(signal.SIGTERM, previous)
+            sender = threading.Thread(target=send_stop, daemon=True)
+            try:
+                sender.start()
+                try:
+                    with self.assertRaisesRegex(GenerationError, "Codex was stopped"):
+                        runner._run([str(stub)], "prompt", root / "run.log")
+                finally:
+                    finished.set()
+                restored = signal.getsignal(signal.SIGTERM)
+            finally:
+                signal.signal(signal.SIGTERM, original)
+                sender.join(15.0)
+            agent = int(pid_file.read_text())
+            survived = not _wait_for_exit(agent, 5.0)
+            if survived:
+                os.kill(agent, signal.SIGKILL)
+        self.assertEqual(received, [signal.SIGTERM])
+        self.assertIs(restored, previous)
+        self.assertFalse(survived, "the agent kept running after the stop signal")
 
     def test_timeout_logs_captured_output_and_names_the_log(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -336,11 +444,46 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
             with self.assertRaises(GenerationError) as raised:
                 runner._run([str(stub)], "prompt", log_path)
 
-            self.assertIn("timed out", str(raised.exception))
-            self.assertIn(str(log_path), str(raised.exception))
+            message = str(raised.exception)
+            self.assertIn("timed out", message)
+            self.assertIn("see run.log", message)
+            self.assertNotIn(temporary, message)
             log = log_path.read_text()
         self.assertIn("early stdout marker", log)
         self.assertIn("early stderr marker", log)
+
+    def test_failure_messages_name_files_without_absolute_paths(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = CodexRunner(_stub_executable(root, "exit 3"), root)
+
+            with self.assertRaises(GenerationError) as exited:
+                runner._run([str(root / "codex")], "prompt", root / "logs" / "plate.log")
+            with self.assertRaises(GenerationError) as missing:
+                runner.generate_plate(
+                    _species(), _profile(), [], [], root / "plate.png", root / "plate.log"
+                )
+
+        self.assertEqual(str(exited.exception), "Codex exited with status 3; see plate.log")
+        self.assertIn("plate", str(missing.exception))
+        for raised in (exited, missing):
+            self.assertNotIn(temporary, str(raised.exception))
+
+    def test_unwritable_log_keeps_the_failure_cause(self) -> None:
+        cases = {"exit 3": "Codex finished with exit status 3", "exec sleep 60": "Codex timed out"}
+        for body, cause in cases.items():
+            with self.subTest(body), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "blocked").write_text("a file where the log directory belongs")
+                runner = CodexRunner(_stub_executable(root, body), root, timeout_seconds=1)
+
+                with self.assertRaises(GenerationError) as raised:
+                    runner._run([str(root / "codex")], "prompt", root / "blocked" / "run.log")
+
+                message = str(raised.exception)
+                self.assertTrue(message.startswith(cause), message)
+                self.assertIn("run.log could not be written", message)
+                self.assertNotIn(temporary, message)
 
     def test_captured_output_is_bounded(self) -> None:
         with TemporaryDirectory() as temporary:
