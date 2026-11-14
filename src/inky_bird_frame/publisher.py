@@ -1511,6 +1511,7 @@ def _pull_request(
     branch: str,
     *,
     branch_existed: bool,
+    commit: str,
 ) -> dict[str, object] | None:
     """Return the PR to reuse for this branch, or None when a new one is needed."""
     raw = _gh(
@@ -1541,8 +1542,11 @@ def _pull_request(
     if open_pull is not None:
         return open_pull
     # The branch name repeats when the catalog returns to an earlier state on the same base.
-    # Earlier PRs whose branch was deleted, for example by stale cleanup, belong to the past.
-    return typed[0] if typed and branch_existed else None
+    # A closed PR is current only when the branch survived and still points at its head;
+    # one for a deleted or since-recreated branch, for example after stale cleanup, is past.
+    if not branch_existed:
+        return None
+    return next((item for item in typed if item.get("headRefOid") == commit), None)
 
 
 def _create_pull_request(
@@ -1797,7 +1801,7 @@ def _publish_from_worktree(
     result["branch"] = branch
 
     pull_request = _pull_request(
-        publication, repository, branch, branch_existed=bool(remote_branch)
+        publication, repository, branch, branch_existed=bool(remote_branch), commit=commit
     )
     if pull_request is None:
         pull_request_url = _create_pull_request(

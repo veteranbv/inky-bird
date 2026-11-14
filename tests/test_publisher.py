@@ -271,6 +271,7 @@ class _FakeGitHub:
         self.pull_requests: list[dict[str, object]] = []
         self.merged_commits: list[str] = []
         self.fail_next_merge = False
+        self.fail_next_create = False
 
     def add_pull_request(self, branch: str, *, author: str = "example") -> dict[str, object]:
         number = len(self.pull_requests) + 1
@@ -314,10 +315,14 @@ class _FakeGitHub:
             if "--head" in arguments:
                 head = arguments[arguments.index("--head") + 1]
                 matches = [item for item in matches if item["headRefName"] == head]
-            stdout = json.dumps(matches)
+            # Like gh, list the newest pull request first.
+            stdout = json.dumps(matches[::-1])
         elif arguments[:2] == ("pr", "create"):
             branch = arguments[arguments.index("--head") + 1]
             self.test.assertEqual(arguments[arguments.index("--base") + 1], "main")
+            if self.fail_next_create:
+                self.fail_next_create = False
+                raise CatalogPublishError("gh pr create failed: simulated outage")
             stdout = str(self.add_pull_request(branch)["url"]) + "\n"
         elif arguments[:2] == ("pr", "merge"):
             pull_request = self._by_url(arguments[2])
@@ -2288,6 +2293,47 @@ class PublicationRunTests(unittest.TestCase):
                 [item["state"] for item in fake.pull_requests], ["CLOSED", "CLOSED", "MERGED"]
             )
             self.assertIn("catalog/species/1-example-bird/manifest.json", _remote_files(remote))
+
+    def test_recycled_branch_publishes_after_pull_request_creation_failed(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Example Bird")
+            fake.fail_next_merge = True
+            with _github(fake), self.assertRaisesRegex(CatalogPublishError, "simulated outage"):
+                run_catalog_publish(config)
+            first_branch = str(fake.pull_requests[0]["headRefName"])
+            closed_head = fake.pull_requests[0]["headRefOid"]
+
+            second = _create_species(catalog, 2, "Second Bird")
+            fake.fail_next_merge = True
+            with _github(fake), self.assertRaisesRegex(CatalogPublishError, "simulated outage"):
+                run_catalog_publish(config)
+            self.assertEqual(fake.pull_requests[0]["state"], "CLOSED")
+
+            shutil.rmtree(second)
+            rebuild_catalog_index(catalog)
+            fake.fail_next_create = True
+            later = "2030-01-01T00:00:00+00:00"
+            with (
+                _github(fake),
+                patch.dict(os.environ, {"GIT_AUTHOR_DATE": later, "GIT_COMMITTER_DATE": later}),
+                self.assertRaisesRegex(CatalogPublishError, "simulated outage"),
+            ):
+                run_catalog_publish(config)
+            self.assertIn(first_branch, _remote_branches(remote))
+            self.assertNotEqual(
+                _run_git(remote, "rev-parse", f"refs/heads/{first_branch}"), closed_head
+            )
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["branch"], first_branch)
+            self.assertEqual(
+                [item["state"] for item in fake.pull_requests], ["CLOSED", "CLOSED", "MERGED"]
+            )
 
     def test_refuses_a_closed_pull_request_whose_branch_was_kept(self) -> None:
         with TemporaryDirectory() as temporary:
