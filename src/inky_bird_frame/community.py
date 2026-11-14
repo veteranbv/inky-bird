@@ -40,7 +40,8 @@ def _nameless(item: object) -> bool:
         return False
     taxon = item.get("taxon")
     if (
-        not isinstance(taxon, dict)
+        type(item.get("count")) is not int
+        or not isinstance(taxon, dict)
         or taxon.get("rank") != "species"
         or type(taxon.get("id")) is not int
         or not isinstance(taxon.get("name"), str)

@@ -164,3 +164,22 @@ def test_named_species_with_a_malformed_count_is_refused_not_skipped(
     ):
         history.preview(choices())
     assert history.status() == {"status": "empty"}
+
+
+@pytest.mark.parametrize("count", ["4", None, 4.0, True])
+def test_nameless_species_with_a_malformed_count_is_refused_not_skipped(
+    tmp_path: Path, count: object
+) -> None:
+    payload = result()
+    rows = cast(list[dict[str, object]], payload["results"])
+    malformed = _nameless(7)
+    malformed["count"] = count
+    rows.append(malformed)
+    payload["total_results"] = len(rows)
+    history = CommunityHistory(tmp_path)
+    with (
+        patch("inky_bird_frame.community.get_json", return_value=payload),
+        pytest.raises(JournalError, match="complete usable result"),
+    ):
+        history.preview(choices())
+    assert history.status() == {"status": "empty"}
