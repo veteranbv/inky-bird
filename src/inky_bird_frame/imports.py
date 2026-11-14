@@ -593,8 +593,8 @@ class HistoryImports:
         collection_id: object,
         revision: object,
         lookup_limit: int = 0,
-    ) -> tuple[JournalCollection, int]:
-        """Build the trip and count names left unlooked-up by ``lookup_limit``."""
+    ) -> tuple[JournalCollection, frozenset[str]]:
+        """Build the trip and return the names ``lookup_limit`` left unlooked-up."""
         expected = _revision(revision)
         start, end = _dates(start_date, end_date)
         if start is None or end is None:
@@ -676,7 +676,7 @@ class HistoryImports:
             end,
             expected + 1,
             expected + 1,
-        ), len(resolution.deferred)
+        ), frozenset(item.scientific_name for item in resolution.deferred)
 
     def preview_trip(self, upload_id: str, **choices: object) -> dict[str, object]:
         value = self._checked(upload_id)
@@ -714,30 +714,39 @@ class HistoryImports:
                 "Journal storage is full. Back it up and remove unused collections first."
             )
         approved = {item["taxon_id"] for item in JournalService(self.config.controller).catalog()}
+        # Same shape as the collection's own unresolved list.
+        missing = [
+            (member.scientific_name in deferred, member)
+            for member in group.members
+            if member.taxon_id is None
+        ]
         result = {
             "label": group.label,
             "matched": len(group.taxon_ids),
             "ready": sum(id in approved for id in group.taxon_ids),
-            "unresolved": group.owner_dict()["unresolved"],
-            "unresolved_for_now": deferred,
+            "unresolved": [
+                {"common_name": member.common_name, "scientific_name": member.scientific_name}
+                for later, member in missing
+                if not later
+            ],
+            "unresolved_for_now": len(deferred),
+            "not_looked_up": [
+                {"common_name": member.common_name, "scientific_name": member.scientific_name}
+                for later, member in missing
+                if later
+            ],
             "preview_hash": _digest(asdict(group)),
             "history_revision": choices["history_revision"],
             "notice": "Save fixes this trip's membership. "
             "It does not queue plates or change the wall.",
         }
         if deferred:
-            result["notice"] = (
-                f"{result['notice']} {deferred} species were not looked up yet. "
-                "Edit the trip selection and check it again to look them up."
-            )
+            result["notice"] = f"{result['notice']} {_not_looked_up(len(deferred))}"
         value["trip"] = {"choices": choices, "preview": result}
         self._write(value)
         message = "Trip checked. Review matched and unresolved species before saving."
         if deferred:
-            message = (
-                f"Trip checked. {deferred} species were not looked up yet; "
-                "check the trip again to look them up."
-            )
+            message = f"Trip checked. {_not_looked_up(len(deferred))}"
         return {"upload_id": upload_id, "message": message}
 
     def save_trip(self, upload_id: str, *, preview_hash: str) -> dict[str, object]:
@@ -752,7 +761,10 @@ class HistoryImports:
             raise JournalError("Preview this trip before saving")
         choices = trip["choices"]
         # Saving uses only names already looked up, so it matches the preview.
-        group, _ = self._trip_group(**choices)
+        group, deferred = self._trip_group(**choices)
+        if deferred:
+            # Saved unresolved members are never looked up again.
+            raise JournalError(_not_looked_up(len(deferred)))
         if _digest(asdict(group)) != preview_hash:
             raise JournalError("This trip's identities changed. Preview it again.")
         with ebird_checklists(self.config.controller.state_dir) as (revision, _):
@@ -767,6 +779,13 @@ class HistoryImports:
             "collection_id": group.collection_id,
             "revision": state.revision,
         }
+
+
+def _not_looked_up(count: int) -> str:
+    return (
+        f"{count} species were not looked up yet. "
+        "Edit the trip selection and check it again before saving."
+    )
 
 
 def recover_import(state_dir: Path, request_id: str) -> dict[str, object] | None:

@@ -672,7 +672,7 @@ def committed_selection(
     }
 
 
-def test_trip_preview_bounds_name_lookups_and_save_adds_none(tmp_path: Path) -> None:
+def test_trip_save_waits_until_every_name_was_looked_up(tmp_path: Path) -> None:
     config = configuration(tmp_path)
     imports = HistoryImports(config)
     identifier, selection = committed_selection(config, imports, large_archive(1, 45))
@@ -688,14 +688,26 @@ def test_trip_preview_bounds_name_lookups_and_save_adds_none(tmp_path: Path) -> 
         assert len(looked_up) == 30
         assert trip["matched"] == 30
         assert trip["unresolved_for_now"] == 15
-        assert len(trip["unresolved"]) == 15
+        # Names not looked up yet are listed apart from real misses.
+        assert trip["unresolved"] == []
+        assert len(trip["not_looked_up"]) == 15
         assert "15 species were not looked up" in str(result["message"])
-        imports.save_trip(identifier, preview_hash=trip["preview_hash"])
+        with pytest.raises(JournalError, match="15 species were not looked up yet"):
+            imports.save_trip(identifier, preview_hash=trip["preview_hash"])
+        assert read_journal(config.controller.state_dir).collections == ()
         assert len(looked_up) == 30
 
+        imports.preview_trip(identifier, **selection)
+        trip = status(imports)["trip"]["preview"]
+        assert len(looked_up) == 45
+        assert trip["matched"] == 45 and trip["unresolved_for_now"] == 0
+        assert trip["not_looked_up"] == []
+        imports.save_trip(identifier, preview_hash=trip["preview_hash"])
+        assert len(looked_up) == 45
+
     group = read_journal(config.controller.state_dir).collections[0]
-    assert sum(member.taxon_id is not None for member in group.members) == 30
     assert len(group.members) == 45
+    assert all(member.taxon_id is not None for member in group.members)
 
 
 def test_trip_preview_refuses_a_trip_too_large_for_the_journal(tmp_path: Path) -> None:
