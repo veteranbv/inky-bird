@@ -8,7 +8,6 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
 from uuid import uuid4
 
 from .catalog import utc_now
@@ -55,28 +54,48 @@ _KEYS = {
 }
 
 
+_TEXT_LIMIT = 200
+
+
+def _valid(field: str, value: object) -> bool:
+    if value is None:
+        return True
+    if field in {"taxon_id", "attempt", "species_count", "unresolved_count"}:
+        return type(value) is int and value >= 0
+    if field.endswith("_at"):
+        return parse_utc_timestamp(value) is not None
+    return isinstance(value, str) and len(value) <= _TEXT_LIMIT
+
+
+def _bounded(values: dict[str, object]) -> dict[str, object]:
+    """Keep only known, valid fields so one value can never invalidate the file."""
+    result: dict[str, object] = {}
+    for field, value in values.items():
+        if isinstance(value, str):
+            value = value[:_TEXT_LIMIT]
+        if field in _FIELDS and _valid(field, value):
+            result[field] = value
+    return result
+
+
 def _rows(state_dir: Path) -> dict[str, dict[str, object]]:
     raw = read_state(state_dir / "activity.json")
     if raw is None:
         return {}
     rows = raw.get("entries")
-    if raw.get("schema_version") != 1 or not isinstance(rows, dict) or set(rows) - _KEYS:
+    if raw.get("schema_version") != 1 or not isinstance(rows, dict):
         raise CatalogError("Activity state is invalid")
-    for row in rows.values():
-        if not isinstance(row, dict) or set(row) - _FIELDS:
-            raise CatalogError("Activity record is invalid")
-        for field, value in row.items():
-            if value is None:
-                continue
-            if field in {"taxon_id", "attempt", "species_count", "unresolved_count"}:
-                valid = type(value) is int and value >= 0
-            elif field.endswith("_at"):
-                valid = parse_utc_timestamp(value) is not None
-            else:
-                valid = isinstance(value, str) and len(value) <= 200
-            if not valid:
-                raise CatalogError("Activity field is invalid")
-    return cast(dict[str, dict[str, object]], rows)
+    # Observations only: drop an invalid value, or a field from a newer
+    # release, instead of hiding the rest of its entry or every other entry.
+    return {
+        key: {
+            field: value
+            for field, value in row.items()
+            if field in _FIELDS and _valid(field, value)
+        }
+        for key, row in rows.items()
+        if key in _KEYS and isinstance(row, dict)
+    }
 
 
 def _write(state_dir: Path, rows: dict[str, dict[str, object]]) -> None:
@@ -99,7 +118,7 @@ class Activity:
             row = rows.get(self.key, {})
             if row.get("run_id") != self.run_id:
                 return
-            row.update(values, updated_at=utc_now())
+            row.update(_bounded(values), updated_at=utc_now())
             rows[self.key] = row
             _write(self.state_dir, rows)
 

@@ -869,9 +869,21 @@ class AccessStore:
             elif return_to_access and not owner_hash:
                 raise AccessDeniedError("Sign in again before confirming your identity")
             if len(state.oidc_transactions) >= MAX_OIDC_TRANSACTIONS:
-                raise AccessRateLimitError(
-                    "Too many sign-in requests; wait ten minutes before trying again"
-                )
+                # Anyone who can reach the sign-in page can start anonymously,
+                # so those starts only ever replace each other. A signed-in
+                # link or confirmation replaces an anonymous start first.
+                anonymous = [
+                    t
+                    for t in state.oidc_transactions
+                    if t.owner_session_hash is None and t.confirmation_session_hash is None
+                ]
+                signed_in = owner_hash is not None or confirmation_hash is not None
+                candidates = anonymous or (state.oidc_transactions if signed_in else [])
+                if not candidates:
+                    raise AccessRateLimitError(
+                        "Too many sign-in requests; wait ten minutes before trying again"
+                    )
+                state.oidc_transactions.remove(min(candidates, key=lambda t: t.created_at))
             browser_secret = secrets.token_urlsafe(32)
             transaction = OIDCTransaction(
                 secrets.token_urlsafe(32),
