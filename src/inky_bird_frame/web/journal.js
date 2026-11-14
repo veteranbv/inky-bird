@@ -22,6 +22,18 @@ export function closeJournal() {
   document.body.classList.remove('journal', 'presenting');
 }
 
+// Plates are 3:4. Grids use the small copy; Frame, Home and bird pages keep the full plate.
+const plateSizes = { full: [1200, 1600], thumbnail: [480, 640] };
+export function plateURL(bird, size = 'full') {
+  return (
+    '/v1/owner/journal/birds/' +
+    bird.taxon_id +
+    (size === 'thumbnail' ? '/thumbnail' : '/portrait') +
+    '?revision=' +
+    encodeURIComponent(bird.portrait_sha256)
+  );
+}
+
 const sourceNames = {
   inaturalist: ['iNaturalist', 'Community reports'],
   ebird: ['eBird nearby', 'Community reports'],
@@ -54,12 +66,16 @@ export async function openJournal(ui, message = '') {
   function note(text) {
     return el('p', text, 'hint');
   }
-  function art(bird, className = '') {
+  function art(bird, className = '', size = 'full') {
     const image = el('img', '', className);
-    image.src = bird.portrait_url;
     image.alt = 'Approved field-journal plate: ' + bird.common_name;
+    // Set before src so the browser can defer the request and reserve the space.
     image.loading = 'lazy';
     image.decoding = 'async';
+    const [width, height] = plateSizes[size];
+    image.width = width;
+    image.height = height;
+    image.src = plateURL(bird, size);
     return image;
   }
   function evidence(bird) {
@@ -82,7 +98,7 @@ export async function openJournal(ui, message = '') {
   }
   function card(bird) {
     const node = link('', 'bird', { bird: bird.taxon_id }, 'bird-card');
-    if (bird.plate_ready) node.append(art(bird));
+    if (bird.plate_ready) node.append(art(bird, '', 'thumbnail'));
     else node.append(el('div', 'Plate not ready', 'missing-art'));
     node.append(
       el('h2', bird.common_name),
@@ -435,22 +451,31 @@ export async function openJournal(ui, message = '') {
     count.setAttribute('role', 'status');
     const grid = el('div', '', 'bird-grid');
     main.append(label, search, count, grid);
+    // Cards are built once; searching only hides them, so images are never refetched.
+    const cards = data.birds
+      .filter((bird) => (artScope ? bird.plate_ready : bird.known))
+      .map((bird) => {
+        const node = card(bird);
+        grid.append(node);
+        return [(bird.common_name + ' ' + bird.scientific_name).toLocaleLowerCase(), node];
+      });
+    let none = null;
     function filter() {
       const term = search.value.trim().toLocaleLowerCase();
-      const birds = data.birds.filter(
-        (bird) =>
-          (artScope ? bird.plate_ready : bird.known) &&
-          (bird.common_name + ' ' + bird.scientific_name).toLocaleLowerCase().includes(term),
-      );
-      grid.replaceChildren(...birds.map(card));
-      count.textContent = birds.length + (birds.length === 1 ? ' species' : ' species');
-      if (!birds.length)
-        grid.append(
-          empty(
+      let shown = 0;
+      for (const [name, node] of cards) {
+        node.hidden = !name.includes(term);
+        if (!node.hidden) shown += 1;
+      }
+      count.textContent = shown + ' species';
+      none?.remove();
+      none = shown
+        ? null
+        : empty(
             'No birds here yet',
             term ? 'Try another name.' : 'Connect a source or choose artwork for a collection.',
-          ),
-        );
+          );
+      if (none) grid.append(none);
     }
     search.addEventListener('input', filter);
     filter();
@@ -606,7 +631,7 @@ export async function openJournal(ui, message = '') {
       const node = el('section', '', 'journal-card');
       if (ready[0]) {
         const cover = link('', 'collection', { view: key });
-        cover.append(art(ready[0]));
+        cover.append(art(ready[0], '', 'thumbnail'));
         node.append(cover);
       }
       node.append(
@@ -1171,6 +1196,8 @@ export async function openJournal(ui, message = '') {
       timer = null,
       expired = false,
       shuffle = false;
+    let shownRevision = data.revision,
+      shownSignature = birds.map((bird) => bird.taxon_id + ':' + bird.portrait_sha256).join(' ');
     let image = el('img', '', 'frame-art'),
       objectURL = null,
       renderedKey = '',
@@ -1221,9 +1248,8 @@ export async function openJournal(ui, message = '') {
       loading = request;
       let nextURL;
       try {
-        const response = await fetch(bird.portrait_url, {
+        const response = await fetch(plateURL(bird), {
           credentials: 'same-origin',
-          cache: 'no-store',
           signal: request.signal,
         });
         if (request.signal.aborted || !image.isConnected) return;
@@ -1357,8 +1383,25 @@ export async function openJournal(ui, message = '') {
             'This view has no approved plates or was removed. Inky will not switch views.';
           return;
         }
+        const next = current.birds.filter(
+          (bird) => ids.includes(bird.taxon_id) && bird.plate_ready,
+        );
+        const signature = next.map((bird) => bird.taxon_id + ':' + bird.portrait_sha256).join(' ');
+        // Nothing changed and the current plate is showing: leave Frame as it is.
+        if (
+          current.revision === shownRevision &&
+          signature === shownSignature &&
+          renderedKey &&
+          birds[position] &&
+          renderedKey === birds[position].taxon_id + ':' + birds[position].portrait_sha256
+        ) {
+          status.textContent = '';
+          return;
+        }
+        shownRevision = current.revision;
+        shownSignature = signature;
         const previous = birds[position]?.taxon_id;
-        birds = current.birds.filter((bird) => ids.includes(bird.taxon_id) && bird.plate_ready);
+        birds = next;
         if (
           renderedKey &&
           !birds.some((bird) => bird.taxon_id + ':' + bird.portrait_sha256 === renderedKey)

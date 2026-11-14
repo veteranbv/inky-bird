@@ -16,6 +16,8 @@ const origin = 'http://127.0.0.1:18796',
 const publicCatalog = JSON.parse(fs.readFileSync(root + '/catalog/index.json')).species;
 const cardinal = publicCatalog.find((bird) => bird.common_name === 'Northern Cardinal');
 const robin = publicCatalog.find((bird) => bird.common_name === 'American Robin');
+// Owner plate URLs carry their revision, so a route must match the query too.
+const plateRoute = /\/v1\/owner\/journal\/birds\/\d+\/portrait(\?|$)/;
 // Explicit new-install initialization must precede any synthetic catalog/history.
 execFileSync(python, ['-c', `from pathlib import Path\nfrom inky_bird_frame.settings import initialize_config\ninitialize_config(Path(${JSON.stringify(configPath)}))`], {cwd:root});
 fs.mkdirSync(path.join(fixture, 'catalog/species'), { recursive: true });
@@ -825,6 +827,57 @@ let browser,
       .taxon_id,
     cardinal.taxon_id,
   );
+  phase = 'birds-art-delivery';
+  // Grid cards load the small plate; Back to birds is served from the browser
+  // cache. Any route disables the HTTP cache, so routing is lifted for this
+  // phase only. Same-origin CSP still keeps every request local.
+  await page.goto(origin + '/app?page=birds&scope=art');
+  await heading('Available artwork');
+  const gridImages = page.locator('.bird-grid img');
+  assert(await gridImages.count() > 0);
+  const gridSources = await gridImages.evaluateAll((images) => images.map((image) => image.src));
+  for (const source of gridSources)
+    assert.match(source, /\/v1\/owner\/journal\/birds\/\d+\/thumbnail\?revision=[0-9a-f]{64}$/);
+  const thumbnail = await page.request.get(gridSources[0]);
+  assert.equal(thumbnail.headers()['cache-control'], 'private, max-age=31536000, immutable');
+  assert(['image/jpeg', 'image/webp'].includes(thumbnail.headers()['content-type']));
+  if (engine === 'chromium') {
+    // Earlier phases are finished with their routes; only the guard returns.
+    await context.unrouteAll({ behavior: 'wait' });
+    const network = await page.context().newCDPSession(page);
+    await network.send('Network.enable');
+    const fetched = new Map();
+    network.on('Network.requestWillBeSent', ({ requestId, request }) => {
+      if (/\/v1\/owner\/journal\/birds\/\d+\/(thumbnail|portrait)\?/.test(request.url))
+        fetched.set(requestId, request.url);
+    });
+    network.on('Network.requestServedFromCache', ({ requestId }) => fetched.delete(requestId));
+    // Lazy images below the fold stay unloaded; only on-screen cards must be ready.
+    const visibleLoaded = () =>
+      page.waitForFunction(() =>
+        [...document.querySelectorAll('.bird-grid img')]
+          .filter((image) => {
+            const box = image.getBoundingClientRect();
+            return box.bottom > 0 && box.top < innerHeight;
+          })
+          .every((image) => image.complete && image.naturalWidth > 0),
+      );
+    await page.goto(origin + '/app?page=birds');
+    await heading('Your birds');
+    assert(await gridImages.count() > 0);
+    await visibleLoaded();
+    await page.locator('.bird-grid a.bird-card').first().click();
+    await page.locator('.detail-art').evaluate((image) => image.decode());
+    fetched.clear();
+    await page.getByRole('link', { name: 'Back to birds', exact: true }).click();
+    await heading('Your birds');
+    await visibleLoaded();
+    assert.deepEqual([...fetched.values()], [], 'Back to birds makes no new image requests');
+    await network.detach();
+    await context.route('**/*', (route) =>
+      new URL(route.request().url()).origin === origin ? route.continue() : route.abort(),
+    );
+  }
   phase = 'owner-frame';
   await page.goto(origin + '/app?page=frame&view=' + imported.collection_id);
   await page.locator('.frame-art').waitFor();
@@ -906,13 +959,13 @@ let browser,
         return hidden;
       }),
     );
-    await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
+    await page.route(plateRoute, (route) => route.abort());
     await page.keyboard.press('Shift');
     await page.getByRole('button', { name: 'Next', exact: true }).click();
     const notice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
     await notice.waitFor();
     assert(inside(await notice.boundingBox()));
-    await page.unroute('**/v1/owner/journal/birds/*/portrait');
+    await page.unroute(plateRoute);
     await page.evaluate(() => document.exitFullscreen());
     assert(await fullscreenSettles(page, false));
   }
@@ -921,7 +974,7 @@ let browser,
   // notice must sit fully above the one-row control bar, never behind it.
   await page.keyboard.press('Shift');
   await page.locator('.frame-controls:not(.quiet)').waitFor();
-  await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
+  await page.route(plateRoute, (route) => route.abort());
   // At phone width the bar never scrolls sideways: previous, play, next and
   // More are always on screen, and every control behind More fits the
   // window when it opens. Previous then steps to the other plate, whose
@@ -955,7 +1008,7 @@ let browser,
   const noticeBox = await clearanceNotice.boundingBox();
   const barBox = await page.locator('.frame-controls').boundingBox();
   assert(noticeBox && barBox && noticeBox.y >= 0 && noticeBox.y + noticeBox.height <= barBox.y);
-  await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  await page.unroute(plateRoute);
   phase = 'frame-swipe';
   // A horizontal mouse drag on the plate steps to the next plate instead of
   // starting a native image drag.
@@ -1003,7 +1056,7 @@ let browser,
   await playControl.click();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   await page.route('**/v1/owner/journal', (route) => route.abort());
-  await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
+  await page.route(plateRoute, (route) => route.abort());
   await page.clock.runFor(60100);
   await page.getByText(/Keeping the last approved plate\./).waitFor();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
@@ -1020,7 +1073,7 @@ let browser,
   // Playback stays on, but an emptied view has nothing left to step to.
   const emptiedSteps = [];
   const countStep = (request) => {
-    if (/\/v1\/owner\/journal\/birds\/\d+\/portrait$/.test(request.url()))
+    if (/\/v1\/owner\/journal\/birds\/\d+\/portrait\?revision=/.test(request.url()))
       emptiedSteps.push(request);
   };
   page.on('request', countStep);
@@ -1032,7 +1085,7 @@ let browser,
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
   await page.unroute('**/v1/owner/journal');
-  await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  await page.unroute(plateRoute);
   await page.clock.runFor(60100);
   await page.locator('.frame-art[src]').waitFor();
   await page.keyboard.press('Shift');
@@ -1068,7 +1121,7 @@ let browser,
     plates.expected = ready[(at + 2) % ready.length].common_name;
     await route.fulfill({ response, json: body });
   });
-  await page.route('**/v1/owner/journal/birds/*/portrait', async (route) => {
+  await page.route(plateRoute, async (route) => {
     const id = Number(route.request().url().split('/birds/')[1].split('/')[0]);
     if (id === plates.broken) return route.abort();
     if (id !== copyId) return route.continue();
@@ -1095,7 +1148,7 @@ let browser,
   await page.keyboard.press('Shift');
   await playControl.click();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'false');
-  await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  await page.unroute(plateRoute);
   await page.unroute('**/v1/owner/journal');
   phase = 'frame-wide';
   // Wide screens show every control in one bar and no More button.

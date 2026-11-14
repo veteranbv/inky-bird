@@ -24,13 +24,14 @@ from uuid import uuid4
 
 from .catalog import catalog_state_lock
 from .config import AppConfig
-from .errors import CatalogError, InkyBirdFrameError
+from .errors import CatalogError, DataSourceError, InkyBirdFrameError
 from .http import write_bytes_atomic
-from .settings import SettingsError, confirmed_config
+from .settings import SettingsConflictError, SettingsError, confirmed_config
 from .timeutil import parse_utc_timestamp
 
 # A week covers interrupted work discovered after a weekend. Receipts are small,
-# not imported files. A full allowance fails closed rather than evict active work.
+# not imported files. When the store is full the oldest finished outcomes are
+# evicted; unfinished work is never evicted and only it can fill the store.
 RECEIPT_RETENTION = timedelta(days=7)
 MAX_RECEIPTS = 256
 MAX_RECEIPT_BYTES = 1024 * 1024
@@ -70,6 +71,7 @@ KINDS = {
     "community-save",
     "saved-collection",
 }
+IMPORT_KINDS = {"import-preview", "import-commit"}
 STATUSES = {"pending", "running", "succeeded", "failed", "interrupted"}
 
 
@@ -103,6 +105,33 @@ class OperationReceipt:
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _encode(receipts: list[OperationReceipt]) -> bytes:
+    return (
+        json.dumps(
+            {"schema_version": 1, "receipts": [asdict(row) for row in receipts]},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+
+
+# Column names such as "State/Province" contain a slash; only path- or
+# URL-shaped tokens mark a message as unsafe.
+_PATH_OR_URL = re.compile(r"://|(?:^|[\s:'\"(=])(?:/|~/|\\\\|[A-Za-z]:\\)")
+
+
+def _safe_import_message(kind: str, exc: Exception) -> bool:
+    # History parsers name only columns, rows and file names. Lookups during an
+    # import can name a local path or upstream URL; those stay generic.
+    return (
+        kind in IMPORT_KINDS
+        and isinstance(exc, DataSourceError)
+        and _PATH_OR_URL.search(str(exc)) is None
+        and len(str(exc)) <= 512
+    )
 
 
 def _stamp() -> str:
@@ -206,18 +235,47 @@ class OwnerOperations:
                 "do not replay unknown work."
             ) from exc
 
-    def _write(self, receipts: list[OperationReceipt]) -> None:
-        body = (
-            json.dumps(
-                {"schema_version": 1, "receipts": [asdict(row) for row in receipts]},
-                indent=2,
-                sort_keys=True,
+    def _write(
+        self, receipts: list[OperationReceipt], *, keep: frozenset[str] = frozenset()
+    ) -> None:
+        """Write receipts, evicting the oldest finished ones to fit the store.
+
+        Pending and running receipts, and ``keep`` (receipts this request
+        created, is finishing or is polling), are never evicted.
+        """
+        evictable = sorted(
+            (
+                index
+                for index, row in enumerate(receipts)
+                if row.status not in {"pending", "running"} and row.operation_id not in keep
+            ),
+            key=lambda index: (
+                cast(datetime, parse_utc_timestamp(receipts[index].updated_at)),
+                index,
+            ),
+        )
+
+        def without(count: int) -> tuple[list[OperationReceipt], bytes]:
+            dropped = set(evictable[:count])
+            rows = [row for index, row in enumerate(receipts) if index not in dropped]
+            return rows, _encode(rows)
+
+        # Size shrinks as more rows are evicted, so search for the fewest.
+        low, high = max(0, len(receipts) - MAX_RECEIPTS), len(evictable)
+        if low > high:
+            raise OwnerOperationError(
+                "Too many owner operations are unfinished. Wait for them before continuing."
             )
-            + "\n"
-        ).encode()
+        while low < high:
+            middle = (low + high) // 2
+            if len(without(middle)[1]) <= MAX_RECEIPT_BYTES:
+                high = middle
+            else:
+                low = middle + 1
+        _, body = without(low)
         if len(body) > MAX_RECEIPT_BYTES:
             raise OwnerOperationError(
-                "Owner receipt storage is full. Back it up before removing old receipts."
+                "Too many owner operations are unfinished. Wait for them before continuing."
             )
         write_bytes_atomic(self.path, body, mode=0o600)
 
@@ -227,10 +285,11 @@ class OwnerOperations:
             if not any(row.operation_id == receipt.operation_id for row in receipts):
                 raise OwnerOperationError("Owner receipt was removed while work was running")
             self._write(
-                [receipt if row.operation_id == receipt.operation_id else row for row in receipts]
+                [receipt if row.operation_id == receipt.operation_id else row for row in receipts],
+                keep=frozenset({receipt.operation_id}),
             )
 
-    def _reconcile(self) -> None:
+    def _reconcile(self, polled: str | None = None) -> None:
         if self._active:
             return
         try:
@@ -261,7 +320,12 @@ class OwnerOperations:
                             if row.status in {"pending", "running"}
                             else row
                             for row in receipts
-                        ]
+                        ],
+                        keep=frozenset(
+                            row.operation_id
+                            for row in receipts
+                            if row.status in {"pending", "running"} or row.operation_id == polled
+                        ),
                     )
         except OwnerOperationBusyError:
             # Another service process holds the operation lock. It owns recovery.
@@ -292,7 +356,7 @@ class OwnerOperations:
 
     def status(self, operation_id: str | None = None) -> dict[str, object]:
         with self._guard:
-            self._reconcile()
+            self._reconcile(operation_id)
             with catalog_state_lock(self.state_dir):
                 receipts = self._read()
         if operation_id is not None:
@@ -352,11 +416,6 @@ class OwnerOperations:
                         if row.status in {"pending", "running"}
                         or cast(datetime, parse_utc_timestamp(row.updated_at)) >= cutoff
                     ]
-                    if len(receipts) >= MAX_RECEIPTS:
-                        raise OwnerOperationError(
-                            "The receipt allowance is full. "
-                            "Back up older outcomes before continuing."
-                        )
                     receipt = OperationReceipt(
                         uuid4().hex, _hash(key), digest, kind, "pending", _stamp(), _stamp()
                     )
@@ -385,7 +444,11 @@ class OwnerOperations:
                                 result={
                                     "error_type": type(exc).__name__,
                                     "message": str(exc)
-                                    if isinstance(exc, OwnerOperationError | JournalError)
+                                    if isinstance(
+                                        exc,
+                                        OwnerOperationError | JournalError | SettingsConflictError,
+                                    )
+                                    or _safe_import_message(kind, exc)
                                     else "The operation did not finish. "
                                     "Check its source or work state before retrying.",
                                 },

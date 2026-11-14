@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from inky_bird_frame.cli import scheduler_command
 from inky_bird_frame.config import load_config
-from inky_bird_frame.errors import CatalogError
+from inky_bird_frame.errors import CatalogError, ConfigurationError
 from inky_bird_frame.retry_requests import RETRY_WAKE_LISTENER
 from inky_bird_frame.runtime_state import state_lock_held
 from inky_bird_frame.scheduler import (
@@ -105,13 +105,15 @@ class SchedulerTests(unittest.TestCase):
         clock = FakeClock()
         calls: list[str] = []
         deadlines: dict[str, float] = {}
+        refresh_deadline_seen_by_generate: list[float | None] = []
 
         def runner(args: tuple[str, ...]) -> int:
             calls.append(args[0])
             if args[0] == "refresh":
                 clock.now += 10
             else:
-                assert deadlines["refresh"] == 70
+                # The scheduler swallows runner exceptions; record, assert later.
+                refresh_deadline_seen_by_generate.append(deadlines.get("refresh"))
                 clock.now += 120
             return 0
 
@@ -126,17 +128,20 @@ class SchedulerTests(unittest.TestCase):
             monotonic=clock.monotonic,
             on_schedule=lambda name, delay: deadlines.update({name: clock.now + delay}),
         )
+        assert calls == ["refresh", "generate"]
+        assert refresh_deadline_seen_by_generate == [70]
         assert deadlines["generate"] == 430
 
     def test_deferred_job_deadline_is_published_before_another_job(self) -> None:
         clock = FakeClock()
         calls: list[str] = []
         deadlines: dict[str, float] = {}
+        generate_deadline_seen_by_notifications: list[float | None] = []
 
         def runner(args: tuple[str, ...]) -> int:
             calls.append(args[0])
             if args[0] == "notifications":
-                assert deadlines["generate"] == 60
+                generate_deadline_seen_by_notifications.append(deadlines.get("generate"))
             return 1 if args[0] == "refresh" else 0
 
         run_scheduler(
@@ -152,6 +157,7 @@ class SchedulerTests(unittest.TestCase):
             on_schedule=lambda name, delay: deadlines.update({name: clock.now + delay}),
         )
         assert calls == ["refresh", "notifications"]
+        assert generate_deadline_seen_by_notifications == [60]
 
     def test_bad_retry_wake_state_does_not_stop_unrelated_jobs(self) -> None:
         clock = FakeClock()
@@ -409,6 +415,103 @@ class SchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [("refresh",), ("notifications",)])
+
+    def test_config_that_breaks_mid_run_keeps_last_good_jobs_and_alerts(self) -> None:
+        clock = FakeClock()
+        calls: list[tuple[str, float]] = []
+        broken = False
+        errors: list[Exception] = []
+        recoveries: list[float] = []
+        good = [
+            ScheduledJob("refresh", ("refresh",), 60),
+            ScheduledJob("notifications", ("notifications",), 30),
+        ]
+
+        def jobs() -> list[ScheduledJob]:
+            if broken:
+                raise ConfigurationError("Invalid TOML in PRIVATE_PATH")
+            return good
+
+        def runner(arguments: tuple[str, ...]) -> int:
+            nonlocal broken
+            calls.append((arguments[0], clock.now))
+            if clock.now == 0 and arguments[0] == "notifications":
+                broken = True
+            if clock.now >= 570:
+                broken = False
+            return 0
+
+        with patch("builtins.print") as log:
+            run_scheduler(
+                good,
+                runner,
+                stop_requested=lambda: clock.now > 700,
+                wait=clock.wait,
+                monotonic=clock.monotonic,
+                jobs_provider=jobs,
+                on_jobs_error=errors.append,
+                on_jobs_recovered=lambda: recoveries.append(clock.now),
+                jobs_error_interval_seconds=300,
+            )
+
+        assert [stamp for name, stamp in calls if name == "refresh"] == list(range(0, 700, 60))
+        assert len(errors) == 2
+        assert all(isinstance(error, ConfigurationError) for error in errors)
+        assert recoveries == [570]
+        messages = [json.loads(call.args[0]) for call in log.call_args_list]
+        events = [message["event"] for message in messages]
+        assert events.count("jobs_reload_failed") == 1
+        assert events.count("jobs_reload_recovered") == 1
+        failed = next(message for message in messages if message["event"] == "jobs_reload_failed")
+        assert failed["error_type"] == "ConfigurationError"
+        assert not any("PRIVATE_PATH" in str(call.args[0]) for call in log.call_args_list)
+
+    def test_invalid_reloaded_jobs_keep_the_last_good_jobs(self) -> None:
+        clock = FakeClock()
+        calls: list[str] = []
+        errors: list[Exception] = []
+
+        def runner(arguments: tuple[str, ...]) -> int:
+            calls.append(arguments[0])
+            return 0
+
+        with patch("builtins.print"):
+            run_scheduler(
+                [ScheduledJob("refresh", ("refresh",), 60)],
+                runner,
+                stop_requested=lambda: len(calls) >= 3,
+                wait=clock.wait,
+                monotonic=clock.monotonic,
+                jobs_provider=lambda: [ScheduledJob("refresh", ("refresh",), 0)],
+                on_jobs_error=errors.append,
+            )
+
+        assert calls == ["refresh", "refresh", "refresh"]
+        assert len(errors) == 1
+
+    def test_failing_alert_callback_does_not_stop_the_scheduler(self) -> None:
+        clock = FakeClock()
+        calls: list[str] = []
+
+        def jobs() -> list[ScheduledJob]:
+            raise ConfigurationError("broken")
+
+        def runner(arguments: tuple[str, ...]) -> int:
+            calls.append(arguments[0])
+            return 0
+
+        with patch("builtins.print"):
+            run_scheduler(
+                [ScheduledJob("refresh", ("refresh",), 60)],
+                runner,
+                stop_requested=lambda: len(calls) >= 2,
+                wait=clock.wait,
+                monotonic=clock.monotonic,
+                jobs_provider=jobs,
+                on_jobs_error=Mock(side_effect=RuntimeError("alert failed")),
+            )
+
+        assert calls == ["refresh", "refresh"]
 
     def test_duplicate_job_names_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be unique"):

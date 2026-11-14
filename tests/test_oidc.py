@@ -257,3 +257,18 @@ def test_identity_configuration_changes_have_a_new_session_binding() -> None:
     assert provider_id(CONFIG) != provider_id(
         replace(CONFIG, issuer="https://replacement.example.test/")
     )
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t\n "])
+def test_blank_client_secret_counts_as_missing(value: str) -> None:
+    with (
+        patch.dict("os.environ", {CONFIG.client_secret_env: value}, clear=True),
+        patch(
+            "inky_bird_frame.oidc.httpx2.AsyncHTTPTransport",
+            return_value=httpx2.MockTransport(
+                lambda request: httpx2.Response(200, json=_document())
+            ),
+        ),
+        pytest.raises(OIDCError, match="secret is unavailable"),
+    ):
+        asyncio.run(authorization_url(CONFIG, TX))
