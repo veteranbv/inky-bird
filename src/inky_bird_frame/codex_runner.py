@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import functools
 import json
 import os
+import select
 import signal
 import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -245,14 +251,159 @@ def _signal_group(group: int, stop_signal: signal.Signals) -> None:
         os.killpg(group, stop_signal)
 
 
+_POLL_INTERVAL_SECONDS: Final = 0.05
+
+if sys.platform == "darwin":
+    _PROC_PGRP_ONLY: Final = 2
+    _PROC_PIDTBSDINFO: Final = 3
+    # struct proc_bsdinfo from <sys/proc_info.h>: pbi_status at offset 4 and
+    # pbi_pgid at offset 100 of its 136 bytes.
+    _PROC_BSDINFO_SIZE: Final = 136
+    _SZOMB: Final = 5
+
+    @functools.cache
+    def _libproc() -> ctypes.CDLL:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_listpids.restype = ctypes.c_int
+        library.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_pidinfo.restype = ctypes.c_int
+        return library
+
+    def _wait_unreaped(pid: int, timeout: float | None) -> bool:
+        """Wait for a child to exit without reaping it; False on timeout."""
+        with contextlib.closing(select.kqueue()) as queue:
+            watch = select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            events = queue.control([watch], 1, timeout)
+        for event in events:
+            # Registration on a child that has already exited reports ESRCH.
+            if event.flags & select.KQ_EV_ERROR and event.data != errno.ESRCH:
+                raise OSError(event.data, os.strerror(event.data))
+        return bool(events)
+
+    def _live_member(pid: int, group: int) -> bool:
+        info = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+        size = _libproc().proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, info, _PROC_BSDINFO_SIZE)
+        if size != _PROC_BSDINFO_SIZE:
+            # Zombies and processes that have gone report ESRCH.
+            return ctypes.get_errno() == errno.EPERM
+        status = int.from_bytes(info.raw[4:8], sys.byteorder)
+        pgid = int.from_bytes(info.raw[100:104], sys.byteorder)
+        return status != _SZOMB and pgid == group
+
+    def _group_members(group: int) -> set[int] | None:
+        """Running members of a group other than its leader, or None if unknown."""
+        library = _libproc()
+        slots = 256
+        for _attempt in range(4):
+            pids = (ctypes.c_int * slots)()
+            size = library.proc_listpids(_PROC_PGRP_ONLY, group, pids, ctypes.sizeof(pids))
+            if size < 0:
+                return None
+            count = size // ctypes.sizeof(ctypes.c_int)
+            if count < slots:
+                return {
+                    pid
+                    for pid in pids[:count]
+                    if pid > 0 and pid != group and _live_member(pid, group)
+                }
+            slots *= 4
+        return None
+
+else:
+
+    def _wait_unreaped(pid: int, timeout: float | None) -> bool:
+        """Wait for a child to exit without reaping it; False on timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        delay = 0.001
+        while os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            time.sleep(delay if remaining is None else min(delay, remaining))
+            delay = min(delay * 2, _POLL_INTERVAL_SECONDS)
+        return True
+
+    def _group_members(group: int) -> set[int] | None:
+        """Running members of a group other than its leader, or None if unknown."""
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return None
+        members: set[int] = set()
+        for name in names:
+            if not name.isdigit() or int(name) == group:
+                continue
+            try:
+                stat = Path("/proc", name, "stat").read_bytes()
+            except OSError:
+                continue
+            # Fields after the parenthesised command: state, ppid, pgrp.
+            fields = stat[stat.rfind(b")") + 2 :].split()
+            if len(fields) > 2 and int(fields[2]) == group and fields[0] not in (b"Z", b"X"):
+                members.add(int(name))
+        return members
+
+
+def _wait_for_empty_group(group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if _group_members(group) == set():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _stop_group_members(group: int) -> None:
+    for stop_signal in (signal.SIGTERM, signal.SIGKILL):
+        if _wait_for_empty_group(group, 0):
+            return
+        _signal_group(group, stop_signal)
+        _wait_for_empty_group(group, TERMINATE_GRACE_SECONDS)
+
+
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    # The group ID cannot be reused while any member, including the unreaped
-    # leader, remains; after the leader exits on SIGTERM, the final SIGKILL
-    # still reaches members that ignored it.
-    _signal_group(process.pid, signal.SIGTERM)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=TERMINATE_GRACE_SECONDS)
-    _signal_group(process.pid, signal.SIGKILL)
+    """Stop the agent and everything left in its process group, then reap it.
+
+    The group is signalled only while the agent is unreaped: until then its
+    process ID, which is also the group ID, cannot be reused by another process.
+    """
+    if process.returncode is not None:
+        return
+    group = process.pid
+    try:
+        exited = _wait_unreaped(group, 0)
+        if not exited:
+            _signal_group(group, signal.SIGTERM)
+            exited = _wait_unreaped(group, TERMINATE_GRACE_SECONDS)
+        if not exited:
+            _signal_group(group, signal.SIGKILL)
+            _wait_unreaped(group, None)
+    except ChildProcessError:
+        # Reaped outside this runner, so the group ID may already be reused.
+        pass
+    except OSError:
+        _signal_group(group, signal.SIGKILL)
+    else:
+        _stop_group_members(group)
     process.wait()
 
 
@@ -378,20 +529,11 @@ class CodexRunner:
         try:
             with forwarding:
                 try:
-                    try:
-                        process.wait(timeout=self.timeout_seconds)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        _stop_process_group(process)
-                    # Tool processes that outlive the agent would otherwise hold
-                    # its output pipes open and keep running unsupervised.
-                    for stop_signal in (None, signal.SIGTERM, signal.SIGKILL):
-                        if stop_signal is not None:
-                            _signal_group(process.pid, stop_signal)
-                        stdout.join(TERMINATE_GRACE_SECONDS)
-                        stderr.join(TERMINATE_GRACE_SECONDS)
-                        if not stdout.is_alive() and not stderr.is_alive():
-                            break
+                    timed_out = not _wait_unreaped(process.pid, self.timeout_seconds)
+                    _stop_process_group(process)
+                    # A tool that left the agent's group can still hold a pipe.
+                    stdout.join(TERMINATE_GRACE_SECONDS)
+                    stderr.join(TERMINATE_GRACE_SECONDS)
                 except BaseException:
                     _stop_process_group(process)
                     raise
@@ -400,6 +542,8 @@ class CodexRunner:
             raise GenerationError(
                 f"Codex was stopped because the job received {signal.Signals(stopped.signum).name}"
             ) from None
+        except OSError as exc:
+            raise GenerationError("Codex could not be supervised after it started") from exc
         writer.join(TERMINATE_GRACE_SECONDS)
         stdout_text = stdout.text()
         stderr_text = stderr.text()

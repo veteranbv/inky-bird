@@ -362,6 +362,81 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
         self.assertIsInstance(errors[0], GenerationError)
         self.assertIn("Codex timed out after 1 seconds", str(errors[0]))
 
+    def test_clean_exit_stops_background_tools_with_redirected_streams(self) -> None:
+        # Redirected streams mean the output pipes close as soon as the agent
+        # exits, so pipe EOF says nothing about tools still running.
+        tools = {
+            "stops on TERM": "sleep 600",
+            "ignores TERM": "sh -c \"trap '' TERM; exec sleep 600\"",
+        }
+        for label, tool in tools.items():
+            with self.subTest(tool=label):
+                self._assert_tool_stopped_after_clean_exit(tool)
+
+    def _assert_tool_stopped_after_clean_exit(self, tool: str) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "tool.pid"
+            stub = _stub_executable(
+                root, f'{tool} </dev/null >/dev/null 2>&1 &\necho $! > "{pid_file}"\nexit 0'
+            )
+            runner = CodexRunner(stub, root)
+            results: list[subprocess.CompletedProcess[str]] = []
+            errors: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    results.append(runner._run([str(stub)], "prompt", root / "run.log"))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            # A worker thread keeps a run that never returns from blocking the suite.
+            worker = threading.Thread(target=run, daemon=True)
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5):
+                worker.start()
+                try:
+                    worker.join(15.0)
+                    returned = not worker.is_alive()
+                    running = _process_running(int(pid_file.read_text()))
+                finally:
+                    if pid_file.is_file() and pid_file.read_text().strip():
+                        _kill_if_running(int(pid_file.read_text()))
+                    worker.join(15.0)
+        self.assertTrue(returned, "the Codex run did not return after the agent exited")
+        self.assertEqual(errors, [])
+        self.assertEqual([result.returncode for result in results], [0])
+        self.assertFalse(running, "a background tool survived the agent's clean exit")
+
+    def test_clean_exit_without_leftover_tools_does_not_wait_for_grace(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(root, "exit 0")
+            runner = CodexRunner(stub, root)
+            started = time.monotonic()
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 30.0):
+                runner._run([str(stub)], "prompt", root / "run.log")
+            self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_tools_that_stop_on_term_end_the_run_before_the_grace_expires(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "tool.pid"
+            stub = _stub_executable(
+                root, f'sleep 600 </dev/null >/dev/null 2>&1 &\necho $! > "{pid_file}"\nexit 0'
+            )
+            runner = CodexRunner(stub, root)
+            started = time.monotonic()
+            try:
+                with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 30.0):
+                    runner._run([str(stub)], "prompt", root / "run.log")
+                elapsed = time.monotonic() - started
+                running = _process_running(int(pid_file.read_text()))
+            finally:
+                if pid_file.is_file() and pid_file.read_text().strip():
+                    _kill_if_running(int(pid_file.read_text()))
+        self.assertFalse(running, "a background tool survived the agent's clean exit")
+        self.assertLess(elapsed, 10.0)
+
     def test_job_stop_signal_stops_the_agent(self) -> None:
         # The scheduler stops a job by signalling the job's own process group;
         # the agent runs in a separate session, so the job must pass the stop on.
