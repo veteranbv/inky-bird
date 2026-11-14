@@ -365,9 +365,11 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
     def test_clean_exit_stops_background_tools_with_redirected_streams(self) -> None:
         # Redirected streams mean the output pipes close as soon as the agent
         # exits, so pipe EOF says nothing about tools still running.
+        # A tool writes the ready marker once it is set up, and the agent exits
+        # only after that, so the group stop cannot arrive before the TERM trap.
         tools = {
-            "stops on TERM": "sleep 600",
-            "ignores TERM": "sh -c \"trap '' TERM; exec sleep 600\"",
+            "stops on TERM": "sh -c ': > \"$1\"; exec sleep 600' tool",
+            "ignores TERM": 'sh -c \'trap "" TERM; : > "$1"; exec sleep 600\' tool',
         }
         for label, tool in tools.items():
             with self.subTest(tool=label):
@@ -377,8 +379,17 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             pid_file = root / "tool.pid"
+            ready = root / "tool.ready"
             stub = _stub_executable(
-                root, f'{tool} </dev/null >/dev/null 2>&1 &\necho $! > "{pid_file}"\nexit 0'
+                root,
+                f'{tool} "{ready}" </dev/null >/dev/null 2>&1 &\n'
+                f'echo $! > "{pid_file}"\n'
+                "waited=0\n"
+                f'while [ ! -e "{ready}" ] && [ "$waited" -lt 200 ]; do\n'
+                "  sleep 0.05\n"
+                "  waited=$((waited + 1))\n"
+                "done\n"
+                "exit 0",
             )
             runner = CodexRunner(stub, root)
             results: list[subprocess.CompletedProcess[str]] = []
@@ -398,10 +409,12 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
                     worker.join(15.0)
                     returned = not worker.is_alive()
                     running = _process_running(int(pid_file.read_text()))
+                    was_ready = ready.is_file()
                 finally:
                     if pid_file.is_file() and pid_file.read_text().strip():
                         _kill_if_running(int(pid_file.read_text()))
                     worker.join(15.0)
+        self.assertTrue(was_ready, "the background tool never finished setting up")
         self.assertTrue(returned, "the Codex run did not return after the agent exited")
         self.assertEqual(errors, [])
         self.assertEqual([result.returncode for result in results], [0])
