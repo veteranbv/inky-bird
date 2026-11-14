@@ -141,7 +141,7 @@ def test_disabled_notifications_skip_the_dead_letter_check(tmp_path: Path) -> No
 
 LAUNCHCTL_PRINT = """gui/501/com.inky-bird.{job} = {{
 \tactive count = 0
-\tpath = /Users/example/Library/LaunchAgents/com.inky-bird.{job}.plist
+\tpath = /var/empty/LaunchAgents/com.inky-bird.{job}.plist
 \ttype = LaunchAgent
 \tstate = not running
 \truns = {runs}
