@@ -43,6 +43,7 @@ from .birds import (
     resolve_ebird_species,
 )
 from .catalog import (
+    CandidateApprovalError,
     CatalogEntry,
     CollectionEntry,
     CollectionOrigin,
@@ -54,10 +55,14 @@ from .catalog import (
     candidate_directory,
     catalog_state_lock,
     clear_catalog_staging,
+    drop_listed_taxon,
     find_taxon_directory,
+    fsync_directory,
+    fsync_tree,
     has_passing_sourced_review,
     has_valid_approved_candidate,
     is_bounded_generation,
+    read_approved_entry,
     read_catalog_entries,
     read_collection,
     read_collection_state,
@@ -1431,8 +1436,57 @@ def archive_invalid_approved_catalog_state(
             config.controller.catalog_dir,
             taxon_id,
         )
-        _write_active_catalog(config, observed)
+        _write_active_catalog_after_removal(config, observed, taxon_id)
         return archived
+
+
+def _write_active_catalog_after_removal(
+    config: AppConfig, observed: list[BirdSpecies], taxon_id: int
+) -> int:
+    # Removing one taxon must not wait for every other approved entry to be
+    # valid; while another entry still fails, only this taxon leaves the wall.
+    try:
+        approved = rebuild_catalog_index(config.controller.catalog_dir)
+    except CatalogError:
+        path = _active_catalog_path(config)
+        drop_listed_taxon(path, taxon_id)
+        try:
+            listing = read_json(path) if path.is_file() else None
+        except CatalogError:
+            return 0
+        species = listing.get("species") if isinstance(listing, dict) else None
+        return len(species) if isinstance(species, list) else 0
+    return _write_active_catalog(config, observed, approved=approved)
+
+
+def _invalid_approved_species(
+    approved_path: Path,
+    taxon_id: int,
+    candidates: list[BirdSpecies | None],
+) -> BirdSpecies:
+    manifest_path = approved_path / "manifest.json"
+    try:
+        manifest = read_json(manifest_path)
+    except CatalogError:
+        manifest = None
+    if isinstance(manifest, dict) and manifest.get("taxon_id") == taxon_id:
+        try:
+            return _replacement_species(
+                taxon_id,
+                manifest.get("common_name"),
+                manifest.get("scientific_name"),
+                manifest_path,
+            )
+        except CatalogError:
+            pass
+    for candidate in candidates:
+        if candidate is not None:
+            return _replacement_species(
+                taxon_id, candidate.common_name, candidate.scientific_name, manifest_path
+            )
+    raise SpeciesStateError(
+        f"Taxon {taxon_id} has no recoverable species identity; wait for rediscovery, then retry"
+    )
 
 
 def _replacement_species(
@@ -1553,17 +1607,18 @@ def retry_approved_candidate(
         if pending is not None and (pending / "manifest.json").is_file():
             raise ValueError("Pending candidates must be approved or rejected before retrying")
         with catalog_state_lock(config.controller.state_dir):
-            approved_entries = read_catalog_entries(config.controller.catalog_dir)
-            approved_entry = next(
-                (entry for entry in approved_entries if entry.taxon_id == taxon_id),
-                None,
-            )
             approved_path = find_taxon_directory(
                 config.controller.catalog_dir / "species",
                 taxon_id,
             )
-            if (approved_entry is None) != (approved_path is None):
-                raise CatalogError(f"Approved catalog state is inconsistent for taxon {taxon_id}")
+            invalid_approved = approved_path is not None and not has_valid_approved_candidate(
+                config.controller.catalog_dir, taxon_id
+            )
+            approved_entry = (
+                None
+                if invalid_approved
+                else read_approved_entry(config.controller.catalog_dir, taxon_id)
+            )
 
             retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
             queued_species = read_generation_queue(config)
@@ -1574,7 +1629,7 @@ def retry_approved_candidate(
                     taxon_id,
                     rejection_reason,
                 )
-                if approved_entry is None
+                if approved_entry is None and not invalid_approved
                 else None
             )
             queued = next(
@@ -1586,7 +1641,7 @@ def retry_approved_candidate(
             reference_cache = config.controller.state_dir / "references" / str(taxon_id)
             cleared_cached_profile = refresh_research and profile_cache.exists()
             cleared_cached_references = refresh_research and reference_cache.exists()
-            if approved_entry is None and resumable is None:
+            if approved_entry is None and resumable is None and not invalid_approved:
                 already_prepared = (
                     queued is not None
                     and guidance is not None
@@ -1610,11 +1665,7 @@ def retry_approved_candidate(
                     config.controller.state_dir,
                     cache_sources,
                 )
-                active_count = _write_active_catalog(
-                    config,
-                    observed,
-                    approved=approved_entries,
-                )
+                active_count = _write_active_catalog(config, observed)
                 return {
                     "taxon_id": taxon_id,
                     "status": "eligible",
@@ -1639,6 +1690,17 @@ def retry_approved_candidate(
                     approved_path / "manifest.json",
                 )
                 withdrawn: Path | None = None
+            elif invalid_approved:
+                assert approved_path is not None
+                species = _invalid_approved_species(
+                    approved_path,
+                    taxon_id,
+                    [
+                        queued,
+                        next((item for item in observed if item.taxon_id == taxon_id), None),
+                    ],
+                )
+                withdrawn = None
             else:
                 assert resumable is not None
                 withdrawn, species = resumable
@@ -1675,15 +1737,25 @@ def retry_approved_candidate(
                 invariant_findings=(rejection_reason,),
             )
 
-            if withdrawn is None:
-                withdrawn = withdraw_approved_candidate(
+            if invalid_approved:
+                archived = archive_invalid_approved_candidate(
                     config.controller.state_dir,
                     config.controller.catalog_dir,
                     taxon_id,
-                    rejection_reason,
                 )
-            active_count = _write_active_catalog(config, observed)
-            moved.extend(_archive_controller_paths(config.controller.state_dir, [withdrawn]))
+                active_count = _write_active_catalog_after_removal(config, observed, taxon_id)
+                if archived is not None:
+                    moved.append(str(archived))
+            else:
+                if withdrawn is None:
+                    withdrawn = withdraw_approved_candidate(
+                        config.controller.state_dir,
+                        config.controller.catalog_dir,
+                        taxon_id,
+                        rejection_reason,
+                    )
+                active_count = _write_active_catalog_after_removal(config, observed, taxon_id)
+                moved.extend(_archive_controller_paths(config.controller.state_dir, [withdrawn]))
 
     return {
         "taxon_id": taxon_id,
@@ -2324,6 +2396,11 @@ def generate_candidate(
                     max_attempts=config.controller.max_generation_attempts,
                     correction_source_sha256=correction_source_sha256,
                 )
+                # Build the candidate outside pending/ and rename it in, so a
+                # crash never leaves a partial directory that looks approvable.
+                staged_candidate = work / "pending-candidate"
+                shutil.copytree(attempt_dir, staged_candidate)
+                fsync_tree(staged_candidate)
                 with catalog_state_lock(state_dir):
                     if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
                         raise CatalogError(f"Taxon {species.taxon_id} is already approved")
@@ -2333,7 +2410,8 @@ def generate_candidate(
                         )
                     destination = candidate_directory(state_dir, species)
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(attempt_dir, destination)
+                    staged_candidate.rename(destination)
+                    fsync_directory(destination.parent)
                 return destination
 
             resolved_corrections = tuple(
@@ -2403,6 +2481,7 @@ def generate_candidate(
             failed = state_dir / "failed" / f"{species.taxon_id}-{_timestamp()}"
             failed.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(work, failed)
+            fsync_tree(failed)
         reason = terminal_detail or (
             "the configured maximum of "
             f"{config.controller.max_generation_attempts} attempts was exhausted"
@@ -2429,9 +2508,10 @@ def _terminal_state(state_dir: Path, taxon_id: int) -> tuple[str, tuple[Path, ..
     if pending is not None:
         state = "pending" if (pending / "manifest.json").is_file() else "incomplete_pending"
         return state, (pending,)
-    rejected = find_taxon_directory(state_dir / "rejected", taxon_id)
-    if rejected is not None:
-        return "rejected", (rejected,)
+    # Repeated rejections keep numbered siblings; any of them holds the taxon.
+    rejected = tuple(sorted((state_dir / "rejected").glob(f"{taxon_id}-*")))
+    if rejected:
+        return "rejected", rejected
     failed = tuple(sorted((state_dir / "failed").glob(f"{taxon_id}-*")))
     if failed:
         return "failed", failed
@@ -2671,28 +2751,85 @@ def record_failure(state_dir: Path, species: BirdSpecies, error: InkyBirdFrameEr
     return destination
 
 
-def approve_passing_candidates(config: AppConfig) -> list[dict[str, object]]:
+HELD_CANDIDATE_ERROR = (
+    "The pending plate failed its approval checks, so it was kept for review. "
+    "Reject it to make a new one."
+)
+
+
+def _held_candidate_failure(
+    directory: Path, taxon_id: int, common_name: object
+) -> dict[str, object]:
+    return {
+        "taxon_id": taxon_id,
+        "common_name": common_name if isinstance(common_name, str) else f"Taxon {taxon_id}",
+        "error": HELD_CANDIDATE_ERROR,
+        "failure": f"pending/{directory.name}",
+        "terminal": True,
+    }
+
+
+def approve_passing_candidates(
+    config: AppConfig, *, held: list[dict[str, object]] | None = None
+) -> list[dict[str, object]]:
+    """Approve reviewed pending candidates; a candidate that fails stays pending."""
     published: list[dict[str, object]] = []
     clear_catalog_staging(config.controller.catalog_dir)
     pending_root = config.controller.state_dir / "pending"
     for manifest_path in sorted(pending_root.glob("*/manifest.json")):
+        directory = manifest_path.parent
+        prefix, separator, _ = directory.name.partition("-")
+        if not separator or not prefix.isascii() or not prefix.isdigit() or int(prefix) <= 0:
+            continue
+        taxon_id = int(prefix)
         try:
-            manifest = json.loads(manifest_path.read_text())
-        except json.JSONDecodeError as exc:
-            raise CatalogError(f"Invalid pending manifest: {manifest_path}") from exc
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("taxon_id"), int):
-            raise CatalogError(f"Pending manifest has no taxon ID: {manifest_path}")
+            manifest = read_json(manifest_path)
+        except CatalogError:
+            manifest = None
+        if not isinstance(manifest, dict):
+            if held is not None:
+                held.append(_held_candidate_failure(directory, taxon_id, None))
+            continue
         review = manifest.get("quality_review")
         generation = manifest.get("generation")
         if not has_passing_sourced_review(review) or not is_bounded_generation(generation):
             continue
-        entry = approve_candidate(
-            config.controller.state_dir,
-            config.controller.catalog_dir,
-            cast(int, manifest["taxon_id"]),
-        )
+        try:
+            entry = approve_candidate(
+                config.controller.state_dir,
+                config.controller.catalog_dir,
+                taxon_id,
+            )
+        except CandidateApprovalError:
+            if held is not None:
+                held.append(
+                    _held_candidate_failure(directory, taxon_id, manifest.get("common_name"))
+                )
+            continue
         published.append(entry.as_dict())
     return published
+
+
+def _sweep_abandoned_generation_work(config: AppConfig) -> None:
+    """Remove work left by a generation that stopped; callers hold the cycle lock."""
+    parents = (
+        config.controller.state_dir / "work",
+        config.controller.workspace_dir.resolve() / ".inky-bird-frame-generation",
+    )
+    for parent in parents:
+        if parent.is_symlink() or not parent.is_dir():
+            continue
+        for candidate in sorted(parent.iterdir()):
+            prefix, separator, _ = candidate.name.partition("-")
+            if (
+                not separator
+                or not prefix.isascii()
+                or not prefix.isdigit()
+                or candidate.is_symlink()
+                or not candidate.is_dir()
+            ):
+                continue
+            shutil.rmtree(candidate)
 
 
 def run_generation_cycle(config: AppConfig) -> dict[str, object]:
@@ -2704,6 +2841,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         exclusive_cycle_lock(config.controller.state_dir),
         activity_run(config.controller.state_dir, "generation"),
     ):
+        _sweep_abandoned_generation_work(config)
         progress("preparing_retries")
         prepare_retry_requests(config)
         queued_species = read_generation_queue(config)
@@ -2720,7 +2858,8 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     collection,
                     legacy_seed_queue_migrated_at=migrated_at,
                 )
-            published = approve_passing_candidates(config)
+            held_candidates: list[dict[str, object]] = []
+            published = approve_passing_candidates(config, held=held_candidates)
         snapshot = _read_discovery_snapshot(config)
         species_list = snapshot.species
         retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
@@ -2781,7 +2920,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             work.eligible, key=lambda bird: request_order.get(bird.taxon_id, len(request_order))
         )
         generated: list[dict[str, object]] = []
-        failures: list[dict[str, object]] = []
+        failures: list[dict[str, object]] = list(held_candidates)
         attempted_count = 0
         for species in eligible:
             if len(generated) >= config.controller.generations_per_cycle:
@@ -2842,12 +2981,27 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         initial_profile_conflicts=profile_conflicts,
                     )
                 progress("approving")
-                with catalog_state_lock(config.controller.state_dir):
-                    entry = approve_candidate(
-                        config.controller.state_dir,
-                        config.controller.catalog_dir,
-                        species.taxon_id,
+                try:
+                    with catalog_state_lock(config.controller.state_dir):
+                        entry = approve_candidate(
+                            config.controller.state_dir,
+                            config.controller.catalog_dir,
+                            species.taxon_id,
+                        )
+                except CandidateApprovalError:
+                    pending = find_taxon_directory(
+                        config.controller.state_dir / "pending", species.taxon_id
                     )
+                    failures.append(
+                        _held_candidate_failure(
+                            pending
+                            if pending is not None
+                            else candidate_directory(config.controller.state_dir, species),
+                            species.taxon_id,
+                            species.common_name,
+                        )
+                    )
+                    continue
                 generated.append(
                     {
                         "taxon_id": species.taxon_id,
@@ -2974,6 +3128,28 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         "taxon_id": species.taxon_id,
                         "common_name": species.common_name,
                         "error": str(exc),
+                        "retry_at": retry.next_attempt_at.isoformat(),
+                        "terminal": False,
+                    }
+                )
+            except Exception as exc:
+                # One bird's unexpected failure must not stop the rest of the
+                # cycle; its text may name local paths, so only the type is kept.
+                message = f"Generation stopped unexpectedly ({type(exc).__name__})"
+                retry = retry_store.record_failure(
+                    species.taxon_id,
+                    exc,
+                    now=datetime.now(UTC),
+                    initial_minutes=config.controller.retry_initial_minutes,
+                    maximum_minutes=config.controller.retry_max_minutes,
+                    species=species,
+                    message=message,
+                )
+                failures.append(
+                    {
+                        "taxon_id": species.taxon_id,
+                        "common_name": species.common_name,
+                        "error": message,
                         "retry_at": retry.next_attempt_at.isoformat(),
                         "terminal": False,
                     }

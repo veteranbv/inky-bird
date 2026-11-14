@@ -602,6 +602,11 @@ def retry_species(
                     f"Taxon {taxon_id} is already approved; use --replace-approved "
                     "with --reason after human review"
                 )
+            # An invalid approval is archived below; it may be the only state
+            # left for this bird, and its manifest can still name the bird.
+            invalid_approved = find_taxon_directory(
+                config.controller.catalog_dir / "species", taxon_id
+            )
         failed_directories = sorted((config.controller.state_dir / "failed").glob(f"{taxon_id}-*"))
         quality_findings: tuple[str, ...]
         correction_source: Path | None
@@ -675,7 +680,13 @@ def retry_species(
         profile_conflicts = tuple(conflicts_by_field.values())
         retry_record = retry_store.get(taxon_id)
         deferred = retry_record is not None
-        if not sources and not deferred and source_candidate is None and source_run is None:
+        if (
+            not sources
+            and not deferred
+            and invalid_approved is None
+            and source_candidate is None
+            and source_run is None
+        ):
             raise ValueError(
                 f"No failed, rejected, or deferred candidate exists for taxon {taxon_id}"
             )
@@ -725,6 +736,12 @@ def retry_species(
             )
         if identity is None:
             identity = terminal_identity
+        if identity is None and invalid_approved is not None:
+            identity = _retry_species_identity(
+                taxon_id,
+                [invalid_approved],
+                deferred_malformed_errors=deferred_identity_errors,
+            )
         if identity is None and queued is not None:
             identity = (
                 queued.common_name,

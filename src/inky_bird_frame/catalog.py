@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from .birds import BirdSpecies
-from .errors import CatalogError
+from .errors import CatalogError, MissingDependencyError
 from .http import write_json_atomic
 from .images import slugify
 from .models import QualityReview, ReferencePhoto, SpeciesProfileData
@@ -23,6 +24,11 @@ from .timeutil import parse_utc_timestamp
 
 SCHEMA_VERSION = 1
 COLLECTION_SCHEMA_VERSION = 1
+ASSET_FILENAMES = {"portrait": "portrait.png", "display": "display.png"}
+
+
+class CandidateApprovalError(CatalogError):
+    """Raised when one pending candidate cannot be approved; it stays pending."""
 
 
 class CollectionOrigin(StrEnum):
@@ -231,6 +237,57 @@ def read_json(path: Path) -> object:
         raise CatalogError(f"Catalog file not found: {path}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise CatalogError(f"Invalid JSON in catalog file: {path}") from exc
+    except OSError as exc:
+        raise CatalogError(f"Catalog file cannot be read: {path}") from exc
+
+
+def fsync_directory(directory: Path) -> None:
+    # Some filesystems cannot fsync a directory handle; file contents are
+    # still synced, so treat that as best effort like write_json_atomic.
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def fsync_tree(root: Path) -> None:
+    """Flush a copied directory tree before it is renamed into place."""
+    for directory, _, filenames in os.walk(root):
+        for filename in filenames:
+            path = Path(directory) / filename
+            if path.is_symlink():
+                continue
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        fsync_directory(Path(directory))
+    fsync_directory(root.parent)
+
+
+def drop_listed_taxon(path: Path, taxon_id: int) -> None:
+    """Remove one taxon from an index-shaped listing without validating the rest."""
+    if not path.is_file():
+        return
+    try:
+        listing = read_json(path)
+    except CatalogError:
+        return
+    if not isinstance(listing, dict) or not isinstance(listing.get("species"), list):
+        return
+    species = cast(list[object], listing["species"])
+    remaining = [
+        item for item in species if not isinstance(item, dict) or item.get("taxon_id") != taxon_id
+    ]
+    if len(remaining) != len(species):
+        write_json_atomic(path, {**listing, "species": remaining})
 
 
 def candidate_directory(state_dir: Path, species: BirdSpecies) -> Path:
@@ -295,52 +352,68 @@ def write_candidate_manifest(
     return manifest_path
 
 
+def _manifest_assets(manifest: dict[str, object], manifest_path: Path) -> dict[str, str]:
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        raise CatalogError(f"Manifest has no assets: {manifest_path}")
+    checksums: dict[str, str] = {}
+    for name, filename in ASSET_FILENAMES.items():
+        asset = assets.get(name)
+        if (
+            not isinstance(asset, dict)
+            or asset.get("filename") != filename
+            or not isinstance(asset.get("sha256"), str)
+        ):
+            raise CatalogError(f"Manifest has invalid assets: {manifest_path}")
+        checksums[filename] = cast(str, asset["sha256"])
+    return checksums
+
+
+def _verify_asset_checksums(
+    directory: Path, checksums: dict[str, str], manifest_path: Path
+) -> None:
+    for filename, checksum in checksums.items():
+        try:
+            matches = sha256_file(directory / filename) == checksum
+        except OSError as exc:
+            raise CatalogError(f"Catalog asset is missing or unreadable: {manifest_path}") from exc
+        if not matches:
+            raise CatalogError(f"Asset checksum mismatch: {manifest_path}")
+
+
 def _manifest_entry(manifest_path: Path, catalog_dir: Path) -> CatalogEntry:
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict) or manifest.get("status") != "approved":
         raise CatalogError(f"Expected approved manifest: {manifest_path}")
-    assets = manifest.get("assets")
-    if not isinstance(assets, dict):
-        raise CatalogError(f"Manifest has no assets: {manifest_path}")
-    portrait = assets.get("portrait")
-    display = assets.get("display")
-    if not isinstance(portrait, dict) or not isinstance(display, dict):
-        raise CatalogError(f"Manifest has invalid assets: {manifest_path}")
+    checksums = _manifest_assets(manifest, manifest_path)
 
     directory = manifest_path.parent
-    portrait_file = portrait.get("filename")
-    display_file = display.get("filename")
-    portrait_hash = portrait.get("sha256")
-    display_hash = display.get("sha256")
-    scalar_values = (
-        manifest.get("taxon_id"),
+    taxon_id = manifest.get("taxon_id")
+    text_values = (
         manifest.get("common_name"),
         manifest.get("scientific_name"),
         manifest.get("slug"),
         manifest.get("approved_at"),
-        portrait_file,
-        display_file,
-        portrait_hash,
-        display_hash,
     )
-    if not isinstance(scalar_values[0], int) or any(
-        not isinstance(value, str) for value in scalar_values[1:]
+    if (
+        not isinstance(taxon_id, int)
+        or isinstance(taxon_id, bool)
+        or any(not isinstance(value, str) for value in text_values)
     ):
         raise CatalogError(f"Manifest has invalid scalar fields: {manifest_path}")
-    portrait_path = directory / cast(str, portrait_file)
-    display_path = directory / cast(str, display_file)
-    if sha256_file(portrait_path) != portrait_hash or sha256_file(display_path) != display_hash:
-        raise CatalogError(f"Asset checksum mismatch: {manifest_path}")
+    _verify_asset_checksums(directory, checksums, manifest_path)
+    portrait_path = directory / ASSET_FILENAMES["portrait"]
+    display_path = directory / ASSET_FILENAMES["display"]
     return CatalogEntry(
-        taxon_id=scalar_values[0],
-        common_name=cast(str, scalar_values[1]),
-        scientific_name=cast(str, scalar_values[2]),
-        slug=cast(str, scalar_values[3]),
+        taxon_id=taxon_id,
+        common_name=cast(str, text_values[0]),
+        scientific_name=cast(str, text_values[1]),
+        slug=cast(str, text_values[2]),
         portrait_path=str(portrait_path.relative_to(catalog_dir)),
-        portrait_sha256=cast(str, portrait_hash),
+        portrait_sha256=checksums[ASSET_FILENAMES["portrait"]],
         display_path=str(display_path.relative_to(catalog_dir)),
-        display_sha256=cast(str, display_hash),
-        approved_at=cast(str, scalar_values[4]),
+        display_sha256=checksums[ASSET_FILENAMES["display"]],
+        approved_at=cast(str, text_values[3]),
     )
 
 
@@ -493,6 +566,62 @@ def has_valid_approved_candidate(catalog_dir: Path, taxon_id: int) -> bool:
     return entry.taxon_id == taxon_id
 
 
+def read_approved_entry(catalog_dir: Path, taxon_id: int) -> CatalogEntry | None:
+    """Validate only one taxon's approval, so other entries cannot block it."""
+    directory = find_taxon_directory(catalog_dir / "species", taxon_id)
+    if directory is None:
+        return None
+    entry = _manifest_entry(directory / "manifest.json", catalog_dir)
+    if entry.taxon_id != taxon_id:
+        raise CatalogError(f"Approved manifest identity does not match taxon {taxon_id}")
+    return entry
+
+
+def _refresh_index_after_removal(catalog_dir: Path, taxon_id: int) -> None:
+    # A removal must not depend on every other entry being valid: if another
+    # entry still fails validation, only withdraw this taxon from the index and
+    # leave the remaining failure for its own recovery.
+    try:
+        rebuild_catalog_index(catalog_dir)
+    except CatalogError:
+        drop_listed_taxon(catalog_dir / "index.json", taxon_id)
+
+
+def _copy_tree_durably(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(source, destination)
+        fsync_tree(destination)
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        with suppress(OSError):
+            destination.parent.rmdir()
+        raise
+
+
+def _remove_with_restore(source: Path, retained: Path, *, restore_manifest: object) -> None:
+    try:
+        shutil.rmtree(source)
+        fsync_directory(source.parent)
+    except Exception:
+        try:
+            if source.exists():
+                shutil.rmtree(source)
+            shutil.copytree(retained, source)
+            if restore_manifest is not None:
+                write_json_atomic(source / "manifest.json", restore_manifest)
+        except Exception as rollback_error:
+            raise CatalogError(
+                "Catalog entry removal failed and could not be rolled back; "
+                f"a recovery copy was retained as {retained.name}"
+            ) from rollback_error
+        shutil.rmtree(retained)
+        with suppress(OSError):
+            retained.parent.rmdir()
+        raise
+
+
 def archive_invalid_approved_candidate(
     state_dir: Path,
     catalog_dir: Path,
@@ -510,33 +639,67 @@ def archive_invalid_approved_candidate(
     while destination.exists():
         destination = archive / f"invalid-approved-{source.name}-{counter}"
         counter += 1
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copytree(source, destination)
-    except Exception:
-        if destination.exists():
-            shutil.rmtree(destination)
-        with suppress(OSError):
-            destination.parent.rmdir()
-        raise
-    try:
-        shutil.rmtree(source)
-        rebuild_catalog_index(catalog_dir)
-    except Exception as error:
-        try:
-            if source.exists():
-                shutil.rmtree(source)
-            shutil.copytree(destination, source)
-        except Exception as rollback_error:
-            raise CatalogError(
-                "Invalid approved candidate archival failed and could not be rolled back; "
-                f"recovery copy retained at {destination}: {rollback_error}"
-            ) from error
-        shutil.rmtree(destination)
-        with suppress(OSError):
-            destination.parent.rmdir()
-        raise
+    _copy_tree_durably(source, destination)
+    _remove_with_restore(source, destination, restore_manifest=None)
+    _refresh_index_after_removal(catalog_dir, taxon_id)
     return destination
+
+
+def _verify_candidate_images(directory: Path) -> None:
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as exc:
+        raise MissingDependencyError("Pillow is required to approve candidates") from exc
+
+    for filename in ASSET_FILENAMES.values():
+        path = directory / filename
+        try:
+            with Image.open(path) as image:
+                if image.format != "PNG":
+                    raise CandidateApprovalError(
+                        f"Candidate {directory.name} has a non-PNG {filename}"
+                    )
+                image.verify()
+            with Image.open(path) as image:
+                image.load()
+        except CandidateApprovalError:
+            raise
+        except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+            raise CandidateApprovalError(
+                f"Candidate {directory.name} has an unreadable {filename}"
+            ) from exc
+
+
+def _validate_pending_candidate_files(
+    source: Path, manifest: dict[str, object], taxon_id: int
+) -> None:
+    manifest_path = source / "manifest.json"
+    if (
+        not isinstance(manifest.get("taxon_id"), int)
+        or isinstance(manifest.get("taxon_id"), bool)
+        or manifest.get("taxon_id") != taxon_id
+    ):
+        raise CandidateApprovalError(f"Candidate {source.name} has a different taxon ID")
+    for filename in ASSET_FILENAMES.values():
+        path = source / filename
+        if path.is_symlink() or not path.is_file():
+            raise CandidateApprovalError(f"Candidate {source.name} is missing {filename}")
+    try:
+        checksums = _manifest_assets(manifest, manifest_path)
+        _verify_asset_checksums(source, checksums, manifest_path)
+    except CatalogError as exc:
+        raise CandidateApprovalError(
+            f"Candidate {source.name} files do not match its manifest"
+        ) from exc
+    _verify_candidate_images(source)
+
+
+def _discard_pending(source: Path) -> None:
+    # Drop the manifest first: an interrupted removal then leaves an incomplete
+    # directory that no reader treats as a candidate to approve.
+    (source / "manifest.json").unlink(missing_ok=True)
+    shutil.rmtree(source)
+    fsync_directory(source.parent)
 
 
 def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> CatalogEntry:
@@ -544,50 +707,76 @@ def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> Cata
     if source is None:
         raise CatalogError(f"No pending candidate exists for taxon {taxon_id}")
     manifest_path = source / "manifest.json"
-    manifest = read_json(manifest_path)
+    try:
+        manifest = read_json(manifest_path)
+    except CatalogError as exc:
+        raise CandidateApprovalError(f"Candidate {source.name} has no readable manifest") from exc
     if not isinstance(manifest, dict) or manifest.get("status") not in ("pending", "approved"):
-        raise CatalogError(f"Candidate manifest is not pending: {manifest_path}")
+        raise CandidateApprovalError(f"Candidate manifest is not pending: {source.name}")
     review = manifest.get("quality_review")
     if not isinstance(review, dict) or review.get("passed") is not True:
-        raise CatalogError("Candidate did not pass automated quality review")
+        raise CandidateApprovalError("Candidate did not pass automated quality review")
 
     slug = manifest.get("slug")
-    if not isinstance(slug, str):
-        raise CatalogError("Candidate manifest has no slug")
+    if not isinstance(slug, str) or not slug:
+        raise CandidateApprovalError("Candidate manifest has no slug")
     destination = catalog_dir / "species" / f"{taxon_id}-{slug}"
+    existing_approval = find_taxon_directory(catalog_dir / "species", taxon_id)
+    if existing_approval is not None and existing_approval != destination:
+        raise CandidateApprovalError(
+            f"Taxon {taxon_id} is already approved; use an explicit replacement workflow"
+        )
     clear_catalog_staging(catalog_dir, destination.name)
+    existing = _existing_destination_manifest(destination) if destination.exists() else None
+    if (
+        existing is not None
+        and _same_candidate(manifest, existing)
+        and _valid_destination_entry(destination, catalog_dir)
+    ):
+        # An earlier approval completed its rename before it stopped; only the
+        # pending copy remains to be dropped.
+        _discard_pending(source)
+        entries = rebuild_catalog_index(catalog_dir)
+        return next(entry for entry in entries if entry.taxon_id == taxon_id)
+    if existing is not None and not _same_candidate(manifest, existing):
+        raise CandidateApprovalError(
+            f"Taxon {taxon_id} is already approved; use an explicit replacement workflow"
+        )
+    # Verify the candidate before anything is staged: an unverified copy would
+    # replace the only retained plate with an entry that blocks every reader.
+    _validate_pending_candidate_files(source, manifest, taxon_id)
     if destination.exists():
-        existing = _existing_destination_manifest(destination)
-        if existing is None:
-            # No readable manifest is never a valid approval, only debris from
-            # an interrupted legacy copy: discard it and approve again.
-            shutil.rmtree(destination)
-        elif not _same_candidate(manifest, existing):
-            raise CatalogError(
-                f"Taxon {taxon_id} is already approved; use an explicit replacement workflow"
-            )
-        elif _valid_destination_entry(destination, catalog_dir):
-            shutil.rmtree(source)
-            entries = rebuild_catalog_index(catalog_dir)
-            return next(entry for entry in entries if entry.taxon_id == taxon_id)
-        else:
-            # Same candidate but an incomplete copy: discard it and approve again.
-            shutil.rmtree(destination)
+        # Debris from an interrupted legacy copy, or the same candidate copied
+        # incompletely: never a valid approval, so approve again.
+        shutil.rmtree(destination)
 
     approved_manifest = dict(manifest)
     approved_manifest["status"] = "approved"
     approved_manifest["approved_at"] = utc_now()
     staged = catalog_dir / ".staging" / destination.name
-    shutil.copytree(source, staged)
-    write_json_atomic(staged / "manifest.json", approved_manifest)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staged.rename(destination)
+    try:
+        _copy_tree_durably(source, staged)
+        write_json_atomic(staged / "manifest.json", approved_manifest)
+        # Re-hash the copy, so a short or failed write never reaches the catalog.
+        _manifest_entry(staged / "manifest.json", catalog_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staged.rename(destination)
+        fsync_directory(destination.parent)
+    except (CatalogError, OSError) as exc:
+        clear_catalog_staging(catalog_dir, destination.name)
+        raise CatalogError(f"Candidate {source.name} could not be copied into the catalog") from exc
     # An empty .staging directory would fail the publish root allowlist.
     with suppress(OSError):
         staged.parent.rmdir()
-    shutil.rmtree(source)
-    entries = rebuild_catalog_index(catalog_dir)
-    return next(entry for entry in entries if entry.taxon_id == taxon_id)
+    try:
+        entry = _manifest_entry(destination / "manifest.json", catalog_dir)
+    except CatalogError:
+        shutil.rmtree(destination)
+        fsync_directory(destination.parent)
+        raise
+    _discard_pending(source)
+    rebuild_catalog_index(catalog_dir)
+    return entry
 
 
 def _available_rejected_destination(state_dir: Path, name: str) -> Path:
@@ -621,38 +810,20 @@ def withdraw_approved_candidate(
         raise CatalogError(f"Approved candidate manifest is invalid: {manifest_path}")
 
     destination = _available_rejected_destination(state_dir, source.name)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copytree(source, destination)
-    except Exception:
-        if destination.exists():
-            shutil.rmtree(destination)
-        with suppress(OSError):
-            destination.parent.rmdir()
-        raise
+    _copy_tree_durably(source, destination)
     try:
         rejected_manifest = dict(manifest)
         rejected_manifest["status"] = "rejected"
         rejected_manifest["rejected_at"] = utc_now()
         rejected_manifest["rejection_reason"] = rejection_reason
         write_json_atomic(destination / "manifest.json", rejected_manifest)
-        shutil.rmtree(source)
-        rebuild_catalog_index(catalog_dir)
-    except Exception as error:
-        try:
-            if source.exists():
-                shutil.rmtree(source)
-            shutil.copytree(destination, source)
-            write_json_atomic(source / "manifest.json", manifest)
-        except Exception as rollback_error:
-            raise CatalogError(
-                "Approved candidate withdrawal failed and could not be rolled back; "
-                f"recovery copy retained at {destination}: {rollback_error}"
-            ) from error
+    except Exception:
         shutil.rmtree(destination)
         with suppress(OSError):
             destination.parent.rmdir()
         raise
+    _remove_with_restore(source, destination, restore_manifest=manifest)
+    _refresh_index_after_removal(catalog_dir, taxon_id)
     return destination
 
 
@@ -663,11 +834,15 @@ def reject_candidate(state_dir: Path, taxon_id: int, reason: str) -> Path:
     manifest = read_json(source / "manifest.json")
     if not isinstance(manifest, dict):
         raise CatalogError("Candidate manifest is invalid")
+    destination = _available_rejected_destination(state_dir, source.name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Move first: a crash before the manifest rewrite then leaves an ordinary
+    # rejected directory, never a pending candidate marked rejected.
+    source.replace(destination)
+    fsync_directory(source.parent)
+    fsync_directory(destination.parent)
     manifest["status"] = "rejected"
     manifest["rejected_at"] = utc_now()
     manifest["rejection_reason"] = reason
-    write_json_atomic(source / "manifest.json", manifest)
-    destination = _available_rejected_destination(state_dir, source.name)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source.replace(destination)
+    write_json_atomic(destination / "manifest.json", manifest)
     return destination
