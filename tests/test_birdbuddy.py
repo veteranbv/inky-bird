@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import stat
 import unittest
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 from inky_bird_frame.birdbuddy import (
     _CONFIRMED_HISTORY,
@@ -980,11 +983,12 @@ class BirdBuddyTests(unittest.TestCase):
             )
 
     def test_revoked_refresh_token_has_actionable_redacted_error(self) -> None:
+        opener = MagicMock()
+        opener.open.side_effect = HTTPError(
+            "https://example.test/graphql", 401, "Unauthorized", Message(), io.BytesIO()
+        )
         with (
-            patch(
-                "inky_bird_frame.birdbuddy._graphql_request",
-                side_effect=DataSourceError("HTTP 401 from Bird Buddy API"),
-            ),
+            patch("inky_bird_frame.http.build_opener", return_value=opener),
             self.assertRaisesRegex(DataSourceError, "run birdbuddy login again") as raised,
         ):
             _refresh_access_token("private-refresh-token")

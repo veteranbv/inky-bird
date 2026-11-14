@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
+from urllib.error import HTTPError
 
 from .birds import BirdBuddySpecies, ObservationWindow
 from .errors import DataSourceError
@@ -208,11 +209,25 @@ class BirdBuddyFeederSelectionRequiredError(DataSourceError):
         )
 
 
+class _GraphQLRejectedError(DataSourceError):
+    """The API answered with GraphQL errors instead of data."""
+
+
+class _RefreshRejectedError(DataSourceError):
+    """Bird Buddy rejected the refresh token itself, not the request."""
+
+
+_SESSION_INVALID: Final = "Bird Buddy session is invalid; run birdbuddy login again"
+
+
 @dataclass(frozen=True)
 class BirdBuddyAuthState:
     authorization_confirmed_at: str
     feeder: BirdBuddyFeeder
     refresh_token: str
+    # The last token Bird Buddy accepted, kept for one retry when the current
+    # token is rejected. Absent in state written by earlier releases.
+    previous_refresh_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +359,16 @@ def _history_path(state_dir: Path) -> Path:
 
 
 @contextmanager
+def _state_errors() -> Iterator[None]:
+    try:
+        yield
+    except OSError as exc:
+        raise DataSourceError(
+            "Bird Buddy could not use its state folder. Check its permissions and free space."
+        ) from exc
+
+
+@contextmanager
 def _auth_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "birdbuddy-auth.lock").open("a+") as handle:
@@ -381,20 +406,20 @@ def _sync_lock(state_dir: Path) -> Iterator[None]:
 
 def _require_private_file(path: Path, label: str) -> None:
     if path.is_symlink():
-        raise DataSourceError(f"Refusing symlinked {label} state: {path}")
+        raise DataSourceError(f"Refusing symlinked {label} state: {path.name}")
     permissions = stat.S_IMODE(path.stat().st_mode)
     if permissions & 0o077:
-        raise DataSourceError(f"{label} state must use mode 0600: {path}")
+        raise DataSourceError(f"{label} state must use mode 0600: {path.name}")
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, object]:
     _require_private_file(path, label)
     try:
-        value: object = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DataSourceError(f"Invalid {label} state: {path}") from exc
+        value: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DataSourceError(f"Invalid {label} state: {path.name}") from exc
     if not isinstance(value, dict):
-        raise DataSourceError(f"Invalid {label} state: {path}")
+        raise DataSourceError(f"Invalid {label} state: {path.name}")
     return value
 
 
@@ -430,7 +455,7 @@ def _graphql_data(payload: object, operation: str) -> dict[str, object]:
         raise DataSourceError(f"Bird Buddy {operation} response was not an object")
     errors = payload.get("errors")
     if isinstance(errors, list) and errors:
-        raise DataSourceError(f"Bird Buddy {operation} failed")
+        raise _GraphQLRejectedError(f"Bird Buddy {operation} failed")
     data = payload.get("data")
     if not isinstance(data, dict):
         raise DataSourceError(f"Bird Buddy {operation} response did not include data")
@@ -496,13 +521,18 @@ def _auth_payload(state: BirdBuddyAuthState) -> dict[str, object]:
             "role": state.feeder.role,
         },
         "refresh_token": state.refresh_token,
+        **(
+            {"previous_refresh_token": state.previous_refresh_token}
+            if state.previous_refresh_token is not None
+            else {}
+        ),
     }
 
 
 def _read_auth_state(state_dir: Path) -> BirdBuddyAuthState:
     path = _auth_path(state_dir)
     if path.is_symlink():
-        raise DataSourceError(f"Refusing symlinked Bird Buddy authentication state: {path}")
+        raise DataSourceError(f"Refusing symlinked Bird Buddy authentication state: {path.name}")
     if not path.exists():
         raise DataSourceError("Bird Buddy is not authenticated; run birdbuddy login")
     value = _read_json_object(path, "Bird Buddy authentication")
@@ -510,6 +540,8 @@ def _read_auth_state(state_dir: Path) -> BirdBuddyAuthState:
         raise DataSourceError("Unsupported Bird Buddy authentication state schema")
     authorization_confirmed_at = _nonempty_string(value.get("authorization_confirmed_at"))
     refresh_token = _nonempty_string(value.get("refresh_token"))
+    raw_previous = value.get("previous_refresh_token")
+    previous_refresh_token = _nonempty_string(raw_previous)
     feeder_value = value.get("feeder")
     if isinstance(feeder_value, dict):
         feeder = BirdBuddyFeeder(
@@ -523,12 +555,15 @@ def _read_auth_state(state_dir: Path) -> BirdBuddyAuthState:
         authorization_confirmed_at is None
         or parse_utc_timestamp(authorization_confirmed_at) is None
         or refresh_token is None
+        or (raw_previous is not None and previous_refresh_token is None)
         or not feeder.feeder_id
         or not feeder.name
         or feeder.role not in {"member", "owner"}
     ):
         raise DataSourceError("Invalid Bird Buddy authentication state")
-    return BirdBuddyAuthState(authorization_confirmed_at, feeder, refresh_token)
+    return BirdBuddyAuthState(
+        authorization_confirmed_at, feeder, refresh_token, previous_refresh_token
+    )
 
 
 def login_birdbuddy(
@@ -548,7 +583,7 @@ def login_birdbuddy(
     feeder = _select_feeder(feeders, feeder_id)
     confirmed_at = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).isoformat()
     state = BirdBuddyAuthState(confirmed_at, feeder, refresh_token)
-    with _auth_lock(state_dir):
+    with _state_errors(), _auth_lock(state_dir):
         write_json_atomic(_auth_path(state_dir), _auth_payload(state), mode=0o600)
     return {
         "authenticated": True,
@@ -563,18 +598,22 @@ def login_birdbuddy(
 
 
 def logout_birdbuddy(state_dir: Path) -> dict[str, object]:
-    with _auth_lock(state_dir):
-        path = _auth_path(state_dir)
-        if path.is_symlink():
-            raise DataSourceError(f"Refusing symlinked Bird Buddy authentication state: {path}")
-        removed = path.exists()
-        if removed:
-            _require_private_file(path, "Bird Buddy authentication")
-            path.unlink()
+    with _state_errors():
+        with _auth_lock(state_dir):
+            path = _auth_path(state_dir)
+            if path.is_symlink():
+                raise DataSourceError(
+                    f"Refusing symlinked Bird Buddy authentication state: {path.name}"
+                )
+            removed = path.exists()
+            if removed:
+                _require_private_file(path, "Bird Buddy authentication")
+                path.unlink()
+        history_preserved = _history_path(state_dir).exists()
     return {
         "authenticated": False,
         "local_authentication_removed": removed,
-        "history_preserved": _history_path(state_dir).exists(),
+        "history_preserved": history_preserved,
         "remote_token_revoked": False,
     }
 
@@ -586,41 +625,65 @@ def _refresh_access_token(refresh_token: str) -> tuple[str, str]:
             {"input": {"token": refresh_token}},
             "token refresh",
         )
+    except _GraphQLRejectedError as exc:
+        # The API gives no typed reason; a rejected renewal may also be a
+        # temporary refusal, so it does not claim the session is gone.
+        raise _RefreshRejectedError(
+            "Bird Buddy did not renew the sign-in. If this continues, run birdbuddy login again"
+        ) from exc
     except DataSourceError as exc:
-        if str(exc) in {
-            "Bird Buddy token refresh failed",
-            "HTTP 401 from Bird Buddy API",
-            "HTTP 403 from Bird Buddy API",
-        }:
-            raise DataSourceError(
-                "Bird Buddy session is invalid; run birdbuddy login again"
-            ) from exc
+        if isinstance(exc.__cause__, HTTPError) and exc.__cause__.code in {401, 403}:
+            raise _RefreshRejectedError(_SESSION_INVALID) from exc
         raise
     tokens = data.get("authRefreshToken")
-    if not isinstance(tokens, dict):
-        raise DataSourceError("Bird Buddy session is invalid; run birdbuddy login again")
-    access_token = _nonempty_string(tokens.get("accessToken"))
-    replacement = _nonempty_string(tokens.get("refreshToken"))
+    access_token = _nonempty_string(tokens.get("accessToken")) if isinstance(tokens, dict) else None
+    replacement = _nonempty_string(tokens.get("refreshToken")) if isinstance(tokens, dict) else None
     if access_token is None or replacement is None:
-        raise DataSourceError("Bird Buddy session is invalid; run birdbuddy login again")
+        raise DataSourceError("Bird Buddy returned an incomplete sign-in renewal; try again later")
     return access_token, replacement
+
+
+def _renew_session(state: BirdBuddyAuthState) -> tuple[str, str, str]:
+    """Return access token, replacement and the refresh token Bird Buddy accepted."""
+    try:
+        access_token, replacement = _refresh_access_token(state.refresh_token)
+    except _RefreshRejectedError as rejection:
+        previous = state.previous_refresh_token
+        if previous is None or previous == state.refresh_token:
+            raise
+        # One retry covers a renewal Bird Buddy did not complete; a second
+        # rejection reports the current token's failure.
+        try:
+            access_token, replacement = _refresh_access_token(previous)
+        except _RefreshRejectedError:
+            raise rejection from rejection.__cause__
+        return access_token, replacement, previous
+    return access_token, replacement, state.refresh_token
 
 
 def _refreshed_access_token(state_dir: Path) -> tuple[str, BirdBuddyFeeder]:
     with _auth_lock(state_dir):
         state = _read_auth_state(state_dir)
-        access_token, replacement = _refresh_access_token(state.refresh_token)
-        write_json_atomic(
-            _auth_path(state_dir),
-            _auth_payload(
-                BirdBuddyAuthState(
-                    state.authorization_confirmed_at,
-                    state.feeder,
-                    replacement,
-                )
-            ),
-            mode=0o600,
-        )
+        access_token, replacement, used_token = _renew_session(state)
+        try:
+            write_json_atomic(
+                _auth_path(state_dir),
+                _auth_payload(
+                    BirdBuddyAuthState(
+                        state.authorization_confirmed_at,
+                        state.feeder,
+                        replacement,
+                        used_token,
+                    )
+                ),
+                mode=0o600,
+            )
+        except OSError as exc:
+            raise DataSourceError(
+                "Bird Buddy renewed the sign-in, but Inky could not save it. Check the state "
+                "folder's permissions and free space; if the next sync fails, run birdbuddy "
+                "login again"
+            ) from exc
     return access_token, state.feeder
 
 
@@ -1312,7 +1375,7 @@ def _parse_feeder_history(value: object) -> FeederHistory:
 def _read_history(state_dir: Path) -> dict[str, FeederHistory]:
     path = _history_path(state_dir)
     if path.is_symlink():
-        raise DataSourceError(f"Refusing symlinked Bird Buddy detection state: {path}")
+        raise DataSourceError(f"Refusing symlinked Bird Buddy detection state: {path.name}")
     if not path.exists():
         return {}
     value = _read_json_object(path, "Bird Buddy detection")
@@ -1763,7 +1826,7 @@ def sync_birdbuddy_detections(
         raise ValueError("Bird Buddy species limit must be greater than zero")
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
     sync_lock = _sync_lock(state_dir) if persist_history else nullcontext()
-    with sync_lock:
+    with _state_errors(), sync_lock:
         access_token, feeder = _refreshed_access_token(state_dir)
         incoming, pages, processed, ignored = _fetch_postcards(access_token, feeder.feeder_id)
         confirmed = _fetch_confirmed_history(
@@ -1812,12 +1875,15 @@ def read_birdbuddy_history_species(
     state_dir: Path, *, include_manual_sightings: bool = False
 ) -> tuple[list[BirdBuddySpecies], str]:
     """Read one selected feeder's retained history; never refresh authentication."""
-    with _history_lock(state_dir):
-        histories = _read_history(state_dir)
-    if not histories:
-        return [], "No retained feeder history"
-    if _auth_path(state_dir).exists():
-        selected = _read_auth_state(state_dir).feeder.feeder_id
+    with _state_errors():
+        with _history_lock(state_dir):
+            histories = _read_history(state_dir)
+        if not histories:
+            return [], "No retained feeder history"
+        auth_present = _auth_path(state_dir).exists()
+        selected_state = _read_auth_state(state_dir) if auth_present else None
+    if selected_state is not None:
+        selected = selected_state.feeder.feeder_id
     elif len(histories) == 1:
         selected = next(iter(histories))
     else:
@@ -1837,9 +1903,14 @@ def read_birdbuddy_history_species(
 def birdbuddy_status(
     state_dir: Path, *, include_manual_sightings: bool = False
 ) -> dict[str, object]:
+    with _state_errors():
+        return _birdbuddy_status(state_dir, include_manual_sightings=include_manual_sightings)
+
+
+def _birdbuddy_status(state_dir: Path, *, include_manual_sightings: bool) -> dict[str, object]:
     path = _auth_path(state_dir)
     if path.is_symlink():
-        raise DataSourceError(f"Refusing symlinked Bird Buddy authentication state: {path}")
+        raise DataSourceError(f"Refusing symlinked Bird Buddy authentication state: {path.name}")
     if not path.exists():
         history_present = _history_path(state_dir).exists()
         if history_present:
