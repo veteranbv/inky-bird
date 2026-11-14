@@ -53,8 +53,8 @@ class ZipParsingTests(unittest.TestCase):
                     {
                         "place name": "Exampleville",
                         "state abbreviation": "XY",
-                        "latitude": "38.25",
-                        "longitude": "-77.50",
+                        "latitude": "1.25",
+                        "longitude": "-2.50",
                     }
                 ]
             },
@@ -63,8 +63,8 @@ class ZipParsingTests(unittest.TestCase):
         self.assertEqual(location.postal_code, "12345")
         self.assertEqual(location.place_name, "Exampleville")
         self.assertEqual(location.state, "XY")
-        self.assertEqual(location.latitude, 38.25)
-        self.assertEqual(location.longitude, -77.50)
+        self.assertEqual(location.latitude, 1.25)
+        self.assertEqual(location.longitude, -2.50)
         self.assertEqual(location.country_code, "us")
         self.assertEqual(location.geocoder, "zippopotam")
         self.assertEqual(location.label, "Exampleville, XY | postal code 12345")
@@ -122,49 +122,49 @@ class GeoapifyParsingTests(unittest.TestCase):
             "features": [
                 {
                     "properties": {
-                        "postcode": "SW1A 2AA",
+                        "postcode": "ZZ1 2ZZ",
                         "country_code": "gb",
-                        "lat": 51.5,
-                        "lon": -0.1,
+                        "lat": 1.0,
+                        "lon": 2.0,
                     }
                 }
             ]
         }
 
         with self.assertRaisesRegex(DataSourceError, "no exact match"):
-            parse_geoapify_postcode_response("SW1A 1AA", "gb", payload)
+            parse_geoapify_postcode_response("ZZ1 1ZZ", "gb", payload)
 
     def test_rejects_ambiguous_exact_postcode_results(self) -> None:
         payload = {
             "features": [
                 {
                     "properties": {
-                        "postcode": "100 00",
+                        "postcode": "999 99",
                         "country_code": "cz",
-                        "lat": 50.1,
-                        "lon": 14.4,
+                        "lat": 1.0,
+                        "lon": 2.0,
                     }
                 },
                 {
                     "properties": {
-                        "postcode": "10000",
+                        "postcode": "99999",
                         "country_code": "cz",
-                        "lat": 50.2,
-                        "lon": 14.5,
+                        "lat": 1.5,
+                        "lon": 2.5,
                     }
                 },
             ]
         }
 
         with self.assertRaisesRegex(DataSourceError, "multiple locations"):
-            parse_geoapify_postcode_response("100 00", "cz", payload)
+            parse_geoapify_postcode_response("999 99", "cz", payload)
 
     def test_accepts_duplicate_results_that_differ_only_by_rounding(self) -> None:
         payload = {
             "features": [
                 {
                     "properties": {
-                        "postcode": "100 00",
+                        "postcode": "999 99",
                         "country_code": "cz",
                         "city": "Exampleville",
                         "lat": 1.25,
@@ -173,7 +173,7 @@ class GeoapifyParsingTests(unittest.TestCase):
                 },
                 {
                     "properties": {
-                        "postcode": "10000",
+                        "postcode": "99999",
                         "country_code": "cz",
                         "city": "Exampleville",
                         "lat": 1.2500004,
@@ -183,7 +183,7 @@ class GeoapifyParsingTests(unittest.TestCase):
             ]
         }
 
-        location = parse_geoapify_postcode_response("100 00", "cz", payload)
+        location = parse_geoapify_postcode_response("999 99", "cz", payload)
 
         self.assertEqual((location.latitude, location.longitude), (1.25, 2.5))
 
@@ -192,10 +192,10 @@ class GeoapifyParsingTests(unittest.TestCase):
             patch("inky_bird_frame.geo.get_json", return_value={"features": []}) as get,
             self.assertRaises(DataSourceError),
         ):
-            lookup_geoapify_postcode("SW1A 1AA", "gb", "private-key")
+            lookup_geoapify_postcode("ZZ1 1ZZ", "gb", "private-key")
 
         url = get.call_args.args[0]
-        self.assertIn("postcode=SW1A+1AA", url)
+        self.assertIn("postcode=ZZ1+1ZZ", url)
         self.assertIn("countrycode=gb", url)
         self.assertIn("apiKey=private-key", url)
         self.assertEqual(get.call_args.kwargs["error_label"], "Geoapify Postcode API")
@@ -204,20 +204,20 @@ class GeoapifyParsingTests(unittest.TestCase):
 class DiscoveryLocationTests(unittest.TestCase):
     def test_resolves_configured_coordinates_without_network(self) -> None:
         config = discovery_config(
-            latitude=51.5,
-            longitude=-0.1,
+            latitude=1.5,
+            longitude=2.5,
         )
         with patch("inky_bird_frame.geo.get_json") as get:
             location = resolve_discovery_location(config)
 
-        self.assertEqual(location.latitude, 51.5)
-        self.assertEqual(location.longitude, -0.1)
+        self.assertEqual(location.latitude, 1.5)
+        self.assertEqual(location.longitude, 2.5)
         self.assertEqual(location.geocoder, "configured")
         get.assert_not_called()
 
     def test_resolves_geoapify_postcode_configuration(self) -> None:
         config = discovery_config(
-            postal_code="SW1A 1AA",
+            postal_code="ZZ1 1ZZ",
             country_code="gb",
             geoapify_api_key="secret",
         )
@@ -226,7 +226,7 @@ class DiscoveryLocationTests(unittest.TestCase):
             location = resolve_discovery_location(config)
 
         self.assertIs(location, expected)
-        lookup.assert_called_once_with("SW1A 1AA", "gb", "secret")
+        lookup.assert_called_once_with("ZZ1 1ZZ", "gb", "secret")
 
     def test_resolves_legacy_us_zip_configuration(self) -> None:
         config = discovery_config(zip_code="12345")
