@@ -170,9 +170,12 @@ def settings_status(initial: AppConfig) -> dict[str, object]:
             ],
         },
         "backup_available": previous.is_file(),
+        # The name the first browser save keeps (or has kept) the operator's
+        # file under; whether that copy exists yet is reported separately.
         "original_backup": original.name
         if managed or original.is_file() or original.is_symlink()
         else None,
+        "original_backup_available": original.is_file(),
         "adoption_notice": (
             (
                 f"An earlier copy is already kept in {original.name}. "

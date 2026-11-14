@@ -393,6 +393,7 @@ def test_adoption_keeps_the_operator_file_unchanged_across_later_saves(tmp_path:
     initial = load_config(path)
     status = settings_status(initial)
     assert status["original_backup"] == "config.toml.original"
+    assert status["original_backup_available"] is False
     assert "config.toml.original" in str(status["adoption_notice"])
     assert "never change" in str(status["adoption_notice"])
     result = save_settings(initial, revision=str(status["revision"]), changes={}, adopt=True)
@@ -401,6 +402,7 @@ def test_adoption_keeps_the_operator_file_unchanged_across_later_saves(tmp_path:
     assert kept.read_bytes() == original
     assert kept.stat().st_mode & 0o777 == 0o600
     adopted = load_config(path)
+    assert settings_status(adopted)["original_backup_available"] is True
     for window in ("all-time", "last-30-days"):
         status = settings_status(adopted)
         save_settings(
@@ -417,6 +419,7 @@ def test_adoption_never_replaces_an_existing_original_copy(tmp_path: Path) -> No
     kept.chmod(0o600)
     initial = load_config(path)
     status = settings_status(initial)
+    assert status["original_backup_available"] is True
     notice = str(status["adoption_notice"])
     assert "already kept in config.toml.original" in notice
     assert "config.toml.previous" in notice
