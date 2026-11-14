@@ -46,6 +46,18 @@ MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 # reads before ZipFile allocates entries, including ZIP64 directory metadata.
 # This is separate from the streamed CSV limit and needs no custom ZIP parser.
 MAX_ZIP_METADATA_BYTES = 46 + 3 * (2**16 - 1)
+# The byte ceiling alone still lets a hostile file of tiny rows or of distinct
+# names exhaust a small controller's memory. These bounds sit well above the
+# largest personal exports: the official export has 23 columns and a row is a
+# few hundred characters.
+MAX_ROWS = 3_000_000
+MAX_CHECKLISTS = 500_000
+MAX_SPECIES = 50_000
+MAX_COLUMNS = 256
+MAX_LINE_CHARACTERS = 256 * 1024
+# A ZIP file starts with a local file header; one that is no longer a readable
+# ZIP was cut short, not exported as CSV.
+_ZIP_MAGIC = b"PK\x03\x04"
 
 
 class _BoundedZipMetadata(BufferedReader):
@@ -348,6 +360,9 @@ def _open_archive_csv(archive_path: Path) -> Iterator[TextIO]:
         raise DataSourceError("Could not read eBird archive") from exc
     if not is_zip:
         try:
+            with archive_path.open("rb") as probe:
+                if probe.read(len(_ZIP_MAGIC)) == _ZIP_MAGIC:
+                    raise DataSourceError("This eBird export is damaged; download it again")
             _validate_input_size(archive_path.stat().st_size)
             with archive_path.open("r", encoding="utf-8-sig", newline="") as handle:
                 yield handle
@@ -384,6 +399,16 @@ def _open_archive_csv(archive_path: Path) -> Iterator[TextIO]:
         raise DataSourceError("Could not read eBird archive") from exc
 
 
+def _bounded_lines(handle: TextIO) -> Iterator[str]:
+    """Feed the CSV reader physical lines, refusing one too long to hold in memory."""
+    number = 0
+    while line := handle.readline(MAX_LINE_CHARACTERS + 1):
+        number += 1
+        if len(line) > MAX_LINE_CHARACTERS:
+            raise DataSourceError(f"eBird archive line {number} is too long")
+        yield line
+
+
 def _required_text(row: dict[str, str | None], name: str, line: int) -> str:
     value = row.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -406,14 +431,18 @@ def _parse_archive(
     locations: dict[str, str] | None = None,
 ) -> tuple[dict[str, _StoredChecklist], int, int, date, date]:
     builders: dict[str, tuple[date, dict[str, _StoredSpecies]]] = {}
+    # One shared object per name pair keeps memory proportional to species, not rows.
+    known_species: dict[_StoredSpecies, _StoredSpecies] = {}
     rows = duplicate_rows = 0
     # Text is decoded in blocks, so a decoding failure is reported near, not at, a row.
     line: int | None = None
     with _open_archive_csv(archive_path) as handle:
         try:
-            reader = csv.DictReader(handle, strict=True)
+            reader = csv.DictReader(_bounded_lines(handle), strict=True)
             fieldnames = reader.fieldnames or []
             line = 1
+            if len(fieldnames) > MAX_COLUMNS:
+                raise DataSourceError(f"eBird archive has more than {MAX_COLUMNS} columns")
             if len(fieldnames) != len(set(fieldnames)):
                 raise DataSourceError("eBird archive contains duplicate columns")
             missing = [name for name in REQUIRED_COLUMNS if name not in fieldnames]
@@ -425,6 +454,8 @@ def _parse_archive(
                 if len(row) != len(fieldnames):
                     raise DataSourceError(f"Malformed eBird archive row {line}")
                 rows += 1
+                if rows > MAX_ROWS:
+                    raise DataSourceError(f"eBird archive has more than {MAX_ROWS:,} rows")
                 submission_id = _required_text(row, "Submission ID", line)
                 common_name = _species_name(row, "Common Name", line)
                 scientific_name = _species_name(row, "Scientific Name", line)
@@ -440,6 +471,10 @@ def _parse_archive(
                     locations[fingerprint] = location
                 checklist = builders.get(fingerprint)
                 if checklist is None:
+                    if len(builders) >= MAX_CHECKLISTS:
+                        raise DataSourceError(
+                            f"eBird archive has more than {MAX_CHECKLISTS:,} checklists"
+                        )
                     species_by_name: dict[str, _StoredSpecies] = {}
                     builders[fingerprint] = (observed_on, species_by_name)
                 else:
@@ -449,6 +484,13 @@ def _parse_archive(
                             f"Conflicting dates for one eBird checklist on row {line}"
                         )
                 species = _StoredSpecies(scientific_name, common_name)
+                if species not in known_species:
+                    if len(known_species) >= MAX_SPECIES:
+                        raise DataSourceError(
+                            f"eBird archive has more than {MAX_SPECIES:,} species"
+                        )
+                    known_species[species] = species
+                species = known_species[species]
                 existing = species_by_name.get(scientific_name)
                 if existing is not None:
                     if existing != species:
