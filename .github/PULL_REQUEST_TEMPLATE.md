@@ -20,6 +20,9 @@ uv run ruff check .
 uv run mypy
 uv run pytest
 uv run inky-bird catalog validate --catalog catalog
+for source in src/inky_bird_frame/web/*.js; do
+  node --input-type=module --check < "$source"
+done
 node --test tests/web/*.test.mjs
 ```
 
