@@ -4,6 +4,11 @@ External `uses:` references must name a full commit SHA and `docker://` images a
 sha256 digest. Every `runs-on:` must be one literal GitHub-hosted label: this
 public repository registers no self-hosted runner, and a workflow that asks for
 one, by the `self-hosted` label, a custom label or a runner group, fails here.
+
+The check reads lines, not parsed YAML, so it is repository hygiene rather than
+a security boundary: an escaped key or a remote reusable workflow can get past
+it, and a pull request runs its own copy. The controls are that no runner is
+registered and that outside contributors' workflows wait for approval.
 """
 
 from __future__ import annotations
