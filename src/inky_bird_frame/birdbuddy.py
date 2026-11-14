@@ -1763,11 +1763,12 @@ def _update_history(
             FeederHistory(current_iso, None, None, {}, {}, {}),
         )
         # History written before media linkage cannot safely reconcile a later
-        # confirmation. Migrate only the selected feeder after both remote
-        # snapshots succeeded; inactive feeder history must remain untouched.
-        for postcard_id, postcard in list(history.postcards.items()):
-            if not postcard.media_ids:
-                del history.postcards[postcard_id]
+        # confirmation. Migrate only the selected feeder after a complete
+        # confirmed snapshot; inactive feeder history must remain untouched.
+        if confirmed_complete:
+            for postcard_id, postcard in list(history.postcards.items()):
+                if not postcard.media_ids:
+                    del history.postcards[postcard_id]
         duplicates = 0
         reclassified_postcard_ids: set[str] = set()
         for postcard in incoming:

@@ -15,6 +15,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from inky_bird_frame.birdbuddy import (
+    _CONFIRMED_HISTORY,
     _FEED_QUERIES,
     _REFRESH_TOKEN,
     ArchivedPostcardLink,
@@ -576,6 +577,104 @@ class PartialConfirmedSyncTests(unittest.TestCase):
         self.assertIs(partial.stats.as_dict()["confirmed_history_complete"], False)
         self.assertEqual(complete.species, [])
         self.assertIs(complete.stats.as_dict()["confirmed_history_complete"], True)
+
+
+class ConfirmedHistoryApi(FakeBirdBuddyApi):
+    """Serve an empty feed and the given confirmed-history pages in order."""
+
+    def __init__(self, confirmed_pages: list[dict[str, object]]) -> None:
+        super().__init__(page(), page())
+        self.confirmed_pages = list(confirmed_pages)
+
+    def __call__(
+        self,
+        query: str,
+        variables: dict[str, object],
+        operation: str,
+        *,
+        access_token: str | None = None,
+    ) -> dict[str, object]:
+        if query == _CONFIRMED_HISTORY:
+            return self.confirmed_pages.pop(0)
+        return super().__call__(query, variables, operation, access_token=access_token)
+
+
+class LegacyPostcardMigrationTests(unittest.TestCase):
+    """Postcards saved before media linkage are dropped only after a complete snapshot."""
+
+    def sync_over_legacy_history(
+        self, confirmed_pages: list[dict[str, object]], *, max_pages: int = 100
+    ) -> tuple[list[str], list[dict[str, object]]]:
+        legacy = {
+            "id": "postcard-legacy",
+            "observed_at": "2026-08-03T09:00:00+00:00",
+            "species": [
+                {
+                    "id": "species-bluebird",
+                    "common_name": "Eastern Bluebird",
+                    "scientific_name": "Sialia sialis",
+                }
+            ],
+        }
+        payload = {
+            "schema_version": 1,
+            "feeders": {
+                "feeder-1": {
+                    "history_started_at": "2026-08-01T00:00:00+00:00",
+                    "earliest_initial_feed_at": legacy["observed_at"],
+                    "last_successful_sync_at": "2026-08-02T00:00:00+00:00",
+                    "postcards": [legacy],
+                    "archived_species": {},
+                    "confirmed_species": [],
+                }
+            },
+        }
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in(state_dir)
+            history_path = state_dir / "birdbuddy-detections.json"
+            history_path.write_text(json.dumps(payload))
+            history_path.chmod(0o600)
+            with (
+                patch("inky_bird_frame.birdbuddy.BIRDBUDDY_MAX_CONFIRMED_PAGES", max_pages),
+                patch(
+                    "inky_bird_frame.birdbuddy._graphql_request",
+                    side_effect=ConfirmedHistoryApi(confirmed_pages),
+                ),
+            ):
+                result = sync_birdbuddy_detections(
+                    state_dir, window=ObservationWindow.ALL_TIME, limit=20, now=NOW
+                )
+            stored = json.loads(history_path.read_text())["feeders"]["feeder-1"]["postcards"]
+        return [item.scientific_name for item in result.species], stored
+
+    def test_snapshot_with_a_skipped_record_keeps_the_legacy_postcard(self) -> None:
+        malformed = confirmed_record("media-2")
+        assert isinstance(malformed["media"], dict)
+        malformed["media"]["createdAt"] = None
+        species, stored = self.sync_over_legacy_history(
+            [confirmed_page(confirmed_record("media-1"), malformed)]
+        )
+
+        self.assertIn("Sialia sialis", species)
+        self.assertEqual([item["id"] for item in stored], ["postcard-legacy"])
+
+    def test_snapshot_cut_at_the_page_bound_keeps_the_legacy_postcard(self) -> None:
+        species, stored = self.sync_over_legacy_history(
+            [confirmed_page(confirmed_record("media-1"), next_cursor="cursor-1")],
+            max_pages=1,
+        )
+
+        self.assertIn("Sialia sialis", species)
+        self.assertEqual([item["id"] for item in stored], ["postcard-legacy"])
+
+    def test_complete_snapshot_drops_the_legacy_postcard(self) -> None:
+        species, stored = self.sync_over_legacy_history(
+            [confirmed_page(confirmed_record("media-1"))]
+        )
+
+        self.assertNotIn("Sialia sialis", species)
+        self.assertEqual(stored, [])
 
 
 class HistoryFileTests(BirdBuddyResilienceTestCase):
