@@ -323,7 +323,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                     # Do not return the secret or its reference to unsigned-in clients.
                     import os
 
-                    if not os.environ.get(config.oidc.client_secret_env):
+                    if not os.environ.get(config.oidc.client_secret_env, "").strip():
                         raise OIDCError(
                             "Sign-in provider secret is unavailable; ask the installer to check it"
                         )

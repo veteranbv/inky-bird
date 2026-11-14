@@ -659,3 +659,35 @@ def test_bundled_owner_page_uses_external_assets_and_cannot_frame(tmp_path: Path
         assert favicon.status_code == 200
         assert favicon.content.startswith(b"\x00\x00\x01\x00")
         assert client.get("/app/../access.json").status_code == 404
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_blank_sign_in_secret_is_reported_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    oidc = OIDCConfig(
+        "https://id.example.test/",
+        "client",
+        "https://inky.example.test/v1/owner/oidc/callback",
+        "SYNTHETIC_BLANK_SECRET",
+    )
+    config = replace(_config(tmp_path), oidc=oidc)
+    origin = "https://inky.example.test"
+    monkeypatch.setenv("SYNTHETIC_BLANK_SECRET", value)
+    AccessStore(config.state_dir).setup_owner("birder", PASSPHRASE)
+    with (
+        patch("inky_bird_frame.web.metadata", new=AsyncMock(return_value={})),
+        TestClient(create_app(config), base_url=origin) as client,
+    ):
+        client.post(
+            "/v1/owner/login",
+            json={"username": "birder", "passphrase": PASSPHRASE},
+            headers={"Origin": origin},
+        )
+        provider = client.get("/v1/owner/access").json()["data"]["provider"]
+    assert provider["ready"] is False
+    assert provider["error"] == (
+        "Sign-in provider secret is unavailable; ask the installer to check it"
+    )
