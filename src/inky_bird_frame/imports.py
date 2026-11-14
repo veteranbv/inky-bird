@@ -26,7 +26,7 @@ from .birdnet_analyzer import (
     analyzer_history_revision,
     import_birdnet_analyzer_csv,
 )
-from .birds import date_range_for_window, resolve_ebird_archive_species
+from .birds import EbirdArchiveSpecies, date_range_for_window, resolve_ebird_archive_names
 from .catalog import catalog_state_lock
 from .config import AppConfig, DiscoveryProvider
 from .ebird_archive import (
@@ -50,6 +50,7 @@ from .journal import (
     JournalError,
     JournalMember,
     JournalService,
+    JournalState,
     MemberOrigin,
     _dates,
     _label,
@@ -70,6 +71,13 @@ MAX_UPLOAD_BYTES = MAX_UNCOMPRESSED_BYTES
 # need headroom. Keep four upload ceilings free before admitting an upload.
 MIN_IMPORT_FREE_BYTES = 4 * MAX_UPLOAD_BYTES
 IMPORT_KINDS = {"ebird-archive", "birdnet-analyzer"}
+# Trip preview runs on the single owner worker. Look up at most this many new
+# names per preview, within this many seconds; previewing again continues.
+TRIP_PREVIEW_LOOKUP_LIMIT = 30
+TRIP_PREVIEW_LOOKUP_SECONDS = 60.0
+# The owner app stops a transfer after 30 minutes while holding the owner
+# reservation. A receiving upload older than this was interrupted.
+STALE_UPLOAD_SECONDS = 60 * 60
 
 
 def _read_private(path: Path, maximum: int) -> bytes:
@@ -123,8 +131,11 @@ class HistoryImports:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.root = config.controller.state_dir / "owner-import"
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = self.root.lstat()
+        try:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = self.root.lstat()
+        except OSError as exc:
+            raise OwnerOperationError("Import staging is unavailable. Check storage.") from exc
         if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
             raise OwnerOperationError("Import staging must be a private directory with mode 0700")
         self.path = self.root / "upload.bin"
@@ -226,10 +237,29 @@ class HistoryImports:
         self.metadata_path.unlink(missing_ok=True)
 
     def cleanup_expired(self) -> None:
+        """Remove expired or interrupted staging; failures surface only as owner errors."""
+        try:
+            self._cleanup()
+        except OwnerOperationError:
+            raise
+        except Exception as exc:
+            raise OwnerOperationError(
+                "Private import cleanup could not finish. Check storage; "
+                "confirmed history is not changed."
+            ) from exc
+
+    def _cleanup(self) -> None:
         value = self._read()
-        if value is not None and datetime.now(UTC) >= cast(
-            datetime, parse_utc_timestamp(value["expires_at"])
-        ):
+        if value is None:
+            # A raw file is only ever staged after its preview record.
+            self.path.unlink(missing_ok=True)
+            return
+        now = datetime.now(UTC)
+        interrupted = (
+            value.get("status") == "receiving"
+            and now.timestamp() - self.metadata_path.lstat().st_mtime > STALE_UPLOAD_SECONDS
+        )
+        if interrupted or now >= cast(datetime, parse_utc_timestamp(value["expires_at"])):
             self.cancel(cast(str, value["upload_id"]))
 
     def edit_trip(self, upload_id: str) -> None:
@@ -562,7 +592,9 @@ class HistoryImports:
         label: object,
         collection_id: object,
         revision: object,
-    ) -> JournalCollection:
+        lookup_limit: int = 0,
+    ) -> tuple[JournalCollection, frozenset[str]]:
+        """Build the trip and return the names ``lookup_limit`` left unlooked-up."""
         expected = _revision(revision)
         start, end = _dates(start_date, end_date)
         if start is None or end is None:
@@ -592,13 +624,18 @@ class HistoryImports:
         by_name = {
             species.scientific_name: species for record in chosen for species in record.species
         }
+        resolution = resolve_ebird_archive_names(
+            [
+                EbirdArchiveSpecies(species.common_name, name, 1)
+                for name, species in sorted(by_name.items())
+            ],
+            self.config.controller.state_dir / "ebird-archive-taxonomy-crosswalk.json",
+            max_lookups=lookup_limit,
+            deadline_seconds=TRIP_PREVIEW_LOOKUP_SECONDS,
+        )
         members: dict[tuple[int | None, str], JournalMember] = {}
         for name, species in sorted(by_name.items()):
-            resolved, _ = resolve_ebird_archive_species(
-                [species],
-                self.config.controller.state_dir / "ebird-archive-taxonomy-crosswalk.json",
-            )
-            identity = resolved[0] if resolved else None
+            identity = resolution.resolved.get(name)
             evidence = tuple(
                 ChecklistEvidence(record.checklist_hash, name)
                 for record in chosen
@@ -639,7 +676,7 @@ class HistoryImports:
             end,
             expected + 1,
             expected + 1,
-        )
+        ), frozenset(item.scientific_name for item in resolution.deferred)
 
     def preview_trip(self, upload_id: str, **choices: object) -> dict[str, object]:
         value = self._checked(upload_id)
@@ -656,7 +693,7 @@ class HistoryImports:
         }
         if set(choices) != required or not isinstance(choices["history_revision"], str):
             raise JournalError("Review a complete checklist selection")
-        group = self._trip_group(
+        group, deferred = self._trip_group(
             history_revision=choices["history_revision"],
             checklist_keys=choices["checklist_keys"],
             start_date=choices["start_date"],
@@ -664,24 +701,53 @@ class HistoryImports:
             label=choices["label"],
             collection_id=choices["collection_id"],
             revision=choices["revision"],
+            lookup_limit=TRIP_PREVIEW_LOOKUP_LIMIT,
         )
+        with catalog_state_lock(self.config.controller.state_dir):
+            journal = read_journal(self.config.controller.state_dir)
+        # Same encoding as the journal's own write, so saving cannot fail on size.
+        projected = JournalState(journal.revision + 1, (*journal.collections, group)).as_dict()
+        if len((json.dumps(projected, indent=2, sort_keys=True) + "\n").encode()) > (
+            MAX_JOURNAL_BYTES
+        ):
+            raise JournalError(
+                "Journal storage is full. Back it up and remove unused collections first."
+            )
         approved = {item["taxon_id"] for item in JournalService(self.config.controller).catalog()}
+        # Same shape as the collection's own unresolved list.
+        missing = [
+            (member.scientific_name in deferred, member)
+            for member in group.members
+            if member.taxon_id is None
+        ]
         result = {
             "label": group.label,
             "matched": len(group.taxon_ids),
             "ready": sum(id in approved for id in group.taxon_ids),
-            "unresolved": group.owner_dict()["unresolved"],
+            "unresolved": [
+                {"common_name": member.common_name, "scientific_name": member.scientific_name}
+                for later, member in missing
+                if not later
+            ],
+            "unresolved_for_now": len(deferred),
+            "not_looked_up": [
+                {"common_name": member.common_name, "scientific_name": member.scientific_name}
+                for later, member in missing
+                if later
+            ],
             "preview_hash": _digest(asdict(group)),
             "history_revision": choices["history_revision"],
             "notice": "Save fixes this trip's membership. "
             "It does not queue plates or change the wall.",
         }
+        if deferred:
+            result["notice"] = f"{result['notice']} {_not_looked_up(len(deferred))}"
         value["trip"] = {"choices": choices, "preview": result}
         self._write(value)
-        return {
-            "upload_id": upload_id,
-            "message": "Trip checked. Review matched and unresolved species before saving.",
-        }
+        message = "Trip checked. Review matched and unresolved species before saving."
+        if deferred:
+            message = f"Trip checked. {_not_looked_up(len(deferred))}"
+        return {"upload_id": upload_id, "message": message}
 
     def save_trip(self, upload_id: str, *, preview_hash: str) -> dict[str, object]:
         value = self._checked(upload_id)
@@ -694,7 +760,11 @@ class HistoryImports:
         ):
             raise JournalError("Preview this trip before saving")
         choices = trip["choices"]
-        group = self._trip_group(**choices)
+        # Saving uses only names already looked up, so it matches the preview.
+        group, deferred = self._trip_group(**choices)
+        if deferred:
+            # Saved unresolved members are never looked up again.
+            raise JournalError(_not_looked_up(len(deferred)))
         if _digest(asdict(group)) != preview_hash:
             raise JournalError("This trip's identities changed. Preview it again.")
         with ebird_checklists(self.config.controller.state_dir) as (revision, _):
@@ -709,6 +779,13 @@ class HistoryImports:
             "collection_id": group.collection_id,
             "revision": state.revision,
         }
+
+
+def _not_looked_up(count: int) -> str:
+    return (
+        f"{count} species were not looked up yet. "
+        "Edit the trip selection and check it again before saving."
+    )
 
 
 def recover_import(state_dir: Path, request_id: str) -> dict[str, object] | None:
