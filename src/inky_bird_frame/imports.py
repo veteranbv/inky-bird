@@ -705,7 +705,8 @@ class HistoryImports:
         )
         with catalog_state_lock(self.config.controller.state_dir):
             journal = read_journal(self.config.controller.state_dir)
-        # Same encoding as the journal's own write, so saving cannot fail on size.
+        # Same encoding as the journal's own write. A collection saved after this
+        # check can still fill the journal; saving then refuses with this message.
         projected = JournalState(journal.revision + 1, (*journal.collections, group)).as_dict()
         if len((json.dumps(projected, indent=2, sort_keys=True) + "\n").encode()) > (
             MAX_JOURNAL_BYTES
