@@ -5,7 +5,11 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -14,8 +18,13 @@ from starlette.testclient import TestClient
 from inky_bird_frame import settings as settings_module
 from inky_bird_frame.config import load_config
 from inky_bird_frame.controller import exclusive_cycle_lock
+from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.owner_operations import (
+    MAX_RECEIPT_BYTES,
+    MAX_RECEIPTS,
     MAX_RESULT_BYTES,
+    OperationKind,
+    OperationReceipt,
     OwnerOperationBusyError,
     OwnerOperationError,
     OwnerOperations,
@@ -23,7 +32,7 @@ from inky_bird_frame.owner_operations import (
 )
 from inky_bird_frame.retry_requests import RETRY_WAKE_LISTENER, retry_requests, retry_wake_token
 from inky_bird_frame.runtime_state import state_lock
-from inky_bird_frame.settings import initialize_config, settings_status
+from inky_bird_frame.settings import SettingsConflictError, initialize_config, settings_status
 from inky_bird_frame.web import create_app
 
 
@@ -389,3 +398,155 @@ def test_http_operation_boundary_and_no_secret_or_model_operation(
             101,
             202,
         ]
+
+
+def _finished_receipts(count: int, *, result_bytes: int, age: timedelta) -> dict[str, object]:
+    stamp = (datetime.now(UTC) - age).replace(microsecond=0).isoformat()
+    return {
+        "schema_version": 1,
+        "receipts": [
+            {
+                "operation_id": f"{index:032x}",
+                "key_hash": f"{index:064x}",
+                "input_hash": "0" * 64,
+                "kind": "saved-collection",
+                "status": "succeeded",
+                "created_at": stamp,
+                "updated_at": stamp,
+                "result": {"message": "x" * result_bytes},
+            }
+            for index in range(count)
+        ],
+    }
+
+
+def test_ordinary_use_never_fills_the_receipt_store(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    try:
+        last = ""
+        for index in range(MAX_RECEIPTS + 44):
+            receipt = worker.submit(
+                "saved-collection",
+                key=f"saved-birds-toggle-{index:04d}",
+                inputs={"taxon_id": index},
+                execute=lambda: {"message": "Saved birds updated."},
+            )
+            last = str(receipt["operation_id"])
+            assert completed(partial(worker.status, last))["status"] == "succeeded"
+        rows = json.loads(worker.path.read_text())["receipts"]
+        assert len(rows) == MAX_RECEIPTS
+        assert rows[-1]["operation_id"] == last
+    finally:
+        worker.close()
+
+
+def test_final_result_evicts_old_outcomes_instead_of_reporting_interrupted(
+    tmp_path: Path,
+) -> None:
+    # A nearly full file of recent outcomes, then a result at the size limit.
+    count = 70
+    while True:
+        seeded = json.dumps(
+            _finished_receipts(count, result_bytes=16_000, age=timedelta(hours=1)),
+            indent=2,
+            sort_keys=True,
+        )
+        if len(seeded.encode()) <= MAX_RECEIPT_BYTES - 1024:
+            break
+        count -= 1
+    assert len(seeded.encode()) + MAX_RESULT_BYTES > MAX_RECEIPT_BYTES
+    path = tmp_path / "owner-operations.json"
+    path.write_text(seeded)
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        receipt = worker.submit(
+            "refresh",
+            key="large-final-result-key",
+            inputs={},
+            execute=lambda: {"message": "y" * (MAX_RESULT_BYTES - 64)},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "succeeded"
+        assert result["result"] == {"message": "y" * (MAX_RESULT_BYTES - 64)}
+        body = path.read_bytes()
+        assert len(body) <= MAX_RECEIPT_BYTES
+        kept = [row["operation_id"] for row in json.loads(body)["receipts"]]
+        # Only the oldest outcomes went, in order.
+        assert kept[-1] == receipt["operation_id"]
+        assert len(kept) < count + 1
+        assert kept[:-1] == [f"{index:032x}" for index in range(count - len(kept) + 1, count)]
+    finally:
+        worker.close()
+
+
+def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    old = datetime.now(UTC) - timedelta(days=1)
+    rows = [
+        OperationReceipt(
+            f"{index:032x}",
+            f"{index:064x}",
+            "0" * 64,
+            "refresh",
+            "running" if index == 0 else "succeeded",
+            old.isoformat(),
+            (old + timedelta(seconds=index)).isoformat(),
+        )
+        for index in range(MAX_RECEIPTS)
+    ]
+    newest = replace(rows[-1], operation_id="f" * 32, key_hash="f" * 64, status="pending")
+    worker._write([*rows, newest], keep=newest.operation_id)
+    kept = {row.operation_id for row in worker._read()}
+    assert rows[0].operation_id in kept  # oldest, but still running
+    assert newest.operation_id in kept
+    assert rows[1].operation_id not in kept  # oldest finished outcome
+    assert len(kept) == MAX_RECEIPTS
+    unfinished = [replace(row, status="running") for row in rows]
+    with pytest.raises(OwnerOperationError, match="unfinished"):
+        worker._write([*unfinished, newest], keep=newest.operation_id)
+    worker.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "error", "shown"),
+    [
+        (
+            "import-preview",
+            DataSourceError("eBird archive is missing required columns: Date"),
+            "eBird archive is missing required columns: Date",
+        ),
+        (
+            "import-commit",
+            SettingsConflictError("Settings changed. Reload and review this action again."),
+            "Settings changed. Reload and review this action again.",
+        ),
+        (
+            "import-preview",
+            DataSourceError("Invalid taxonomy crosswalk: /private/state/crosswalk.json"),
+            None,
+        ),
+        ("refresh", DataSourceError("HTTP 500 from api.example.test"), None),
+    ],
+)
+def test_receipts_keep_safe_import_and_settings_messages(
+    tmp_path: Path, kind: OperationKind, error: Exception, shown: str | None
+) -> None:
+    worker = OwnerOperations(tmp_path)
+
+    def fail() -> dict[str, object]:
+        raise error
+
+    try:
+        receipt = worker.submit(kind, key="safe-message-synthetic", inputs={}, execute=fail)
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "failed"
+        message = cast(dict[str, object], result["result"])["message"]
+        if shown is None:
+            assert str(message).startswith("The operation did not finish.")
+            assert "private" not in worker.path.read_text()
+        else:
+            assert message == shown
+        assert cast(dict[str, object], result["result"])["error_type"] == type(error).__name__
+    finally:
+        worker.close()
