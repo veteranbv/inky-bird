@@ -50,9 +50,10 @@ birdbuddy_include_manual_sightings = false
 # To change this existing file through the browser, use the explicit adoption
 # preview in Settings, then re-run the installer and restart the service.
 # configuration_ownership = "managed"
-# Existing configurations keep generation enabled. Turn it off to use only
-# approved artwork. Re-run native setup to remove the generation timer.
-# generation_enabled = false
+# New installs show approved artwork only. Set true to create new artwork with
+# your own image-generation account; that provider's charges apply. Re-run
+# native setup after changing it. Older files without this line keep generation on.
+generation_enabled = false
 # Private upload previews expire after 24 hours; choose 1–168. Cleanup never
 # removes confirmed history or saved trips. Restart after changing this policy.
 # owner_import_retention_hours = 24
