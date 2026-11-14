@@ -646,6 +646,169 @@ class CarryForwardTests(unittest.TestCase):
         self.assertEqual([item["taxon_id"] for item in after], [FIELD_BIRD.taxon_id])
         self.assertEqual(after[0]["sources"], ["iNaturalist"])
 
+    @staticmethod
+    def snapshot_species(config: AppConfig) -> dict[int, dict[str, object]]:
+        snapshot = json.loads((config.controller.state_dir / "discovery.json").read_text())
+        return {item["taxon_id"]: item for item in snapshot["species"]}
+
+    @staticmethod
+    def wall_species(config: AppConfig) -> dict[int, dict[str, object]]:
+        active = json.loads((config.controller.state_dir / "active-catalog.json").read_text())
+        return {item["taxon_id"]: item for item in active["species"]}
+
+    def shared_bird_refreshes(self, config: AppConfig, *, recent: str) -> None:
+        heard = BirdSpecies(
+            FIELD_BIRD.taxon_id,
+            FIELD_BIRD.common_name,
+            FIELD_BIRD.scientific_name,
+            100,
+            "BirdNET-Go",
+            latest_detection_at=recent,
+        )
+        self.refresh(config, inaturalist=[FIELD_BIRD], birdnet_go=[heard])
+        merged = self.snapshot_species(config)[FIELD_BIRD.taxon_id]
+        self.assertEqual(merged["observation_count"], 100)
+        self.assertEqual(merged["latest_detection_at"], recent)
+        self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[])
+
+    def test_carried_bird_keeps_the_failed_providers_own_count_and_time(self) -> None:
+        recent = datetime.now(UTC).replace(microsecond=0).isoformat()
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.shared_bird_refreshes(config, recent=recent)
+            carried = self.snapshot_species(config)[FIELD_BIRD.taxon_id]
+            listed = self.wall_species(config)[FIELD_BIRD.taxon_id]
+
+        self.assertEqual(carried["sources"], ["iNaturalist"])
+        self.assertEqual(carried["observation_count"], FIELD_BIRD.observation_count)
+        self.assertNotIn("latest_detection_at", carried)
+        self.assertEqual(listed["observation_count"], FIELD_BIRD.observation_count)
+        self.assertNotIn("latest_detection_at", listed)
+
+    def test_repeated_failure_keeps_carrying_the_providers_own_values(self) -> None:
+        recent = datetime.now(UTC).replace(microsecond=0).isoformat()
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.shared_bird_refreshes(config, recent=recent)
+            heard_again = BirdSpecies(
+                FIELD_BIRD.taxon_id,
+                FIELD_BIRD.common_name,
+                FIELD_BIRD.scientific_name,
+                50,
+                "BirdNET-Go",
+                latest_detection_at=recent,
+            )
+            self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[heard_again])
+            self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[])
+            carried = self.snapshot_species(config)[FIELD_BIRD.taxon_id]
+
+        # BirdNET-Go's withdrawn 50 must not become iNaturalist's value through
+        # the intermediate refresh where both were merged.
+        self.assertEqual(carried["sources"], ["iNaturalist"])
+        self.assertEqual(carried["observation_count"], FIELD_BIRD.observation_count)
+        self.assertNotIn("latest_detection_at", carried)
+
+    def test_single_provider_bird_is_carried_with_its_values_unchanged(self) -> None:
+        recent = datetime.now(UTC).replace(microsecond=0).isoformat()
+        heard = BirdSpecies(
+            YARD_BIRD.taxon_id,
+            YARD_BIRD.common_name,
+            YARD_BIRD.scientific_name,
+            7,
+            "BirdNET-Go",
+            latest_detection_at=recent,
+        )
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            with (
+                patch(
+                    "inky_bird_frame.controller.resolve_discovery_location",
+                    return_value=LOCATION,
+                ),
+                patch(
+                    "inky_bird_frame.controller.fetch_inaturalist_birds",
+                    return_value=[FIELD_BIRD],
+                ),
+                patch("inky_bird_frame.controller.fetch_birdnet_go_species", return_value=[]),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdnet_go_species",
+                    side_effect=[([heard], []), DataSourceError("BirdNET-Go timed out")],
+                ),
+                patch(
+                    "inky_bird_frame.controller.rebuild_catalog_index",
+                    return_value=[approved(FIELD_BIRD), approved(YARD_BIRD)],
+                ),
+            ):
+                run_refresh_cycle(config)
+                before = self.snapshot_species(config)
+                run_refresh_cycle(config)
+                after = self.snapshot_species(config)
+
+        self.assertEqual(after, before)
+        self.assertEqual(after[YARD_BIRD.taxon_id]["observation_count"], 7)
+        self.assertEqual(after[YARD_BIRD.taxon_id]["latest_detection_at"], recent)
+
+    def test_old_snapshot_carries_a_shared_bird_without_the_merged_values(self) -> None:
+        recent = datetime.now(UTC).replace(microsecond=0).isoformat()
+        heard = BirdSpecies(
+            FIELD_BIRD.taxon_id,
+            FIELD_BIRD.common_name,
+            FIELD_BIRD.scientific_name,
+            100,
+            "BirdNET-Go",
+            latest_detection_at=recent,
+        )
+        lone = BirdSpecies(
+            YARD_BIRD.taxon_id, YARD_BIRD.common_name, YARD_BIRD.scientific_name, 2, "iNaturalist"
+        )
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.refresh(config, inaturalist=[FIELD_BIRD, lone], birdnet_go=[heard])
+            path = config.controller.state_dir / "discovery.json"
+            snapshot = json.loads(path.read_text())
+            # Written before per-provider values were recorded.
+            del snapshot["provider_species"]
+            path.write_text(json.dumps(snapshot))
+            self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[])
+            carried = self.snapshot_species(config)
+
+        self.assertEqual(sorted(carried), [FIELD_BIRD.taxon_id, YARD_BIRD.taxon_id])
+        shared = carried[FIELD_BIRD.taxon_id]
+        self.assertEqual(shared["sources"], ["iNaturalist"])
+        self.assertEqual(shared["observation_count"], 1)
+        self.assertNotIn("latest_detection_at", shared)
+        # A bird only the failed provider reported holds that provider's values.
+        self.assertEqual(carried[YARD_BIRD.taxon_id]["observation_count"], 2)
+
+    def test_snapshot_records_each_providers_own_values(self) -> None:
+        recent = datetime.now(UTC).replace(microsecond=0).isoformat()
+        heard = BirdSpecies(
+            FIELD_BIRD.taxon_id,
+            FIELD_BIRD.common_name,
+            FIELD_BIRD.scientific_name,
+            100,
+            "BirdNET-Go",
+            latest_detection_at=recent,
+        )
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.refresh(config, inaturalist=[FIELD_BIRD], birdnet_go=[heard])
+            snapshot = json.loads((config.controller.state_dir / "discovery.json").read_text())
+
+        self.assertEqual(
+            snapshot["provider_species"],
+            {
+                "inaturalist": [{"taxon_id": FIELD_BIRD.taxon_id, "observation_count": 3}],
+                "birdnet-go": [
+                    {
+                        "taxon_id": FIELD_BIRD.taxon_id,
+                        "observation_count": 100,
+                        "latest_detection_at": recent,
+                    }
+                ],
+            },
+        )
+
     def test_changed_discovery_settings_do_not_carry_old_birds(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary, BIRDNET_GO_SOURCES)
