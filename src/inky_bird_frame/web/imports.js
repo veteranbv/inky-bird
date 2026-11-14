@@ -197,6 +197,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       unchanged_checklists: 'Unchanged checklists',
       imported: 'New detections',
       updated: 'Changed detections',
+      removed: 'Removed detections',
       duplicates: 'Unchanged detections',
       dated: 'Dated detections',
       undated: 'Undated detections',
