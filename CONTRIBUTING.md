@@ -142,7 +142,6 @@ The test covers normal tasks, stale edits, interrupted responses, explicit
 work, scope withdrawal and revocation. Its community query is mocked, so it is
 not a live iNaturalist contract test.
 
-
 Chromium, Firefox and WebKit journeys and automated accessibility checks are
 separate from physical-phone, hardware and live-provider qualification. A narrow
 viewport is not proof of a particular phone. The README screenshots use two

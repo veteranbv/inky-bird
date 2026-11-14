@@ -228,8 +228,11 @@ The setup preview refuses, before `sudo` or any installer step, what the native
 installers would refuse: provider keys read from environment variables
 (`*_api_key_env`, `birdweather_token_env`), notification destinations that use
 `url_env`, a missing OIDC client secret or an unsafe `native-access.env`, and an
-unsafe `native-tls.env`. Store those values directly in the private mode-`0600`
-configuration file instead.
+unsafe `native-tls.env`. Store provider keys and notification URLs directly in
+the private mode-`0600` configuration file. Supply the OIDC client secret in its
+named environment variable when you run setup (see
+[browser access](browser-access.md)). Keep `native-access.env` and
+`native-tls.env` as private (mode `0600`) regular files.
 
 LaunchAgents begin when this macOS user logs in. They survive application
 updates and restart after logout/login or reboot. For unattended recovery, the

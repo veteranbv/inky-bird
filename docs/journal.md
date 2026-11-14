@@ -119,8 +119,8 @@ unreadable species-match file marks only its own source unavailable. A damaged
 working while an unrelated part is unreadable. A change that names a bird
 missing because of the unreadable part is refused with its notice, and
 collection import preview and apply are refused while a history or bird-listing
-part is unreadable (never because of plate work). Fix the file, or let the next
-refresh rewrite it, and reload.
+part is unreadable (never because of plate work). Fix or restore the file, then
+reload. The next refresh rewrites `active-catalog.json`.
 
 The journal reads each retained history through its summary file
 (`*-summary.json` beside the history; species names, counts and dates, no

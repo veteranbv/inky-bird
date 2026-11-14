@@ -119,9 +119,10 @@ settings again. Delete the kept copy once the new configuration works.
   were not delivered. Fix the destination, then run
   `"$IBF" notifications retry --config "$CONFIG"`.
 - `job_refresh`, `job_generate`, `job_catalog_publish` and `job_notifications`
-  (fail): the most recent run of that scheduled job exited with an error or was
-  stopped by a signal. Read that job's log, then run doctor again after its next
-  run. Only the jobs your configuration enables are checked.
+  (fail), on installations with per-job timers or launchd jobs: the most
+  recent run of that scheduled job exited with an error or was stopped by a
+  signal. Read that job's log, then run doctor again after its next run. Only
+  the jobs your configuration enables are checked.
 
 ### Scheduled jobs stop after a configuration edit
 

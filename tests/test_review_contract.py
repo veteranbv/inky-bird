@@ -832,7 +832,7 @@ def test_ai_attribution_in_the_squash_description_blocks(field: str) -> None:
 
 def test_human_co_author_is_allowed() -> None:
     snapshot = _base()
-    snapshot["commits"][0]["message"] += "\n\nCo-authored-by: Charity <c@example.com>"
+    snapshot["commits"][0]["message"] += "\n\nCo-authored-by: Alex Example <alex@example.com>"
     assert _verdict(snapshot).qualified
 
 

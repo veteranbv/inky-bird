@@ -463,7 +463,7 @@ compatible within their minor line. Before version 1.0, a minor release may
 include a documented configuration or operational migration. Release notes are
 the source of truth for each upgrade.
 
-A release builds nothing new. The release workflow checks that the tag is `v`
+A release builds no new image. The release workflow checks that the tag is `v`
 followed by the version in `pyproject.toml`, that the tagged commit is on `main`
 and has a passing `ci` run, and that `main` already published a container image
 for that commit. It runs that exact image natively on arm64 (version, catalog
@@ -540,7 +540,7 @@ failure require it.
 
 ### Command results and exit codes
 
-Every command prints one JSON object. Success is `{"ok": true, "data": ...,
+Every one-shot command prints one JSON object. Success is `{"ok": true, "data": ...,
 "schema_version": 1}`. A failure is `{"ok": false, "error": {"type": ...,
 "message": ...}, "schema_version": 1}`. Scripts should branch on the exit code
 and `error.type`, not on the message wording.
@@ -572,7 +572,7 @@ display size, is `internal` with exit code `1` and keeps its message.
 | `installation` | Setup, a required program or a dependency failed. |
 | `access` | Owner access or sign-in state refused the request. |
 | `storage` | A file could not be read or written, or owner-operation storage is full. |
-| `internal` | An unexpected error. The message is fixed text and one diagnostic line goes to standard error, which is the service log. |
+| `internal` | An error with no more specific type. A readable project error or value error keeps its message. Any other unexpected error gets fixed text, and one diagnostic line goes to standard error, which is the service log. |
 
 `busy` means, for example, that a cycle, refresh, publication, display cycle,
 owner operation or a second scheduler is already running. `generate` and
@@ -644,7 +644,7 @@ only; they never enter the approved catalog or rotation.
   generation reaches a successful or terminal quality result. If a bird's only
   state is an invalid approved entry (for example a damaged image), `retry
   TAXON_ID`, `retry TAXON_ID --refresh-research` and `retry TAXON_ID
-  --replace-approved` move it to `state_dir/archive/invalid-approved-*`, remove
+  --replace-approved --reason "..."` move it to `state_dir/archive/invalid-approved-*`, remove
   it from the local catalog index and queue the bird again. Removing one entry
   works even when another entry is also invalid. A valid approved plate still
   requires the explicit replacement command below. When a
