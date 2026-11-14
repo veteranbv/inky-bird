@@ -16,6 +16,7 @@ from inky_bird_frame.birdnet_analyzer import (
 )
 from inky_bird_frame.birds import BirdNetAnalyzerSpecies, ObservationWindow
 from inky_bird_frame.errors import DataSourceError
+from inky_bird_frame.imports import recover_import
 
 HEADER = "Start (s),End (s),Scientific name,Common name,Confidence,File\n"
 
@@ -205,6 +206,31 @@ class BirdNetAnalyzerMultiSpeciesTests(unittest.TestCase):
         self.assertEqual((result.duplicates, result.removed), (1, 1))
         # The untouched 3-6 s segment keeps its row.
         self.assertEqual(counts, {"Sialia sialis": 2})
+
+    def test_committed_import_with_removals_can_be_recovered_by_operation(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir = root / "state"
+            csv_path = root / "results.csv"
+            csv_path.write_text(self.TWO_SPECIES)
+            import_birdnet_analyzer_csv(csv_path, state_dir)
+            csv_path.write_text(HEADER + "0,3,Sialia sialis,Eastern Bluebird,0.95,one.wav\n")
+            operation_id = "b" * 64
+            result = import_birdnet_analyzer_csv(
+                csv_path,
+                state_dir,
+                expected_revision=analyzer_history_revision(state_dir),
+                operation_id=operation_id,
+            )
+            recovered = recover_import(state_dir, operation_id)
+
+        self.assertEqual(result.removed, 1)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(
+            {key: value for key, value in recovered.items() if key != "message"},
+            {key: value for key, value in result.as_dict().items() if key != "removed"},
+        )
 
     def test_legacy_state_loads_and_reimport_replaces_rather_than_duplicates(self) -> None:
         with TemporaryDirectory() as temporary:
