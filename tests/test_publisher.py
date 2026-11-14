@@ -2098,6 +2098,24 @@ class PublicationRunTests(unittest.TestCase):
             self.assertIn("catalog/species/1-rüppell-warbler/display.png", _remote_files(remote))
             self.assertEqual(fake.merged_commits, [result["commit"]])
 
+    def test_finder_metadata_in_the_local_catalog_does_not_block_or_get_published(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            directory = _create_species(catalog, 1, "Example Bird")
+            for parent in (catalog, catalog / "species", directory):
+                (parent / ".DS_Store").write_bytes(b"\0\0\0\1Bud1")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["skipped"], [])
+            files = _remote_files(remote)
+            self.assertIn("catalog/species/1-example-bird/manifest.json", files)
+            self.assertFalse(any(path.endswith(".DS_Store") for path in files))
+            self.assertTrue((directory / ".DS_Store").is_file())
+
     def test_skips_a_species_that_fails_publication_gates_and_publishes_the_rest(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

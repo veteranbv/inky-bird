@@ -126,6 +126,8 @@ def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
 def _snapshot_catalog(source: Path, destination: Path) -> None:
     """Snapshot the live catalog while holding its lock, without copying every plate.
 
+    Finder metadata is left out: it is never published and would fail the layout checks.
+
     Catalog files are only ever replaced by rename, never rewritten in place, so a hard
     link keeps the snapshot's bytes; where linking is not possible the files are copied.
     """
@@ -141,7 +143,13 @@ def _snapshot_catalog(source: Path, destination: Path) -> None:
                 linking = False
         return shutil.copy2(source_file, destination_file, follow_symlinks=False)
 
-    shutil.copytree(source, destination, symlinks=True, copy_function=place)
+    shutil.copytree(
+        source,
+        destination,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(_FINDER_METADATA),
+        copy_function=place,
+    )
     # Snapshot directories are its own: keep them writable, so removing the snapshot never
     # resorts to changing permissions on a file it shares with the live catalog.
     for directory, _, _ in os.walk(destination):

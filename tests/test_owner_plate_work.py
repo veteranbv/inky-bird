@@ -447,6 +447,19 @@ def test_generation_completion_keeps_owner_requests_added_during_the_cycle(tmp_p
     assert read_collection(application.controller.state_dir) == []
 
 
+def test_finder_metadata_does_not_mark_plate_work_incomplete(tmp_path: Path) -> None:
+    application = config(tmp_path)
+    candidate(application)
+    (application.controller.state_dir / "pending/.DS_Store").write_bytes(b"\0\0\0\1Bud1")
+
+    inventory = pending_inventory(application)
+
+    assert inventory["status"] == "ok"
+    assert [item["taxon_id"] for item in cast(list[dict[str, Any]], inventory["candidates"])] == [
+        10
+    ]
+
+
 def test_plate_review_reads_give_up_while_the_catalog_is_being_changed(tmp_path: Path) -> None:
     application = config(tmp_path)
     candidate(application)

@@ -140,6 +140,8 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
     ids = set()
     unknown = False
     for directory in sorted(root.iterdir()) if root.exists() else []:
+        if directory.name == ".DS_Store":
+            continue
         prefix, separator, _ = directory.name.partition("-")
         if not separator or not prefix.isascii() or not prefix.isdigit() or int(prefix) <= 0:
             unknown = True
