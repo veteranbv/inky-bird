@@ -1369,15 +1369,22 @@ def _published_directory_names(remote_species: list[dict[str, object]] | None) -
     }
 
 
-def _remote_species_match(
+def _git_blob_id(object_format: str, data: bytes) -> str:
+    blob = hashlib.new(object_format, usedforsecurity=False)
+    blob.update(f"blob {len(data)}\0".encode())
+    blob.update(data)
+    return blob.hexdigest()
+
+
+def _remote_catalog_matches(
     checkout: Path, remote_ref: str, catalog_dir: Path, directories: set[str]
 ) -> bool:
-    """Return whether the remote holds byte-identical files for these local species."""
+    """Return whether the remote catalog tree is byte-identical to the local catalog."""
     object_format = _git(checkout, "rev-parse", "--show-object-format").stdout.strip()
     if object_format not in {"sha1", "sha256"}:
         return False
     listing = _git(
-        checkout, "ls-tree", "-r", "-z", "--full-tree", remote_ref, "--", "catalog/species"
+        checkout, "ls-tree", "-r", "-z", "--full-tree", remote_ref, "--", "catalog"
     ).stdout
     remote: dict[str, tuple[str, str, str]] = {}
     for record in listing.split("\0"):
@@ -1388,16 +1395,21 @@ def _remote_species_match(
         if len(fields) != 3:
             return False
         remote[path] = (fields[0], fields[1], fields[2])
-    local: dict[str, tuple[str, str, str]] = {}
+    local: dict[str, tuple[str, str, str]] = {
+        "catalog/index.json": (
+            "100644",
+            "blob",
+            _git_blob_id(object_format, (catalog_dir / "index.json").read_bytes()),
+        )
+    }
     for name in directories:
         for file in (catalog_dir / "species" / name).iterdir():
-            data = file.read_bytes()
-            blob = hashlib.new(object_format, usedforsecurity=False)
-            blob.update(f"blob {len(data)}\0".encode())
-            blob.update(data)
-            local[f"catalog/species/{name}/{file.name}"] = ("100644", "blob", blob.hexdigest())
-    remote_paths = {path for path in remote if path.split("/")[2] in directories}
-    return remote_paths == set(local) and all(remote[path] == local[path] for path in local)
+            local[f"catalog/species/{name}/{file.name}"] = (
+                "100644",
+                "blob",
+                _git_blob_id(object_format, file.read_bytes()),
+            )
+    return remote == local
 
 
 def _already_published_taxa(
@@ -1406,7 +1418,7 @@ def _already_published_taxa(
     catalog_dir: Path,
     remote_species: list[dict[str, object]] | None,
 ) -> list[int] | None:
-    """Return the local taxa when the remote already holds every local approval unchanged."""
+    """Return the local taxa when the remote catalog already equals the local catalog."""
     if remote_species is None:
         return None
     try:
@@ -1421,8 +1433,8 @@ def _already_published_taxa(
             item not in remote_species for item in local_species
         ):
             return None
-        # A damaged remote copy must take the worktree path, which validates and reports it.
-        if not _remote_species_match(checkout, remote_ref, catalog_dir, directories):
+        # Any remote difference must take the worktree path, which validates and reports it.
+        if not _remote_catalog_matches(checkout, remote_ref, catalog_dir, directories):
             return None
     except (CatalogError, CatalogPublishError, OSError):
         return None

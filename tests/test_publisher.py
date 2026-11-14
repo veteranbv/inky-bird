@@ -2211,6 +2211,13 @@ class PublicationRunTests(unittest.TestCase):
     def _assert_damaged_remote_species_is_not_reported_published(
         self, damage: Callable[[Path], None]
     ) -> None:
+        self._assert_damaged_remote_catalog_is_not_reported_published(
+            lambda catalog: damage(catalog / "species/1-example-bird"), "1-example-bird"
+        )
+
+    def _assert_damaged_remote_catalog_is_not_reported_published(
+        self, damage: Callable[[Path], None], reason: str
+    ) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             remote, _, config, fake = self._environment(root)
@@ -2223,8 +2230,7 @@ class PublicationRunTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-            species = editor / "catalog/species/1-example-bird"
-            damage(species)
+            damage(editor / "catalog")
             _run_git(editor, "add", "-A", "catalog")
             _run_git(
                 editor,
@@ -2234,13 +2240,13 @@ class PublicationRunTests(unittest.TestCase):
                 "user.email=test@example.test",
                 "commit",
                 "-m",
-                "Damage the published species",
+                "Damage the published catalog",
             )
             _run_git(editor, "push", "origin", "main")
 
             with (
                 _github(fake),
-                self.assertRaisesRegex(CatalogPublishError, "1-example-bird"),
+                self.assertRaisesRegex(CatalogPublishError, reason),
             ):
                 run_catalog_publish(config)
 
@@ -2257,6 +2263,44 @@ class PublicationRunTests(unittest.TestCase):
     def test_does_not_report_a_species_whose_remote_image_was_replaced(self) -> None:
         self._assert_damaged_remote_species_is_not_reported_published(
             lambda species: Image.new("RGB", (1600, 1200), "black").save(species / "display.png")
+        )
+
+    def test_does_not_report_published_when_another_remote_species_is_damaged(self) -> None:
+        def add_broken_species(catalog: Path) -> None:
+            other = _create_species(catalog, 2, "Other Bird")
+            rebuild_catalog_index(catalog)
+            (other / "display.png").unlink()
+
+        self._assert_damaged_remote_catalog_is_not_reported_published(
+            add_broken_species, "Required catalog files missing.*2-other-bird"
+        )
+
+    def test_does_not_report_published_when_the_remote_index_lists_a_missing_species(
+        self,
+    ) -> None:
+        def add_ghost_entry(catalog: Path) -> None:
+            index = json.loads((catalog / "index.json").read_text())
+            index["species"].append(
+                {
+                    "taxon_id": 99,
+                    "common_name": "Ghost",
+                    "scientific_name": "Avis exemplaris",
+                    "slug": "ghost",
+                }
+            )
+            (catalog / "index.json").write_text(json.dumps(index))
+
+        self._assert_damaged_remote_catalog_is_not_reported_published(
+            add_ghost_entry, "Catalog index does not match species manifests"
+        )
+
+    def test_does_not_report_published_when_the_remote_catalog_has_a_stray_file(self) -> None:
+        def add_stray_file(catalog: Path) -> None:
+            (catalog / "notes.txt").write_text("unexpected")
+
+        self._assert_damaged_remote_catalog_is_not_reported_published(
+            add_stray_file,
+            "Unexpected catalog root entries.*notes.txt",
         )
 
     def test_reports_skipped_species_when_nothing_can_be_published(self) -> None:
