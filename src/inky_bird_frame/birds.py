@@ -5,12 +5,12 @@ from __future__ import annotations
 import fcntl
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Final, cast
 from urllib.parse import quote, urlencode
 
@@ -86,6 +86,16 @@ class BirdNetAnalyzerSpecies:
 class EbirdResolution:
     species: list[BirdSpecies]
     unresolved: list[EbirdSpecies]
+    # Names not looked up because a lookup cap or deadline was reached. They
+    # carry no cached miss and are looked up again on the next call.
+    deferred: list[EbirdSpecies] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ArchiveResolution:
+    resolved: dict[str, BirdSpecies]
+    unresolved: list[EbirdArchiveSpecies]
+    deferred: list[EbirdArchiveSpecies]
 
 
 @dataclass(frozen=True)
@@ -117,7 +127,7 @@ EBIRD_MAX_RADIUS_KM: Final = 50
 # default 15-minute refresh cadence.
 EBIRD_HTTP_TIMEOUT_SECONDS: Final = 90.0
 EBIRD_UNRESOLVED_RETRY_DAYS: Final = 7
-TAXONOMY_MATCH_STRATEGY: Final = "scientific-name-or-exact-synonym-v1"
+TAXONOMY_MATCH_STRATEGY: Final = "scientific-name-then-exact-synonym-v2"
 # AOS moved Winter Wren to Nannus (doi:10.1093/ornithology/ukag037).
 # iNaturalist can return a trinomial as the matched term for the old binomial.
 INATURALIST_TAXON_ALIASES: Final[dict[str, tuple[int, str]]] = {
@@ -127,6 +137,10 @@ BIRDWEATHER_MAX_SPECIES: Final = 100
 # iNaturalist asks API clients to stay near one request per second. Taxonomy
 # lookups cannot be batched because every source name needs an exact-match check.
 INATURALIST_TAXONOMY_REQUEST_DELAY_SECONDS: Final = 1.0
+# Save crosswalk progress and release its lock at least this often so an
+# interrupted first import keeps its lookups and other writers are not starved.
+TAXONOMY_CHECKPOINT_ENTRIES: Final = 25
+TAXONOMY_LOCK_HOLD_SECONDS: Final = 30.0
 
 
 @dataclass(frozen=True)
@@ -322,6 +336,7 @@ def fetch_ebird_observations(
         f"https://api.ebird.org/v2/data/obs/geo/recent?{params}",
         timeout_seconds,
         headers={"X-eBirdApiToken": api_key},
+        error_label="eBird API",
     )
     return parse_ebird_observations(payload)
 
@@ -486,14 +501,17 @@ def parse_inaturalist_taxon_match(payload: object, scientific_name: str) -> Bird
         raise DataSourceError("iNaturalist taxon search response did not include results")
 
     alias = INATURALIST_TAXON_ALIASES.get(scientific_name)
-    matches: list[BirdSpecies] = []
+    exact: list[BirdSpecies] = []
+    synonyms: list[BirdSpecies] = []
     for item in results:
         if not isinstance(item, dict):
             continue
         taxon_id = item.get("id")
         common_name = item.get("preferred_common_name")
         name = item.get("name")
-        matched_term = item.get("matched_term")
+        current = name == scientific_name or (
+            (taxon_id, name) == alias and item.get("is_active") is True
+        )
         if (
             item.get("rank") == "species"
             and item.get("is_active") is not False
@@ -502,23 +520,24 @@ def parse_inaturalist_taxon_match(payload: object, scientific_name: str) -> Bird
             and name
             and isinstance(taxon_id, int)
             and not isinstance(taxon_id, bool)
-            and (
-                name == scientific_name
-                or matched_term == scientific_name
-                or ((taxon_id, name) == alias and item.get("is_active") is True)
-            )
+            and (current or item.get("matched_term") == scientific_name)
             and isinstance(common_name, str)
             and common_name
         ):
-            matches.append(
-                BirdSpecies(
-                    taxon_id=taxon_id,
-                    common_name=common_name,
-                    scientific_name=name,
-                    observation_count=1,
-                    source="eBird",
-                )
+            species = BirdSpecies(
+                taxon_id=taxon_id,
+                common_name=common_name,
+                scientific_name=name,
+                observation_count=1,
+                source="eBird",
             )
+            # After a split the source name can stay current for one daughter
+            # while another lists it as a synonym. The current name wins.
+            if current:
+                exact.append(species)
+            else:
+                synonyms.append(species)
+    matches = exact or synonyms
     if len(matches) != 1:
         raise TaxonomyMatchError(
             f"Expected one active iNaturalist bird species matching {scientific_name}; "
@@ -551,121 +570,164 @@ def resolve_ebird_species(
     timeout_seconds: float = 10.0,
     persist_cache: bool = True,
 ) -> EbirdResolution:
-    if not persist_cache:
-        return _resolve_external_species_locked(
-            observations,
-            cache_path,
-            now=now,
-            timeout_seconds=timeout_seconds,
-            persist_cache=False,
-        )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with _taxonomy_crosswalk_lock(cache_path):
-        return _resolve_external_species_locked(
-            observations,
-            cache_path,
-            now=now,
-            timeout_seconds=timeout_seconds,
-            persist_cache=True,
-        )
+    return _resolve_external_species(
+        observations,
+        cache_path,
+        source="eBird",
+        counts=None,
+        now=now,
+        timeout_seconds=timeout_seconds,
+        persist_cache=persist_cache,
+    )
 
 
-def _resolve_external_species_locked(
+def _resolve_external_species(
     observations: list[EbirdSpecies],
     cache_path: Path,
     *,
+    source: str,
+    counts: dict[str, int] | None,
     now: datetime | None,
     timeout_seconds: float,
     persist_cache: bool,
-    source: str = "eBird",
-    counts: dict[str, int] | None = None,
+    max_lookups: int | None = None,
+    deadline_seconds: float | None = None,
 ) -> EbirdResolution:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
-    cache = _read_taxonomy_crosswalk(cache_path)
+    deadline = None if deadline_seconds is None else monotonic() + deadline_seconds
+    # Observation index to the matched canonical species, or None for a miss.
+    outcomes: dict[int, BirdSpecies | None] = {}
+    deferred: set[int] = set()
+    pending = list(range(len(observations)))
+    lookups = 0
+    if persist_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    while pending:
+        # Each pass holds the lock for a bounded batch, saving its progress on
+        # every exit, so another writer or an interruption loses little work.
+        with _taxonomy_crosswalk_lock(cache_path) if persist_cache else nullcontext():
+            cache = _read_taxonomy_crosswalk(cache_path)
+            release_at = monotonic() + TAXONOMY_LOCK_HOLD_SECONDS
+            added = 0
+            try:
+                while pending:
+                    index = pending[0]
+                    observation = observations[index]
+                    match_strategy = _match_strategy(observation.scientific_name)
+                    answered, species = _cached_outcome(
+                        cache.get(observation.species_code),
+                        observation,
+                        match_strategy,
+                        current,
+                    )
+                    if answered:
+                        outcomes[index] = species
+                        pending.pop(0)
+                        continue
+                    if (max_lookups is not None and lookups >= max_lookups) or (
+                        deadline is not None and monotonic() >= deadline
+                    ):
+                        deferred.add(index)
+                        pending.pop(0)
+                        continue
+                    if (
+                        persist_cache
+                        and added
+                        and (added >= TAXONOMY_CHECKPOINT_ENTRIES or monotonic() >= release_at)
+                    ):
+                        break
+                    lookups += 1
+                    try:
+                        species = fetch_inaturalist_taxon_match(
+                            observation.scientific_name, timeout_seconds=timeout_seconds
+                        )
+                    except TaxonomyMatchError:
+                        cache[observation.species_code] = {
+                            "match_strategy": match_strategy,
+                            "scientific_name": observation.scientific_name,
+                            "retry_at": (
+                                current + timedelta(days=EBIRD_UNRESOLVED_RETRY_DAYS)
+                            ).isoformat(),
+                        }
+                        outcomes[index] = None
+                    else:
+                        cache_entry: dict[str, object] = {
+                            "scientific_name": species.scientific_name,
+                            "common_name": species.common_name,
+                            "taxon_id": species.taxon_id,
+                            "resolved_at": current.isoformat(),
+                        }
+                        if species.scientific_name != observation.scientific_name:
+                            cache_entry["source_scientific_name"] = observation.scientific_name
+                        cache[observation.species_code] = cache_entry
+                        outcomes[index] = species
+                    added += 1
+                    pending.pop(0)
+            finally:
+                if added and persist_cache:
+                    _write_taxonomy_crosswalk(cache_path, cache)
+
     resolved: list[BirdSpecies] = []
     unresolved: list[EbirdSpecies] = []
-    changed = False
-
-    for observation in observations:
-        alias = INATURALIST_TAXON_ALIASES.get(observation.scientific_name)
-        # Recheck old misses for this alias only. A new miss is cached normally.
-        match_strategy = TAXONOMY_MATCH_STRATEGY
-        if alias is not None:
-            match_strategy = f"{match_strategy}+alias:{alias[0]}:{alias[1]}"
-        cached = cache.get(observation.species_code)
-        cached_source_name = (
-            cached.get("source_scientific_name", cached.get("scientific_name"))
-            if cached is not None
-            else None
-        )
-        if cached is not None and cached_source_name == observation.scientific_name:
-            taxon_id = cached.get("taxon_id")
-            common_name = cached.get("common_name")
-            canonical_name = cached.get("scientific_name")
-            if (
-                isinstance(taxon_id, int)
-                and isinstance(common_name, str)
-                and isinstance(canonical_name, str)
-            ):
-                resolved.append(
-                    BirdSpecies(
-                        taxon_id=taxon_id,
-                        common_name=common_name,
-                        scientific_name=canonical_name,
-                        observation_count=(counts or {}).get(observation.species_code, 1),
-                        source=source,
-                    )
-                )
-                continue
-            retry_at = _parse_cache_datetime(cached.get("retry_at"))
-            if (
-                cached.get("match_strategy") == match_strategy
-                and retry_at is not None
-                and current < retry_at
-            ):
-                unresolved.append(observation)
-                continue
-
-        try:
-            species = fetch_inaturalist_taxon_match(
-                observation.scientific_name, timeout_seconds=timeout_seconds
-            )
-        except TaxonomyMatchError:
-            cache[observation.species_code] = {
-                "match_strategy": match_strategy,
-                "scientific_name": observation.scientific_name,
-                "retry_at": (current + timedelta(days=EBIRD_UNRESOLVED_RETRY_DAYS)).isoformat(),
-            }
-            unresolved.append(observation)
-            changed = True
+    for index, observation in enumerate(observations):
+        if index in deferred:
             continue
-        except DataSourceError:
-            if changed and persist_cache:
-                _write_taxonomy_crosswalk(cache_path, cache)
-            raise
-        cache_entry: dict[str, object] = {
-            "scientific_name": species.scientific_name,
-            "common_name": species.common_name,
-            "taxon_id": species.taxon_id,
-            "resolved_at": current.isoformat(),
-        }
-        if species.scientific_name != observation.scientific_name:
-            cache_entry["source_scientific_name"] = observation.scientific_name
-        cache[observation.species_code] = cache_entry
-        resolved.append(
-            BirdSpecies(
-                taxon_id=species.taxon_id,
-                common_name=species.common_name,
-                scientific_name=species.scientific_name,
-                observation_count=(counts or {}).get(observation.species_code, 1),
-                source=source,
+        outcome = outcomes[index]
+        if outcome is None:
+            unresolved.append(observation)
+        else:
+            resolved.append(
+                BirdSpecies(
+                    taxon_id=outcome.taxon_id,
+                    common_name=outcome.common_name,
+                    scientific_name=outcome.scientific_name,
+                    observation_count=(counts or {}).get(observation.species_code, 1),
+                    source=source,
+                )
             )
-        )
-        changed = True
+    return EbirdResolution(
+        species=resolved,
+        unresolved=unresolved,
+        deferred=[observations[index] for index in sorted(deferred)],
+    )
 
-    if changed and persist_cache:
-        _write_taxonomy_crosswalk(cache_path, cache)
-    return EbirdResolution(species=resolved, unresolved=unresolved)
+
+def _match_strategy(scientific_name: str) -> str:
+    alias = INATURALIST_TAXON_ALIASES.get(scientific_name)
+    # Recheck old misses for this alias only. A new miss is cached normally.
+    if alias is None:
+        return TAXONOMY_MATCH_STRATEGY
+    return f"{TAXONOMY_MATCH_STRATEGY}+alias:{alias[0]}:{alias[1]}"
+
+
+def _cached_outcome(
+    cached: dict[str, object] | None,
+    observation: EbirdSpecies,
+    match_strategy: str,
+    current: datetime,
+) -> tuple[bool, BirdSpecies | None]:
+    """Return whether the cache answers, with its match or None for a recent miss."""
+    if cached is None or (
+        cached.get("source_scientific_name", cached.get("scientific_name"))
+        != observation.scientific_name
+    ):
+        return False, None
+    taxon_id = cached.get("taxon_id")
+    common_name = cached.get("common_name")
+    canonical_name = cached.get("scientific_name")
+    if (
+        isinstance(taxon_id, int)
+        and isinstance(common_name, str)
+        and isinstance(canonical_name, str)
+    ):
+        return True, BirdSpecies(taxon_id, common_name, canonical_name, 1, "eBird")
+    retry_at = _parse_cache_datetime(cached.get("retry_at"))
+    recent_miss = (
+        cached.get("match_strategy") == match_strategy
+        and retry_at is not None
+        and current < retry_at
+    )
+    return recent_miss, None
 
 
 def resolve_birdweather_species(
@@ -856,37 +918,40 @@ def resolve_ebird_archive_species(
     ]
 
 
-def _resolve_external_species(
-    observations: list[EbirdSpecies],
+def resolve_ebird_archive_names(
+    observations: list[EbirdArchiveSpecies],
     cache_path: Path,
     *,
-    source: str,
-    counts: dict[str, int],
-    now: datetime | None,
-    timeout_seconds: float,
-    persist_cache: bool,
-) -> EbirdResolution:
-    if not persist_cache:
-        return _resolve_external_species_locked(
-            observations,
-            cache_path,
-            now=now,
-            timeout_seconds=timeout_seconds,
-            persist_cache=False,
-            source=source,
-            counts=counts,
-        )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with _taxonomy_crosswalk_lock(cache_path):
-        return _resolve_external_species_locked(
-            observations,
-            cache_path,
-            now=now,
-            timeout_seconds=timeout_seconds,
-            persist_cache=True,
-            source=source,
-            counts=counts,
-        )
+    max_lookups: int | None = None,
+    deadline_seconds: float | None = None,
+    now: datetime | None = None,
+    timeout_seconds: float = 10.0,
+) -> ArchiveResolution:
+    """Resolve unique archive names in one bounded pass, keyed by source name."""
+    by_name = {item.scientific_name: item for item in observations}
+    if len(by_name) != len(observations):
+        raise ValueError("archive names must be unique")
+    resolution = _resolve_external_species(
+        [
+            EbirdSpecies(item.scientific_name, item.common_name, item.scientific_name, None)
+            for item in observations
+        ],
+        cache_path,
+        source="eBird Archive",
+        counts={item.scientific_name: item.observation_count for item in observations},
+        now=now,
+        timeout_seconds=timeout_seconds,
+        persist_cache=True,
+        max_lookups=max_lookups,
+        deadline_seconds=deadline_seconds,
+    )
+    skipped = {item.species_code for item in (*resolution.unresolved, *resolution.deferred)}
+    names = [item.scientific_name for item in observations if item.scientific_name not in skipped]
+    return ArchiveResolution(
+        resolved=dict(zip(names, resolution.species, strict=True)),
+        unresolved=[by_name[item.species_code] for item in resolution.unresolved],
+        deferred=[by_name[item.species_code] for item in resolution.deferred],
+    )
 
 
 @contextmanager
@@ -957,6 +1022,23 @@ def parse_inaturalist_taxon(payload: object) -> TaxonContext:
     taxon_id = taxon.get("id")
     common_name = taxon.get("preferred_common_name")
     scientific_name = taxon.get("name")
+    # Only an explicit inactive flag stops research; a missing flag is not
+    # evidence that the identity changed.
+    if taxon.get("is_active") is False and isinstance(taxon_id, int):
+        successors = taxon.get("current_synonymous_taxon_ids")
+        replacements = [
+            str(item)
+            for item in (successors if isinstance(successors, list) else [])
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0
+        ][:3]
+        outcome = (
+            f"it was replaced by taxon {', '.join(replacements)}"
+            if replacements
+            else "it has no current replacement"
+        )
+        raise DataSourceError(
+            f"iNaturalist no longer uses taxon {taxon_id}; {outcome}. Research was skipped."
+        )
     summary_value = taxon.get("wikipedia_summary")
     source_url_value = taxon.get("wikipedia_url")
     ancestors = taxon.get("ancestors")
