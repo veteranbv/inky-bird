@@ -1,5 +1,1 @@
-self-hosted-runner:
-  labels:
-    - inky-bird-controller
-
 config-variables: null
