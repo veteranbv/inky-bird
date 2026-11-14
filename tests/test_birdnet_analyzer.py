@@ -229,7 +229,7 @@ class BirdNetAnalyzerMultiSpeciesTests(unittest.TestCase):
         assert recovered is not None
         self.assertEqual(
             {key: value for key, value in recovered.items() if key != "message"},
-            {key: value for key, value in result.as_dict().items() if key != "removed"},
+            result.as_dict(),
         )
 
     def test_legacy_state_loads_and_reimport_replaces_rather_than_duplicates(self) -> None:

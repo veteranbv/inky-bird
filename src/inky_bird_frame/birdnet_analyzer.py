@@ -377,15 +377,8 @@ def import_birdnet_analyzer_csv(
         if not dry_run:
             path = _state_path(state_dir)
             previous = path.read_bytes() if path.exists() else None
-            # Commit recovery accepts only the original result fields, so the
-            # optional removal count stays out of the persisted marker.
             marker = (
-                {
-                    "operation_id": operation_id,
-                    "result": {
-                        key: value for key, value in stats.as_dict().items() if key != "removed"
-                    },
-                }
+                {"operation_id": operation_id, "result": stats.as_dict()}
                 if operation_id
                 else json.loads(previous or b"{}").get("owner_operation")
             )

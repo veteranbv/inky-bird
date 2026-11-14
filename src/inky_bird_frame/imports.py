@@ -405,7 +405,7 @@ class HistoryImports:
                 "undated_notice": "Undated detections remain undated "
                 "and do not enter date-based windows.",
             }
-            unchanged = not (stats["imported"] or stats["updated"])
+            unchanged = not (stats["imported"] or stats["updated"] or stats["removed"])
         result = {
             "stats": stats,
             "impact": impact,
@@ -712,7 +712,7 @@ class HistoryImports:
 
 
 def recover_import(state_dir: Path, request_id: str) -> dict[str, object] | None:
-    for filename, message, fields in (
+    for filename, message, fields, optional in (
         (
             EBIRD_STATE,
             "History updated. Trip not saved yet.",
@@ -729,11 +729,15 @@ def recover_import(state_dir: Path, request_id: str) -> dict[str, object] | None
                 "latest_observed_on",
                 "dry_run",
             },
+            set[str](),
         ),
         (
             ANALYZER_STATE,
             "Analyzer history updated. No collection or wall selection changed.",
             {"rows", "imported", "updated", "duplicates", "dated", "undated", "dry_run"},
+            # Markers written before Analyzer re-imports could remove detections
+            # carry no removal count.
+            {"removed"},
         ),
     ):
         path = state_dir / filename
@@ -748,7 +752,7 @@ def recover_import(state_dir: Path, request_id: str) -> dict[str, object] | None
                 and isinstance(marker.get("result"), dict)
             ):
                 stats = marker["result"]
-                if set(stats) == fields and all(
+                if fields <= set(stats) <= fields | optional and all(
                     type(item) in {str, int, bool} for item in stats.values()
                 ):
                     return {"message": message, **stats}

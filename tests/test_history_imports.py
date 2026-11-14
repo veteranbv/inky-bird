@@ -505,3 +505,115 @@ def test_http_upload_requires_owner_csrf_and_never_commits_before_confirmation(
             == 200
         )
         assert not HistoryImports(config).path.exists()
+
+
+ANALYZER_HEADER = b"Start (s),End (s),Scientific name,Common name,Confidence,File\n"
+ANALYZER_TWO_SPECIES = (
+    ANALYZER_HEADER
+    + b"0,3,Sialia sialis,Eastern Bluebird,0.91,fixture.wav\n"
+    + b"0,3,Cardinalis cardinalis,Northern Cardinal,0.62,fixture.wav\n"
+)
+ANALYZER_ONE_SPECIES = ANALYZER_HEADER + b"0,3,Sialia sialis,Eastern Bluebird,0.91,fixture.wav\n"
+
+
+def analyzer_species(config: AppConfig) -> list[str]:
+    path = config.controller.state_dir / "birdnet-analyzer-detections.json"
+    detections = json.loads(path.read_text())["detections"].values()
+    return sorted(item["scientific_name"] for item in detections)
+
+
+def commit_analyzer(
+    imports: HistoryImports, content: bytes, revision: str, key: str
+) -> tuple[dict[str, Any], dict[str, object]]:
+    identifier = staged(imports, content, "birdnet-analyzer")
+    preview = checked(imports, identifier, revision)
+    result = imports.commit(
+        identifier,
+        revision=revision,
+        preview_hash=preview["preview_hash"],
+        key=key,
+        allow_reduction=False,
+    )
+    imports.cancel(identifier)
+    return preview, result
+
+
+def test_analyzer_removal_only_reimport_is_previewed_and_committed(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    imports = HistoryImports(config)
+    revision = str(settings_status(config)["revision"])
+    commit_analyzer(imports, ANALYZER_TWO_SPECIES, revision, "first-analyzer-import")
+    assert analyzer_species(config) == ["Cardinalis cardinalis", "Sialia sialis"]
+
+    preview, result = commit_analyzer(
+        imports, ANALYZER_ONE_SPECIES, revision, "removal-analyzer-import"
+    )
+
+    assert preview["stats"]["removed"] == 1
+    assert preview["stats"]["imported"] == preview["stats"]["updated"] == 0
+    assert preview["unchanged"] is False
+    assert result["removed"] == 1
+    assert analyzer_species(config) == ["Sialia sialis"]
+
+
+def test_analyzer_commit_with_removals_is_recovered_with_its_removal_count(
+    tmp_path: Path,
+) -> None:
+    config = configuration(tmp_path)
+    imports = HistoryImports(config)
+    revision = str(settings_status(config)["revision"])
+    commit_analyzer(imports, ANALYZER_TWO_SPECIES, revision, "first-analyzer-import")
+    identifier = staged(
+        imports,
+        ANALYZER_ONE_SPECIES + b"3,6,Turdus migratorius,Robin,0.9,fixture.wav\n",
+        "birdnet-analyzer",
+    )
+    preview = checked(imports, identifier, revision)
+    result = imports.commit(
+        identifier,
+        revision=revision,
+        preview_hash=preview["preview_hash"],
+        key="mixed-analyzer-import",
+        allow_reduction=False,
+    )
+
+    recovered = recover_import(
+        config.controller.state_dir, hashlib.sha256(b"mixed-analyzer-import").hexdigest()
+    )
+
+    assert recovered is not None
+    assert recovered["removed"] == 1
+    assert {key: value for key, value in recovered.items() if key != "message"} == {
+        key: value for key, value in result.items() if key not in {"message", "upload_id"}
+    }
+    # A retried commit after a lost reply returns the recorded result.
+    assert (
+        imports.commit(
+            identifier,
+            revision=revision,
+            preview_hash=preview["preview_hash"],
+            key="mixed-analyzer-import",
+            allow_reduction=False,
+        )["removed"]
+        == 1
+    )
+
+
+def test_analyzer_marker_written_before_removal_counts_still_recovers(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    imports = HistoryImports(config)
+    revision = str(settings_status(config)["revision"])
+    commit_analyzer(imports, ANALYZER_TWO_SPECIES, revision, "older-analyzer-import")
+    path = config.controller.state_dir / "birdnet-analyzer-detections.json"
+    raw = json.loads(path.read_text())
+    raw["owner_operation"]["result"].pop("removed")
+    path.write_text(json.dumps(raw))
+    path.chmod(0o600)
+
+    recovered = recover_import(
+        config.controller.state_dir, hashlib.sha256(b"older-analyzer-import").hexdigest()
+    )
+
+    assert recovered is not None
+    assert "removed" not in recovered
+    assert recovered["imported"] == 2
