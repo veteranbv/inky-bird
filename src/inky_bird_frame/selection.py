@@ -41,7 +41,9 @@ def select_catalog_entry(
     if mode is not RotationMode.SHUFFLE:
         raise ValueError(f"Unsupported rotation mode: {mode}")
 
-    remaining = [taxon_id for taxon_id in shuffle_remaining if taxon_id in by_taxon]
+    remaining = list(
+        dict.fromkeys(taxon_id for taxon_id in shuffle_remaining if taxon_id in by_taxon)
+    )
     if not remaining:
         remaining = list(by_taxon)
         _shuffle_without_immediate_repeat(remaining, last_taxon_id, random_source)
