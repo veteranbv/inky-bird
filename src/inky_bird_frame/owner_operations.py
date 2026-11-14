@@ -407,7 +407,7 @@ class OwnerOperations:
                     receipt = OperationReceipt(
                         uuid4().hex, _hash(key), digest, kind, "pending", _stamp(), _stamp()
                     )
-                    self._write([*receipts, receipt], keep=receipt.operation_id)
+                    self._write([*receipts, receipt])
                 self._active = True
 
                 def run() -> None:

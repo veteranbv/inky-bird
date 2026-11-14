@@ -480,6 +480,37 @@ def test_final_result_evicts_old_outcomes_instead_of_reporting_interrupted(
         worker.close()
 
 
+def test_finished_receipt_survives_eviction_after_the_clock_moves_back(tmp_path: Path) -> None:
+    # Saved outcomes stamped later than now (the clock was corrected) sort
+    # after the receipt being finished; its own large result must not evict it.
+    count = 70
+    while True:
+        seeded = json.dumps(
+            _finished_receipts(count, result_bytes=16_000, age=-timedelta(hours=1)),
+            indent=2,
+            sort_keys=True,
+        )
+        if len(seeded.encode()) <= MAX_RECEIPT_BYTES - 1024:
+            break
+        count -= 1
+    path = tmp_path / "owner-operations.json"
+    path.write_text(seeded)
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        receipt = worker.submit(
+            "refresh",
+            key="clock-moved-back-key",
+            inputs={},
+            execute=lambda: {"message": "y" * (MAX_RESULT_BYTES - 64)},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "succeeded"
+        assert len(path.read_bytes()) <= MAX_RECEIPT_BYTES
+    finally:
+        worker.close()
+
+
 def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
     worker = OwnerOperations(tmp_path)
     old = datetime.now(UTC) - timedelta(days=1)

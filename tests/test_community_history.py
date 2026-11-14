@@ -146,3 +146,21 @@ def test_species_without_an_english_name_is_skipped_and_counted(
     assert [member["taxon_id"] for member in members] == ([] if all_nameless else [1])
     assert "2 species" in str(preview["notice"])
     history.save(str(preview["preview_hash"]))
+
+
+@pytest.mark.parametrize("count", ["4", None, 4.0])
+def test_named_species_with_a_malformed_count_is_refused_not_skipped(
+    tmp_path: Path, count: object
+) -> None:
+    payload = result()
+    rows = cast(list[dict[str, object]], payload["results"])
+    rows[0]["count"] = count
+    rows.append(_nameless(7))
+    payload["total_results"] = len(rows)
+    history = CommunityHistory(tmp_path)
+    with (
+        patch("inky_bird_frame.community.get_json", return_value=payload),
+        pytest.raises(JournalError, match="complete usable result"),
+    ):
+        history.preview(choices())
+    assert history.status() == {"status": "empty"}
