@@ -405,3 +405,46 @@ def test_local_owner_access_does_not_permit_plain_lan_screen_credentials(tmp_pat
         assert "inky-local-screen" not in client.cookies
         assert client.get("/v1/screen/view").status_code == 401
         assert access.status()["grants"] == []
+
+
+def test_screen_plate_replaced_after_authorization_is_not_cached_as_the_old_revision(
+    tmp_path: Path,
+) -> None:
+    config, _, access = fixture(tmp_path)
+    secret, _ = access.request_pair("")
+    status = cast(dict[str, Any], access.status())
+    access.update(
+        revision=status["revision"],
+        action="pair",
+        id=status["grants"][0]["id"],
+        name="Office screen",
+        view="all",
+        confirm=True,
+    )
+    old = hashlib.sha256(PNG).hexdigest()
+    replacement = b"synthetic replacement image fixture"
+    original = JournalService.view_entries
+
+    def replace_after_read(
+        self: JournalService, view: str, **options: bool
+    ) -> list[dict[str, object]]:
+        entries = original(self, view, **options)
+        # The plate changes between authorizing the revision and reading the bytes.
+        (config.catalog_dir / "species/1-robin/portrait.png").write_bytes(replacement)
+        index = json.loads((config.catalog_dir / "index.json").read_text())
+        index["species"][0]["portrait_sha256"] = hashlib.sha256(replacement).hexdigest()
+        write_json_atomic(config.catalog_dir / "index.json", index)
+        return entries
+
+    with TestClient(create_app(config), base_url=ORIGIN) as screen:
+        screen.cookies.set("__Host-inky-screen", secret)
+        with patch.object(JournalService, "view_entries", replace_after_read):
+            plate = screen.get(f"/v1/screen/plates/1?revision={old}")
+        assert plate.status_code == 200
+        assert plate.content == replacement
+        assert plate.headers["cache-control"] == "no-store"
+        current = screen.get(
+            f"/v1/screen/plates/1?revision={hashlib.sha256(replacement).hexdigest()}"
+        )
+        assert current.content == replacement
+        assert current.headers["cache-control"] == "private, max-age=31536000, immutable"

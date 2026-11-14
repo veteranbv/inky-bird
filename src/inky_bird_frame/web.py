@@ -940,7 +940,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             ]:
                 return _error(404, "not_found", "This approved image is outside the screen's view")
             body = await run_in_threadpool(journal.portrait, id)
-            return _plate(request, body, "image/png", cast(str, entry["portrait_sha256"]))
+            # The plate can be replaced after the view was read; cache only what was sent.
+            return _plate(request, body, "image/png", hashlib.sha256(body).hexdigest())
         return _result(
             {
                 "name": grant.name,

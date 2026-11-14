@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 from starlette.testclient import TestClient
@@ -10,6 +11,7 @@ from starlette.testclient import TestClient
 from inky_bird_frame.access import AccessStore
 from inky_bird_frame.config import ControllerConfig
 from inky_bird_frame.http import write_json_atomic
+from inky_bird_frame.journal import JournalService
 from inky_bird_frame.web import create_app
 
 ORIGIN = "https://inky.example.test"
@@ -160,6 +162,42 @@ def test_replaced_plates_drop_their_old_thumbnail(tmp_path: Path) -> None:
         stale = client.get(f"/v1/owner/journal/birds/1/thumbnail?revision={first}")
         assert stale.headers["cache-control"] == "no-store"
         assert [path.name.split(".")[0] for path in cache.iterdir()] == [second]
+
+
+def test_a_plate_replaced_mid_request_is_never_cached_as_the_old_revision(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    initial = _plate((40, 40, 200))
+    first = _publish(config, initial)
+    replacement = _plate((200, 200, 40))
+    second = hashlib.sha256(replacement).hexdigest()
+    original = JournalService.portrait
+
+    def replace_then_read(self: JournalService, taxon_id: int) -> bytes:
+        # The request named the first revision; the plate changes before its bytes are read.
+        _publish(config, replacement)
+        return original(self, taxon_id)
+
+    with TestClient(create_app(config), base_url=ORIGIN) as client:
+        _signed_in(client, config)
+        for kind in ("portrait", "thumbnail"):
+            _publish(config, initial)
+            with patch.object(JournalService, "portrait", replace_then_read):
+                response = client.get(f"/v1/owner/journal/birds/1/{kind}?revision={first}")
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+            current = client.get(f"/v1/owner/journal/birds/1/{kind}?revision={second}")
+            assert current.headers["cache-control"] == IMMUTABLE
+            assert response.content == current.content
+        # The cached thumbnail is named for the plate it was made from.
+        cache = config.state_dir / "plate-thumbnails"
+        assert [path.name.split(".")[0] for path in cache.iterdir()] == [second]
+        with Image.open(next(cache.iterdir())) as image:
+            pixel = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        assert isinstance(pixel, tuple)
+        red, green, blue = pixel
+        assert red > blue and green > blue
 
 
 def test_an_undecodable_plate_fails_without_revealing_paths(tmp_path: Path) -> None:
