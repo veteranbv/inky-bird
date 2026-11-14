@@ -80,8 +80,16 @@ def run_scheduler(
     jobs_provider: Callable[[], Sequence[ScheduledJob]] | None = None,
     wake_provider: Callable[[], str | None] | None = None,
     on_schedule: Callable[[str, float], None] | None = None,
+    on_jobs_error: Callable[[Exception], None] | None = None,
+    on_jobs_recovered: Callable[[], None] | None = None,
+    jobs_error_interval_seconds: float = 300.0,
 ) -> None:
-    """Run due jobs serially, isolating failures and gating generation on refresh."""
+    """Run due jobs serially, isolating failures and gating generation on refresh.
+
+    When ``jobs_provider`` fails, the last good jobs keep running. The failure
+    is logged once and ``on_jobs_error`` is called at most once per
+    ``jobs_error_interval_seconds`` until ``on_jobs_recovered`` is called.
+    """
     if not jobs:
         raise ValueError("Scheduler requires at least one job")
     if any(job.interval_seconds < 1 for job in jobs):
@@ -94,6 +102,47 @@ def run_scheduler(
     seen_wake: str | None = None
     published: dict[str, float] = {}
     wake_failed = False
+    jobs_failed = False
+    jobs_error_reported_at: float | None = None
+
+    def report(callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception as exc:  # An alert path must never stop scheduled work.
+            _log_event("jobs_alert_failed", error_type=type(exc).__name__)
+
+    def reload_jobs(
+        provider: Callable[[], Sequence[ScheduledJob]],
+    ) -> Sequence[ScheduledJob] | None:
+        nonlocal jobs_failed, jobs_error_reported_at
+        try:
+            updated = provider()
+            if (
+                not updated
+                or any(job.interval_seconds < 1 for job in updated)
+                or len({job.name for job in updated}) != len(updated)
+            ):
+                raise ValueError("Scheduler configuration has invalid jobs")
+        except Exception as exc:
+            if not jobs_failed:
+                _log_event("jobs_reload_failed", error_type=type(exc).__name__)
+            jobs_failed = True
+            observed_at = monotonic()
+            alert, failure = on_jobs_error, exc
+            if alert is not None and (
+                jobs_error_reported_at is None
+                or observed_at - jobs_error_reported_at >= jobs_error_interval_seconds
+            ):
+                jobs_error_reported_at = observed_at
+                report(lambda: alert(failure))
+            return None
+        if jobs_failed:
+            jobs_failed = False
+            jobs_error_reported_at = None
+            _log_event("jobs_reload_recovered")
+            if on_jobs_recovered is not None:
+                report(on_jobs_recovered)
+        return updated
 
     def publish_schedule() -> None:
         if on_schedule is None:
@@ -107,14 +156,8 @@ def run_scheduler(
 
     while not stop_requested():
         now = monotonic()
-        if jobs_provider is not None:
-            updated = jobs_provider()
-            if (
-                not updated
-                or any(job.interval_seconds < 1 for job in updated)
-                or len({job.name for job in updated}) != len(updated)
-            ):
-                raise ValueError("Scheduler configuration has invalid jobs")
+        updated = reload_jobs(jobs_provider) if jobs_provider is not None else None
+        if updated is not None:
             previous = {job.name: job for job in jobs}
             if tuple(updated) != tuple(jobs):
                 # A changed policy must complete a new refresh before generation.
@@ -159,7 +202,8 @@ def run_scheduler(
         for job in due_jobs:
             if stop_requested():
                 return
-            if jobs_provider is not None and job not in jobs_provider():
+            current = reload_jobs(jobs_provider) if jobs_provider is not None else None
+            if current is not None and job not in current:
                 # Settings can change while the previous child is running.
                 # Never start a removed or changed job from a stale due list.
                 continue

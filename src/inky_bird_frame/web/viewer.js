@@ -268,7 +268,6 @@ function present(initial) {
     try {
       const response = await fetch(bird.portrait_url, {
         credentials: 'same-origin',
-        cache: 'no-store',
         signal: controller.signal,
       });
       if ([401, 403].includes(response.status)) {

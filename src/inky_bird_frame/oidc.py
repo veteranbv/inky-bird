@@ -123,8 +123,8 @@ def _https_endpoint(value: object) -> str:
 
 
 def _client(config: OIDCConfig, transaction: OIDCTransaction | None = None) -> OAuthClient:
-    secret = os.environ.get(config.client_secret_env)
-    if not secret:
+    secret = os.environ.get(config.client_secret_env, "")
+    if not secret.strip():
         raise OIDCError(
             "Sign-in provider secret is unavailable; set its configured environment variable"
         )

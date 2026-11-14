@@ -34,6 +34,23 @@ from .journal import (
 MAX_COMMUNITY_SPECIES = 500
 
 
+def _nameless(item: object) -> bool:
+    """A reported species with no English name, which a collection cannot list."""
+    if not isinstance(item, dict):
+        return False
+    taxon = item.get("taxon")
+    if (
+        type(item.get("count")) is not int
+        or not isinstance(taxon, dict)
+        or taxon.get("rank") != "species"
+        or type(taxon.get("id")) is not int
+        or not isinstance(taxon.get("name"), str)
+    ):
+        return False
+    common = taxon.get("preferred_common_name")
+    return not isinstance(common, str) or not common.strip()
+
+
 class CommunityHistory:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -142,8 +159,13 @@ class CommunityHistory:
                     "This search has more than 500 species. "
                     "Narrow its dates or radius; nothing was saved."
                 )
-            birds = parse_inaturalist_species_counts(raw)
-            if total < 0 or len(birds) != total:
+            results = raw.get("results")
+            if not isinstance(results, list):
+                raise DataSourceError("Incomplete results")
+            named = [item for item in results if not _nameless(item)]
+            skipped = len(results) - len(named)
+            birds = parse_inaturalist_species_counts({**raw, "results": named})
+            if total < 0 or len(birds) + skipped != total:
                 raise DataSourceError("Incomplete species identities")
         except DataSourceError as exc:
             raise JournalError(
@@ -179,7 +201,8 @@ class CommunityHistory:
                 "preview_hash": digest,
                 "notice": "Birds reported near this place. These are community reports, "
                 "not your personal sightings. Saving requests no generation "
-                "and changes no wall selection.",
+                "and changes no wall selection."
+                + (f" {skipped} species without an English name were left out." if skipped else ""),
             }
             encoded = json.dumps(
                 {
@@ -193,7 +216,8 @@ class CommunityHistory:
                 )
             write_bytes_atomic(self.path, encoded, mode=0o600)
         return {
-            "message": "Community reports checked. Review the complete selection before saving."
+            "message": "Community reports checked. Review the complete selection before saving.",
+            "skipped_count": skipped,
         }
 
     def save(self, preview_hash: str) -> dict[str, object]:
