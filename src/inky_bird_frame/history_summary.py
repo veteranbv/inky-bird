@@ -167,7 +167,7 @@ def load_summary(
     ``rebuild`` reads the complete history without taking that lock again.
     """
     payload = _fresh_payload(history_path, source)
-    if payload is not None:
+    if payload is not None and _names_showable(payload):
         try:
             return parse(payload)
         except DataSourceError:
@@ -192,12 +192,30 @@ def _count(value: object, *, minimum: int) -> int:
     return value
 
 
-def _showable(value: object) -> bool:
-    # The journal's own name rule; a summary it would refuse is rebuilt instead.
-    if not isinstance(value, str):
-        return False
+def _showable(value: str) -> bool:
     text = unicodedata.normalize("NFC", value.strip())
     return len(text) <= 256 and not any(unicodedata.category(char).startswith("C") for char in text)
+
+
+def _names_showable(payload: dict[str, object]) -> bool:
+    """A stored summary with a name the journal would refuse is rebuilt once.
+
+    Names from the history itself are kept as they are: the journal shows a
+    matched bird under its own name and refuses only an unmatched odd name.
+    """
+    pending: list[object] = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"common_name", "scientific_name"}:
+                    if isinstance(item, str) and not _showable(item):
+                        return False
+                else:
+                    pending.append(item)
+    return True
 
 
 def parse_species_rows(value: object) -> list[SpeciesSummary]:
@@ -216,8 +234,6 @@ def parse_species_rows(value: object) -> list[SpeciesSummary]:
             not isinstance(common, str)
             or not isinstance(scientific, str)
             or not scientific
-            or not _showable(common)
-            or not _showable(scientific)
             or undated > count
             or first is not None
             and (not _is_iso_date(first) or last is None)

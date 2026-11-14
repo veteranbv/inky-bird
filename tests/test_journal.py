@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
+from ebird_fixtures import EXPORT_COLUMNS as EBIRD_COLUMNS
 from starlette.testclient import TestClient
 
 from inky_bird_frame.access import AccessStore
@@ -28,7 +29,6 @@ from inky_bird_frame.config import (
     DisplayNodeConfig,
 )
 from inky_bird_frame.controller import GenerationWork, TerminalQueueEntry
-from inky_bird_frame.ebird_archive import EXPORT_COLUMNS as EBIRD_COLUMNS
 from inky_bird_frame.ebird_archive import import_ebird_archive
 from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.http import write_json_atomic
@@ -970,6 +970,95 @@ def test_unreadable_crosswalk_refuses_changes_that_need_every_known_bird(
     (controller.state_dir / "ebird-archive-taxonomy-crosswalk.json").write_bytes(b"\xff")
     with pytest.raises(JournalError, match="^Saved species matches for this history"):
         JournalService(controller).collection_import_preview(portable_document())
+
+
+def test_unrelated_unavailable_history_still_allows_changes_for_listed_birds(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    controller.state_dir.mkdir(parents=True, exist_ok=True)
+    damaged = controller.state_dir / "birdnet-analyzer-detections.json"
+    damaged.write_text("not json")
+    damaged.chmod(0o600)
+    service = JournalService(controller)
+    assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
+    assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
+    # A bird missing from the list may be in the unreadable history: say so.
+    with pytest.raises(JournalError, match="^Retained history needs attention"):
+        service.favorite(revision=2, taxon_id=900, favorite=True)
+    with pytest.raises(JournalError, match="^Retained history needs attention"):
+        service.save_selection(revision=2, label="Later", taxon_ids=[1, 900])
+
+
+def test_unreadable_plate_work_never_refuses_bird_changes(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    app = _app_config(controller, tmp_path)
+    service = JournalService(controller, app_config=app)
+    with (
+        patch("inky_bird_frame.journal.current_config", side_effect=lambda value: value),
+        patch.object(JournalService, "management", side_effect=PermissionError("private path")),
+    ):
+        snapshot = service.snapshot()
+        assert snapshot["management"] == {"available": False, "reason": "unreadable"}
+        assert [n["part"] for n in cast(list[dict[str, str]], snapshot["notices"])] == [
+            "plate-work"
+        ]
+        assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
+        assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
+        service.collection_import_preview(portable_document())
+        with pytest.raises(JournalError, match="^Choose a bird from your journal"):
+            service.favorite(revision=2, taxon_id=900, favorite=True)
+
+
+def test_unshowable_name_in_history_marks_the_source_unavailable_without_partial_rows(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir,
+        tmp_path,
+        [
+            ("S1", "Robin", "Turdus migratorius", "2020-01-01"),
+            ("S2", "Unmatched", "Fixture unknown", "2020-01-02"),
+        ],
+    )
+    history = controller.state_dir / "ebird-archive-observations.json"
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        for species in checklist["species"]:
+            if species["scientific_name"] == "Fixture unknown":
+                species["common_name"] = "Bad\u200bname"
+    write_json_atomic(history, payload, mode=0o600)
+    snapshot = JournalService(controller).snapshot()
+    coverage = cast(list[dict[str, object]], snapshot["history_coverage"])
+    assert [row["status"] for row in coverage] == ["unavailable"]
+    assert cast(list[dict[str, object]], snapshot["birds"])[0]["retained_evidence"] == []
+    assert snapshot["unresolved_history"] == []
+
+
+def test_unusual_name_on_a_matched_history_row_still_shows_like_before(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    history = controller.state_dir / "ebird-archive-observations.json"
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        checklist["species"][0]["common_name"] = "Rob\u200din" + "x" * 300
+    write_json_atomic(history, payload, mode=0o600)
+    service = JournalService(controller)
+    snapshot = service.snapshot()
+    coverage = cast(list[dict[str, object]], snapshot["history_coverage"])
+    assert [row["status"] for row in coverage] == ["available"]
+    bird = cast(list[dict[str, object]], snapshot["birds"])[0]
+    assert bird["common_name"] == "Robin"
+    assert [row["count"] for row in cast(list[dict[str, object]], bird["retained_evidence"])] == [1]
+    # Such a summary is rebuilt on each read, the full parse every read did before.
+    assert service.snapshot() == snapshot
 
 
 def test_unreadable_crosswalk_marks_only_its_source_unavailable(tmp_path: Path) -> None:

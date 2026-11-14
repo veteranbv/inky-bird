@@ -818,14 +818,7 @@ class JournalService:
         if type(favorite) is not bool:
             raise JournalError("Choose whether to keep this bookmark")
         _taxa([taxon_id])
-        bird = next(
-            (
-                bird
-                for bird in cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
-                if bird["taxon_id"] == taxon_id
-            ),
-            None,
-        )
+        bird = self._listed_birds([cast(int, taxon_id)]).get(cast(int, taxon_id))
         if bird is None:
             raise JournalError("Choose a bird from your journal or available artwork")
         return set_favorite(
@@ -853,7 +846,7 @@ class JournalService:
                 cast(str, bird["common_name"]),
                 cast(str, bird["scientific_name"]),
             )
-            for bird in cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
+            for bird in self._listed_birds(list(taxa)).values()
         }
         if any(taxon not in identities for taxon in taxa):
             raise JournalError("Choose birds from your journal or available artwork")
@@ -865,6 +858,26 @@ class JournalService:
             collection_id=collection_id,
             member_names=identities,
         )
+
+    def _listed_birds(self, taxa: list[int]) -> dict[int, dict[str, object]]:
+        """The journal's birds by taxon, for changes that name only these birds.
+
+        A requested bird missing while a part that lists birds is unreadable
+        may be in that part, so its message is the answer instead.
+        """
+        snapshot = self.snapshot()
+        birds = {
+            cast(int, bird["taxon_id"]): bird
+            for bird in cast(list[dict[str, object]], snapshot["birds"])
+        }
+        if any(taxon not in birds for taxon in taxa):
+            for row in cast(list[dict[str, object]], snapshot["history_coverage"]):
+                if row["status"] == "unavailable":
+                    raise JournalError(cast(str, row["coverage"]))
+            for notice in cast(list[dict[str, str]], snapshot["notices"]):
+                if notice["part"] != "plate-work":
+                    raise JournalError(notice["message"])
+        return birds
 
     def queue_preview(self, *, collection_id: str, revision: object) -> dict[str, object]:
         with catalog_state_lock(self.config.state_dir):
@@ -1097,15 +1110,16 @@ class JournalService:
         """Owner journal projection.
 
         The page degrades an unreadable part to a notice. ``strict`` callers use
-        the bird list as the record of which birds exist, so they refuse instead.
+        the bird list as the record of which birds exist, so they refuse when a
+        part that lists birds is unreadable.
         """
         if self.app_config is not None:
             self.app_config = current_config(self.app_config)
         retained, evidence, coverage, unresolved, recent = self._retained_history(strict=strict)
         notices: list[dict[str, str]] = []
 
-        def degrade(part: str, message: str, error: Exception) -> None:
-            if strict:
+        def degrade(part: str, message: str, error: Exception, *, lists_birds: bool = True) -> None:
+            if strict and lists_birds:
                 raise JournalError(message) from error
             notices.append({"part": part, "message": message})
 
@@ -1223,12 +1237,13 @@ class JournalService:
             try:
                 management = self.management(approved=approved_ids, pending=pending)
             except (CatalogError, JournalError, OSError, ValueError) as error:
-                management = {"available": False}
+                management = {"available": False, "reason": "unreadable"}
                 degrade(
                     "plate-work",
                     "Plate work could not be read. Manage shows it again "
                     "once its files are readable.",
                     error,
+                    lists_birds=False,
                 )
             result = {
                 "revision": state.revision,
