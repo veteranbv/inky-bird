@@ -246,6 +246,8 @@ Replace the names and URLs with addresses reachable from the Homepage server
 and browser. `siteMonitor` uses `/v1/catalog`, not `/health`, because the
 catalog route fails closed when active catalog state is unavailable. Inky
 answers Homepage's `HEAD` readiness probe without transferring the catalog.
+`/health` answers `GET` only and returns 404 to `HEAD`, so do not point a
+`HEAD`-based monitor at it.
 The stats request is server-side and needs no CORS permission. Polling every
 five minutes avoids Homepage's much noisier default while keeping the counts
 useful.
@@ -365,6 +367,23 @@ runtime to `~/Services/inky-bird`, installs its locked controller
 environment, creates LaunchAgents, loads them, and verifies them with
 `launchctl`.
 
+At the end of `--yes`, setup asks for `Inky username:` and then a hidden
+password when the controller has no browser owner yet. These create the owner
+account you use to sign in at `/app`. Cancelling leaves the controller running
+with owner controls locked; run `uv run inky-bird access setup --config "$CONFIG"`
+later in a private terminal.
+
+Paid plate generation is on with `config.example.toml`: `generation_enabled`
+defaults to true unless the file sets `configuration_ownership = "app"`. Each generation cycle uses Codex,
+through your ChatGPT plan's Codex allowance or a billed API key. On macOS, the
+first scheduled generation runs one `schedule.generation_minutes` interval
+after setup (six hours with the example value), then at that interval. To keep
+it off, set `generation_enabled = false` under `[controller]` before setup; if
+setup already ran, change it and run setup again to remove the generation job.
+With an app-managed configuration, generation is off until you turn it on; when
+it is on, the scheduler starts generation right after its first successful
+refresh.
+
 LaunchAgents begin when this macOS user logs in. They survive application
 updates and restart after logout/login or reboot. For unattended recovery, the
 Mac must also power on after an outage and reach that user session. Newer
@@ -430,12 +449,26 @@ uv run inky-bird doctor controller --config "$CONFIG"
 ```
 
 The installer creates a persistent `inky-bird-controller.service` plus
-refresh, generation, and optional notification/publication timers. It enables
-them for boot and verifies their state through systemd. Setup performs one
-successful refresh before installing the units, then each timer schedules its
-first run relative to activation and continues at the configured interval.
-Installer progress and any `sudo` prompt remain visible. See the official
+refresh, generation, and optional notification/publication timers. An
+app-managed configuration (the default from `config init`) gets one persistent
+`inky-bird-scheduler.service` instead of those timers. It enables them for boot
+and verifies their state through systemd. Setup performs one successful refresh
+before installing the units, then each timer schedules its first run two minutes
+after activation and continues at the configured interval. Installer progress
+and any `sudo` prompt remain visible. See the official
 [`systemd.timer` manual](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html).
+
+As on macOS, `--yes` ends by asking for `Inky username:` and a hidden password
+when no browser owner exists yet.
+
+Paid plate generation is on with `config.example.toml`. On Linux, the generation
+timer first runs two minutes after setup, then every
+`schedule.generation_minutes`. Each cycle uses Codex, through your ChatGPT
+plan's Codex allowance or a billed API key. To keep it off, set
+`generation_enabled = false` under `[controller]` before setup; if setup already
+ran, change it and run setup again to remove the generation timer. With an
+app-managed configuration, generation is off until you turn it on; when it is
+on, the scheduler starts generation right after its first successful refresh.
 
 ### Docker controller
 
@@ -468,6 +501,14 @@ directly.
 An existing controller can explicitly retain every currently approved plate
 after upgrading by previewing and applying `collection import-approved`; see
 the [operations guide](operations.md#seed-and-manage-a-private-collection).
+
+### Open the journal
+
+Open `http://CONTROLLER_ADDRESS:8793/app` in a browser on your home network,
+using the controller's actual LAN address, and sign in with the username and
+password you created at the end of setup. The approved artwork is under
+**Birds → Available artwork**; Home stays empty until a bird is observed or
+saved. See [browser access](browser-access.md) for allowed addresses and HTTPS.
 
 ### Import an approved catalog without changing parent permissions
 
@@ -573,8 +614,8 @@ Reboot if the installer asks.
 Clone this project and install it into the same Pimoroni environment:
 
 ```bash
-git clone https://github.com/veteranbv/inky-bird.git
-cd inky-bird
+git clone https://github.com/veteranbv/inky-bird.git "$HOME/inky-bird"
+cd "$HOME/inky-bird"
 INKY_VERSION=vX.Y.Z
 git checkout --detach "$INKY_VERSION"
 "$HOME/.virtualenvs/pimoroni/bin/python" -m pip install -e '.[inky]'
@@ -596,10 +637,16 @@ controller dependency.
 Create a private display configuration. Do not copy the controller's private
 file because it may contain credentials and a private discovery location.
 
+When one Pi runs both roles, the controller already uses this same file. The
+`if` below keeps an existing file; edit its `[display_node]` section instead of
+creating a second configuration.
+
 ```bash
 cd "$HOME/inky-bird"
 mkdir -p "$HOME/.config/inky-bird"
-cp config.example.toml "$HOME/.config/inky-bird/config.toml"
+if [ ! -e "$HOME/.config/inky-bird/config.toml" ]; then
+  cp config.example.toml "$HOME/.config/inky-bird/config.toml"
+fi
 chmod 600 "$HOME/.config/inky-bird/config.toml"
 nano "$HOME/.config/inky-bird/config.toml"
 ```
@@ -679,6 +726,10 @@ launchctl print "gui/$(id -u)/com.inky-bird.refresh"
 launchctl print "gui/$(id -u)/com.inky-bird.generate"
 ```
 
+An app-managed configuration has `com.inky-bird.scheduler` instead of the
+`refresh` and `generate` agents, and the generation agent exists only while
+generation is on.
+
 The Pi and Linux controller services return automatically after a reboot. The
 macOS LaunchAgents return when their owning user logs in. The e-paper panel
 keeps its last image without power, so a controller or network outage does not
@@ -709,8 +760,8 @@ one. If setup detects both native identities, it stops before making changes.
 For every display runtime update, stop its timer, let the
 current service finish, and preserve a recoverable runtime backup. The installer
 refuses to replace either installed Python distribution while that role is running.
-Resume the recorded timer state after validation; a forced panel cycle is not
-required. See [package upgrade and rollback](repository-name.md#python-environments).
+Display setup enables and restarts the timer when it finishes; a forced panel
+cycle is not required. See [package upgrade and rollback](repository-name.md#python-environments).
 
 The remote display wrapper transfers public source to a private staging
 directory beside the application, not over the installed runtime. It checks
@@ -745,12 +796,22 @@ uv run inky-bird setup controller --config "$CONFIG" --yes
 uv run inky-bird doctor controller --config "$CONFIG"
 ```
 
-On the display:
+On the display, stop the timer and wait for a running panel update to finish
+before setup. An install that began under the old name uses
+`inky-bird-frame-display` instead of `inky-bird-display`:
 
 ```bash
+cd "$HOME/inky-bird"
+CONFIG="$HOME/.config/inky-bird/config.toml"
+INKY="$HOME/.virtualenvs/pimoroni/bin/inky-bird"
 INKY_VERSION=vX.Y.Z
 git fetch --tags --prune
 git checkout --detach "$INKY_VERSION"
+sudo systemctl stop inky-bird-display.timer
+while systemctl show --property=ActiveState --value inky-bird-display.service |
+  grep -Eqv '^(inactive|failed)$'; do
+  sleep 5
+done
 "$INKY" setup display --config "$CONFIG" --source-dir "$PWD" \
   --venv "$HOME/.virtualenvs/pimoroni" --yes
 "$INKY" doctor display --config "$CONFIG"
@@ -798,18 +859,21 @@ private configuration, controller state, catalogs, and generated art:
 ./deploy/uninstall-display-local.sh        # display node
 ```
 
-The equivalent manual removal follows. On a systemd controller:
+The equivalent manual removal follows. On an install that began under the old
+name, replace `inky-bird` with `inky-bird-frame` in each name. On a systemd
+controller:
 
 ```bash
 for unit in \
   inky-bird-controller.service \
+  inky-bird-scheduler.service \
   inky-bird-refresh.timer \
   inky-bird-generate.timer \
   inky-bird-catalog-publish.timer \
   inky-bird-notifications.timer; do
   sudo systemctl disable --now "$unit" 2>/dev/null || true
 done
-sudo rm -f /etc/systemd/system/inky-bird-{controller,refresh,generate,catalog-publish,notifications}.{service,timer}
+sudo rm -f /etc/systemd/system/inky-bird-{controller,scheduler,refresh,generate,catalog-publish,notifications}.{service,timer}
 sudo systemctl daemon-reload
 ```
 
@@ -825,7 +889,7 @@ On macOS, unload each installed label and remove its matching plist from
 `~/Library/LaunchAgents`:
 
 ```bash
-for label in serve refresh generate catalog-publish notifications; do
+for label in serve scheduler refresh generate catalog-publish notifications; do
   launchctl bootout "gui/$(id -u)/com.inky-bird.$label" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/com.inky-bird.$label.plist"
 done

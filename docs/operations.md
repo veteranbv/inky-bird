@@ -401,29 +401,32 @@ the private discovery snapshot, downloaded reference bitmaps, run logs, failed
 attempts, or display state. The macOS installer creates the publication
 LaunchAgent only when `[public_catalog].enabled` is true.
 
-## Maintainer deployment on macOS
+## Maintainer deployment
 
-The optional owner-only deployment workflow uses the included macOS controller
-installer. The self-hosted Actions runner dispatches that installer as a
-one-shot job in the controller user's GUI launchd domain. This is the same
-security context as the catalog publisher, so the existing keychain-backed
-GitHub CLI credential remains available without copying it into an Actions
-secret or environment variable.
+Deployment has no GitHub workflow and no self-hosted Actions runner. The
+operator runs it on the controller, from a source checkout of the selected
+release tag: rerun controller setup as described in
+[Update](installation.md#update).
 
-The trusted runner reads display connection details from
-`~/Library/Application Support/Inky Bird Frame/deployment.env`:
+To update a display node over SSH from the controller, set these six values in
+the operator's shell and run the remote wrapper from the same checkout:
 
 ```bash
-INKY_BIRD_DISPLAY_HOST=display-node-address
-INKY_BIRD_DISPLAY_USER=display-user
-INKY_BIRD_DISPLAY_SSH_KEY="$HOME/.ssh/inky-bird-frame-display"
-INKY_BIRD_DISPLAY_APP_DIR=/home/display-user/Services/inky-bird-frame
-INKY_BIRD_DISPLAY_CONFIG_PATH=/home/display-user/.config/inky-bird-frame/config.toml
-INKY_BIRD_DISPLAY_VENV=/home/display-user/.virtualenvs/inky-bird-frame
+export INKY_BIRD_DISPLAY_HOST=display-node-address
+export INKY_BIRD_DISPLAY_USER=display-user
+export INKY_BIRD_DISPLAY_SSH_KEY="$HOME/.ssh/inky-bird-display"
+export INKY_BIRD_DISPLAY_APP_DIR=/home/display-user/Services/inky-bird
+export INKY_BIRD_DISPLAY_CONFIG_PATH=/home/display-user/.config/inky-bird/config.toml
+export INKY_BIRD_DISPLAY_VENV=/home/display-user/.virtualenvs/pimoroni
+./deploy/install-display-node.sh
 ```
 
-All six values are deployment-specific and required. Keep this file on the
-controller. It is not part of the repository.
+All six values are deployment-specific and required; keep them out of the
+repository. The wrapper stages the public source on the display and runs its
+local installer with non-interactive `sudo`, so the display account needs
+`sudo` without a password prompt. That installer refuses to replace the runtime
+while the display timer is active: stop the timer on the display first, as in
+the display update steps.
 
 ## Releases and upgrades
 

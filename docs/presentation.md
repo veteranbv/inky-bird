@@ -84,17 +84,23 @@ controller_url = "http://inky-controller:8793/wall"
 
 Use your actual reachable private address. Retain HTTPS and certificate trust
 when required. This HTTP hostname also needs its exact origin in the existing
-controller configuration:
+controller configuration, with local access mode. A list of allowed origins
+without `owner_access_mode` defaults to HTTPS-only, which rejects an HTTP
+origin and stops the controller from loading its configuration:
 
 ```toml
 [controller]
+owner_access_mode = "local"
 owner_allowed_origins = ["http://inky-controller:8793"]
 ```
 
 Merge it with any existing origins; do not replace an HTTPS or OIDC origin.
-Keep HTTPS-only mode unchanged and use its configured HTTPS address instead
-if that is your installation's policy. Docker also needs the actual published
-origin, even for a literal IP; see [Docker address setup](docker.md#what-runs).
+If your installation is HTTPS-only, keep that mode and use its configured HTTPS
+address instead; switching it to local mode allows HTTP owner sign-in. Behind a
+reverse proxy, that address must route `/wall/*`, as the
+[reverse-proxy recipes](browser-access.md#advanced-https-through-a-reverse-proxy)
+do. Docker also needs the actual published origin, even for a literal IP; see
+[Docker address setup](docker.md#what-runs).
 The origin permits that address, not arbitrary clients or internet exposure.
 
 Validate the file, rerun display setup and restart its service
@@ -111,6 +117,9 @@ Displays show only the last confirmed physical success.
 
 An empty or removed selected view pauses rotation. The panel keeps its last
 image; Inky does not fall back to other birds or claim a new physical success.
+Because no update completes, a controller with notifications enabled sends a
+`display_stale` notice once the [staleness threshold](notifications.md#events-and-noise-controls)
+passes, and repeats it after each cooldown.
 Choose a populated view to resume at the next scheduled cycle. This also means
 removing a bird from the view cannot erase pixels already on an e-paper panel.
 

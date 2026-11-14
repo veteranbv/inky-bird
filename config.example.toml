@@ -9,12 +9,15 @@ sources = ["inaturalist"]
 # Choose exactly one location form for iNaturalist or eBird. The legacy five-digit US
 # zip_code remains the no-key path. For any country, use latitude/longitude directly,
 # or use postal_code + country_code with a private Geoapify key. See docs/discovery.md.
-zip_code = "12345"
+# 00000 is a placeholder, not a real ZIP code: replace it before the first refresh.
+zip_code = "00000"
 # latitude = 0.0
 # longitude = 0.0
 # postal_code = "YOUR_POSTAL_CODE"
 # country_code = "XX"
 # geoapify_api_key = "YOUR_PRIVATE_GEOAPIFY_API_KEY"
+# The discovery *_env keys in this section work for Docker (controller.env) and for
+# commands you run yourself. Native setup refuses them: put the value in this file.
 # geoapify_api_key_env = "GEOAPIFY_API_KEY"
 # Eight kilometers is approximately five miles: local enough to feel relevant while
 # usually covering enough observations for variety. Increase it in sparsely observed areas.
@@ -176,6 +179,7 @@ delivery_retry_minutes = 5
 max_delivery_attempts = 20
 
 # Keep real service URLs only in your private config.toml. Choose url or url_env, not both.
+# url_env works for Docker; the native installers require url.
 # Events: discovery, generation_approved, terminal_error, degraded, recovered,
 # publication_error, publication_recovered, display_stale, display_recovered.
 
