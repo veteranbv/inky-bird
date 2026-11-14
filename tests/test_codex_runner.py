@@ -252,23 +252,38 @@ class CodexRunnerSubprocessTests(unittest.TestCase):
                 )
 
 
-def _process_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def _process_running(pid: int) -> bool:
+    # A killed process stays a zombie until its parent reaps it, and a container
+    # init may never reap adopted children, so only a non-zombie counts.
+    if Path("/proc/self/stat").is_file():
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+        except OSError:
+            return False
+        state = stat[stat.rfind(b")") + 2 :].split(maxsplit=1)[0]
+    else:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, check=False
+        )
+        state = result.stdout.strip()
+        if result.returncode != 0 or not state:
+            return False
+    return not state.startswith((b"Z", b"X"))
 
 
 def _wait_for_exit(pid: int, seconds: float) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if not _process_exists(pid):
+        if not _process_running(pid):
             return True
         time.sleep(0.05)
-    return not _process_exists(pid)
+    return not _process_running(pid)
+
+
+def _kill_if_running(pid: int) -> None:
+    if _process_running(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 class CodexRunnerProcessSafetyTests(unittest.TestCase):
@@ -330,14 +345,16 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
             started = time.monotonic()
             with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5):
                 worker.start()
-                worker.join(15.0)
-                elapsed = time.monotonic() - started
-                returned = not worker.is_alive()
-                grandchild = int(pid_file.read_text())
-                survived = not _wait_for_exit(grandchild, 5.0)
-                if survived:
-                    os.kill(grandchild, signal.SIGKILL)
-                worker.join(15.0)
+                try:
+                    worker.join(15.0)
+                    elapsed = time.monotonic() - started
+                    returned = not worker.is_alive()
+                    grandchild = int(pid_file.read_text())
+                    survived = not _wait_for_exit(grandchild, 5.0)
+                finally:
+                    if pid_file.is_file() and pid_file.read_text().strip():
+                        _kill_if_running(int(pid_file.read_text()))
+                    worker.join(15.0)
         self.assertTrue(returned, "the Codex run did not return after its timeout")
         self.assertLess(elapsed, 15.0)
         self.assertFalse(survived, "a grandchild of the Codex process survived its timeout")
@@ -382,8 +399,8 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
                     if job.poll() is None:
                         job.kill()
                         job.wait()
-                    if agent is not None and _process_exists(agent):
-                        os.kill(agent, signal.SIGKILL)
+                    if agent is not None:
+                        _kill_if_running(agent)
                 self.assertFalse(survived, "the agent kept running after the job was stopped")
                 self.assertEqual(returncode, -stop_signal)
 
@@ -426,8 +443,7 @@ class CodexRunnerProcessSafetyTests(unittest.TestCase):
                 sender.join(15.0)
             agent = int(pid_file.read_text())
             survived = not _wait_for_exit(agent, 5.0)
-            if survived:
-                os.kill(agent, signal.SIGKILL)
+            _kill_if_running(agent)
         self.assertEqual(received, [signal.SIGTERM])
         self.assertIs(restored, previous)
         self.assertFalse(survived, "the agent kept running after the stop signal")
