@@ -710,13 +710,6 @@ def _feeder_id(value: object) -> str | None:
     return _nonempty_string(value.get("id"))
 
 
-def _is_other_feeder_postcard(value: object, selected_feeder_id: str) -> bool:
-    if not isinstance(value, dict) or value.get("__typename") != "FeedItemNewPostcard":
-        return False
-    feeder_id = _feeder_id(value.get("feeder"))
-    return feeder_id is not None and feeder_id != selected_feeder_id
-
-
 def _parse_postcard(
     value: object,
     selected_feeder_id: str,
@@ -855,7 +848,6 @@ def _fetch_postcard_variant(
 ) -> tuple[list[BirdBuddyPostcard], int, int, int]:
     postcards: dict[str, BirdBuddyPostcard] = {}
     raw_records = raw_postcards if raw_postcards is not None else {}
-    malformed_ids: set[str] = set()
     after: str | None = None
     seen_cursors: set[str] = set()
     pages = 0
@@ -883,11 +875,6 @@ def _fetch_postcard_variant(
         for edge in edges:
             processed += 1
             node = edge.get("node") if isinstance(edge, dict) else None
-            # Accounts can see several feeders; another feeder's postcard is
-            # outside this integration, not a malformed response.
-            if _is_other_feeder_postcard(node, feeder_id):
-                ignored += 1
-                continue
             postcard = _parse_postcard(node, feeder_id, sighting_type)
             raw_id = _nonempty_string(node.get("id")) if isinstance(node, dict) else None
             confidence = (
@@ -907,11 +894,9 @@ def _fetch_postcard_variant(
                         raise DataSourceError(
                             "Bird Buddy feed returned conflicting duplicate postcards"
                         )
-                # A postcard that is malformed in any copy stays incomplete for
-                # this sync, so it can neither add nor withdraw a detection.
+                # A postcard that is malformed (or another feeder's) in any copy
+                # stays marked, so the sync can neither add nor withdraw it.
                 malformed = postcard is None or (previous is not None and previous[1] is None)
-                if malformed:
-                    malformed_ids.add(raw_id)
                 raw_records[raw_id] = (sighting_type, None if malformed else postcard, confidence)
             if postcard is None:
                 ignored += 1
@@ -934,15 +919,7 @@ def _fetch_postcard_variant(
             raise DataSourceError("Bird Buddy feed returned a repeated pagination cursor")
         seen_cursors.add(cursor)
         after = cursor
-    return (
-        [
-            replace(postcard, complete=False) if postcard.postcard_id in malformed_ids else postcard
-            for postcard in postcards.values()
-        ],
-        pages,
-        processed,
-        ignored,
-    )
+    return list(postcards.values()), pages, processed, ignored
 
 
 def _merge_postcard_variants(

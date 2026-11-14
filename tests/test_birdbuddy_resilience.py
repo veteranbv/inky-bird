@@ -212,6 +212,24 @@ class FeedParsingTests(BirdBuddyResilienceTestCase):
         self.assertEqual(postcards, [])
         self.assertEqual((processed, ignored), (1, 1))
 
+    def test_postcard_malformed_on_a_later_page_of_the_same_variant_is_not_accepted(
+        self,
+    ) -> None:
+        first_page = page(node("postcard-1", species=BLUEBIRD))
+        feed = first_page["me"]
+        assert isinstance(feed, dict) and isinstance(feed["feed"], dict)
+        feed["feed"]["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor-1"}
+        responses = [
+            first_page,
+            page(node("postcard-1", created_at=None, species=BLUEBIRD)),
+            page(node("postcard-1", variant="SightingRecognizedBirdUnlocked")),
+        ]
+        with patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=responses):
+            postcards, pages, _, _ = _fetch_postcards("access", "feeder-1")
+
+        self.assertEqual(pages, 3)
+        self.assertEqual(postcards, [])
+
     def test_postcards_without_media_never_reach_history(self) -> None:
         for medias in ([], None, [{"__typename": "MediaImage", "id": None}]):
             recognized = node("postcard-1", confidence="LOW_CONFIDENCE", species=BLUEBIRD)
