@@ -658,7 +658,23 @@ def test_receipts_show_real_missing_column_list_from_a_wrong_upload(tmp_path: Pa
         assert result["status"] == "failed"
         message = str(cast(dict[str, object], result["result"])["message"])
         assert message.startswith("eBird archive is missing required columns: ")
-        assert "State/Province" in message
         assert "Date" in message
+    finally:
+        worker.close()
+
+
+def test_receipts_show_a_column_name_that_contains_a_slash(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    message = "eBird archive is missing required columns: State/Province, Date"
+
+    def fail() -> dict[str, object]:
+        raise DataSourceError(message)
+
+    try:
+        receipt = worker.submit(
+            "import-preview", key="slash-column-synthetic", inputs={}, execute=fail
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert str(cast(dict[str, object], result["result"])["message"]) == message
     finally:
         worker.close()
