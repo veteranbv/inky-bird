@@ -246,6 +246,8 @@ Replace the names and URLs with addresses reachable from the Homepage server
 and browser. `siteMonitor` uses `/v1/catalog`, not `/health`, because the
 catalog route fails closed when active catalog state is unavailable. Inky
 answers Homepage's `HEAD` readiness probe without transferring the catalog.
+`/health` answers `GET` only and returns 404 to `HEAD`, so do not point a
+`HEAD`-based monitor at it.
 The stats request is server-side and needs no CORS permission. Polling every
 five minutes avoids Homepage's much noisier default while keeping the counts
 useful.

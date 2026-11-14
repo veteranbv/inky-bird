@@ -12,6 +12,11 @@ bird catalog.
 
 ## Basic setup
 
+The commands below use `inky-bird-frame`, the older name of the `inky-bird`
+command; both run the same program. On a native installation, run the managed
+copy instead, as shown in
+[Find your installation's names and paths](troubleshooting.md#find-your-installations-names-and-paths).
+
 1. Copy one destination example from `config.example.toml` into your private `config.toml`.
 2. Replace the placeholders with the credentials supplied by that service.
 3. Set `enabled = true` under `[notifications]`.
@@ -50,7 +55,7 @@ Each destination has its own `events` list:
 
 | Event | Sent when |
 | --- | --- |
-| `discovery` | A refresh finds species absent from the last reliable comparison; names are aggregated |
+| `discovery` | A refresh finds species absent from the last complete refresh. One notice names them all; the first refresh names every species found |
 | `generation_approved` | A new plate passes factual and visual review |
 | `terminal_error` | A taxon exhausts automated quality review and needs an explicit retry |
 | `degraded` | A transient operation crosses the configured count or duration threshold |
@@ -99,6 +104,13 @@ all configured providers succeed again. Their return is not a new discovery;
 genuinely new taxa from healthy providers can still notify. If upgrading while
 the previous refresh was degraded, the first complete refresh establishes a
 reliable comparison without a discovery notice.
+
+The first refresh of a new installation names every species it finds in one
+notice, however many there are. Later, a notice that matches one still queued
+or already delivered is not sent again; the outbox remembers the last 1,000
+delivered notices. A plate approval notifies once per species. A discovery notice is
+skipped when it names exactly the same species as an earlier one, so a species
+that returns on its own next season may not be announced again.
 
 ## Delivery reliability
 

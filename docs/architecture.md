@@ -170,7 +170,9 @@ failures never block controller or display work.
 
 The controller exposes a small HTTP interface:
 
-- `GET /health`: service state, catalog counts, and application version
+- `GET /health`: service state, catalog counts, and application version. It
+  answers `GET` only: `HEAD /health` returns 404, so point a monitor that
+  uses `HEAD` at `/v1/catalog`
 - `GET /v1/catalog`
 - `HEAD /v1/catalog`: the same fail-closed readiness status without a body
 - `GET /v1/assets/<active-image-path>`
