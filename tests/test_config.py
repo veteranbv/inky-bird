@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,14 +8,17 @@ from unittest.mock import patch
 
 from inky_bird_frame.birds import ObservationWindow
 from inky_bird_frame.config import (
+    KNOWN_CONFIG_KEYS,
     DiscoveryProvider,
     NotificationEvent,
     OwnerAccessMode,
     RotationMode,
     discovery_source_label,
     load_config,
+    overlapping_controller_directories,
 )
 from inky_bird_frame.errors import ConfigurationError
+from inky_bird_frame.settings import initialize_config
 
 CONFIG = """
 [discovery]
@@ -1262,6 +1266,203 @@ events = ["terminal_error"]
             config = load_config(path, load_secrets=False)
 
         self.assertEqual(config.notifications.destinations[0].url, "pover://redacted")
+
+    def test_reports_unknown_keys_at_every_level_without_rejecting_them(self) -> None:
+        configured = (
+            CONFIG.replace("[discovery]\n", "[discovery]\ngeneration_enable = false\n")
+            .replace(
+                'bind_host = "0.0.0.0"',
+                'bind_host = "0.0.0.0"\n'
+                'owner_acces_mode = "https-only"\n'
+                'owner_allowed_origins = ["https://inky.example.test"]',
+            )
+            .replace('rotation_mode = "weighted"', 'rotation_mode = "weighted"\nrotaton = 1')
+            + """
+[controller.oidc]
+issuer = "https://id.example.test/application/o/inky/"
+client_id = "inky"
+callback_url = "https://inky.example.test/v1/owner/oidc/callback"
+client_secret_env = "INKY_OIDC_SECRET"
+sso-only = true
+
+[notification]
+enabled = true
+
+[notifications]
+enabled = false
+
+[[notifications.destinations]]
+name = "first"
+url_env = "FIRST_URL"
+
+[[notifications.destinations]]
+name = "second"
+url_env = "SECOND_URL"
+event = ["degraded"]
+
+[research.limits]
+daily = 1
+"""
+        )
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(configured)
+            config = load_config(path)
+
+        self.assertEqual(
+            config.unknown_keys,
+            (
+                "discovery.generation_enable",
+                "controller.owner_acces_mode",
+                "controller.oidc.sso-only",
+                "display_node.rotaton",
+                "notification",
+                "notifications.destinations[1].event",
+                "research.limits",
+            ),
+        )
+        self.assertIsNotNone(config.controller.oidc)
+
+    def test_documented_and_generated_configurations_have_no_unknown_keys(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(load_config(root / "config.example.toml").unknown_keys, ())
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(CONFIG)
+            self.assertEqual(load_config(path).unknown_keys, ())
+            generated = Path(temporary) / "generated.toml"
+            initialize_config(generated)
+            self.assertEqual(load_config(generated).unknown_keys, ())
+
+    def test_known_key_catalog_covers_every_key_the_parser_reads(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "src/inky_bird_frame/config.py").read_text(
+            encoding="utf-8"
+        )
+        read_keys = set(
+            re.findall(
+                r"_(?:string|integer|optional_integer|optional_string|optional_boolean|number|"
+                r"string_tuple|http_origins|csp_frame_origins|private_value)\(\s*\w+,\s*\"(\w+)\"",
+                source,
+            )
+        )
+        read_keys.update(
+            re.findall(r"\"(\w+)\" in (?:discovery|controller|public_catalog)", source)
+        )
+        known = {key for keys in KNOWN_CONFIG_KEYS.values() for key in keys}
+        self.assertTrue(read_keys)
+        self.assertEqual(read_keys - known, set())
+
+    def test_whitespace_only_environment_secret_counts_as_missing(self) -> None:
+        required = CONFIG.replace(
+            "[discovery]\n",
+            '[discovery]\nsource = "ebird"\nebird_api_key_env = "TEST_EBIRD_KEY"\n',
+        )
+        optional = CONFIG.replace(
+            "[discovery]\n", '[discovery]\nebird_api_key_env = "TEST_EBIRD_KEY"\n'
+        )
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            with patch.dict("os.environ", {"TEST_EBIRD_KEY": " \t "}):
+                path.write_text(required)
+                with self.assertRaisesRegex(ConfigurationError, "requires environment variable"):
+                    load_config(path)
+                path.write_text(optional)
+                config = load_config(path)
+
+        self.assertIsNone(config.discovery.ebird_api_key)
+        self.assertEqual(config.discovery.ebird_api_key_env, "TEST_EBIRD_KEY")
+
+    def test_reads_configuration_as_utf8_and_rejects_other_encodings(self) -> None:
+        configured = CONFIG.replace(
+            'commit_name = "Catalog Publisher"', 'commit_name = "Café Publisher"'
+        )
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(configured.encode("utf-8"))
+            config = load_config(path)
+            self.assertEqual(config.public_catalog.commit_name, "Café Publisher")
+            path.write_bytes(configured.encode("latin-1"))
+            with self.assertRaisesRegex(ConfigurationError, "not valid UTF-8"):
+                load_config(path)
+
+    def test_controller_url_uses_base_url_validation(self) -> None:
+        for value, message in (
+            ("http://user:secret@controller.test:8793", "without credentials"),
+            ("http://controller.test:8793/?x=1", "without credentials"),
+            ("http://controller.test:8793/#plate", "without credentials"),
+            ("http://controller.test:notaport", "not a valid HTTP or HTTPS URL"),
+            ("http://controller.test:70000", "not a valid HTTP or HTTPS URL"),
+            ("http:///inky", "without credentials"),
+            ("ftp://controller.test", "must start with http:// or https://"),
+        ):
+            with self.subTest(value=value), TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(
+                    CONFIG.replace(
+                        'controller_url = "http://controller.test:8793/"',
+                        f'controller_url = "{value}"',
+                    )
+                )
+                with self.assertRaisesRegex(ConfigurationError, f"controller_url.*{message}"):
+                    load_config(path)
+
+    def test_controller_url_keeps_accepting_base_urls_with_paths(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                CONFIG.replace(
+                    'controller_url = "http://controller.test:8793/"',
+                    'controller_url = "https://[::1]:8793/inky/"',
+                )
+            )
+            config = load_config(path)
+
+        self.assertEqual(config.display_node.controller_url, "https://[::1]:8793/inky")
+
+    def test_public_catalog_git_values_reject_option_like_and_unsafe_text(self) -> None:
+        for key, original, value in (
+            ("remote", '"public"', '"-upload-pack=x"'),
+            ("remote", '"public"', '"pub lic"'),
+            ("base_branch", '"main"', '"--force"'),
+            ("base_branch", '"main"', '"main;x"'),
+            ("base_branch", '"main"', '"main..other"'),
+            ("repository", '"example/inky-bird-frame"', '"-example/inky"'),
+            ("repository", '"example/inky-bird-frame"', '"example/-inky"'),
+            ("repository", '"example/inky-bird-frame"', '"example/inky bird"'),
+        ):
+            with self.subTest(key=key, value=value), TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(CONFIG.replace(f"{key} = {original}", f"{key} = {value}"))
+                with self.assertRaisesRegex(ConfigurationError, key):
+                    load_config(path)
+
+    def test_public_catalog_git_values_accept_ordinary_names(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                CONFIG.replace('remote = "public"', 'remote = "up_stream.2"')
+                .replace('base_branch = "main"', 'base_branch = "release/1.x"')
+                .replace('"example/inky-bird-frame"', '"Example-Org/.inky_bird.frame"')
+            )
+            config = load_config(path)
+
+        self.assertEqual(config.public_catalog.remote, "up_stream.2")
+        self.assertEqual(config.public_catalog.base_branch, "release/1.x")
+        self.assertEqual(config.public_catalog.repository, "Example-Org/.inky_bird.frame")
+
+    def test_reports_overlapping_controller_directories(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(CONFIG)
+            overlapping = load_config(path)
+            path.write_text(CONFIG.replace('workspace_dir = "."', 'workspace_dir = "workspace"'))
+            separate = load_config(path)
+
+        self.assertEqual(
+            overlapping_controller_directories(overlapping.controller),
+            (("workspace_dir", "catalog_dir"), ("workspace_dir", "state_dir")),
+        )
+        self.assertEqual(overlapping_controller_directories(separate.controller), ())
 
 
 if __name__ == "__main__":

@@ -54,14 +54,47 @@ protection as a password or long-lived token.
 
 ## Native controller backup
 
-### 1. Prepare a private destination
+The commands below run in `bash` or `zsh` on the controller, as the account
+that runs Inky. Each block that can stop on a failed check is wrapped in
+parentheses, so a failure prints an error and ends only that block, not your
+terminal session. Stop and resolve any error before running the next block.
+
+### 1. Find your installation's names and paths
+
+Clean installs use the `inky-bird` service names. Installs that began under the
+old repository name keep `inky-bird-frame`. Ask the installer's own name
+resolver which one this computer has. Run it from your Inky source checkout:
+
+```bash
+cd /path/to/your/inky-bird/checkout
+NATIVE_NAMES=$(python3 src/inky_bird_frame/native_names.py) &&
+  eval "$NATIVE_NAMES" &&
+  printf 'family: %s\napplication: %s\nconfig: %s\n' \
+    "$service_prefix" "$app_dir" "$config_path"
+```
+
+It prints the service family, the managed application directory and the
+default configuration path, and stops with an error when both families are
+installed. If setup used `--app-dir`, `--support-dir` or a different `--config`
+path, use those values instead. Then set the variables used below:
+
+```bash
+FAMILY="$service_prefix"
+IBF="$app_dir/.venv/bin/inky-bird"
+CONFIG="$config_path"
+```
+
+`IBF` is the managed command's full path; a bare `inky-bird` command is not on
+the service account's `PATH`.
+
+### 2. Prepare a private destination
 
 Create a backup directory on encrypted storage and restrict it to the controller
 operator. Keep it outside the source checkout and outside any public issue
 attachment.
 
 ```bash
-BACKUP=/path/to/private-backup/inky-bird-frame
+BACKUP=/path/to/private-backup/inky-bird
 mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
 ```
@@ -70,15 +103,10 @@ Set these paths from the deployment’s private configuration. Use absolute,
 resolved paths; do not copy the placeholders.
 
 ```bash
-CONFIG=/absolute/path/to/config.toml
 WORKSPACE=/absolute/path/to/workspace
 CATALOG=/absolute/path/to/catalog
 STATE=/absolute/path/to/controller-state
-IBF="$HOME/Services/inky-bird-frame/.venv/bin/inky-bird-frame"
 ```
-
-`IBF` is the default managed-runtime path. Replace it when setup used a custom
-application directory.
 
 Validate the configuration before stopping services:
 
@@ -86,123 +114,153 @@ Validate the configuration before stopping services:
 "$IBF" config validate --config "$CONFIG"
 ```
 
-### 2. Quiesce scheduled work
+### 3. Quiesce scheduled work
 
 Do not copy controller state while refresh, generation, notification dispatch,
 or publication is writing it. Wait for any running job to finish, then stop its
 timer before copying data. Record what was active first so the backup does not
 silently resume work that an operator had intentionally suspended.
 
-On systemd Linux, capture the active controller and timer set in the protected
-backup directory, then stop the timers. Confirm that their corresponding
-one-shot services are inactive before stopping the HTTP service:
+App-managed installations (the default from `config init`) run one
+`scheduler` service instead of per-job timers. Stopping the scheduler also ends
+a job that it is running. Before stopping it, check its log: the newest
+`job_started` line should already have a matching `job_finished` or
+`job_failed` line. On systemd Linux, read it with
+`journalctl -u "$FAMILY-scheduler.service" -n 20`; on macOS, with
+`tail -n 20 "$support_dir/logs/scheduler.log"`.
+
+On systemd Linux, capture the active controller, scheduler and timer set in the
+protected backup directory. The first check confirms that `FAMILY` names the
+installed controller:
 
 ```bash
-SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"
-: > "$SYSTEMD_STATE"
-for unit in \
-  inky-bird-frame-controller.service \
-  inky-bird-frame-refresh.timer \
-  inky-bird-frame-generate.timer \
-  inky-bird-frame-catalog-publish.timer \
-  inky-bird-frame-notifications.timer; do
-  state=$(systemctl is-active "$unit" 2>/dev/null || true)
-  case "$state" in
-    active) printf '%s\n' "$unit" >> "$SYSTEMD_STATE" ;;
-    inactive | failed) ;;
-    unknown)
-      case "$unit" in
-        inky-bird-frame-catalog-publish.timer | \
-        inky-bird-frame-notifications.timer) ;;
-        *)
-          echo "Required unit state is unknown: $unit" >&2
-          exit 1
-          ;;
-      esac
-      ;;
-    *)
-      echo "Could not determine stable pre-backup state: $unit (${state:-no state})" >&2
-      exit 1
-      ;;
-  esac
-done
-chmod 600 "$SYSTEMD_STATE"
-
-sudo systemctl stop \
-  inky-bird-frame-refresh.timer \
-  inky-bird-frame-generate.timer \
-  inky-bird-frame-catalog-publish.timer \
-  inky-bird-frame-notifications.timer
-
-for service in \
-  inky-bird-frame-refresh.service \
-  inky-bird-frame-generate.service \
-  inky-bird-frame-catalog-publish.service \
-  inky-bird-frame-notifications.service; do
-  state=$(systemctl is-active "$service" 2>/dev/null || true)
-  case "$state" in
-    inactive | failed | unknown) ;;
-    *)
-      echo "One-shot service is not quiesced: $service ($state)" >&2
-      exit 1
-      ;;
-  esac
-done
-
-sudo systemctl stop inky-bird-frame-controller.service
-
-while IFS= read -r unit; do
-  state=$(systemctl is-active "$unit" 2>/dev/null || true)
-  case "$state" in
-    inactive | failed) ;;
-    *)
-      echo "Could not confirm recorded unit stopped: $unit (${state:-no state})" >&2
-      exit 1
-      ;;
-  esac
-done < "$SYSTEMD_STATE"
+(
+  SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"
+  load=$(systemctl show --property=LoadState --value "$FAMILY-controller.service")
+  if [ "$load" != loaded ]; then
+    echo "No installed $FAMILY-controller.service; check FAMILY" >&2
+    exit 1
+  fi
+  : > "$SYSTEMD_STATE"
+  for unit in \
+    "$FAMILY-controller.service" \
+    "$FAMILY-scheduler.service" \
+    "$FAMILY-refresh.timer" \
+    "$FAMILY-generate.timer" \
+    "$FAMILY-catalog-publish.timer" \
+    "$FAMILY-notifications.timer"; do
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    case "$state" in
+      active) printf '%s\n' "$unit" >> "$SYSTEMD_STATE" ;;
+      inactive | failed | unknown) ;;
+      *)
+        echo "Could not determine stable pre-backup state: $unit (${state:-no state})" >&2
+        exit 1
+        ;;
+    esac
+  done
+  chmod 600 "$SYSTEMD_STATE"
+  cat "$SYSTEMD_STATE"
+)
 ```
 
-Optional units can report `unknown` when the feature is disabled. Do not copy
-until every installed one-shot service reports `inactive` or `failed`; an
-`active`, `activating`, or `deactivating` job is still running.
-
-On macOS, first inspect the LaunchAgents and wait for one-shot work to finish:
+Units that are not installed report `inactive` and are not recorded. Then stop
+the recorded timers, confirm that no one-shot job is still running, and stop the
+scheduler and controller last:
 
 ```bash
-LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"
-: > "$LAUNCHD_STATE"
-for label in refresh generate catalog-publish notifications; do
-  launchctl print "gui/$(id -u)/com.inky-bird-frame.$label" 2>/dev/null || true
-done
+(
+  SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"
+  while IFS= read -r unit; do
+    case "$unit" in
+      *.timer) sudo systemctl stop "$unit" || exit 1 ;;
+    esac
+  done < "$SYSTEMD_STATE"
 
-for label in serve refresh generate catalog-publish notifications; do
-  if launchctl print "gui/$(id -u)/com.inky-bird-frame.$label" >/dev/null 2>&1; then
-    printf '%s\n' "$label" >> "$LAUNCHD_STATE"
+  for job in refresh generate catalog-publish notifications; do
+    state=$(systemctl is-active "$FAMILY-$job.service" 2>/dev/null || true)
+    case "$state" in
+      inactive | failed | unknown) ;;
+      *)
+        echo "One-shot service is not quiesced: $FAMILY-$job.service ($state)" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  for unit in "$FAMILY-scheduler.service" "$FAMILY-controller.service"; do
+    if grep -Fxq "$unit" "$SYSTEMD_STATE"; then
+      sudo systemctl stop "$unit" || exit 1
+    fi
+  done
+
+  while IFS= read -r unit; do
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    case "$state" in
+      inactive | failed) ;;
+      *)
+        echo "Could not confirm recorded unit stopped: $unit (${state:-no state})" >&2
+        exit 1
+        ;;
+    esac
+  done < "$SYSTEMD_STATE"
+)
+```
+
+Do not copy until this block finishes without an error; an `active`,
+`activating`, or `deactivating` one-shot job is still running. Wait for it and
+run the block again.
+
+On macOS, first inspect the LaunchAgents and wait for one-shot work to finish.
+The first check confirms that `FAMILY` names the installed controller:
+
+```bash
+(
+  LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"
+  if [ ! -f "$HOME/Library/LaunchAgents/com.$FAMILY.serve.plist" ]; then
+    echo "No installed com.$FAMILY.serve LaunchAgent; check FAMILY" >&2
+    exit 1
   fi
-done
-chmod 600 "$LAUNCHD_STATE"
+  for label in scheduler refresh generate catalog-publish notifications; do
+    launchctl print "gui/$(id -u)/com.$FAMILY.$label" 2>/dev/null || true
+  done
+
+  : > "$LAUNCHD_STATE"
+  for label in serve scheduler refresh generate catalog-publish notifications; do
+    if launchctl print "gui/$(id -u)/com.$FAMILY.$label" >/dev/null 2>&1; then
+      printf '%s\n' "$label" >> "$LAUNCHD_STATE"
+    fi
+  done
+  chmod 600 "$LAUNCHD_STATE"
+  cat "$LAUNCHD_STATE"
+)
 ```
 
 Then quiesce exactly the recorded agents. `bootout` stops scheduling and may
 terminate an active job, so use it only after the inspection shows that no
-one-shot job is running. Every recorded agent must unload successfully and be
-absent before the copy begins:
+one-shot job is running and the scheduler log shows no unfinished job. Every
+recorded agent must unload successfully and be absent before the copy begins:
 
 ```bash
-while IFS= read -r label; do
-  launchctl bootout "gui/$(id -u)/com.inky-bird-frame.$label" || exit 1
-done < "$LAUNCHD_STATE"
+(
+  LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"
+  while IFS= read -r label; do
+    launchctl bootout "gui/$(id -u)/com.$FAMILY.$label" || exit 1
+  done < "$LAUNCHD_STATE"
 
-while IFS= read -r label; do
-  if launchctl print "gui/$(id -u)/com.inky-bird-frame.$label" >/dev/null 2>&1; then
-    echo "Recorded LaunchAgent is still loaded after bootout: $label" >&2
-    exit 1
-  fi
-done < "$LAUNCHD_STATE"
+  while IFS= read -r label; do
+    if launchctl print "gui/$(id -u)/com.$FAMILY.$label" >/dev/null 2>&1; then
+      echo "Recorded LaunchAgent is still loaded after bootout: $label" >&2
+      exit 1
+    fi
+  done < "$LAUNCHD_STATE"
+)
 ```
 
-### 3. Copy a consistent snapshot
+An operator-managed installation that uses system LaunchDaemons instead of
+LaunchAgents follows that operator's own stop and start procedure.
+
+### 4. Copy a consistent snapshot
 
 `rsync -a` preserves timestamps and permission bits. The separate destination
 directories make restore targets explicit even when the original paths live in
@@ -238,75 +296,84 @@ rsync -acni --delete "$CATALOG/" "$BACKUP/catalog/"
 rsync -acni --delete "$STATE/" "$BACKUP/state/"
 ```
 
-Record the application release or commit and the four original absolute paths
-beside the backup. If using `native-tls.env`, separately back up its referenced
-public CA bundle and record its original path and verified fingerprint. Restore
-that bundle with protected ownership before starting a recovered role. Do not
+Record the application release or commit, the service family and the four
+original absolute paths beside the backup. If using `native-tls.env`, separately
+back up its referenced public CA bundle and record its original path and
+verified fingerprint. Restore that bundle with protected ownership before
+starting a recovered role. If `controller.tls_certificate` and
+`controller.tls_private_key` are set, or `public_catalog.checkout_dir` is used,
+copy those files or that checkout too; they are outside the four directories
+above, and the private key needs the same protection as `config.toml`. Do not
 put credentials into that note.
 
-### 4. Restart and verify
+### 5. Restart and verify
 
 Restore only the services recorded before the backup. On systemd Linux, reject
 unexpected unit names before starting the saved active set:
 
 ```bash
-SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"
-while IFS= read -r unit; do
-  case "$unit" in
-    inky-bird-frame-controller.service | \
-    inky-bird-frame-refresh.timer | \
-    inky-bird-frame-generate.timer | \
-    inky-bird-frame-catalog-publish.timer | \
-    inky-bird-frame-notifications.timer) ;;
-    *)
-      echo "Unexpected unit in $SYSTEMD_STATE: $unit" >&2
-      exit 1
-      ;;
-  esac
-done < "$SYSTEMD_STATE"
+(
+  SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"
+  while IFS= read -r unit; do
+    case "$unit" in
+      "$FAMILY-controller.service" | \
+      "$FAMILY-scheduler.service" | \
+      "$FAMILY-refresh.timer" | \
+      "$FAMILY-generate.timer" | \
+      "$FAMILY-catalog-publish.timer" | \
+      "$FAMILY-notifications.timer") ;;
+      *)
+        echo "Unexpected unit in $SYSTEMD_STATE: $unit" >&2
+        exit 1
+        ;;
+    esac
+  done < "$SYSTEMD_STATE"
 
-while IFS= read -r unit; do
-  sudo systemctl start "$unit" || exit 1
-done < "$SYSTEMD_STATE"
+  while IFS= read -r unit; do
+    sudo systemctl start "$unit" || exit 1
+  done < "$SYSTEMD_STATE"
 
-while IFS= read -r unit; do
-  systemctl is-active "$unit" || exit 1
-done < "$SYSTEMD_STATE"
+  while IFS= read -r unit; do
+    systemctl is-active "$unit" || exit 1
+  done < "$SYSTEMD_STATE"
+)
 ```
 
 On macOS, bootstrap only the LaunchAgents that were loaded before the backup:
 
 ```bash
-LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"
-while IFS= read -r label; do
-  case "$label" in
-    serve | refresh | generate | catalog-publish | notifications) ;;
-    *)
-      echo "Unexpected label in $LAUNCHD_STATE: $label" >&2
+(
+  LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"
+  while IFS= read -r label; do
+    case "$label" in
+      serve | scheduler | refresh | generate | catalog-publish | notifications) ;;
+      *)
+        echo "Unexpected label in $LAUNCHD_STATE: $label" >&2
+        exit 1
+        ;;
+    esac
+    plist="$HOME/Library/LaunchAgents/com.$FAMILY.$label.plist"
+    if [ ! -f "$plist" ]; then
+      echo "Recorded LaunchAgent is missing: $plist" >&2
       exit 1
-      ;;
-  esac
-  plist="$HOME/Library/LaunchAgents/com.inky-bird-frame.$label.plist"
-  if [ ! -f "$plist" ]; then
-    echo "Recorded LaunchAgent is missing: $plist" >&2
-    exit 1
-  fi
-done < "$LAUNCHD_STATE"
+    fi
+  done < "$LAUNCHD_STATE"
 
-while IFS= read -r label; do
-  plist="$HOME/Library/LaunchAgents/com.inky-bird-frame.$label.plist"
-  launchctl bootstrap "gui/$(id -u)" "$plist" || exit 1
-done < "$LAUNCHD_STATE"
+  while IFS= read -r label; do
+    plist="$HOME/Library/LaunchAgents/com.$FAMILY.$label.plist"
+    launchctl bootstrap "gui/$(id -u)" "$plist" || exit 1
+  done < "$LAUNCHD_STATE"
 
-while IFS= read -r label; do
-  launchctl print "gui/$(id -u)/com.inky-bird-frame.$label" >/dev/null || exit 1
-done < "$LAUNCHD_STATE"
+  while IFS= read -r label; do
+    launchctl print "gui/$(id -u)/com.$FAMILY.$label" >/dev/null || exit 1
+  done < "$LAUNCHD_STATE"
+)
 ```
 
 Restored systemd timers schedule their next activation. Several macOS
-LaunchAgents use `RunAtLoad` and may run immediately when bootstrapped; preserving
-the recorded set prevents the backup itself from resuming intentionally
-suspended work.
+LaunchAgents, including the scheduler, use `RunAtLoad` and may run immediately
+when bootstrapped; preserving the recorded set prevents the backup itself from
+resuming intentionally suspended work.
 
 If no installed component was deliberately suspended before the backup, finish
 with `"$IBF" doctor controller --config "$CONFIG"`. When a component was already
@@ -329,8 +396,8 @@ paths recorded with the backup. Replace every placeholder with the actual
 private path before continuing:
 
 ```bash
-cd /path/to/inky-bird-frame
-BACKUP=/path/to/private-backup/inky-bird-frame
+cd /path/to/your/inky-bird/checkout
+BACKUP=/path/to/private-backup/inky-bird
 CONFIG=/absolute/path/to/config.toml
 WORKSPACE=/absolute/path/to/workspace
 CATALOG=/absolute/path/to/catalog
@@ -350,31 +417,34 @@ wildcard bind such as `0.0.0.0` is checked through `127.0.0.1`.
    uv sync --extra controller --locked
    ```
 
-2. On an existing host, stop the controller and scheduled jobs as described
-   above. A new host has no installed services to stop.
+2. On an existing host, find the installation's names and stop the
+   controller and scheduled jobs as described above. A new host has no
+   installed services to stop.
 3. Move any existing destination directories aside. Create empty replacement
    directories at the recorded paths, then restore as the controller account:
 
    ```bash
-   for target in "$CONFIG" "$WORKSPACE" "$CATALOG" "$STATE" \
-     "$(dirname "$CONFIG")/native-access.env" "$(dirname "$CONFIG")/native-tls.env"; do
-     if [ -e "$target" ] || [ -L "$target" ]; then
-       printf 'Refusing to merge restored state into existing path: %s\n' "$target" >&2
-       exit 1
-     fi
-   done
-   mkdir -p "$(dirname "$CONFIG")" "$WORKSPACE" "$CATALOG" "$STATE"
-   rsync -a "$BACKUP/config/config.toml" "$CONFIG"
-   for name in native-access.env native-tls.env; do
-     if [ -f "$BACKUP/config/$name" ]; then
-       rsync -a "$BACKUP/config/$name" "$(dirname "$CONFIG")/$name"
-       chmod 600 "$(dirname "$CONFIG")/$name"
-     fi
-   done
-   rsync -a "$BACKUP/workspace/" "$WORKSPACE/"
-   rsync -a "$BACKUP/catalog/" "$CATALOG/"
-   rsync -a "$BACKUP/state/" "$STATE/"
-   chmod 600 "$CONFIG"
+   (
+     for target in "$CONFIG" "$WORKSPACE" "$CATALOG" "$STATE" \
+       "$(dirname "$CONFIG")/native-access.env" "$(dirname "$CONFIG")/native-tls.env"; do
+       if [ -e "$target" ] || [ -L "$target" ]; then
+         printf 'Refusing to merge restored state into existing path: %s\n' "$target" >&2
+         exit 1
+       fi
+     done
+     mkdir -p "$(dirname "$CONFIG")" "$WORKSPACE" "$CATALOG" "$STATE"
+     rsync -a "$BACKUP/config/config.toml" "$CONFIG"
+     for name in native-access.env native-tls.env; do
+       if [ -f "$BACKUP/config/$name" ]; then
+         rsync -a "$BACKUP/config/$name" "$(dirname "$CONFIG")/$name"
+         chmod 600 "$(dirname "$CONFIG")/$name"
+       fi
+     done
+     rsync -a "$BACKUP/workspace/" "$WORKSPACE/"
+     rsync -a "$BACKUP/catalog/" "$CATALOG/"
+     rsync -a "$BACKUP/state/" "$STATE/"
+     chmod 600 "$CONFIG"
+   )
    ```
 
 4. Confirm that the controller account owns the restored paths. If a privileged
@@ -459,45 +529,47 @@ anything. A running `bootstrap` is an active catalog writer; wait for it to exit
 and repeat this step instead of interrupting and later restarting it.
 
 ```bash
-BACKUP=/path/to/private-backup/inky-bird-frame-docker
+BACKUP=/path/to/private-backup/inky-bird-docker
 mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
 DOCKER_STATE="$BACKUP/docker-running-services.txt"
-if ! docker compose ps --status running --services > "$DOCKER_STATE"; then
-  echo "Could not capture running Compose services" >&2
-  exit 1
-fi
-chmod 600 "$DOCKER_STATE"
-
-while IFS= read -r service; do
-  case "$service" in
-    controller | scheduler) ;;
-    bootstrap)
-      echo "Bootstrap is still running; wait for it to exit before backup" >&2
-      exit 1
-      ;;
-    *)
-      echo "Unexpected running service in $DOCKER_STATE: $service" >&2
-      exit 1
-      ;;
-  esac
-done < "$DOCKER_STATE"
-
-docker compose stop scheduler controller bootstrap
-docker compose ps --all
-
-STOPPED_STATE="$BACKUP/docker-running-after-stop.txt"
-if ! docker compose ps --status running --services > "$STOPPED_STATE"; then
-  echo "Could not verify stopped Compose services" >&2
-  exit 1
-fi
-chmod 600 "$STOPPED_STATE"
-for service in scheduler controller bootstrap; do
-  if grep -Fxq "$service" "$STOPPED_STATE"; then
-    echo "Compose writer is still running: $service" >&2
+(
+  if ! docker compose ps --status running --services > "$DOCKER_STATE"; then
+    echo "Could not capture running Compose services" >&2
     exit 1
   fi
-done
+  chmod 600 "$DOCKER_STATE"
+
+  while IFS= read -r service; do
+    case "$service" in
+      controller | scheduler) ;;
+      bootstrap)
+        echo "Bootstrap is still running; wait for it to exit before backup" >&2
+        exit 1
+        ;;
+      *)
+        echo "Unexpected running service in $DOCKER_STATE: $service" >&2
+        exit 1
+        ;;
+    esac
+  done < "$DOCKER_STATE"
+
+  docker compose stop scheduler controller bootstrap
+  docker compose ps --all
+
+  STOPPED_STATE="$BACKUP/docker-running-after-stop.txt"
+  if ! docker compose ps --status running --services > "$STOPPED_STATE"; then
+    echo "Could not verify stopped Compose services" >&2
+    exit 1
+  fi
+  chmod 600 "$STOPPED_STATE"
+  for service in scheduler controller bootstrap; do
+    if grep -Fxq "$service" "$STOPPED_STATE"; then
+      echo "Compose writer is still running: $service" >&2
+      exit 1
+    fi
+  done
+)
 ```
 
 Do not continue unless the final loop confirms that `scheduler`, `controller`,
@@ -513,26 +585,28 @@ host port from `INKY_BIRD_PORT`; the default is shown.
 
 ```bash
 HEALTH_URL=http://127.0.0.1:8793/health
-if [ ! -f "$BACKUP/docker-running-services.txt" ]; then
-  echo "Missing pre-backup Compose service snapshot" >&2
-  exit 1
-fi
-
-docker compose run --rm --no-deps -T --entrypoint tar controller \
-  -C /data -czf - . > "$BACKUP/controller-data.tar.gz"
-
-cp config.toml .env "$BACKUP/"
-for private_env in controller.env access.env; do
-  if [ -f "$private_env" ]; then
-    cp "$private_env" "$BACKUP/"
-    chmod 600 "$BACKUP/$private_env"
+(
+  if [ ! -f "$BACKUP/docker-running-services.txt" ]; then
+    echo "Missing pre-backup Compose service snapshot" >&2
+    exit 1
   fi
-done
-chmod 600 \
-  "$BACKUP/controller-data.tar.gz" \
-  "$BACKUP/config.toml" \
-  "$BACKUP/.env"
-tar -tzf "$BACKUP/controller-data.tar.gz" >/dev/null
+
+  docker compose run --rm --no-deps -T --entrypoint tar controller \
+    -C /data -czf - . > "$BACKUP/controller-data.tar.gz"
+
+  cp config.toml .env "$BACKUP/"
+  for private_env in controller.env access.env; do
+    if [ -f "$private_env" ]; then
+      cp "$private_env" "$BACKUP/"
+      chmod 600 "$BACKUP/$private_env"
+    fi
+  done
+  chmod 600 \
+    "$BACKUP/controller-data.tar.gz" \
+    "$BACKUP/config.toml" \
+    "$BACKUP/.env"
+  tar -tzf "$BACKUP/controller-data.tar.gz" >/dev/null
+)
 ```
 
 Reauthenticate Codex and GitHub after restore unless policy requires backing up
@@ -555,39 +629,41 @@ order. `docker compose start` does not recreate dependencies or rerun
 `bootstrap`. Check controller health only when it was previously running.
 
 ```bash
-DOCKER_STATE="$BACKUP/docker-running-services.txt"
-while IFS= read -r service; do
-  case "$service" in
-    controller | scheduler) ;;
-    *)
-      echo "Unexpected service in $DOCKER_STATE: $service" >&2
-      exit 1
-      ;;
-  esac
-done < "$DOCKER_STATE"
+(
+  DOCKER_STATE="$BACKUP/docker-running-services.txt"
+  while IFS= read -r service; do
+    case "$service" in
+      controller | scheduler) ;;
+      *)
+        echo "Unexpected service in $DOCKER_STATE: $service" >&2
+        exit 1
+        ;;
+    esac
+  done < "$DOCKER_STATE"
 
-if grep -Fxq controller "$DOCKER_STATE"; then
-  docker compose start controller || exit 1
-  curl --fail --silent --show-error \
-    --retry 12 --retry-connrefused --retry-delay 5 "$HEALTH_URL" || exit 1
-fi
-if grep -Fxq scheduler "$DOCKER_STATE"; then
-  docker compose start scheduler || exit 1
-fi
+  if grep -Fxq controller "$DOCKER_STATE"; then
+    docker compose start controller || exit 1
+    curl --fail --silent --show-error \
+      --retry 12 --retry-connrefused --retry-delay 5 "$HEALTH_URL" || exit 1
+  fi
+  if grep -Fxq scheduler "$DOCKER_STATE"; then
+    docker compose start scheduler || exit 1
+  fi
 
-RESTARTED_STATE="$BACKUP/docker-running-after-restart.txt"
-if ! docker compose ps --status running --services > "$RESTARTED_STATE"; then
-  echo "Could not verify restarted Compose services" >&2
-  exit 1
-fi
-chmod 600 "$RESTARTED_STATE"
-while IFS= read -r service; do
-  if ! grep -Fxq "$service" "$RESTARTED_STATE"; then
-    echo "Recorded Compose service did not restart: $service" >&2
+  RESTARTED_STATE="$BACKUP/docker-running-after-restart.txt"
+  if ! docker compose ps --status running --services > "$RESTARTED_STATE"; then
+    echo "Could not verify restarted Compose services" >&2
     exit 1
   fi
-done < "$DOCKER_STATE"
-docker compose ps --all
+  chmod 600 "$RESTARTED_STATE"
+  while IFS= read -r service; do
+    if ! grep -Fxq "$service" "$RESTARTED_STATE"; then
+      echo "Recorded Compose service did not restart: $service" >&2
+      exit 1
+    fi
+  done < "$DOCKER_STATE"
+  docker compose ps --all
+)
 ```
 
 ## Docker restore
@@ -601,8 +677,8 @@ command with the same project name.
    host-side `config.toml`, and any provider/access environment files:
 
    ```bash
-   cd /path/to/inky-bird-frame-docker
-   BACKUP=/path/to/private-backup/inky-bird-frame-docker
+   cd /path/to/inky-bird-docker
+   BACKUP=/path/to/private-backup/inky-bird-docker
    HEALTH_URL=http://127.0.0.1:8793/health
    cp "$BACKUP/.env" "$BACKUP/config.toml" .
    chmod 600 .env config.toml
@@ -627,23 +703,25 @@ command with the same project name.
    docker compose ls --all
    ORIGINAL_PROJECT=
    RESTORE_PROJECT=inky-bird-frame-restore
-   if [ -n "$(docker compose -p "$RESTORE_PROJECT" ps --all --quiet)" ]; then
-     printf 'Restore project already has containers: %s\n' "$RESTORE_PROJECT" >&2
-     exit 1
-   fi
-   if [ -n "$(docker volume ls --quiet \
-     --filter "label=com.docker.compose.project=$RESTORE_PROJECT")" ]; then
-     printf 'Restore project already has volumes: %s\n' "$RESTORE_PROJECT" >&2
-     exit 1
-   fi
-   for volume in controller-data codex-auth github-auth; do
-     if docker volume inspect "${RESTORE_PROJECT}_${volume}" >/dev/null 2>&1; then
-       printf 'Restore volume already exists: %s\n' \
-         "${RESTORE_PROJECT}_${volume}" >&2
+   (
+     if [ -n "$(docker compose -p "$RESTORE_PROJECT" ps --all --quiet)" ]; then
+       printf 'Restore project already has containers: %s\n' "$RESTORE_PROJECT" >&2
        exit 1
      fi
-   done
-   docker compose -p "$RESTORE_PROJECT" create
+     if [ -n "$(docker volume ls --quiet \
+       --filter "label=com.docker.compose.project=$RESTORE_PROJECT")" ]; then
+       printf 'Restore project already has volumes: %s\n' "$RESTORE_PROJECT" >&2
+       exit 1
+     fi
+     for volume in controller-data codex-auth github-auth; do
+       if docker volume inspect "${RESTORE_PROJECT}_${volume}" >/dev/null 2>&1; then
+         printf 'Restore volume already exists: %s\n' \
+           "${RESTORE_PROJECT}_${volume}" >&2
+         exit 1
+       fi
+     done
+     docker compose -p "$RESTORE_PROJECT" create
+   )
    ```
 
 3. Restore the controller archive through the project image:
@@ -782,12 +860,10 @@ may still reveal species, counts, timestamps, research, or generated artifacts.
 Once observations have been merged, shared derived state cannot be attributed
 safely to one provider. Do not hand-edit those derived JSON files.
 
-The selective removal path requires at least one configured provider that you
-intend to keep. Inky rejects an empty `discovery.sources` list, and deleting the
-setting selects the default iNaturalist source rather than disabling discovery.
-If the provider being removed is the only source and no replacement is intended,
-keep scheduled work stopped and use the full state-and-workspace reset below. Do
-not restart the controller until a valid replacement source is configured.
+If the provider being removed is the only source, set `sources = []` rather
+than deleting the setting: an empty list is valid and a refresh with no sources
+makes no requests to observation services, while a missing `sources` setting
+selects the default iNaturalist source.
 
 For provider-owned history removal, first disable the provider, quiesce every
 writer, and make a separately protected recovery backup if policy permits. The
@@ -803,9 +879,9 @@ controller's normal locks; it does not erase the other retained state listed
 above.
 
 ```bash
-# Native managed runtime
-IBF="$HOME/Services/inky-bird-frame/.venv/bin/inky-bird-frame"
-"$IBF" refresh --config /path/to/config.toml
+# Native managed runtime; set IBF and CONFIG as in "Find your installation's
+# names and paths" above
+"$IBF" refresh --config "$CONFIG"
 
 # Docker Compose, from the release bundle
 docker compose run --rm --no-deps scheduler refresh --config /data/config.toml

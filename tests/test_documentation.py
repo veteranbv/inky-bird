@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import tomllib
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import pytest
 from PIL import Image
+
+from inky_bird_frame.config import DiscoveryProvider, parse_config
+from inky_bird_frame.errors import ConfigurationError
 
 ROOT = Path(__file__).resolve().parents[1]
 FENCED_BLOCK = re.compile(r"^\s*```.*?^\s*```\s*$", re.MULTILINE | re.DOTALL)
@@ -227,7 +235,7 @@ def test_private_history_removal_documents_retained_state_and_refresh() -> None:
         "workspace_dir",
     ):
         assert retained_path in section
-    assert '"$IBF" refresh --config /path/to/config.toml' in section
+    assert '"$IBF" refresh --config "$CONFIG"' in section
     assert (
         "docker compose run --rm --no-deps scheduler refresh --config /data/config.toml" in section
     )
@@ -236,32 +244,334 @@ def test_private_history_removal_documents_retained_state_and_refresh() -> None:
         assert retained_store in section
 
 
-def test_backup_restores_only_the_previously_active_native_services() -> None:
+FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
+# Synthetic systemctl: "$FAKE/units" holds "<unit> <state>" for installed units.
+units="$FAKE/units"
+state_of() { awk -v unit="$1" '$1 == unit { print $2 }' "$units"; }
+set_state() {
+  awk -v unit="$1" -v state="$2" '$1 == unit { $2 = state } { print }' "$units" > "$units.new"
+  mv "$units.new" "$units"
+}
+case "$1" in
+  show)
+    if [ -n "$(state_of "$4")" ]; then echo loaded; else echo not-found; fi ;;
+  is-active)
+    state=$(state_of "$2")
+    echo "${state:-inactive}"
+    [ "$state" = active ] ;;
+  stop | start)
+    if [ -z "$(state_of "$2")" ]; then
+      echo "Unit $2 not loaded." >&2
+      exit 5
+    fi
+    echo "$1 $2" >> "$FAKE/log"
+    if [ "$1" = stop ]; then set_state "$2" inactive; else set_state "$2" active; fi ;;
+  *) echo "unexpected systemctl call: $*" >&2; exit 64 ;;
+esac
+"""
+
+FAKE_LAUNCHCTL = r"""#!/usr/bin/env bash
+# Synthetic launchctl: "$FAKE/loaded" lists loaded labels.
+touch "$FAKE/loaded"
+case "$1" in
+  print) grep -Fxq "${2##*/}" "$FAKE/loaded" ;;
+  bootout)
+    label=${2##*/}
+    grep -Fxq "$label" "$FAKE/loaded" || exit 3
+    grep -Fxv "$label" "$FAKE/loaded" > "$FAKE/loaded.new" || true
+    mv "$FAKE/loaded.new" "$FAKE/loaded"
+    echo "bootout $label" >> "$FAKE/log" ;;
+  bootstrap)
+    label=$(basename "$3" .plist)
+    echo "$label" >> "$FAKE/loaded"
+    echo "bootstrap $label" >> "$FAKE/log" ;;
+  *) echo "unexpected launchctl call: $*" >&2; exit 64 ;;
+esac
+"""
+
+FAKE_SUDO = '#!/usr/bin/env bash\nexec "$@"\n'
+
+
+def _bash_blocks(section: str) -> list[str]:
+    return re.findall(r"^```bash\n(.*?)^```$", section, re.MULTILINE | re.DOTALL)
+
+
+def _native_backup_blocks() -> tuple[list[str], list[str]]:
     guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
     backup = guide.split("## Native controller backup", 1)[1].split(
         "\n## Native controller restore", 1
     )[0]
+    quiesce = backup.split("### 3. Quiesce scheduled work", 1)[1].split("\n### 4.", 1)[0]
+    restart = backup.split("### 5. Restart and verify", 1)[1]
+    return _bash_blocks(quiesce), _bash_blocks(restart)
 
-    assert 'SYSTEMD_STATE="$BACKUP/native-active-systemd-units.txt"' in backup
-    assert 'LAUNCHD_STATE="$BACKUP/native-loaded-launchagents.txt"' in backup
-    assert 'done < "$SYSTEMD_STATE"' in backup
-    assert 'done < "$LAUNCHD_STATE"' in backup
-    assert "Restore only the services recorded before the backup" in backup
-    assert backup.index('done < "$SYSTEMD_STATE"') < backup.index('sudo systemctl start "$unit"')
-    assert backup.index('done < "$LAUNCHD_STATE"') < backup.index("launchctl bootstrap")
-    assert "Unexpected unit in $SYSTEMD_STATE" in backup
-    assert "Unexpected label in $LAUNCHD_STATE" in backup
-    assert "Recorded LaunchAgent is missing" in backup
-    assert "One-shot service is not quiesced" in backup
-    assert "Could not determine stable pre-backup state" in backup
-    assert "Could not confirm recorded unit stopped" in backup
-    quiesce = backup.split("Then quiesce exactly the recorded agents", 1)[1].split(
-        "\n### 3. Copy", 1
-    )[0]
-    assert 'launchctl bootout "gui/$(id -u)/com.inky-bird-frame.$label" || exit 1' in quiesce
-    assert 'done < "$LAUNCHD_STATE"' in quiesce
-    assert "|| true" not in quiesce
-    assert "Recorded LaunchAgent is still loaded after bootout" in quiesce
+
+class _NativeHost:
+    """Run documented snippets against synthetic service managers, never the real ones."""
+
+    def __init__(self, root: Path, family: str) -> None:
+        self.fake = root / "fake"
+        self.home = root / "home"
+        self.backup = root / "backup"
+        for directory in (self.fake / "bin", self.home, self.backup):
+            directory.mkdir(parents=True)
+        for name, script in (
+            ("systemctl", FAKE_SYSTEMCTL),
+            ("launchctl", FAKE_LAUNCHCTL),
+            ("sudo", FAKE_SUDO),
+        ):
+            path = self.fake / "bin" / name
+            path.write_text(script)
+            path.chmod(0o755)
+        (self.fake / "log").write_text("")
+        self.family = family
+
+    def install_units(self, **states: str) -> None:
+        lines = [f"{self.family}-{name} {state}\n" for name, state in states.items()]
+        (self.fake / "units").write_text("".join(lines))
+
+    def install_agents(self, *labels: str, loaded: tuple[str, ...]) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in labels:
+            (agents / f"com.{self.family}.{label}.plist").write_text("synthetic")
+        (self.fake / "loaded").write_text(
+            "".join(f"com.{self.family}.{label}\n" for label in loaded)
+        )
+
+    def run(self, block: str, *, family: str | None = None) -> subprocess.CompletedProcess[str]:
+        environment = {
+            "PATH": f"{self.fake / 'bin'}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(self.home),
+            "FAKE": str(self.fake),
+            "BACKUP": str(self.backup),
+            "FAMILY": family or self.family,
+        }
+        return subprocess.run(
+            ["bash", "-c", f"{block}\nprintf 'block-status=%s\\n' \"$?\""],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+            timeout=30,
+        )
+
+    @staticmethod
+    def status(result: subprocess.CompletedProcess[str]) -> int:
+        # The shell that pasted the block must survive to report its status.
+        match = re.search(r"^block-status=(\d+)$", result.stdout, re.MULTILINE)
+        assert match, result.stdout
+        return int(match.group(1))
+
+    def calls(self) -> list[str]:
+        return (self.fake / "log").read_text().splitlines()
+
+    def recorded(self, name: str) -> list[str]:
+        return (self.backup / name).read_text().splitlines()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@pytest.mark.parametrize("family", ["inky-bird", "inky-bird-frame"])
+def test_native_backup_quiesces_and_restores_an_app_managed_systemd_install(
+    tmp_path: Path, family: str
+) -> None:
+    (record, quiesce, *_), (start, _) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, family)
+    host.install_units(**{"controller.service": "active", "scheduler.service": "active"})
+
+    for block in (record, quiesce):
+        result = host.run(block)
+        assert host.status(result) == 0, result.stderr
+
+    assert host.recorded("native-active-systemd-units.txt") == [
+        f"{family}-controller.service",
+        f"{family}-scheduler.service",
+    ]
+    assert host.calls() == [
+        f"stop {family}-scheduler.service",
+        f"stop {family}-controller.service",
+    ]
+
+    result = host.run(start)
+    assert host.status(result) == 0, result.stderr
+    assert host.calls()[2:] == [
+        f"start {family}-controller.service",
+        f"start {family}-scheduler.service",
+    ]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_stops_timers_before_the_controller_and_skips_missing_units(
+    tmp_path: Path,
+) -> None:
+    (record, quiesce, *_), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(
+        **{
+            "controller.service": "active",
+            "refresh.timer": "active",
+            "refresh.service": "inactive",
+            "generate.timer": "inactive",
+            "generate.service": "inactive",
+        }
+    )
+
+    for block in (record, quiesce):
+        result = host.run(block)
+        assert host.status(result) == 0, result.stderr
+
+    assert host.recorded("native-active-systemd-units.txt") == [
+        "inky-bird-controller.service",
+        "inky-bird-refresh.timer",
+    ]
+    assert host.calls() == ["stop inky-bird-refresh.timer", "stop inky-bird-controller.service"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_refuses_a_family_that_is_not_installed(tmp_path: Path) -> None:
+    (record, *_), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "active"})
+
+    result = host.run(record, family="inky-bird-frame")
+
+    assert host.status(result) != 0
+    assert "No installed inky-bird-frame-controller.service" in result.stderr
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_leaves_services_running_while_a_job_is_active(tmp_path: Path) -> None:
+    (record, quiesce, *_), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(
+        **{
+            "controller.service": "active",
+            "generate.timer": "active",
+            "generate.service": "active",
+        }
+    )
+
+    assert host.status(host.run(record)) == 0
+    result = host.run(quiesce)
+
+    assert host.status(result) != 0
+    assert "One-shot service is not quiesced: inky-bird-generate.service" in result.stderr
+    assert host.calls() == ["stop inky-bird-generate.timer"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@pytest.mark.parametrize("family", ["inky-bird", "inky-bird-frame"])
+def test_native_backup_quiesces_and_restores_app_managed_launch_agents(
+    tmp_path: Path, family: str
+) -> None:
+    (_, _, inspect, bootout), (_, bootstrap) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, family)
+    host.install_agents("serve", "scheduler", loaded=("serve", "scheduler"))
+
+    for block in (inspect, bootout):
+        result = host.run(block)
+        assert host.status(result) == 0, result.stderr
+
+    assert host.recorded("native-loaded-launchagents.txt") == ["serve", "scheduler"]
+    assert host.calls() == [f"bootout com.{family}.serve", f"bootout com.{family}.scheduler"]
+
+    result = host.run(bootstrap)
+    assert host.status(result) == 0, result.stderr
+    assert host.calls()[2:] == [
+        f"bootstrap com.{family}.serve",
+        f"bootstrap com.{family}.scheduler",
+    ]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_refuses_launch_agents_of_another_family(tmp_path: Path) -> None:
+    (_, _, inspect, _), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", loaded=("serve",))
+
+    result = host.run(inspect, family="inky-bird-frame")
+
+    assert host.status(result) != 0
+    assert "No installed com.inky-bird-frame.serve LaunchAgent" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_backup_bootout_stops_at_the_first_agent_that_fails(tmp_path: Path) -> None:
+    (_, _, _, bootout), _ = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "scheduler", loaded=("scheduler",))
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
+
+    result = host.run(bootout)
+
+    assert host.status(result) != 0
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_foreign_unit_and_starts_nothing(tmp_path: Path) -> None:
+    _, (start, _) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "inactive", "other.service": "inactive"})
+    (host.backup / "native-active-systemd-units.txt").write_text(
+        "inky-bird-controller.service\ninky-bird-other.service\n"
+    )
+
+    result = host.run(start)
+
+    assert host.status(result) != 0
+    assert "Unexpected unit in" in result.stderr
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_foreign_label_and_bootstraps_nothing(tmp_path: Path) -> None:
+    _, (_, bootstrap) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "other", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nother\n")
+
+    result = host.run(bootstrap)
+
+    assert host.status(result) != 0
+    assert "Unexpected label in" in result.stderr
+    assert host.calls() == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+def test_native_restart_refuses_a_missing_launch_agent_and_bootstraps_nothing(
+    tmp_path: Path,
+) -> None:
+    _, (_, bootstrap) = _native_backup_blocks()
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
+
+    result = host.run(bootstrap)
+
+    assert host.status(result) != 0
+    assert "Recorded LaunchAgent is missing" in result.stderr
+    assert host.calls() == []
+
+
+def test_backup_snippets_that_can_fail_run_in_a_subshell() -> None:
+    guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"^( *)```bash\n(.*?)^\1```$", guide, re.MULTILINE | re.DOTALL)
+    checked = 0
+    for indent, block in blocks:
+        depth = 0
+        for line in block.splitlines():
+            stripped = line.removeprefix(indent).rstrip()
+            if stripped == "(":
+                depth += 1
+            elif stripped == ")":
+                depth -= 1
+            elif re.search(r"\bexit\b", stripped):
+                checked += 1
+                assert depth > 0, f"exit outside a subshell would close the shell: {stripped}"
+        assert depth == 0
+    assert checked
 
 
 def test_docker_backup_restores_only_the_previously_running_services() -> None:
@@ -289,14 +599,176 @@ def test_docker_backup_restores_only_the_previously_running_services() -> None:
     assert "Recorded Compose service did not restart" in section
 
 
-def test_sole_provider_removal_fails_closed_until_a_replacement_exists() -> None:
+def test_sole_provider_removal_uses_the_empty_source_list_the_parser_accepts(
+    tmp_path: Path,
+) -> None:
     guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
-    section = guide.split("## Private-data lifecycle and removal", 1)[1]
-    normalized = " ".join(section.split())
+    section = " ".join(guide.split("## Private-data lifecycle and removal", 1)[1].split())
 
-    assert "rejects an empty `discovery.sources` list" in normalized
-    assert "deleting the setting selects the default iNaturalist source" in normalized
+    assert "set `sources = []` rather than deleting the setting" in section
+    assert "rejects an empty" not in section
+
+    raw = tomllib.loads((ROOT / "config.example.toml").read_text(encoding="utf-8"))
+    raw["discovery"]["sources"] = []
+    raw["discovery"].pop("zip_code")
     assert (
-        "Do not restart the controller until a valid replacement source is configured" in normalized
+        parse_config(raw, path=tmp_path / "config.toml", load_secrets=False).discovery.sources == ()
     )
-    assert "Only after the replacement configuration validates" in normalized
+    del raw["discovery"]["sources"]
+    raw["discovery"]["zip_code"] = "00000"
+    default = parse_config(raw, path=tmp_path / "config.toml", load_secrets=False)
+    assert default.discovery.sources == (DiscoveryProvider.INATURALIST,)
+
+
+# Legacy trusted-network routes that the owner proxy recipes must keep closed.
+LEGACY_PROXY_SAMPLES = (
+    "/",
+    "/health",
+    "/v1/catalog",
+    "/v1/assets/species/1-example/portrait.png",
+    "/v1/embed/featured-plate",
+    "/v1/display-fetch",
+    "/v1/display-success",
+)
+
+
+def _served_owner_paths() -> list[str]:
+    """Every explicit route in web.py; the legacy routes all go through the catch-all."""
+    source = (ROOT / "src/inky_bird_frame/web.py").read_text(encoding="utf-8")
+    routes = re.findall(r'Route\(\s*"([^"]+)"', source)
+    assert "/{path:path}" in routes
+    explicit = [route for route in routes if route not in {"/", "/favicon.ico", "/{path:path}"}]
+    samples = {"int": "1", "path": "species/1-example/portrait.png"}
+
+    def sample(match: re.Match[str]) -> str:
+        return samples.get(match.group(2) or "", "example")
+
+    paths = [re.sub(r"\{(\w+)(?::(\w+))?\}", sample, route) for route in explicit]
+    assert {"/app/ui.js", "/app/work-status.js", "/app/icon-32.png", "/wall/v1/catalog"} <= set(
+        paths
+    )
+    return paths
+
+
+def _proxy_matchers() -> dict[str, Callable[[str], bool]]:
+    guide = (ROOT / "docs/browser-access.md").read_text(encoding="utf-8")
+
+    rules = re.findall(r'^\s+rule: "(.+)"$', guide, re.MULTILINE)
+    assert len(rules) == 2
+    expressions = []
+    for rule in rules:
+        expression = re.sub(r"Host\(`[^`]+`\)|Method\(`[^`]+`\)", "True", rule)
+        expression = re.sub(r"PathPrefix\(`([^`]+)`\)", r"path.startswith('\1')", expression)
+        expression = re.sub(r"Path\(`([^`]+)`\)", r"(path == '\1')", expression)
+        expression = expression.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+        assert re.fullmatch(r"[\w\s()'/.=-]+", expression), expression
+        expressions.append(compile(expression, "traefik-rule", "eval"))
+
+    def traefik(path: str) -> bool:
+        return any(eval(code, {"__builtins__": {}}, {"path": path}) for code in expressions)
+
+    caddy_patterns = re.search(r"^\s+@owner path (.+)$", guide, re.MULTILINE)
+    assert caddy_patterns
+    patterns = caddy_patterns.group(1).split()
+
+    def caddy(path: str) -> bool:
+        return any(
+            path.startswith(pattern[:-1]) if pattern.endswith("*") else path == pattern
+            for pattern in patterns
+        )
+
+    nginx_location = re.search(r"^\s+location ~ (\S+) \{$", guide, re.MULTILINE)
+    assert nginx_location
+    nginx_pattern = re.compile(nginx_location.group(1))
+
+    def nginx(path: str) -> bool:
+        return nginx_pattern.fullmatch(path) is not None
+
+    return {"Traefik": traefik, "Caddy": caddy, "Nginx": nginx}
+
+
+@pytest.mark.parametrize("proxy", ["Traefik", "Caddy", "Nginx"])
+def test_proxy_recipes_route_every_owner_and_wall_path_and_no_legacy_path(proxy: str) -> None:
+    routes = _proxy_matchers()[proxy]
+
+    missing = [path for path in _served_owner_paths() if not routes(path)]
+    exposed = [path for path in LEGACY_PROXY_SAMPLES if routes(path)]
+
+    assert not missing, f"{proxy} recipe does not route: {missing}"
+    assert not exposed, f"{proxy} recipe exposes legacy routes: {exposed}"
+
+
+TOML_EXAMPLE = re.compile(
+    r"^(?P<indent>[ ]*)(?P<fence>```|~~~)toml\n(?P<body>.*?)^(?P=indent)(?P=fence)[ ]*$",
+    re.MULTILINE | re.DOTALL,
+)
+LOCATION_KEYS = ("zip_code", "postal_code", "country_code", "latitude", "longitude")
+
+
+def _merge(target: dict[str, object], update: dict[str, object]) -> None:
+    for key, value in update.items():
+        current = target.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            _merge(current, value)
+        else:
+            target[key] = value
+
+
+def _documented_toml_examples() -> list[tuple[str, str, dict[str, object]]]:
+    examples = []
+    for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
+        text = path.read_text(encoding="utf-8")
+        for match in TOML_EXAMPLE.finditer(text):
+            indent = match.group("indent")
+            body = "\n".join(line.removeprefix(indent) for line in match.group("body").splitlines())
+            lead_in = text[: match.start()].rstrip().rsplit("\n\n", 1)[-1]
+            line = text.count("\n", 0, match.start()) + 1
+            examples.append((f"{path.relative_to(ROOT)}:{line}", lead_in, tomllib.loads(body)))
+    return examples
+
+
+def test_documented_configuration_examples_load_or_say_they_are_fragments(
+    tmp_path: Path,
+) -> None:
+    """Load each example into config.example.toml the way an owner would apply it.
+
+    A [discovery] table that selects sources replaces the whole table; anything
+    else is merged, and a new location form replaces the old one.
+    """
+    examples = _documented_toml_examples()
+    assert len(examples) > 20
+    failures = []
+    for where, lead_in, example in examples:
+        if "fragment" in lead_in.lower():
+            continue
+        raw: dict[str, object] = tomllib.loads(
+            (ROOT / "config.example.toml").read_text(encoding="utf-8")
+        )
+        discovery = example.get("discovery")
+        base_discovery = raw["discovery"]
+        assert isinstance(base_discovery, dict)
+        if isinstance(discovery, dict) and "sources" in discovery:
+            raw["discovery"] = discovery
+            example = {key: value for key, value in example.items() if key != "discovery"}
+        elif isinstance(discovery, dict) and any(key in discovery for key in LOCATION_KEYS):
+            for key in LOCATION_KEYS:
+                base_discovery.pop(key, None)
+        _merge(raw, example)
+        try:
+            parse_config(raw, path=tmp_path / "config.toml", load_secrets=False)
+        except ConfigurationError as exc:
+            failures.append(f"{where}: {exc}")
+    assert not failures, "\n" + "\n".join(failures)
+
+
+def test_architecture_describes_the_fields_the_request_log_actually_writes() -> None:
+    server = (ROOT / "src/inky_bird_frame/server.py").read_text(encoding="utf-8")
+    dispatch = server.split("async def dispatch(", 1)[1].split("\n    def ", 1)[0]
+    logged = re.search(r'"event": "http_request",(.*?)\}', dispatch, re.DOTALL)
+    assert logged
+    assert set(re.findall(r'"(\w+)":', logged.group(1))) == {"method", "route", "status"}
+
+    guide = " ".join((ROOT / "docs/architecture.md").read_text(encoding="utf-8").split())
+    assert "with source IP address, path and query" not in guide
+    assert "It never logs the source address, query, cookies" in guide
+    assert "Owner, screen, wall and status routes are not logged per request" in guide

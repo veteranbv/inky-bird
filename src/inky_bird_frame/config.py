@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -226,6 +227,166 @@ class AppConfig:
     notifications: NotificationsConfig = NotificationsConfig()
     configuration_path: Path | None = field(default=None, repr=False, compare=False)
     discovery_revision: str | None = field(default=None, repr=False, compare=False)
+    unknown_keys: tuple[str, ...] = field(default=(), repr=False, compare=False)
+
+
+KNOWN_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    "": frozenset(
+        {
+            "discovery",
+            "controller",
+            "display_node",
+            "public_catalog",
+            "schedule",
+            "research",
+            "notifications",
+        }
+    ),
+    "discovery": frozenset(
+        {
+            "window",
+            "source",
+            "sources",
+            "zip_code",
+            "postal_code",
+            "country_code",
+            "latitude",
+            "longitude",
+            "radius_km",
+            "species_limit",
+            "geoapify_api_key",
+            "geoapify_api_key_env",
+            "ebird_api_key",
+            "ebird_api_key_env",
+            "birdweather_token",
+            "birdweather_token_env",
+            "birdbuddy_include_manual_sightings",
+            "birdnet_go_url",
+        }
+    ),
+    "controller": frozenset(
+        {
+            "workspace_dir",
+            "catalog_dir",
+            "state_dir",
+            "codex_path",
+            "codex_model",
+            "bind_host",
+            "port",
+            "references_per_species",
+            "generations_per_cycle",
+            "max_generation_attempts",
+            "max_species_attempts_per_cycle",
+            "retry_initial_minutes",
+            "retry_max_minutes",
+            "insufficient_references_retry_minutes",
+            "cors_allowed_origins",
+            "embed_allowed_origins",
+            "owner_allowed_origins",
+            "trusted_proxy_addresses",
+            "owner_access_mode",
+            "tls_certificate",
+            "tls_private_key",
+            "oidc",
+            "generation_enabled",
+            "configuration_ownership",
+            "owner_import_retention_hours",
+            "healthcheck_origin",
+        }
+    ),
+    "controller.oidc": frozenset(
+        {
+            "issuer",
+            "client_id",
+            "callback_url",
+            "client_secret_env",
+            "label",
+            "owner_subject",
+            "sso_only",
+        }
+    ),
+    "display_node": frozenset(
+        {"controller_url", "state_dir", "rotation_mode", "prioritize_latest_detection"}
+    ),
+    "public_catalog": frozenset(
+        {
+            "enabled",
+            "checkout_dir",
+            "repository",
+            "gh_path",
+            "remote",
+            "base_branch",
+            "commit_name",
+            "commit_email",
+        }
+    ),
+    "schedule": frozenset(
+        {
+            "refresh_minutes",
+            "generation_minutes",
+            "rotation_minutes",
+            "rotation_jitter_seconds",
+            "display_startup_delay_seconds",
+            "catalog_publish_minutes",
+        }
+    ),
+    "research": frozenset(
+        {"enabled", "max_searches_per_day", "max_searches_per_species", "allowed_domains"}
+    ),
+    "notifications": frozenset(
+        {
+            "enabled",
+            "destinations",
+            "degradation_failure_threshold",
+            "degradation_window_minutes",
+            "cooldown_minutes",
+            "delivery_retry_minutes",
+            "max_delivery_attempts",
+        }
+    ),
+    "notifications.destinations": frozenset({"name", "url", "url_env", "events"}),
+}
+
+
+def unknown_config_keys(raw: object) -> tuple[str, ...]:
+    """Return dotted names of keys and tables that no setting reads."""
+
+    found: list[str] = []
+
+    def visit(table: object, schema: str, label: str) -> None:
+        if not isinstance(table, dict):
+            return
+        for key, value in table.items():
+            name = f"{label}.{key}" if label else key
+            child = f"{schema}.{key}" if schema else key
+            if key not in KNOWN_CONFIG_KEYS[schema]:
+                found.append(name)
+            elif child == "notifications.destinations" and isinstance(value, list):
+                for index, item in enumerate(value):
+                    visit(item, child, f"{name}[{index}]")
+            elif child in KNOWN_CONFIG_KEYS:
+                visit(value, child, name)
+
+    visit(raw, "", "")
+    return tuple(found)
+
+
+def overlapping_controller_directories(
+    controller: ControllerConfig,
+) -> tuple[tuple[str, str], ...]:
+    """Return pairs of controller directories where one equals or contains the other."""
+
+    directories = (
+        ("workspace_dir", controller.workspace_dir.resolve()),
+        ("catalog_dir", controller.catalog_dir.resolve()),
+        ("state_dir", controller.state_dir.resolve()),
+    )
+    overlapping: list[tuple[str, str]] = []
+    for index, (name, path) in enumerate(directories):
+        for other_name, other in directories[index + 1 :]:
+            if path == other or path in other.parents or other in path.parents:
+                overlapping.append((name, other_name))
+    return tuple(overlapping)
 
 
 def _section(data: object, name: str) -> dict[str, object]:
@@ -559,6 +720,34 @@ def _notification_destinations(
     return tuple(destinations)
 
 
+# Git and gh receive these as arguments; a leading "-" would read as an option.
+_GIT_NAME = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]*")
+_GIT_BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
+
+
+def _http_base_url(value: str, name: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} is not a valid HTTP or HTTPS URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        raise ConfigurationError(
+            f"{name} must be an HTTP or HTTPS base URL without credentials, a query, or a fragment"
+        )
+    return value.rstrip("/")
+
+
 def _path(value: str, base_dir: Path) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else (base_dir / path).resolve()
@@ -594,8 +783,7 @@ def _private_value(
     resolved = direct_value.strip() if load_secret and isinstance(direct_value, str) else None
     variable = environment_name.strip() if isinstance(environment_name, str) else None
     if variable is not None and load_secret:
-        environment_value = environ.get(variable)
-        resolved = environment_value.strip() if environment_value else None
+        resolved = environ.get(variable, "").strip() or None
         if required and resolved is None:
             raise ConfigurationError(
                 f"{provider_name} discovery requires environment variable {variable}"
@@ -607,11 +795,27 @@ def _private_value(
 
 def load_config(path: Path, *, load_secrets: bool = True) -> AppConfig:
     try:
-        raw = tomllib.loads(path.read_text())
+        content = path.read_bytes()
     except FileNotFoundError as exc:
         raise ConfigurationError(f"Configuration file not found: {path}") from exc
+    return parse_config_bytes(content, path=path, load_secrets=load_secrets)
+
+
+def parse_config_bytes(
+    content: bytes, *, path: Path, source: str | None = None, load_secrets: bool = True
+) -> AppConfig:
+    """Validate TOML bytes as if they were stored at ``path``.
+
+    ``source`` names the bytes in errors when they are not yet at ``path``.
+    """
+
+    label = source if source is not None else str(path)
+    try:
+        raw = tomllib.loads(content.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(f"Configuration in {label} is not valid UTF-8") from exc
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigurationError(f"Invalid TOML in {path}: {exc}") from exc
+        raise ConfigurationError(f"Invalid TOML in {label}: {exc}") from exc
 
     return parse_config(raw, path=path, load_secrets=load_secrets)
 
@@ -626,6 +830,9 @@ def parse_config(raw: object, *, path: Path, load_secrets: bool = True) -> AppCo
     schedule = _optional_section(raw, "schedule")
     research = _optional_section(raw, "research")
     notifications = _optional_section(raw, "notifications")
+    # Unknown keys are reported, not rejected: rejecting them is a 1.x contract
+    # decision. Raise here, and only here, if that decision changes.
+    unknown_keys = unknown_config_keys(raw)
     base_dir = path.parent.resolve()
 
     window_value = _string(discovery, "window")
@@ -743,31 +950,12 @@ def parse_config(raw: object, *, path: Path, load_secrets: bool = True) -> AppCo
     if DiscoveryProvider.BIRDNET_GO in discovery_sources and birdnet_go_url is None:
         raise ConfigurationError("BirdNET-Go discovery requires birdnet_go_url")
     if birdnet_go_url is not None:
-        try:
-            parsed_birdnet_go_url = urlsplit(birdnet_go_url)
-            _ = parsed_birdnet_go_url.port
-        except ValueError as exc:
-            raise ConfigurationError("birdnet_go_url is not a valid HTTP or HTTPS URL") from exc
-        if (
-            parsed_birdnet_go_url.scheme not in {"http", "https"}
-            or not parsed_birdnet_go_url.netloc
-            or parsed_birdnet_go_url.hostname is None
-            or parsed_birdnet_go_url.username is not None
-            or parsed_birdnet_go_url.password is not None
-            or parsed_birdnet_go_url.query
-            or parsed_birdnet_go_url.fragment
-            or "?" in birdnet_go_url
-            or "#" in birdnet_go_url
-        ):
-            raise ConfigurationError(
-                "birdnet_go_url must be an HTTP or HTTPS base URL without credentials, "
-                "a query, or a fragment"
-            )
-        birdnet_go_url = birdnet_go_url.rstrip("/")
+        birdnet_go_url = _http_base_url(birdnet_go_url, "birdnet_go_url")
 
     controller_url = _string(display_node, "controller_url").rstrip("/")
     if not controller_url.startswith(("http://", "https://")):
         raise ConfigurationError("controller_url must start with http:// or https://")
+    controller_url = _http_base_url(controller_url, "controller_url")
 
     rotation_mode_value = _optional_string(
         display_node, "rotation_mode", default=RotationMode.SEQUENTIAL.value
@@ -792,6 +980,27 @@ def parse_config(raw: object, *, path: Path, load_secrets: bool = True) -> AppCo
         parts = repository.split("/")
         if len(parts) != 2 or any(not part or part in {".", ".."} for part in parts):
             raise ConfigurationError("repository must use the owner/name format")
+        if any(_GIT_NAME.fullmatch(part) is None for part in parts):
+            raise ConfigurationError(
+                "repository owner and name must use only letters, digits, '.', '_' or '-' "
+                "and must not start with '-'"
+            )
+    remote = _optional_string(public_catalog, "remote", default="origin")
+    if _GIT_NAME.fullmatch(remote) is None:
+        raise ConfigurationError(
+            "remote must use only letters, digits, '.', '_' or '-' and must not start with '-'"
+        )
+    base_branch = _optional_string(public_catalog, "base_branch", default="main")
+    if (
+        _GIT_BRANCH.fullmatch(base_branch) is None
+        or ".." in base_branch
+        or "//" in base_branch
+        or base_branch.endswith(("/", ".", ".lock"))
+    ):
+        raise ConfigurationError(
+            "base_branch must be a Git branch name using only letters, digits, '.', '_', "
+            "'-' or '/' and must not start with '-'"
+        )
 
     allowed_domains = tuple(
         domain.casefold()
@@ -856,6 +1065,7 @@ def parse_config(raw: object, *, path: Path, load_secrets: bool = True) -> AppCo
         raise ConfigurationError("owner_import_retention_hours must be between 1 and 168")
 
     return AppConfig(
+        unknown_keys=unknown_keys,
         configuration_path=path.absolute(),
         discovery_revision=hashlib.sha256(
             json.dumps(discovery, sort_keys=True, default=str).encode()
@@ -944,8 +1154,8 @@ def parse_config(raw: object, *, path: Path, load_secrets: bool = True) -> AppCo
             gh_path=_executable_path(
                 _optional_string(public_catalog, "gh_path", default="gh"), base_dir
             ),
-            remote=_optional_string(public_catalog, "remote", default="origin"),
-            base_branch=_optional_string(public_catalog, "base_branch", default="main"),
+            remote=remote,
+            base_branch=base_branch,
             commit_name=_optional_string(
                 public_catalog, "commit_name", default="Inky Bird Frame Catalog"
             ),

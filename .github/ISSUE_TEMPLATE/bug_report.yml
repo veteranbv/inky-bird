@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Inky Bird Frame. Remove locations, credentials,
+        Thanks for helping improve Inky Bird. Remove locations, credentials,
         notification URLs, and other private values before submitting.
   - type: dropdown
     id: area
@@ -15,6 +15,10 @@ body:
       label: Affected area
       options:
         - Controller and discovery
+        - Web journal
+        - Owner access and sign-in
+        - History imports
+        - Home Assistant
         - Generation and review
         - Catalog and publishing
         - Display node and Inky hardware

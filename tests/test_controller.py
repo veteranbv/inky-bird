@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from collections.abc import Iterator
@@ -9,6 +10,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import cast
 from unittest.mock import patch
+
+from png_fixtures import write_plate_pair, write_png
 
 from inky_bird_frame.birdbuddy import BirdBuddySyncResult, BirdBuddySyncStats
 from inky_bird_frame.birdnet_analyzer import BirdNetAnalyzerHistory
@@ -115,8 +118,7 @@ def approve_test_species(config: AppConfig, species: BirdSpecies) -> CatalogEntr
     review = QualityReview(True, 5, 5, 5, 5, True, ())
     candidate = candidate_directory(config.controller.state_dir, species)
     candidate.mkdir(parents=True)
-    (candidate / "portrait.png").write_bytes(b"portrait")
-    (candidate / "display.png").write_bytes(b"display")
+    write_plate_pair(candidate)
     write_candidate_manifest(
         candidate,
         species,
@@ -2088,7 +2090,7 @@ class ControllerTests(unittest.TestCase):
             )
             recovered: list[str] = []
 
-            def approve(_config: object) -> list[dict[str, object]]:
+            def approve(_config: object, **_kwargs: object) -> list[dict[str, object]]:
                 collection = read_collection_state(config.controller.state_dir)
                 self.assertEqual([entry.taxon_id for entry in collection.entries], [42])
                 self.assertIsNotNone(collection.legacy_seed_queue_migrated_at)
@@ -2650,8 +2652,7 @@ class ControllerTests(unittest.TestCase):
             config = load_config(config_path)
             candidate = candidate_directory(config.controller.state_dir, species)
             candidate.mkdir(parents=True)
-            (candidate / "portrait.png").write_bytes(b"portrait")
-            (candidate / "display.png").write_bytes(b"display")
+            write_plate_pair(candidate)
             write_candidate_manifest(
                 candidate,
                 species,
@@ -2691,8 +2692,7 @@ class ControllerTests(unittest.TestCase):
             config = load_config(config_path)
             candidate = candidate_directory(config.controller.state_dir, species)
             candidate.mkdir(parents=True)
-            (candidate / "portrait.png").write_bytes(b"portrait")
-            (candidate / "display.png").write_bytes(b"display")
+            write_plate_pair(candidate)
             write_candidate_manifest(
                 candidate,
                 species,
@@ -2938,8 +2938,8 @@ class ControllerTests(unittest.TestCase):
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
             assert not catalog_lock_held
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -2981,6 +2981,11 @@ class ControllerTests(unittest.TestCase):
                     invariant_correction_findings=("Render clearly visible natural eyes",),
                 )
             manifest = json.loads((candidate / "manifest.json").read_text())
+            # Every fake attempt writes identical plate bytes, so attempt one's
+            # portrait (the correction source) hashes like the staged copy.
+            prepared_portrait_sha256 = hashlib.sha256(
+                (candidate / "portrait.png").read_bytes()
+            ).hexdigest()
             private_histories = list(
                 (config.controller.state_dir / "runs").glob("*/attempt-history.json")
             )
@@ -3008,7 +3013,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(FakeRunner.correction_sources[1], FakeRunner.review_paths[0])
         self.assertEqual(
             manifest["generation"]["correction_source_sha256"],
-            "51c5a8296a032ce7b3014e66000c20d0d759d2e910873f28fa6107ab012bf887",
+            prepared_portrait_sha256,
         )
         self.assertEqual(manifest["generation"]["attempt"], 2)
         self.assertEqual(manifest["status"], "pending")
@@ -3132,8 +3137,8 @@ class ControllerTests(unittest.TestCase):
                 return next(self.reviews)
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -3290,8 +3295,8 @@ class ControllerTests(unittest.TestCase):
                 return conflict_review
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -3389,8 +3394,8 @@ class ControllerTests(unittest.TestCase):
                 return next(self.reviews)
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -3495,8 +3500,8 @@ class ControllerTests(unittest.TestCase):
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
             assert not catalog_lock_held
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -3605,8 +3610,8 @@ class ControllerTests(unittest.TestCase):
                 return next(reviews)
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -3934,8 +3939,8 @@ class ControllerTests(unittest.TestCase):
                 return review
 
         def prepare(_source: Path, portrait: Path, display: Path) -> None:
-            portrait.write_bytes(b"portrait")
-            display.write_bytes(b"display")
+            write_png(portrait, color=(200, 40, 40))
+            write_png(display, color=(40, 40, 200))
 
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -4006,8 +4011,7 @@ class ControllerTests(unittest.TestCase):
             config = load_config(config_path)
             candidate = candidate_directory(config.controller.state_dir, species)
             candidate.mkdir(parents=True)
-            (candidate / "portrait.png").write_bytes(b"portrait")
-            (candidate / "display.png").write_bytes(b"display")
+            write_plate_pair(candidate)
             manifest_path = write_candidate_manifest(
                 candidate,
                 species,

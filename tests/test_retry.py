@@ -43,6 +43,46 @@ class RetryStoreTests(unittest.TestCase):
             self.assertEqual(reloaded.common_name, "Example Bird")
             self.assertEqual(reloaded.scientific_name, "Avis exemplum")
 
+    def test_failure_without_message_is_recorded_in_a_readable_form(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            RetryStore(path).record_failure(
+                42, KeyError(), now=now, initial_minutes=30, maximum_minutes=60
+            )
+            RetryStore(path).record_failure(
+                43, RuntimeError("  "), now=now, initial_minutes=30, maximum_minutes=60
+            )
+            reloaded = RetryStore(path)
+
+        first = reloaded.get(42)
+        second = reloaded.get(43)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        if first is not None and second is not None:
+            self.assertEqual(first.error, "KeyError without details")
+            self.assertEqual(second.error, "RuntimeError without details")
+
+    def test_explicit_message_replaces_the_exception_text(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            RetryStore(path).record_failure(
+                42,
+                OSError("private detail"),
+                now=now,
+                initial_minutes=30,
+                maximum_minutes=60,
+                message="Generation stopped unexpectedly (OSError)",
+            )
+            text = path.read_text()
+            record = RetryStore(path).get(42)
+
+        self.assertNotIn("private detail", text)
+        self.assertIsNotNone(record)
+        if record is not None:
+            self.assertEqual(record.error_type, "OSError")
+
     def test_fixed_delay_and_clear(self) -> None:
         now = datetime(2026, 7, 10, tzinfo=UTC)
         with TemporaryDirectory() as temporary:
