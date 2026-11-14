@@ -430,10 +430,10 @@ def safe_record_recovery(
 
 def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -> dict[str, object]:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
-    success_at, success_warning = _read_display_heartbeat(
+    success_at, success_warning, _ = _read_display_heartbeat(
         display_success_path(config), "succeeded_at"
     )
-    fetched_at, fetch_warning = _read_display_heartbeat(
+    fetched_at, fetch_warning, fetch_route = _read_display_heartbeat(
         display_heartbeat_path(config), "fetched_at"
     )
     warning = success_warning or fetch_warning
@@ -460,10 +460,13 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         stale = True
         described = f"fetched the catalog at {fetched_at.isoformat()} but never completed an update"
     # A display pointed at an empty wall view keeps fetching but deliberately
-    # leaves the panel unchanged. That is a pause, not a failure.
+    # leaves the panel unchanged. That is a pause, not a failure. Only a fetch
+    # recorded on the wall route proves such a display; a record without a
+    # route (older controllers) or from /v1/catalog keeps the stale alert.
     paused = (
         stale
         and fetched_at is not None
+        and fetch_route == "wall"
         and current - fetched_at <= threshold
         and _wall_view_is_empty(config)
     )
@@ -774,20 +777,25 @@ def _health_datetime(value: object) -> datetime | None:
     return parse_utc_timestamp(value)
 
 
-def _read_display_heartbeat(path: Path, field: str) -> tuple[datetime | None, str | None]:
+def _read_display_heartbeat(
+    path: Path, field: str
+) -> tuple[datetime | None, str | None, str | None]:
+    """Return the timestamp, any warning, and the optional route the display used."""
+
     # A missing file is a valid no-signal state; a corrupt file is reported, never fatal.
     if not path.exists():
-        return None, None
+        return None, None, None
     try:
         raw = json.loads(path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, f"Invalid display heartbeat: {path}"
+        return None, f"Invalid display heartbeat: {path}", None
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        return None, f"Unsupported display heartbeat: {path}"
+        return None, f"Unsupported display heartbeat: {path}", None
     seen_at = _health_datetime(raw.get(field))
     if seen_at is None:
-        return None, f"Invalid display heartbeat timestamp: {path}"
-    return seen_at, None
+        return None, f"Invalid display heartbeat timestamp: {path}", None
+    route = raw.get("route")
+    return seen_at, None, route if isinstance(route, str) else None
 
 
 def _read_health(path: Path) -> dict[str, dict[str, object]]:

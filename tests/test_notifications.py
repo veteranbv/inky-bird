@@ -545,11 +545,16 @@ class DisplayHeartbeatTests(unittest.TestCase):
         path.write_text(DISPLAY_CONFIG.format(rotation_minutes=rotation_minutes))
         return load_config(path)
 
-    def _write_heartbeat(self, config: AppConfig, fetched_at: datetime) -> None:
+    def _write_heartbeat(
+        self, config: AppConfig, fetched_at: datetime, *, route: str | None = None
+    ) -> None:
+        """Write a fetch record; ``route=None`` is the format older controllers wrote."""
+
+        record: dict[str, object] = {"schema_version": 1, "fetched_at": fetched_at.isoformat()}
+        if route is not None:
+            record["route"] = route
         config.controller.state_dir.mkdir(parents=True, exist_ok=True)
-        (config.controller.state_dir / "display-last-fetch.json").write_text(
-            json.dumps({"schema_version": 1, "fetched_at": fetched_at.isoformat()})
-        )
+        (config.controller.state_dir / "display-last-fetch.json").write_text(json.dumps(record))
 
     def _write_wall(self, config: AppConfig, *, members: bool) -> None:
         """Approve one synthetic plate; ``members`` puts it in the default wall view."""
@@ -735,7 +740,7 @@ class DisplayHeartbeatTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = self._config(temporary)
             self._write_wall(config, members=False)
-            self._write_heartbeat(config, now - timedelta(minutes=5))
+            self._write_heartbeat(config, now - timedelta(minutes=5), route="wall")
             self._write_success(config, now - timedelta(minutes=200))
             with patch("inky_bird_frame.notifications.safe_notify") as notify:
                 result = check_display_heartbeat(config, now=now)
@@ -755,7 +760,7 @@ class DisplayHeartbeatTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = self._config(temporary)
             self._write_wall(config, members=False)
-            self._write_heartbeat(config, now - timedelta(minutes=200))
+            self._write_heartbeat(config, now - timedelta(minutes=200), route="wall")
             with patch(
                 "inky_bird_frame.notifications.safe_notify",
                 return_value={"queued": True},
@@ -777,7 +782,7 @@ class DisplayHeartbeatTests(unittest.TestCase):
                 return_value={"queued": True},
             ) as notify:
                 dead = check_display_heartbeat(config, now=now)
-                self._write_heartbeat(config, now + timedelta(minutes=5))
+                self._write_heartbeat(config, now + timedelta(minutes=5), route="wall")
                 paused = check_display_heartbeat(config, now=now + timedelta(minutes=10))
                 self._write_wall(config, members=True)
                 self._write_success(config, now + timedelta(minutes=15))
@@ -799,7 +804,46 @@ class DisplayHeartbeatTests(unittest.TestCase):
             config = self._config(temporary)
             self._write_wall(config, members=False)
             (config.controller.state_dir / "presentation-access.json").write_text("not json")
-            self._write_heartbeat(config, now - timedelta(minutes=5))
+            self._write_heartbeat(config, now - timedelta(minutes=5), route="wall")
+            with patch(
+                "inky_bird_frame.notifications.safe_notify",
+                return_value={"queued": True},
+            ) as notify:
+                result = check_display_heartbeat(config, now=now)
+
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["paused"])
+        self.assertIs(notify.call_args.args[1], NotificationEvent.DISPLAY_STALE)
+
+    def test_empty_wall_view_does_not_pause_a_display_on_the_catalog_route(self) -> None:
+        # Displays on /v1/catalog never pause for the wall view, so a fresh
+        # fetch with a stale panel is still a failed update there.
+        for route in ("catalog", None, "unexpected"):
+            with self.subTest(route=route):
+                now = datetime(2026, 7, 10, tzinfo=UTC)
+                with TemporaryDirectory() as temporary:
+                    config = self._config(temporary)
+                    self._write_wall(config, members=False)
+                    self._write_heartbeat(config, now - timedelta(minutes=5), route=route)
+                    self._write_success(config, now - timedelta(minutes=200))
+                    with patch(
+                        "inky_bird_frame.notifications.safe_notify",
+                        return_value={"queued": True},
+                    ) as notify:
+                        result = check_display_heartbeat(config, now=now)
+
+                self.assertTrue(result["stale"])
+                self.assertFalse(result["paused"])
+                self.assertEqual(result["signal"], "display-update")
+                self.assertIs(notify.call_args.args[1], NotificationEvent.DISPLAY_STALE)
+
+    def test_wall_route_fetch_with_a_populated_wall_view_is_stale(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            self._write_heartbeat(config, now - timedelta(minutes=5), route="wall")
+            self._write_success(config, now - timedelta(minutes=200))
             with patch(
                 "inky_bird_frame.notifications.safe_notify",
                 return_value={"queued": True},
