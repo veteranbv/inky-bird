@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from inky_bird_frame import birds
 from inky_bird_frame.birdbuddy import BirdBuddySyncResult, BirdBuddySyncStats
 from inky_bird_frame.birds import BirdBuddySpecies, BirdSpecies
 from inky_bird_frame.catalog import CatalogEntry
-from inky_bird_frame.config import AppConfig, load_config
-from inky_bird_frame.controller import discover_species, refresh_observations, run_refresh_cycle
+from inky_bird_frame.config import AppConfig, DiscoveryProvider, load_config
+from inky_bird_frame.controller import (
+    PROVIDER_SOURCE_LABELS,
+    discover_species,
+    refresh_observations,
+    run_refresh_cycle,
+)
 from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.geo import DiscoveryLocation
 
@@ -102,8 +110,14 @@ class ProviderIsolationTests(unittest.TestCase):
                     "inky_bird_frame.controller.sync_birdbuddy_detections",
                     side_effect=KeyError("/private/state/birdbuddy.json"),
                 ),
+                self.assertLogs("inky_bird_frame.controller", level="WARNING") as logs,
             ):
                 result = discover_species(config)
+
+        # The service log keeps the traceback that the stored status leaves out.
+        exc_info = logs.records[0].exc_info
+        assert exc_info is not None
+        self.assertIs(exc_info[0], KeyError)
 
         self.assertEqual(result.species, [FIELD_BIRD])
         self.assertEqual(
@@ -170,46 +184,74 @@ class ProviderIsolationTests(unittest.TestCase):
         self.assertIn("eBird API key is not configured", str(raised.exception))
         self.assertIn("BirdWeather station token is not configured", str(raised.exception))
 
-    def test_partial_birdbuddy_history_reports_degraded_with_skipped_count(self) -> None:
+    def refresh_birdbuddy(
+        self, config: AppConfig, stats: BirdBuddySyncStats
+    ) -> tuple[dict[str, object], list[str], list[str], str | None]:
         resolved = BirdSpecies(303, "Feeder Bird", "Avis mensae", 1, "Bird Buddy")
         detection = BirdBuddySpecies(
             "species-feeder", "Feeder Bird", "Avis mensae", 1, "2026-01-01T00:00:00+00:00"
         )
-        stats = birdbuddy_stats(complete=False, skipped=4)
+        with (
+            patch(
+                "inky_bird_frame.controller.sync_birdbuddy_detections",
+                return_value=BirdBuddySyncResult([detection], stats),
+            ),
+            patch(
+                "inky_bird_frame.controller.resolve_birdbuddy_species",
+                return_value=([resolved], []),
+            ),
+            patch("inky_bird_frame.controller.safe_record_degradation") as degraded,
+            patch("inky_bird_frame.controller.safe_record_recovery") as recovered,
+            patch("inky_bird_frame.controller.safe_notify"),
+        ):
+            result = refresh_observations(config)
+        degraded_keys = [call.kwargs["key"] for call in degraded.call_args_list]
+        recovered_keys = [call.kwargs["key"] for call in recovered.call_args_list]
+        body = next(
+            (
+                call.kwargs["body"]
+                for call in degraded.call_args_list
+                if call.kwargs["key"] == "observation-provider-birdbuddy"
+            ),
+            None,
+        )
+        return result, degraded_keys, recovered_keys, body
+
+    def test_skipped_birdbuddy_records_stay_ok_with_a_warning_and_notice(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary, '[discovery]\nsources = ["birdbuddy"]\n')
-            with (
-                patch(
-                    "inky_bird_frame.controller.sync_birdbuddy_detections",
-                    return_value=BirdBuddySyncResult([detection], stats),
-                ),
-                patch(
-                    "inky_bird_frame.controller.resolve_birdbuddy_species",
-                    return_value=([resolved], []),
-                ),
-                patch("inky_bird_frame.controller.safe_record_degradation") as degraded,
-                patch("inky_bird_frame.controller.safe_record_recovery") as recovered,
-                patch("inky_bird_frame.controller.safe_notify"),
-            ):
-                result = refresh_observations(config)
+            result, degraded_keys, recovered_keys, body = self.refresh_birdbuddy(
+                config, birdbuddy_stats(complete=False, skipped=4)
+            )
 
         providers = result["providers"]
         assert isinstance(providers, list)
-        self.assertEqual(providers[0]["status"], "degraded")
+        # Existing readers treat any status other than ok as a failed source.
+        self.assertEqual(providers[0]["status"], "ok")
         self.assertEqual(providers[0]["species_count"], 1)
         self.assertEqual(providers[0]["details"]["confirmed_records_skipped"], 4)
-        self.assertIn("4", providers[0]["warning"])
+        self.assertIn("4 records were skipped", providers[0]["warning"])
         self.assertEqual(result["species_count"], 1)
-        degraded_keys = [call.kwargs["key"] for call in degraded.call_args_list]
-        recovered_keys = [call.kwargs["key"] for call in recovered.call_args_list]
         self.assertIn("observation-provider-birdbuddy", degraded_keys)
         self.assertNotIn("observation-provider-birdbuddy", recovered_keys)
-        body = next(
-            call.kwargs["body"]
-            for call in degraded.call_args_list
-            if call.kwargs["key"] == "observation-provider-birdbuddy"
-        )
-        self.assertIn("4", body)
+        assert body is not None
+        self.assertIn("4 records were skipped", body)
+
+    def test_birdbuddy_history_page_cap_is_not_reported_as_skipped_records(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, '[discovery]\nsources = ["birdbuddy"]\n')
+            result, degraded_keys, recovered_keys, _ = self.refresh_birdbuddy(
+                config, birdbuddy_stats(complete=False, skipped=0)
+            )
+
+        providers = result["providers"]
+        assert isinstance(providers, list)
+        self.assertEqual(providers[0]["status"], "ok")
+        warning = providers[0]["warning"]
+        self.assertNotIn("skipped", warning)
+        self.assertIn("5000", warning)
+        self.assertNotIn("observation-provider-birdbuddy", degraded_keys)
+        self.assertIn("observation-provider-birdbuddy", recovered_keys)
 
     def test_complete_birdbuddy_history_stays_ok(self) -> None:
         resolved = BirdSpecies(303, "Feeder Bird", "Avis mensae", 1, "Bird Buddy")
@@ -234,6 +276,51 @@ class ProviderIsolationTests(unittest.TestCase):
 
         self.assertEqual(result.providers[0].status, "ok")
         self.assertNotIn("warning", result.providers[0].as_dict())
+
+
+class BirdBuddyHistoryBaselineTests(unittest.TestCase):
+    def test_long_birdbuddy_history_still_lets_a_returning_species_be_announced(self) -> None:
+        feeder = BirdSpecies(303, "Feeder Bird", "Avis mensae", 1, "Bird Buddy")
+        migrant = BirdSpecies(404, "Migrant Bird", "Avis migrans", 1, "Bird Buddy")
+        detection = BirdBuddySpecies(
+            "species-feeder", "Feeder Bird", "Avis mensae", 1, "2026-01-01T00:00:00+00:00"
+        )
+        capped = BirdBuddySyncResult([detection], birdbuddy_stats(complete=False, skipped=0))
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, '[discovery]\nsources = ["birdbuddy"]\n')
+            notices = config.controller.state_dir / "new-species-notices.json"
+            with (
+                patch(
+                    "inky_bird_frame.controller.sync_birdbuddy_detections",
+                    return_value=capped,
+                ),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdbuddy_species",
+                    side_effect=[
+                        ([feeder, migrant], []),
+                        ([feeder], []),
+                        ([feeder], []),
+                        ([feeder, migrant], []),
+                    ],
+                ),
+                patch("inky_bird_frame.controller.rebuild_catalog_index", return_value=[]),
+                patch(
+                    "inky_bird_frame.controller.safe_notify",
+                    return_value={"queued": True, "attempted": 0, "delivered": 0, "failed": 0},
+                ) as notify,
+                patch("inky_bird_frame.controller.safe_record_degradation"),
+                patch("inky_bird_frame.controller.safe_record_recovery"),
+            ):
+                refresh_observations(config)
+                refresh_observations(config)
+                refresh_observations(config)
+                saved = json.loads(notices.read_text())
+                saved["year"] = datetime.now(UTC).year - 1
+                notices.write_text(json.dumps(saved))
+                refresh_observations(config)
+
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(notify.call_args.kwargs["body"], "Migrant Bird")
 
 
 class CarryForwardTests(unittest.TestCase):
@@ -362,6 +449,22 @@ class CarryForwardTests(unittest.TestCase):
 
         self.assertEqual(wall, [FIELD_BIRD.taxon_id])
 
+    def test_carried_bird_keeps_only_the_failed_providers_attribution(self) -> None:
+        both = BirdSpecies(
+            FIELD_BIRD.taxon_id, FIELD_BIRD.common_name, FIELD_BIRD.scientific_name, 1, "BirdNET-Go"
+        )
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.refresh(config, inaturalist=[FIELD_BIRD], birdnet_go=[both])
+            path = config.controller.state_dir / "discovery.json"
+            before = json.loads(path.read_text())["species"]
+            self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[])
+            after = json.loads(path.read_text())["species"]
+
+        self.assertEqual(sorted(before[0]["sources"]), ["BirdNET-Go", "iNaturalist"])
+        self.assertEqual([item["taxon_id"] for item in after], [FIELD_BIRD.taxon_id])
+        self.assertEqual(after[0]["sources"], ["iNaturalist"])
+
     def test_changed_discovery_settings_do_not_carry_old_birds(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary, BIRDNET_GO_SOURCES)
@@ -410,6 +513,23 @@ class GeocodeCacheRefreshTests(unittest.TestCase):
         self.assertEqual(providers[0]["status"], "ok")
         self.assertEqual(cache_mode & 0o777, 0o600)
 
+    def test_discovery_preview_does_not_save_the_geocode(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                patch("inky_bird_frame.geo.lookup_us_zip", return_value=LOCATION) as lookup,
+                patch(
+                    "inky_bird_frame.controller.fetch_inaturalist_birds",
+                    return_value=[FIELD_BIRD],
+                ),
+            ):
+                result = discover_species(config, persist_taxonomy_cache=False)
+            cached = (config.controller.state_dir / "geocode-cache.json").exists()
+
+        lookup.assert_called_once()
+        self.assertEqual(result.species, [FIELD_BIRD])
+        self.assertFalse(cached)
+
     def test_geocoder_outage_with_a_saved_location_keeps_the_source_healthy(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary)
@@ -430,6 +550,15 @@ class GeocodeCacheRefreshTests(unittest.TestCase):
         assert isinstance(providers, list)
         self.assertEqual(providers[0]["status"], "ok")
         self.assertEqual(result["species_count"], 1)
+
+
+class ProviderSourceLabelTests(unittest.TestCase):
+    def test_every_provider_maps_to_the_source_label_its_species_carry(self) -> None:
+        birds_source = Path(inspect.getfile(birds)).read_text()
+        labels = set(re.findall(r'\bsource(?:: str)? ?= ?"([^"]+)"', birds_source))
+
+        self.assertEqual(set(PROVIDER_SOURCE_LABELS), {item.value for item in DiscoveryProvider})
+        self.assertEqual(set(PROVIDER_SOURCE_LABELS.values()), labels)
 
 
 if __name__ == "__main__":

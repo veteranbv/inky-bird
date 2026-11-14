@@ -182,6 +182,42 @@ class RefreshNotificationTests(unittest.TestCase):
         self.assertEqual(kwargs["dedupe_key"], f"{datetime.now(UTC).year}:2")
         self.assertEqual(mode, 0o600)
 
+    def test_failed_notice_is_not_recorded_as_announced(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            notices = config.controller.state_dir / "new-species-notices.json"
+            with recorded([discovery([FIRST]), discovery([]), discovery([FIRST])]) as calls:
+                calls.notify.return_value = {
+                    "queued": False,
+                    "attempted": 1,
+                    "delivered": 0,
+                    "failed": 1,
+                }
+                refresh_observations(config)
+                recorded_after_failure = notices.exists()
+                refresh_observations(config)
+                refresh_observations(config)
+
+        self.assertFalse(recorded_after_failure)
+        self.assertEqual(calls.notify.call_count, 2)
+        self.assertEqual(calls.notify.call_args.kwargs["body"], "First Bird")
+
+    def test_symlinked_notice_record_is_not_trusted(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            config.controller.state_dir.mkdir(parents=True, exist_ok=True)
+            elsewhere = Path(temporary) / "elsewhere.json"
+            elsewhere.write_text(
+                json.dumps({"schema_version": 1, "year": datetime.now(UTC).year, "taxon_ids": [1]})
+            )
+            elsewhere.chmod(0o600)
+            (config.controller.state_dir / "new-species-notices.json").symlink_to(elsewhere)
+            with recorded([discovery([FIRST])]) as calls:
+                refresh_observations(config)
+
+        calls.notify.assert_called_once()
+        self.assertEqual(calls.notify.call_args.kwargs["body"], "First Bird")
+
     def test_long_new_species_list_names_the_first_ten(self) -> None:
         many = [
             BirdSpecies(index, f"Bird {index:02d}", f"Avis numerus{index}", 1, "iNaturalist")

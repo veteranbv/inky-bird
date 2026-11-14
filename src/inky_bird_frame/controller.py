@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import shutil
 from collections.abc import Iterator, Mapping
@@ -18,7 +19,12 @@ from time import monotonic
 from typing import cast
 
 from .activity import activity_run, progress
-from .birdbuddy import sync_birdbuddy_detections
+from .birdbuddy import (
+    BIRDBUDDY_MAX_CONFIRMED_PAGES,
+    BIRDBUDDY_PAGE_SIZE,
+    BirdBuddySyncStats,
+    sync_birdbuddy_detections,
+)
 from .birdnet_analyzer import read_birdnet_analyzer_history
 from .birds import (
     BirdBuddySpecies,
@@ -90,7 +96,7 @@ from .errors import (
     SpeciesStateError,
 )
 from .geo import DiscoveryLocation, resolve_discovery_location
-from .http import write_json_atomic
+from .http import read_private_json, write_json_atomic
 from .images import prepare_generated_plate
 from .models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from .notifications import safe_notify, safe_record_degradation, safe_record_recovery
@@ -121,6 +127,8 @@ PROVIDER_SOURCE_LABELS: Mapping[str, str] = {
 CARRY_FORWARD_REFRESHES = 3
 CARRY_FORWARD_MAXIMUM = timedelta(hours=24)
 NEW_SPECIES_NOTICE_NAMES = 10
+NEW_SPECIES_NOTICES_MAX_BYTES = 1024 * 1024
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -166,8 +174,25 @@ class ProviderStatus:
         return value
 
 
+def _birdbuddy_history_warning(stats: BirdBuddySyncStats) -> str | None:
+    if stats.confirmed_records_skipped:
+        return (
+            "Bird Buddy confirmed history was incomplete; "
+            f"{stats.confirmed_records_skipped} records were skipped"
+        )
+    if not stats.confirmed_history_complete:
+        return (
+            "Bird Buddy history is longer than the newest "
+            f"{BIRDBUDDY_MAX_CONFIRMED_PAGES * BIRDBUDDY_PAGE_SIZE} records, "
+            "so only those were read"
+        )
+    return None
+
+
 def _unexpected_source_error(exc: Exception) -> str:
-    # Unexpected exception text can carry paths or coordinates; keep only the type.
+    # Unexpected exception text can carry paths or coordinates; the stored and
+    # displayed status keeps only the type, and the traceback goes to the log.
+    _LOG.warning("Bird discovery source failed unexpectedly", exc_info=exc)
     return f"The source failed unexpectedly ({type(exc).__name__})"
 
 
@@ -595,19 +620,15 @@ def discover_species(
                         )
                     )
                 else:
-                    complete = sync.stats.confirmed_history_complete
                     provider_species.append(resolved)
                     providers.append(
                         ProviderStatus(
                             "birdbuddy",
-                            "ok" if complete else "degraded",
+                            "ok",
                             len(resolved),
                             unresolved_count=len(birdbuddy_unresolved),
                             details=sync.stats.as_dict(),
-                            warning=None
-                            if complete
-                            else "Bird Buddy confirmed history was incomplete; "
-                            f"{sync.stats.confirmed_records_skipped} records were skipped",
+                            warning=_birdbuddy_history_warning(sync.stats),
                         )
                     )
             activity.succeeded = providers[-1].status != "error"
@@ -1284,7 +1305,7 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
                     title=f"{name} bird discovery is degraded",
                     body=f"The {name} provider failed; another configured provider supplied data.",
                 )
-            elif provider.get("status") == "degraded":
+            elif _skipped_records(provider):
                 successful_providers.add(name)
                 warning = provider.get("warning")
                 safe_record_degradation(
@@ -1340,14 +1361,22 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
     return result
 
 
+def _skipped_records(provider: dict[str, object]) -> bool:
+    # A history longer than the read limit is expected on large accounts and is
+    # not a fault; only records that could not be read are.
+    details = provider.get("details")
+    skipped = details.get("confirmed_records_skipped") if isinstance(details, dict) else None
+    return type(skipped) is int and skipped > 0
+
+
 def _new_species_notices_path(config: AppConfig) -> Path:
     return config.controller.state_dir / "new-species-notices.json"
 
 
 def _announced_this_year(path: Path, year: int) -> set[int]:
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw = read_private_json(path, maximum=NEW_SPECIES_NOTICES_MAX_BYTES)
+    except DataSourceError:
         return set()
     if not isinstance(raw, dict) or raw.get("schema_version") != 1 or raw.get("year") != year:
         return set()
@@ -1487,7 +1516,7 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
         current_taxa = {species.taxon_id for species in species_list}
         # A failed provider cannot establish absence. Keep its prior taxa for
         # notification comparison even after its carried species expire.
-        if any(provider.status != "ok" for provider in discovery.providers):
+        if any(provider.status == "error" for provider in discovery.providers):
             next_baseline = (
                 sorted(notification_baseline | current_taxa)
                 if notification_baseline is not None
@@ -1567,7 +1596,7 @@ def _read_discovery_snapshot(config: AppConfig) -> DiscoverySnapshot:
                 parse_utc_timestamp(row["last_success_at"])
                 if "last_success_at" in row
                 else refreshed
-                if row.get("status") in {"ok", "degraded"}
+                if row.get("status") == "ok"
                 else None
             )
             if recorded is not None:
