@@ -474,6 +474,17 @@ let browser,
     if ((await more.isVisible()) && (await more.getAttribute('aria-expanded')) !== 'true')
       await more.click();
   };
+  // The browser enters fullscreen some time after the click, so wait for the
+  // request to settle before deciding; a late entry would otherwise leave the
+  // window fullscreen for every later phase.
+  const fullscreenSettles = async (target, entered) => {
+    for (let n = 0; n < 40; n++) {
+      if ((await target.evaluate(() => Boolean(document.fullscreenElement))) === entered)
+        return true;
+      await target.waitForTimeout(50);
+    }
+    return false;
+  };
   // With More closed, the control bar sits fully below the bird name.
   const captionClear = async (target) => {
     await target.keyboard.press('Shift');
@@ -550,6 +561,7 @@ let browser,
   const screenFullscreen = screen.getByRole('button', { name: 'Fullscreen', exact: true });
   if ((await screenFullscreen.count()) === 1) {
     await screenFullscreen.click();
+    await fullscreenSettles(screen, true);
     screenAmbient = (await screen.evaluate(() => document.fullscreenElement?.tagName)) === 'HTML';
   }
   const screenInside = async (locator) => {
@@ -821,7 +833,10 @@ let browser,
   await page.locator('.frame-art').evaluate((image) => image.decode());
   await openMore(page);
   const fullscreenButton = page.getByRole('button', { name: 'Fullscreen', exact: true });
-  if ((await fullscreenButton.count()) === 1) await fullscreenButton.click();
+  if ((await fullscreenButton.count()) === 1) {
+    await fullscreenButton.click();
+    await fullscreenSettles(page, true);
+  }
   if ((await page.evaluate(() => document.fullscreenElement?.tagName)) === 'HTML') {
     // Fullscreen can resize the window to the real screen (Firefox), so the
     // live window metrics are the frame of reference, not the viewport.
@@ -847,7 +862,7 @@ let browser,
     assert(inside(await notice.boundingBox()));
     await page.unroute('**/v1/owner/journal/birds/*/portrait');
     await page.evaluate(() => document.exitFullscreen());
-    await page.waitForFunction(() => !document.fullscreenElement);
+    assert(await fullscreenSettles(page, false));
   }
   phase = 'frame-ambient-notice-clearance';
   // On every engine, at phone width with the controls revealed, a populated
@@ -973,7 +988,11 @@ let browser,
     return route.fulfill({ response: await route.fetch({ url: original }) });
   });
   // While paused, one check picks up the third plate.
+  const thirdPlate = page.waitForResponse((response) =>
+    response.url().endsWith('/v1/owner/journal'),
+  );
   await page.clock.runFor(60100);
+  await thirdPlate;
   assert(plates.broken !== null && plates.expected !== null);
   await page.keyboard.press('Shift');
   await playControl.click();

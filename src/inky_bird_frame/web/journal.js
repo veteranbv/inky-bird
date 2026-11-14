@@ -1256,8 +1256,9 @@ export async function openJournal(ui, message = '') {
         status.textContent = '';
       } catch (error) {
         // One failed plate never stops playback: the next turn moves past it.
+        // While paused, Previous and Next stay relative to the plate shown.
         if (!request.signal.aborted && !expired && image.isConnected) {
-          position = index;
+          if (!paused) position = index;
           status.textContent = paused
             ? 'Plate unavailable. Keeping the last approved plate. Try Next when the connection returns.'
             : 'Plate unavailable. Keeping the last approved plate. Playback continues.';
