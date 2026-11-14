@@ -42,8 +42,10 @@ runtimes_dir="${app_dir}/.runtimes"
 
 # Run by the old runtime's Python: hold its controller cycle lock so no plate
 # is being made while agents stop. Exit 3 if a cycle is still running at the
-# deadline; exit 0 holding nothing if the old code cannot read the config
-# (then it cannot be running a cycle either).
+# deadline. If the old code cannot read the config (usually because it was
+# edited for the new version), the lock cannot be found: say so and exit 0
+# without waiting, so an upgrade is never blocked by the version it replaces.
+# A broken old runtime that cannot even import exits 1 and refuses.
 cycle_lock_program='
 import fcntl, os, sys, time
 from pathlib import Path
@@ -56,6 +58,11 @@ try:
         config = load_config(config_path)
     state_dir = config.controller.state_dir
 except Exception:
+    print(
+        "The installed version cannot read this configuration, so the upgrade "
+        "cannot check for a plate being made.",
+        file=sys.stderr,
+    )
     sys.exit(0)
 state_dir.mkdir(parents=True, exist_ok=True)
 handle = (state_dir / "controller.lock").open("a+")
@@ -215,7 +222,7 @@ hold_cycle_lock() {
   if [ ! -x "${python}" ]; then
     return 0
   fi
-  "${python}" -c "${cycle_lock_program}" "${config_path}" "${ready}" \
+  "${python}" -I -c "${cycle_lock_program}" "${config_path}" "${ready}" \
     "${quiesce_timeout_seconds}" &
   cycle_lock_pid=$!
   until [ -e "${ready}" ]; do
@@ -310,6 +317,8 @@ cleanup() {
     elif [ "${#stopped_labels[@]}" -gt 0 ]; then
       echo "The upgrade failed; the previous version is running again." >&2
     fi
+  elif [ "${status}" -ne 0 ]; then
+    echo "The new version is installed and running, but a final step failed; see the error above." >&2
   fi
   rm -rf "${work_dir}"
   exit "${status}"
@@ -326,8 +335,16 @@ for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
 done
 env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${new_runtime}" \
   --python "${python_version}" --extra controller --locked
-if ! "${new_runtime}/.venv/bin/inky-bird" config validate --config "${config_path}" >/dev/null; then
+# The CLI reports a rejection as a JSON envelope on stdout; show its message.
+if ! validation=$("${new_runtime}/.venv/bin/inky-bird" config validate --config "${config_path}"); then
   echo "The new version cannot use this configuration. The running controller was not changed." >&2
+  python3 -I -c '
+import json, sys
+try:
+    print(json.loads(sys.argv[1])["error"]["message"])
+except (ValueError, KeyError, TypeError):
+    print(sys.argv[1])
+' "${validation}" >&2
   exit 1
 fi
 

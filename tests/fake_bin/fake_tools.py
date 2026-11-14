@@ -180,6 +180,7 @@ def systemctl(arguments: list[str]) -> int:
             if remaining > 0:
                 busy[unit] = remaining - 1
                 _save("busy", busy)
+                _log("busy-poll", unit, remaining - 1)
                 print("activating")
             else:
                 print("active" if record["active"] else "inactive")
@@ -308,6 +309,12 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     if arguments[:2] == ["-m", "pip"]:
         return _pip(arguments[2:])
     if arguments[:1] == ["-c"]:
+        # Inline programs must run isolated (-I) so the caller's directory and
+        # PYTHON* variables cannot shadow the installed package.
+        print("inline program run without -I", file=sys.stderr)
+        return 64
+    if arguments[:2] == ["-I", "-c"]:
+        arguments = arguments[1:]
         program = arguments[1]
         if "distribution(" in program:
             removed, kept = arguments[2:4]
@@ -316,7 +323,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             dists.pop(removed, None)
             _save("pip", dists)
             return 0
-        environment = dict(os.environ)
+        environment = {
+            name: value for name, value in os.environ.items() if not name.startswith("PYTHON")
+        }
         if (runtime / "src").is_dir():
             environment["PYTHONPATH"] = os.pathsep.join(
                 filter(None, [str(runtime / "src"), environment.get("PYTHONPATH")])
@@ -373,7 +382,9 @@ def inky_bird(executable: str, arguments: list[str]) -> int:
     tag = runtime_tag(executable)
     _log("inky-bird", tag, *arguments)
     if f"{tag}:{arguments[0]}" in _rules():
-        print(f"synthetic {arguments[0]} failure", file=sys.stderr)
+        # The real CLI reports failures as a JSON envelope on stdout.
+        error = {"type": "configuration", "message": f"synthetic {arguments[0]} failure"}
+        print(json.dumps({"ok": False, "error": error, "schema_version": 1}, indent=2))
         return 1
     return 0
 

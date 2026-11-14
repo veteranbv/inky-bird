@@ -108,7 +108,7 @@ class Host:
         for name in ("pyproject.toml", "uv.lock", "README.md", "LICENSE", "docs/browser-access.md"):
             (directory / name).write_text(f"synthetic {tag} {name}\n")
 
-    def script(self, name: str) -> Path:
+    def script(self, name: str, quiesce_timeout: int = 3) -> Path:
         text = (ROOT / "deploy" / name).read_text()
         replacements = {
             "/Library/LaunchDaemons": str(self.fake / "LaunchDaemons"),
@@ -118,7 +118,9 @@ class Host:
         for path in SYSTEM_PATHS[name]:
             assert path in text, f"{name} no longer names {path}"
             text = text.replace(path, replacements[path])
-        text = text.replace("quiesce_timeout_seconds=1800", "quiesce_timeout_seconds=3")
+        text = text.replace(
+            "quiesce_timeout_seconds=1800", f"quiesce_timeout_seconds={quiesce_timeout}"
+        )
         target = self.source / "deploy" / name
         target.write_text(text)
         target.chmod(0o755)
@@ -144,10 +146,10 @@ class Host:
         return environment
 
     def run(
-        self, name: str, *, shell: str = "bash", **extra: str
+        self, name: str, *, shell: str = "bash", quiesce_timeout: int = 3, **extra: str
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [shell, str(self.script(name))],
+            [shell, str(self.script(name, quiesce_timeout))],
             env=self.environment(**extra),
             capture_output=True,
             text=True,
@@ -168,6 +170,13 @@ class Host:
 
     def save_state(self, name: str, value: dict[str, dict[str, object]]) -> None:
         (self.fake / f"{name}.json").write_text(json.dumps(value))
+
+    def set_busy(self, unit: str, polls: int) -> None:
+        """Report ``unit`` as still running for the next ``polls`` state queries."""
+        (self.fake / "busy.json").write_text(json.dumps({f"{self.family}-{unit}": polls}))
+
+    def busy_polls_left(self, unit: str) -> object:
+        return json.loads((self.fake / "busy.json").read_text())[f"{self.family}-{unit}"]
 
     def build_venv(self, project: Path) -> None:
         subprocess.run([sys.executable, str(TOOLS), "build-venv", str(project)], check=True)
@@ -344,6 +353,9 @@ def test_macos_failed_build_or_validation_leaves_controller_untouched(
     assert host.runtime_dirs() == []
     if failure == "new:config":
         assert "running controller was not changed" in result.stderr
+        # The CLI reports the reason on stdout; the operator must still see it.
+        assert "synthetic config failure" in result.stderr
+        assert '"ok": false' not in result.stderr
 
 
 def test_macos_failure_before_switch_restores_only_what_it_stopped(tmp_path: Path) -> None:
@@ -441,6 +453,21 @@ def test_macos_upgrade_waits_for_a_plate_to_finish(tmp_path: Path) -> None:
     assert [call[3] for call in bootouts(host)] == ["lock-held", "lock-held"]
 
 
+def test_macos_failure_after_install_says_the_new_version_is_running(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    host.install_old_runtime("legacy")
+    host.load_agents("serve", "refresh", "controller-cycle")
+    host.fail(f"bootout:com.{host.family}.controller-cycle")
+
+    result = host.run("install-controller.sh", shell=MACOS_BASH)
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "new"
+    assert host.loaded_agents()["serve"]["runtime"] == "new"
+    assert "new version is installed and running" in result.stderr
+    assert "previous version is running again" not in result.stderr
+
+
 # Linux systemd controller installer ------------------------------------------
 
 
@@ -465,9 +492,11 @@ APP_UNITS = "controller.service scheduler.service"
 
 
 def run_linux(
-    host: Host, units: str = TIMER_UNITS, **extra: str
+    host: Host, units: str = TIMER_UNITS, quiesce_timeout: int = 3, **extra: str
 ) -> subprocess.CompletedProcess[str]:
-    return host.run("install-controller-systemd.sh", FAKE_UNITS=units, **extra)
+    return host.run(
+        "install-controller-systemd.sh", quiesce_timeout=quiesce_timeout, FAKE_UNITS=units, **extra
+    )
 
 
 def test_linux_upgrade_switches_runtime_and_restarts_services(tmp_path: Path) -> None:
@@ -517,6 +546,10 @@ def test_linux_failure_before_switch_keeps_old_runtime_and_restarts_stopped_time
     if failure in ("uv", "new:config"):
         # The build happens before anything is stopped.
         assert not any(call[:2] == ["systemctl", "stop"] for call in host.calls())
+    if failure == "new:config":
+        assert "running controller was not changed" in result.stderr
+        assert "synthetic config failure" in result.stderr
+        assert '"ok": false' not in result.stderr
 
 
 def test_linux_failure_after_switch_restores_units_runtime_and_services(tmp_path: Path) -> None:
@@ -569,6 +602,85 @@ def test_linux_first_refresh_failure_does_not_block_install(tmp_path: Path) -> N
     assert "will try again" in result.stderr
     assert host.active_runtime() == "new"
     assert host.unit_state("refresh.timer") == {"active": True, "enabled": True}
+
+
+def unit_install_calls(host: Host) -> list[int]:
+    return [
+        index
+        for index, call in enumerate(host.calls())
+        if call[:2] == ["sudo", "install"] and call[-1].startswith(str(host.units))
+    ]
+
+
+def test_linux_upgrade_waits_for_a_running_timer_job_before_switching(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.set_busy("generate.service", 2)
+
+    result = run_linux(host, quiesce_timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    calls = host.calls()
+    polls = [index for index, call in enumerate(calls) if call[0] == "busy-poll"]
+    assert len(polls) == 2
+    assert host.busy_polls_left("generate.service") == 0
+    timer_stop = calls.index(["sudo", "systemctl", "stop", f"{host.family}-generate.timer"])
+    renders = [index for index, call in enumerate(calls) if call == ["heredoc", "new"]]
+    assert timer_stop < polls[0]
+    # Nothing is rendered, installed or switched until the job has finished.
+    refresh = calls.index(["inky-bird", "new", "refresh", "--config", str(host.config)])
+    assert polls[-1] < renders[0] < refresh < unit_install_calls(host)[0]
+    assert host.active_runtime() == "new"
+
+
+def test_linux_upgrade_gives_up_on_a_job_that_does_not_finish(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.set_busy("generate.service", 1000)
+
+    result = run_linux(host)
+
+    assert result.returncode == 1
+    assert f"Timed out waiting for {host.family}-generate.service" in result.stderr
+    assert not unit_install_calls(host)
+    assert not any(call[0] == "heredoc" for call in host.calls())
+    assert host.active_runtime() == "old"
+    assert not (host.app / ".venv").is_symlink()
+    assert "# old" in host.unit_text("controller.service")
+    for unit in ("refresh.timer", "generate.timer"):
+        assert host.unit_state(unit)["active"] is True
+    assert host.runtime_dirs() == []
+    assert "previous version is running again" in result.stderr
+
+
+def test_linux_rollback_stops_only_what_this_run_started(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    systemd = host.state_of("systemd")
+    systemd[f"{host.family}-controller.service"]["active"] = False
+    systemd[f"{host.family}-refresh.timer"] = {"active": False, "enabled": False}
+    host.save_state("systemd", systemd)
+    host.fail(f"systemctl:restart:{host.family}-generate.timer")
+
+    result = run_linux(host)
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    assert "# old" in host.unit_text("refresh.timer")
+    assert host.unit_state("controller.service") == {"active": False, "enabled": True}
+    assert host.unit_state("refresh.timer") == {"active": False, "enabled": False}
+    assert host.unit_state("generate.timer") == {"active": True, "enabled": True}
+
+
+def test_linux_failure_after_install_says_the_new_version_is_running(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    # A directory where the installer copies itself makes the final tidy-up fail.
+    (host.app / "deploy/install-controller-systemd.sh").mkdir(parents=True)
+
+    result = run_linux(host)
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "new"
+    assert host.unit_state("controller.service")["active"] is True
+    assert "new version is installed and running" in result.stderr
+    assert "previous version is running again" not in result.stderr
 
 
 def test_linux_app_owned_upgrade_stops_scheduler_only_between_plates(tmp_path: Path) -> None:
@@ -665,6 +777,15 @@ def test_display_failure_after_install_reinstalls_the_same_named_previous_versio
     assert "previous version is unchanged" in result.stderr
 
 
+def test_display_failed_fresh_install_leaves_no_enabled_timer(tmp_path: Path) -> None:
+    host = display_host(tmp_path, None)
+    host.fail(f"systemctl:restart:{host.family}-display.timer")
+    result = host.run("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    assert result.returncode == 1
+    assert not (host.units / f"{host.family}-display.timer").exists()
+    assert host.unit_state("display.timer") == {"active": False, "enabled": False}
+
+
 def test_display_rejected_configuration_changes_nothing(tmp_path: Path) -> None:
     host = display_host(tmp_path, "inky-bird")
     host.fail("new:load_config")
@@ -745,3 +866,29 @@ def test_remote_display_staging_is_removed_on_every_exit(tmp_path: Path, failure
     assert result.returncode != 0
     assert any(call[0] == "ssh" for call in host.calls())
     assert not list(host.app.parent.glob(".inky-bird-stage.*"))
+
+
+def test_remote_display_refuses_an_existing_staging_path(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Linux")
+    key = tmp_path / "synthetic-key"
+    key.write_text("")
+    od = host.bin / "od"
+    od.write_text("#!/bin/sh\nprintf ' 0a 1b 2c 3d 4e 5f\\n'\n")
+    od.chmod(0o755)
+    host.app.parent.mkdir(parents=True, exist_ok=True)
+    foreign = host.app.parent / ".inky-bird-stage.0a1b2c3d4e5f"
+    foreign.mkdir()
+    (foreign / "keep").write_text("someone else's file\n")
+    result = host.run(
+        "install-display-node.sh",
+        INKY_BIRD_DISPLAY_HOST="display.example.test",
+        INKY_BIRD_DISPLAY_USER="fixture",
+        INKY_BIRD_DISPLAY_SSH_KEY=str(key),
+        INKY_BIRD_DISPLAY_APP_DIR=str(host.app),
+        INKY_BIRD_DISPLAY_CONFIG_PATH=str(host.config),
+        INKY_BIRD_DISPLAY_VENV=str(host.venv),
+    )
+    assert result.returncode == 1
+    assert "already exists" in result.stderr
+    assert (foreign / "keep").read_text() == "someone else's file\n"
+    assert not any(call[0] == "rsync" for call in host.calls())

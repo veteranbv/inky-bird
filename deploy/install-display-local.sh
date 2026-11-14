@@ -40,6 +40,7 @@ for directory in sorted(directories, key=lambda item: len(item.parts), reverse=T
 validate_program='
 import sys
 from pathlib import Path
+sys.path.insert(0, sys.argv[2])
 from inky_bird_frame.config import load_config
 load_config(Path(sys.argv[1]))
 '
@@ -123,6 +124,9 @@ restore_units() {
   for name in "${service_prefix}-display.service" "${timer}"; do
     if [ ! -e "${unit_backup_dir}/${name}" ] && [ -e "${unit_root}/${name}" ]; then
       changed=true
+      if systemctl is-active --quiet "${name}" || systemctl is-enabled --quiet "${name}"; then
+        "${sudo_command[@]}" systemctl disable --now "${name}" || restored=false
+      fi
       "${sudo_command[@]}" rm -f "${unit_root}/${name}" || restored=false
     fi
   done
@@ -170,7 +174,7 @@ cleanup() {
       # leaves the previous version exactly as it was.
       if [ "${installed}" = inky-bird-frame ]; then
         if [ "${old_package_removed}" != true ] && \
-            "${venv}/bin/python" -c "${remove_distribution_program}" inky-bird inky-bird-frame; then
+            "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird inky-bird-frame; then
           previous_kept=true
         fi
       elif [ "${installed}" = inky-bird ] && reinstall_previous; then
@@ -208,7 +212,7 @@ install -m 0755 "${root}/deploy/install-display-local.sh" "${new_runtime}/deploy
 for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
   install -m 0644 "${root}/${file}" "${new_runtime}/${file}"
 done
-if ! PYTHONPATH="${new_runtime}/src" "${venv}/bin/python" -c "${validate_program}" "${config_path}"; then
+if ! "${venv}/bin/python" -I -c "${validate_program}" "${config_path}" "${new_runtime}/src"; then
   echo "The new version cannot use this configuration. No changes made." >&2
   exit 1
 fi
@@ -256,7 +260,7 @@ PY
 # The new distribution now owns the shared files; remove the rest of the old one.
 if [ "${installed}" = inky-bird-frame ]; then
   old_package_removed=true
-  "${venv}/bin/python" -c "${remove_distribution_program}" inky-bird-frame inky-bird
+  "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird-frame inky-bird
 fi
 
 # ${app_dir}/src links to the active runtime's source; the single-directory

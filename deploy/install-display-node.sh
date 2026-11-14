@@ -88,10 +88,14 @@ if [ "${available}" -lt "$3" ]; then
   exit 1
 fi
 mkdir -p "${parent}"
-if [ -e "$2" ] || [ -L "$2" ]; then
-  exit 17
+# mkdir refuses an existing path atomically; never reuse one.
+if ! mkdir -m 700 "$2" 2>/dev/null; then
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    exit 17
+  fi
+  echo "Cannot create remote staging directory." >&2
+  exit 1
 fi
-mkdir -m 700 "$2"
 printf '%s\n' "$2"
 REMOTE
 if [ "${stage_status}" -eq 17 ]; then
