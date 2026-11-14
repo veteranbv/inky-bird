@@ -1375,9 +1375,11 @@ def _already_published_taxa(
     if remote_species is None:
         return None
     try:
+        # A damaged local approval must take the snapshot path, which reports it.
+        validate_public_catalog(catalog_dir)
         local_index = read_json(catalog_dir / "index.json")
         directories = {path.name for path in _species_directories(catalog_dir / "species")}
-    except (CatalogError, OSError):
+    except (CatalogError, CatalogPublishError, OSError):
         return None
     local_species = local_index.get("species") if isinstance(local_index, dict) else None
     if not isinstance(local_species, list):

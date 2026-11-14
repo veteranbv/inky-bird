@@ -9,7 +9,7 @@ import struct
 import subprocess
 import unittest
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -2170,6 +2170,42 @@ class PublicationRunTests(unittest.TestCase):
             self.assertFalse(result["changed"])
             self.assertEqual(result["published"], [])
             self.assertEqual(result["already_present"], [1])
+
+    def _assert_damaged_published_species_is_reported(
+        self, damage: Callable[[Path], None], reason: str
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            species = _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            with _github(fake):
+                run_catalog_publish(config)
+            index_before = (config.controller.catalog_dir / "index.json").read_bytes()
+            damage(species)
+            self.assertEqual(
+                (config.controller.catalog_dir / "index.json").read_bytes(), index_before
+            )
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertEqual(result["already_present"], [])
+            self.assertFalse(result["changed"])
+            skipped = _result_items(result, "skipped")
+            self.assertEqual([item["species"] for item in skipped], ["1-example-bird"])
+            self.assertIn(reason, str(skipped[0]["reason"]))
+            self.assertIn("catalog/species/1-example-bird/manifest.json", _remote_files(remote))
+
+    def test_reports_an_already_published_species_whose_manifest_is_missing(self) -> None:
+        self._assert_damaged_published_species_is_reported(
+            lambda species: (species / "manifest.json").unlink(),
+            "Required catalog files missing",
+        )
+
+    def test_reports_an_already_published_species_whose_image_is_corrupted(self) -> None:
+        self._assert_damaged_published_species_is_reported(
+            lambda species: Image.new("RGB", (1600, 1200), "black").save(species / "display.png"),
+            "display checksum",
+        )
 
     def test_cleans_stale_owner_publication_branches_and_pull_requests(self) -> None:
         with TemporaryDirectory() as temporary:
