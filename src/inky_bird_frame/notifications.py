@@ -459,7 +459,21 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         seen_at = fetched_at
         stale = True
         described = f"fetched the catalog at {fetched_at.isoformat()} but never completed an update"
-    if stale:
+    # A display pointed at an empty wall view keeps fetching but deliberately
+    # leaves the panel unchanged. That is a pause, not a failure.
+    paused = (
+        stale
+        and fetched_at is not None
+        and current - fetched_at <= threshold
+        and _wall_view_is_empty(config)
+    )
+    if paused:
+        assert fetched_at is not None
+        stale = False
+        signal = "catalog-fetch"
+        seen_at = fetched_at
+        notice: dict[str, object] = {"queued": False}
+    elif stale:
         notice = safe_record_degradation(
             config,
             key="display-heartbeat",
@@ -482,6 +496,7 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
     result: dict[str, object] = {
         "checked": True,
         "stale": stale,
+        "paused": paused,
         "signal": signal,
         "seen_at": seen_at.isoformat(),
         "threshold_minutes": int(threshold.total_seconds() // 60),
@@ -490,6 +505,17 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
     if warning is not None:
         result["warning"] = warning
     return result
+
+
+def _wall_view_is_empty(config: AppConfig) -> bool:
+    try:
+        from .journal import JournalService
+        from .presentation import PresentationAccess
+
+        journal = JournalService(config.controller)
+        return not PresentationAccess(config.controller.state_dir, journal).selected("wall")
+    except Exception:  # Fail open: an unreadable selection keeps the stale alert.
+        return False
 
 
 def requeue_dead_letters(config: AppConfig, *, now: datetime | None = None) -> int:
