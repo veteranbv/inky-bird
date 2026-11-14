@@ -44,6 +44,26 @@ export async function renderImports(ui, { base, link, note, kind }) {
     if (error.code === 'sign_in_required') ui.showProblem(error);
     else node.textContent = error.message;
   }
+  // A recovery button shows its own failure beside it instead of rejecting.
+  function recovery(label, action) {
+    const alert = problem();
+    return button(label, async (event) => {
+      const control = event.currentTarget;
+      control.disabled = true;
+      alert.textContent = '';
+      try {
+        await action();
+      } catch (error) {
+        if (stopped) return;
+        control.disabled = false;
+        fail(alert, error);
+        if (!alert.isConnected) {
+          if (control.isConnected) control.after(alert);
+          else content.append(alert);
+        }
+      }
+    });
+  }
   function operation(label, action, uploadId, extra, onSuccess = load) {
     const section = el('div'),
       error = problem();
@@ -92,7 +112,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
               fail(alert, error);
               content.append(
                 alert,
-                button('Check this operation again', () => watch(id, done)),
+                recovery('Check this operation again', () => watch(id, done)),
               );
             }
           }),
@@ -116,7 +136,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
         receipt.status === 'interrupted' ? 'This step was interrupted' : 'This step did not finish',
       ),
       note(receipt.result?.message || 'Inspect saved state before an explicit retry.'),
-      button('Check saved state', load),
+      recovery('Check saved state', load),
       link('See the saved outcome', 'operation', { operation: id }),
     );
   }
@@ -139,9 +159,11 @@ export async function renderImports(ui, { base, link, note, kind }) {
     content.append(
       note('Private source file expires: ' + new Date(state.expires_at).toLocaleString()),
     );
-    if (Date.parse(state.expires_at) <= Date.now() || state.status === 'receiving') {
+    // The controller removes an expired preview and refuses its steps, so the
+    // browser clock never decides expiry.
+    if (state.status === 'receiving') {
       content.append(
-        el('h2', state.status === 'receiving' ? 'Upload did not finish' : 'Preview expired'),
+        el('h2', 'Upload did not finish'),
         note(
           'Confirmed history and saved trips stay intact. Cancel this temporary file and select the original again.',
         ),
@@ -232,14 +254,20 @@ export async function renderImports(ui, { base, link, note, kind }) {
       );
     if (preview.impact.undated_notice) content.append(note(preview.impact.undated_notice));
     let acknowledge = null;
-    if (preview.stats.removed_checklists || preview.impact.affected_collections?.length) {
+    if (
+      preview.stats.removed_checklists ||
+      preview.stats.removed ||
+      preview.impact.affected_collections?.length
+    ) {
       const label = el('label', '', 'check-label');
       acknowledge = el('input');
       acknowledge.type = 'checkbox';
       label.append(
         acknowledge,
         document.createTextNode(
-          'I reviewed removed checklists and changed collection evidence. Keep my curated groups and mark changed evidence.',
+          kind === 'birdnet-analyzer'
+            ? 'I reviewed the removed detections. Remove them from Analyzer history.'
+            : 'I reviewed removed checklists and changed collection evidence. Keep my curated groups and mark changed evidence.',
         ),
       );
       for (const name of preview.impact.affected_collections || [])
@@ -321,6 +349,8 @@ export async function renderImports(ui, { base, link, note, kind }) {
     cancel.hidden = true;
     const progress = el('p', '', 'hint');
     progress.setAttribute('role', 'status');
+    const recheck = recovery('Check saved upload', load);
+    recheck.hidden = true;
     form.append(
       note(
         'Up to 512 MiB on the wire; eBird ZIP contents must also decode to no more than 512 MiB. Inky requires 2 GiB free before upload. Files stay private and expire after the configured preview period.',
@@ -329,7 +359,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
       cancel,
       progress,
       error,
+      recheck,
     );
+    const mib = (bytes, total) =>
+      (bytes / (1024 * 1024)).toFixed(total < 10 * 1024 * 1024 ? 1 : 0);
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const source = file.files[0];
@@ -343,17 +376,33 @@ export async function renderImports(ui, { base, link, note, kind }) {
       if (observed) observed.disabled = true;
       cancel.hidden = false;
       transfer = new AbortController();
-      progress.textContent = 'Uploading privately. No history has changed. Keep this page open.';
+      error.textContent = '';
+      recheck.hidden = true;
+      progress.textContent =
+        'Uploading ' +
+        mib(source.size, source.size) +
+        ' MiB privately. No history has changed. Keep this page open.';
+      const sent = (loaded, total) => {
+        if (stopped || !total) return;
+        progress.textContent =
+          'Uploading privately: ' +
+          Math.floor((100 * Math.min(loaded, total)) / total) +
+          '% (' +
+          mib(Math.min(loaded, total), total) +
+          ' of ' +
+          mib(total, total) +
+          ' MiB). No history has changed. Keep this page open.';
+      };
       try {
         const suffix = observed?.value ? '?observed_on=' + encodeURIComponent(observed.value) : '';
-        await upload('/v1/owner/imports/upload/' + kind + suffix, source, transfer.signal);
+        await upload('/v1/owner/imports/upload/' + kind + suffix, source, transfer.signal, sent);
         if (!stopped) await load();
       } catch (failure) {
         if (!stopped) {
           progress.textContent =
             'No history changed. If the response was lost, check the saved upload before sending again.';
           fail(error, failure);
-          form.append(button('Check saved upload', load));
+          recheck.hidden = false;
         }
       } finally {
         transfer = null;
@@ -370,6 +419,9 @@ export async function renderImports(ui, { base, link, note, kind }) {
       el('h2', '4. Choose your checklists'),
       note(
         'Calendar dates include both endpoints. Location names come only from this private source file and are not copied into the saved trip.',
+      ),
+      note(
+        'Checking a trip looks up species names Inky has not matched before on iNaturalist. Only the names are sent.',
       ),
     );
     const draft = state.draft || {};
@@ -495,11 +547,18 @@ export async function renderImports(ui, { base, link, note, kind }) {
             '. No generation will be requested for it.',
         ),
       );
+    // The controller refuses to save while any name is still waiting.
+    const waiting = preview.not_looked_up || [];
+    for (const member of waiting)
+      content.append(note('Not looked up yet: ' + (member.scientific_name || member.common_name)));
+    if (!waiting.length && !preview.unresolved_for_now)
+      content.append(
+        operation('Save this trip', 'trip-save', state.upload_id, () => ({
+          preview_hash: preview.preview_hash,
+        })),
+      );
     content.append(
-      operation('Save this trip', 'trip-save', state.upload_id, () => ({
-        preview_hash: preview.preview_hash,
-      })),
-      button('Edit trip selection', async () => {
+      recovery('Edit trip selection', async () => {
         await api('/v1/owner/imports/trip-edit', { upload_id: state.upload_id });
         await load();
       }),
