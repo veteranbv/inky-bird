@@ -145,8 +145,14 @@ class ProviderIsolationTests(unittest.TestCase):
                     "inky_bird_frame.controller.resolve_birdnet_go_species",
                     return_value=([YARD_BIRD], []),
                 ),
+                self.assertLogs("inky_bird_frame.controller", level="WARNING") as logs,
             ):
                 result = discover_species(config)
+
+        # The service log keeps the traceback that the stored status leaves out.
+        exc_info = logs.records[0].exc_info
+        assert exc_info is not None
+        self.assertIs(exc_info[0], RuntimeError)
 
         self.assertEqual(result.species, [YARD_BIRD])
         self.assertEqual(
@@ -155,6 +161,7 @@ class ProviderIsolationTests(unittest.TestCase):
         )
         error = result.providers[0].error
         assert error is not None
+        self.assertIn("Location lookup failed", error)
         self.assertIn("RuntimeError", error)
         self.assertNotIn("1.0", error)
 
@@ -287,7 +294,12 @@ class BirdBuddyHistoryBaselineTests(unittest.TestCase):
         )
         capped = BirdBuddySyncResult([detection], birdbuddy_stats(complete=False, skipped=0))
         with TemporaryDirectory() as temporary:
-            config = load(temporary, '[discovery]\nsources = ["birdbuddy"]\n')
+            config = load(
+                temporary,
+                "[notifications]\nenabled = true\n\n[[notifications.destinations]]\n"
+                'name = "owner"\nurl = "json://notify.example.test/hook"\n'
+                'events = ["discovery"]\n\n[discovery]\nsources = ["birdbuddy"]\n',
+            )
             notices = config.controller.state_dir / "new-species-notices.json"
             with (
                 patch(

@@ -39,6 +39,16 @@ controller_url = "http://controller.test:8793"
 state_dir = "display"
 """
 
+ROUTED = """
+[notifications]
+enabled = true
+
+[[notifications.destinations]]
+name = "owner"
+url = "json://notify.example.test/hook"
+events = ["discovery"]
+"""
+
 FIRST = BirdSpecies(1, "First Bird", "Avis prima", 1, "iNaturalist")
 SECOND = BirdSpecies(2, "Second Bird", "Avis secunda", 1, "eBird")
 
@@ -89,9 +99,9 @@ def recorded(results: list[DiscoveryResult]) -> Iterator[Calls]:
         yield Calls(notify, degraded, recovered)
 
 
-def load(temporary: str) -> AppConfig:
+def load(temporary: str, notifications: str = ROUTED) -> AppConfig:
     path = Path(temporary) / "config.toml"
-    path.write_text(CONFIG)
+    path.write_text(CONFIG + notifications)
     return load_config(path)
 
 
@@ -200,6 +210,32 @@ class RefreshNotificationTests(unittest.TestCase):
 
         self.assertFalse(recorded_after_failure)
         self.assertEqual(calls.notify.call_count, 2)
+        self.assertEqual(calls.notify.call_args.kwargs["body"], "First Bird")
+
+    def test_species_are_not_recorded_as_announced_while_nothing_is_sent(self) -> None:
+        unrouted = ROUTED.replace('events = ["discovery"]', 'events = ["display_stale"]')
+        with TemporaryDirectory() as temporary:
+            notices = Path(temporary) / "state" / "new-species-notices.json"
+            for notifications in ("", unrouted):
+                with (
+                    patch(
+                        "inky_bird_frame.controller.discover_species",
+                        side_effect=[discovery([FIRST]), discovery([])],
+                    ),
+                    patch("inky_bird_frame.controller.rebuild_catalog_index", return_value=[]),
+                    patch("inky_bird_frame.controller.safe_record_degradation"),
+                    patch("inky_bird_frame.controller.safe_record_recovery"),
+                ):
+                    config = load(temporary, notifications)
+                    refresh_observations(config)
+                    self.assertFalse(notices.exists())
+                    refresh_observations(config)
+
+            # The owner turns discovery notices on later in the year and the bird returns.
+            with recorded([discovery([FIRST])]) as calls:
+                refresh_observations(load(temporary))
+
+        calls.notify.assert_called_once()
         self.assertEqual(calls.notify.call_args.kwargs["body"], "First Bird")
 
     def test_symlinked_notice_record_is_not_trusted(self) -> None:

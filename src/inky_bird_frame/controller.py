@@ -362,7 +362,7 @@ def discover_species(
             message = (
                 f"Location lookup failed: {exc}"
                 if isinstance(exc, DataSourceError)
-                else f"Location lookup failed unexpectedly ({type(exc).__name__})"
+                else f"Location lookup failed: {_unexpected_source_error(exc)}"
             )
             providers.extend(
                 ProviderStatus(name, "error", 0, error=message) for name in location_provider_names
@@ -1388,6 +1388,13 @@ def _announced_this_year(path: Path, year: int) -> set[int]:
 
 def _notify_new_species(config: AppConfig, new_species: list[object]) -> None:
     """Announce each species at most once per calendar year, naming a bounded list."""
+    notifications = config.notifications
+    if not notifications.enabled or not any(
+        NotificationEvent.DISCOVERY in destination.events
+        for destination in notifications.destinations
+    ):
+        # Nothing would be sent, so nothing may be recorded as announced.
+        return
     year = datetime.now(UTC).year
     path = _new_species_notices_path(config)
     announced = _announced_this_year(path, year)
