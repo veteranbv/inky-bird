@@ -174,6 +174,20 @@ class Host:
             timeout=120,
         )
 
+    def run_installed(
+        self, name: str, *, shell: str = "bash", **extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the installer copy that ``setup --yes`` finds in the active runtime."""
+        runtime = Path(os.path.realpath(self.app / "src")).parent
+        return subprocess.run(
+            [shell, str(runtime / "deploy" / name)],
+            env=self.environment(**extra),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+
     def fail(self, *rules: str) -> None:
         (self.fake / "fail").write_text("\n".join(rules) + "\n")
 
@@ -437,6 +451,21 @@ def test_macos_failed_upgrade_reports_agents_it_could_not_restart(tmp_path: Path
     assert f"com.{host.family}.serve" in result.stderr
     assert "launchctl bootstrap" in result.stderr
     assert host.loaded_agents()["refresh"]["runtime"] == "old"
+
+
+def test_macos_setup_reruns_from_the_installed_runtime(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    assert host.run("install-controller.sh", shell=MACOS_BASH).returncode == 0
+    first = Path(os.path.realpath(host.app / ".venv")).parent
+
+    result = host.run_installed("install-controller.sh", shell=MACOS_BASH)
+
+    assert result.returncode == 0, result.stderr
+    assert f"installed from {host.app} into" in result.stdout
+    assert host.active_runtime() == "new"
+    assert Path(os.path.realpath(host.app / ".venv")).parent != first
+    assert first in host.runtime_dirs()
+    assert set(host.loaded_agents()) == {"serve", "refresh"}
 
 
 def test_macos_rollback_keeps_the_runtime_of_an_agent_it_could_not_stop(tmp_path: Path) -> None:
@@ -704,6 +733,22 @@ def test_linux_rollback_stops_only_what_this_run_started(tmp_path: Path) -> None
     assert host.unit_state("generate.timer") == {"active": True, "enabled": True}
 
 
+def test_linux_setup_reruns_from_the_installed_runtime(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    assert run_linux(host).returncode == 0
+    first = Path(os.path.realpath(host.app / ".venv")).parent
+
+    result = host.run_installed("install-controller-systemd.sh", FAKE_UNITS=TIMER_UNITS)
+
+    assert result.returncode == 0, result.stderr
+    assert f"installed from {host.app} into" in result.stdout
+    assert host.active_runtime() == "new"
+    assert Path(os.path.realpath(host.app / ".venv")).parent != first
+    assert first in host.runtime_dirs()
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit) == {"active": True, "enabled": True}
+
+
 def test_linux_rollback_keeps_the_runtime_of_a_service_it_could_not_stop(tmp_path: Path) -> None:
     host = linux_host(tmp_path)
     scheduler = f"{host.family}-scheduler.service"
@@ -804,6 +849,20 @@ def test_display_upgrade_installs_new_before_removing_old_distribution(tmp_path:
     assert source.parent == (host.app / ".display-runtimes").resolve()
     assert (source / "src/runtime-tag").read_text() == "new\n"
     assert (host.app / "src").is_symlink()
+    assert host.unit_state("display.timer") == {"active": True, "enabled": True}
+
+
+def test_display_setup_reruns_from_the_installed_runtime(tmp_path: Path) -> None:
+    host = display_host(tmp_path, "inky-bird")
+    assert run_display(host).returncode == 0
+    first = display_source(host)
+
+    result = host.run_installed("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+
+    assert result.returncode == 0, result.stderr
+    assert f"installed from {host.app} into" in result.stdout
+    assert display_source(host) != first
+    assert (display_source(host) / "src/runtime-tag").read_text() == "new\n"
     assert host.unit_state("display.timer") == {"active": True, "enabled": True}
 
 

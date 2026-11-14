@@ -23,6 +23,11 @@ if [ -z "${uv_bin}" ]; then
 fi
 unit_root="/etc/systemd/system"
 runtimes_dir="${app_dir}/.runtimes"
+# setup --yes from the installed CLI runs a runtime's own copy of this script.
+# A runtime holds no catalog, so install from the managed directory as before.
+if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
+  root=${app_dir}
+fi
 user=$(id -un)
 
 # Run by the old runtime's Python: hold its controller cycle lock so no plate

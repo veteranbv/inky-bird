@@ -39,6 +39,11 @@ notifications_plist="${agents_dir}/com.${service_prefix}.notifications.plist"
 scheduler_plist="${agents_dir}/com.${service_prefix}.scheduler.plist"
 legacy_cycle_plist="${agents_dir}/com.${service_prefix}.controller-cycle.plist"
 runtimes_dir="${app_dir}/.runtimes"
+# setup --yes from the installed CLI runs a runtime's own copy of this script.
+# A runtime holds no catalog, so install from the managed directory as before.
+if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
+  root=${app_dir}
+fi
 
 # Run by the old runtime's Python: hold its controller cycle lock so no plate
 # is being made while agents stop. Exit 3 if a cycle is still running at the

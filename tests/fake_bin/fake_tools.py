@@ -393,6 +393,12 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             print("synthetic configuration rejection", file=sys.stderr)
             return 1
         prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+        if "sync_public_catalog" in source:
+            # The real program syncs the catalog from the install source first.
+            root = Path(arguments[7] if "plistlib" in source else arguments[2])
+            if not (root / "catalog").is_dir():
+                print("synthetic catalog source is missing", file=sys.stderr)
+                return 1
         if "plistlib" in source:
             paths = arguments[1:7]
             app_dir = Path(arguments[8])

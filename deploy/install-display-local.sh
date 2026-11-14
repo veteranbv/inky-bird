@@ -18,6 +18,11 @@ unit_root="/etc/systemd/system"
 # The controller keeps its runtimes in ${app_dir}/.runtimes; one Pi can run both
 # roles, so each role prunes only its own directory.
 runtimes_dir="${app_dir}/.display-runtimes"
+# setup --yes from the installed CLI runs a runtime's own copy of this script.
+# A runtime holds no catalog, so install from the managed directory as before.
+if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
+  root=${app_dir}
+fi
 timer="${service_prefix}-display.timer"
 
 # Remove one distribution's files, except those the other one also owns.
