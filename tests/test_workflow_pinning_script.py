@@ -108,7 +108,7 @@ jobs:
     ]
 
 
-def test_current_workflows_are_sha_pinned() -> None:
+def test_current_workflows_are_pinned_and_github_hosted() -> None:
     workflow_pinning = _load_workflow_pinning()
     workflows_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
@@ -146,3 +146,119 @@ def test_review_gate_retrigger_admits_only_codex_bot() -> None:
     assert workflow.count("user.login == 'chatgpt-codex-connector[bot]'") == 1
     assert "github.repository_owner" not in workflow
     assert "${{ github.event.comment.body }}" not in workflow
+    # Only the trusted gate is re-run; the removed legacy workflow is not queried.
+    assert "review-gate-trusted.yml/runs" in workflow
+    assert "review-gate.yml/runs" not in workflow
+
+
+DIGEST = "sha256:" + "0" * 64
+
+
+def test_scan_workflows_requires_digests_for_docker_references(tmp_path: Path) -> None:
+    workflow_pinning = _load_workflow_pinning()
+    workflows_dir = tmp_path / "workflows"
+    _write_workflow(
+        workflows_dir,
+        "ci.yml",
+        f"""
+name: ci
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine@{DIGEST}
+      - uses: docker://alpine:3.20
+      - uses: docker://ghcr.io/owner/image
+      - uses: docker://alpine:3.20@sha256:abc
+""",
+    )
+
+    violations = workflow_pinning.scan_workflows(workflows_dir)
+
+    reason = "docker:// reference is not pinned to a sha256 digest"
+    assert [(v.line, v.value, v.reason) for v in violations] == [
+        (8, "docker://alpine:3.20", reason),
+        (9, "docker://ghcr.io/owner/image", reason),
+        (10, "docker://alpine:3.20@sha256:abc", reason),
+    ]
+
+
+def test_scan_workflows_accepts_one_literal_github_hosted_runner(tmp_path: Path) -> None:
+    workflow_pinning = _load_workflow_pinning()
+    workflows_dir = tmp_path / "workflows"
+    _write_workflow(
+        workflows_dir,
+        "ci.yml",
+        """
+name: ci
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    runs-on: "ubuntu-24.04-arm"  # native arm64
+  c:
+    runs-on: [windows-2025]
+  d:
+    runs-on:
+      - macos-15
+  e:
+    uses: ./.github/workflows/reusable.yml
+""",
+    )
+
+    assert workflow_pinning.scan_workflows(workflows_dir) == []
+
+
+def test_scan_workflows_rejects_runners_that_are_not_github_hosted(tmp_path: Path) -> None:
+    workflow_pinning = _load_workflow_pinning()
+    workflows_dir = tmp_path / "workflows"
+    _write_workflow(
+        workflows_dir,
+        "deploy.yml",
+        """
+name: deploy
+jobs:
+  a:
+    runs-on: [self-hosted, macOS, ARM64, inky-bird-controller]
+  b:
+    runs-on: inky-bird-controller
+  c:
+    runs-on: ${{ matrix.runner }}
+  d:
+    runs-on:
+      - self-hosted
+  e:
+    runs-on:
+      group: private-runners
+  f:
+    runs-on: [ubuntu-latest, gpu]
+  g: { runs-on: ubuntu-latest }
+  h:
+    "runs-on": Self-Hosted
+""",
+    )
+
+    violations = workflow_pinning.scan_workflows(workflows_dir)
+
+    assert [(v.line, v.reason) for v in violations] == [
+        (5, "names a self-hosted runner"),
+        (7, "inky-bird-controller is not a GitHub-hosted runner label"),
+        (9, "runner must be a literal GitHub-hosted label, not an expression"),
+        (11, "names a self-hosted runner"),
+        (14, "runner groups and label mappings are not allowed"),
+        (17, "a GitHub-hosted job names exactly one runner label"),
+        (18, "runs-on inside a flow mapping cannot be checked; use block style"),
+        (20, "names a self-hosted runner"),
+    ]
+
+
+def test_main_reports_runner_violations(tmp_path: Path) -> None:
+    workflow_pinning = _load_workflow_pinning()
+    workflows_dir = tmp_path / "workflows"
+    _write_workflow(
+        workflows_dir,
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: [self-hosted, linux]\n",
+    )
+
+    assert workflow_pinning.main([str(workflows_dir)]) == 1
