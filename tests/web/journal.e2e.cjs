@@ -935,6 +935,61 @@ let browser,
   await page.keyboard.press('Shift');
   await playControl.click();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'false');
+  phase = 'frame-broken-plate';
+  // One plate that keeps failing must not hold playback on one bird. A
+  // synthetic copy of a ready plate under another id makes three plates, so
+  // the step past the broken one shows a different bird. The plate after the
+  // shown one fails; the one after that must appear.
+  const shownId = Number(
+    new URL(
+      await page.locator('.frame-more a[href*="page=bird"]').getAttribute('href'),
+      origin,
+    ).searchParams.get('bird'),
+  );
+  const copyId = 990001;
+  const plates = { broken: null, source: null, expected: null };
+  await page.route('**/v1/owner/journal', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    const ready = body.data.birds.filter((bird) => bird.plate_ready);
+    plates.source = ready[0].taxon_id;
+    ready.push({
+      ...ready[0],
+      taxon_id: copyId,
+      common_name: 'Synthetic copy plate',
+      portrait_url: '/v1/owner/journal/birds/' + copyId + '/portrait',
+    });
+    body.data.birds.push(ready.at(-1));
+    const at = ready.findIndex((bird) => bird.taxon_id === shownId);
+    plates.broken = ready[(at + 1) % ready.length].taxon_id;
+    plates.expected = ready[(at + 2) % ready.length].common_name;
+    await route.fulfill({ response, json: body });
+  });
+  await page.route('**/v1/owner/journal/birds/*/portrait', async (route) => {
+    const id = Number(route.request().url().split('/birds/')[1].split('/')[0]);
+    if (id === plates.broken) return route.abort();
+    if (id !== copyId) return route.continue();
+    const original = route.request().url().replace('/birds/' + copyId + '/', '/birds/' + plates.source + '/');
+    return route.fulfill({ response: await route.fetch({ url: original }) });
+  });
+  // While paused, one check picks up the third plate.
+  await page.clock.runFor(60100);
+  assert(plates.broken !== null && plates.expected !== null);
+  await page.keyboard.press('Shift');
+  await playControl.click();
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
+  const shownName = () => page.locator('.frame-caption span').first().innerText();
+  // Small steps let each plate request settle before the next timer fires.
+  for (let waited = 0; waited < 240000 && (await shownName()) !== plates.expected; waited += 500) {
+    await page.clock.runFor(500);
+    await page.waitForTimeout(20);
+  }
+  assert.equal(await shownName(), plates.expected, 'playback moves past a plate that keeps failing');
+  await page.keyboard.press('Shift');
+  await playControl.click();
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'false');
+  await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  await page.unroute('**/v1/owner/journal');
   phase = 'frame-wide';
   // Wide screens show every control in one bar and no More button.
   await page.setViewportSize({ width: 1280, height: 800 });
