@@ -341,8 +341,12 @@ cleanup() {
       echo "Could not switch back to the previous runtime; it is kept in ${runtimes_dir}." >&2
     fi
     if [ "${controller_restarted}" = true ] && [ "${controller_was_active}" = true ]; then
-      sudo systemctl restart "${service_prefix}-controller.service" || \
-        not_restarted+=("${service_prefix}-controller.service")
+      if ! sudo systemctl restart "${service_prefix}-controller.service"; then
+        keep_runtime_if_running "${service_prefix}-controller.service"
+        if ! systemctl is-active --quiet "${service_prefix}-controller.service"; then
+          not_restarted+=("${service_prefix}-controller.service")
+        fi
+      fi
     fi
     for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
       sudo systemctl start "${unit}" || not_restarted+=("${unit}")

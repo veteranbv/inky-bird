@@ -247,7 +247,16 @@ def sudo(arguments: list[str]) -> int:
     if arguments == ["-v"]:
         return 1 if "sudo:-v" in rules else 0
     expired = FAKE / "sudo-expired"
-    if "sudo-expires-at-install" in rules and (arguments[0] == "install" or expired.exists()):
+    expires_at = ":".join(arguments) in {
+        rule.removeprefix("sudo-expires-at:")
+        for rule in rules
+        if rule.startswith("sudo-expires-at:")
+    }
+    if (
+        expires_at
+        or ("sudo-expires-at-install" in rules and arguments[0] == "install")
+        or expired.exists()
+    ):
         expired.touch()
         print("sudo: a password is required", file=sys.stderr)
         return 1

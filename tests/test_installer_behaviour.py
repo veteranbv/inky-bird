@@ -658,6 +658,24 @@ def test_linux_reports_timers_it_could_not_restart(tmp_path: Path) -> None:
     assert "sudo systemctl start" in result.stderr
 
 
+def test_linux_expired_sudo_after_controller_restart_keeps_its_runtime(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    controller = f"{host.family}-controller.service"
+    host.fail(f"sudo-expires-at:systemctl:restart:{host.family}-refresh.timer")
+
+    result = run_linux(host)
+
+    assert result.returncode != 0
+    assert host.unit_state("controller.service")["active"] is True
+    process = host.state_of("processes")[controller]
+    assert process["runtime"] == "new"
+    assert (Path(str(process["directory"])) / ".venv/tag").read_text() == "new\n"
+    assert controller in result.stderr and "may still" in result.stderr
+    stopped = [line for line in result.stderr.splitlines() if "are stopped" in line]
+    assert stopped and all(controller not in line for line in stopped)
+    assert "running again" not in result.stderr
+
+
 def test_linux_first_refresh_failure_does_not_block_install(tmp_path: Path) -> None:
     host = linux_host(tmp_path)
     host.fail("new:refresh")
