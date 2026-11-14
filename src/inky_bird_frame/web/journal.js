@@ -1275,7 +1275,7 @@ export async function openJournal(ui, message = '') {
       play.setAttribute('aria-pressed', 'false');
       glyph(play, 'play');
     }
-    const play = button('Play', () => {
+    function togglePlay() {
       if (!paused) {
         pause();
         return;
@@ -1289,8 +1289,8 @@ export async function openJournal(ui, message = '') {
             shuffle && birds.length > 1 ? 1 + Math.floor(Math.random() * (birds.length - 1)) : 1,
           );
       }, 60000);
-    });
-    compact(play, 'play');
+    }
+    const play = compact(button('Play', togglePlay), 'play');
     play.setAttribute('aria-pressed', 'false');
     const details = link('Details', 'bird', { bird: birds[0].taxon_id });
     details.addEventListener('click', pause);
@@ -1323,7 +1323,7 @@ export async function openJournal(ui, message = '') {
       secondary: [details, link('Exit Frame', 'collections'), random, labels],
       previous: () => step(-1),
       next: () => step(1),
-      togglePlay: () => play.click(),
+      togglePlay,
     });
     // Check authority, not activity. A display view must not renew an owner session.
     const check = setInterval(async () => {

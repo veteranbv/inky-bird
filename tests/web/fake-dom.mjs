@@ -1,5 +1,6 @@
 // A minimal DOM for the Frame unit tests: tree containment, attributes,
-// listeners and focus. Events do not bubble; tests dispatch where needed.
+// listeners and focus. Events do not bubble; tests dispatch where needed,
+// except click(), which runs the document's listeners first.
 export class Element {
   constructor(tag = 'div') {
     this.tagName = tag.toUpperCase();
@@ -114,8 +115,12 @@ export class Element {
     for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
     return event;
   }
+  // Like a script's element.click(): an untrusted click that the document's
+  // capture listeners see first and may stop.
   click() {
-    if (!this.disabled) this.fire('click');
+    if (this.disabled) return;
+    const event = globalThis.document?.fire('click', { target: this, isTrusted: false });
+    if (!event?.stopped) this.fire('click', event);
   }
   focus() {
     globalThis.document.activeElement = this;

@@ -222,3 +222,38 @@ test('previous and next do nothing harmful once the view empties', async (t) => 
   await flush();
   assert(screen.main.querySelector('img').src, 'the plate returns without a reload');
 });
+
+test('a swipe on a faded wall screen steps, and Space still pauses', async (t) => {
+  const other = {
+    ...bird,
+    taxon_id: 2,
+    common_name: 'Example Finch',
+    portrait_sha256: 'b'.repeat(64),
+    portrait_url: '/v1/screen/plates/2?revision=' + 'b'.repeat(64),
+  };
+  const screen = await open(t, (path) =>
+    path === '/v1/screen/view'
+      ? Promise.resolve(json({ species: [bird, other] }))
+      : Promise.resolve(png()),
+  );
+  const controls = screen.main.querySelector('.frame-controls');
+  const viewport = screen.main.querySelector('.frame-viewport');
+  t.mock.timers.tick(5000);
+  assert(controls.classList.contains('quiet'), 'the wall screen has faded its controls');
+  screen.doc.fire('pointerdown', { target: viewport, pointerType: 'touch' });
+  viewport.fire('pointerdown', { clientX: 300 });
+  viewport.fire('pointerup', { clientX: 200 });
+  await flush();
+  assert(
+    screen.requests.some((request) => request.path === other.portrait_url),
+    'the first swipe after the fade steps to the next plate',
+  );
+  t.mock.timers.tick(5000);
+  screen.doc.fire('pointerdown', { target: viewport, pointerType: 'touch' });
+  viewport.fire('pointerdown', { clientX: 200 });
+  viewport.fire('pointerup', { clientX: 202 });
+  const play = findButton(screen.main, 'Play');
+  assert.equal(play.getAttribute('aria-pressed'), 'true');
+  screen.doc.fire('keydown', { target: screen.doc.body, key: ' ' });
+  assert.equal(play.getAttribute('aria-pressed'), 'false', 'Space pauses after a tap on the plate');
+});

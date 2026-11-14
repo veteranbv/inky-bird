@@ -185,6 +185,7 @@ export function frameTools({
     } else if (keepAwake) acquire();
   };
   const key = (event) => {
+    swallow = false;
     if (event.key === 'Escape' && controls.classList.contains('expanded')) {
       expand(false);
       more.focus();
@@ -206,6 +207,7 @@ export function frameTools({
   };
   const up = (event) => {
     if (startX !== null && Math.abs(event.clientX - startX) > 60) {
+      swallow = false;
       if (event.clientX < startX) next();
       else previous();
     }
@@ -231,7 +233,8 @@ export function frameTools({
   };
   // Faded controls take no pointer events, so a waking press lands beside
   // them. An engine that retargets its click to the revealed control is
-  // stopped here before the control sees it.
+  // stopped here before the control sees it. Clicks made by script are not
+  // taps and pass.
   const wake = () => {
     swallow = controls.classList.contains('quiet');
     reveal();
@@ -244,7 +247,7 @@ export function frameTools({
     if (event.pointerType === 'mouse') reveal();
   };
   const guard = (event) => {
-    if (!swallow) return;
+    if (!swallow || !event.isTrusted) return;
     swallow = false;
     if (controls.contains(event.target)) {
       event.preventDefault();

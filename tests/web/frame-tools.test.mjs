@@ -28,7 +28,7 @@ function press(target) {
     target.focusVisible = false;
     target.focus();
   }
-  const click = globalThis.document.fire('click', { target });
+  const click = globalThis.document.fire('click', { target, isTrusted: true });
   if (!click.stopped) target.fire('click', click);
   return click;
 }
@@ -113,10 +113,53 @@ test('a wake tap outside the controls does not swallow a later keyboard click', 
     frame.play.focusVisible = true;
     frame.play.focus();
     globalThis.document.fire('keydown', { target: frame.play, key: 'Enter' });
-    const click = globalThis.document.fire('click', { target: frame.play });
+    const click = globalThis.document.fire('click', { target: frame.play, isTrusted: true });
     if (!click.stopped) frame.play.fire('click', click);
     assert.equal(frame.calls.played, 1);
   } finally {
+    frame.restore();
+  }
+});
+
+// A caller that maps swipe and Space onto its own buttons, as a page may.
+function setupViaButtons() {
+  const frame = setup();
+  const nextButton = button('Next', () => (frame.calls.next += 1));
+  frame.start = () =>
+    frameTools({
+      viewport: frame.viewport,
+      controls: frame.controls,
+      status: frame.status,
+      button,
+      primary: [frame.play, nextButton],
+      secondary: [frame.shuffle],
+      previous: () => {},
+      next: () => nextButton.click(),
+      togglePlay: () => frame.play.click(),
+    });
+  return frame;
+}
+
+test('a swipe on faded controls steps once, then Space still plays', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const frame = setupViaButtons();
+  const stop = frame.start();
+  try {
+    t.mock.timers.tick(5000);
+    assert(frame.controls.classList.contains('quiet'));
+    globalThis.document.fire('pointerdown', { target: frame.viewport, pointerType: 'touch' });
+    frame.viewport.fire('pointerdown', { clientX: 300 });
+    frame.viewport.fire('pointerup', { clientX: 200 });
+    assert.equal(frame.calls.next, 1, 'the swipe that wakes the bar also steps');
+    t.mock.timers.tick(5000);
+    globalThis.document.fire('pointerdown', { target: frame.viewport, pointerType: 'touch' });
+    frame.viewport.fire('pointerdown', { clientX: 200 });
+    frame.viewport.fire('pointerup', { clientX: 205 });
+    const space = globalThis.document.fire('keydown', { target: globalThis.document.body, key: ' ' });
+    assert(space.defaultPrevented);
+    assert.equal(frame.calls.played, 1, 'Space after a tap that made no click still plays');
+  } finally {
+    stop();
     frame.restore();
   }
 });

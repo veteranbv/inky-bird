@@ -177,14 +177,12 @@ function present(initial) {
   status.setAttribute('role', 'status');
   const controls = el('div');
   controls.className = 'frame-controls';
-  const play = compact(
-    button('Play', () => {
-      paused = !paused;
-      play.setAttribute('aria-pressed', String(!paused));
-      glyph(play, paused ? 'play' : 'pause');
-    }),
-    'pause',
-  );
+  const togglePlay = () => {
+    paused = !paused;
+    play.setAttribute('aria-pressed', String(!paused));
+    glyph(play, paused ? 'play' : 'pause');
+  };
+  const play = compact(button('Play', togglePlay), 'pause');
   play.setAttribute('aria-pressed', 'true');
   const step = (change) => show(stepIndex(position, change, birds.length));
   const previous = compact(
@@ -218,9 +216,9 @@ function present(initial) {
     button,
     primary: [previous, play, next],
     secondary: [random, forgetting.node],
-    previous: () => previous.click(),
-    next: () => next.click(),
-    togglePlay: () => play.click(),
+    previous: () => step(-1),
+    next: () => step(1),
+    togglePlay,
     onQuiet: forgetting.reset,
   });
   const dock = el('div');
