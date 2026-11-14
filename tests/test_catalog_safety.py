@@ -11,8 +11,10 @@ import pytest
 from png_fixtures import write_plate_pair, write_png, write_truncated_png
 from test_controller import CONFIG, discovery_result
 
+from inky_bird_frame import catalog as catalog_module
 from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.catalog import (
+    CandidateApprovalError,
     approve_candidate,
     candidate_directory,
     has_valid_approved_candidate,
@@ -22,11 +24,13 @@ from inky_bird_frame.catalog import (
 )
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
+    _write_generation_queue,
     generate_candidate,
     read_generation_queue,
     retry_approved_candidate,
     run_controller_cycle,
 )
+from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.geo import DiscoveryLocation
 from inky_bird_frame.models import QualityReview, SpeciesProfileData
 from inky_bird_frame.prompts import PROMPT_VERSION
@@ -407,3 +411,101 @@ def test_valid_replacement_does_not_depend_on_other_entries(tmp_path: Path) -> N
     assert not (config.controller.catalog_dir / "species/7513-carolina-wren").exists()
     index = json.loads((config.controller.catalog_dir / "index.json").read_text())
     assert WREN.taxon_id not in [item["taxon_id"] for item in index["species"]]
+
+
+@pytest.mark.parametrize("extra", ["notes.txt", "nested"])
+def test_pending_with_an_unexpected_entry_is_refused(tmp_path: Path, extra: str) -> None:
+    config = load_test_config(tmp_path)
+    pending = write_pending(config, WREN)
+    if extra == "nested":
+        (pending / extra).mkdir()
+        (pending / extra / "file.txt").write_text("x")
+    else:
+        (pending / extra).write_text("x")
+    before = tree(pending)
+
+    with pytest.raises(CandidateApprovalError):
+        approve_candidate(config.controller.state_dir, config.controller.catalog_dir, WREN.taxon_id)
+
+    assert tree(pending) == before
+    assert not (config.controller.catalog_dir / "species").exists() or not list(
+        (config.controller.catalog_dir / "species").iterdir()
+    )
+
+
+def test_pending_with_a_symlinked_profile_is_refused(tmp_path: Path) -> None:
+    config = load_test_config(tmp_path)
+    pending = write_pending(config, WREN)
+    outside = tmp_path / "outside-profile.json"
+    outside.write_text(json.dumps({"private": "value"}))
+    (pending / "profile.json").unlink(missing_ok=True)
+    (pending / "profile.json").symlink_to(outside)
+
+    with pytest.raises(CandidateApprovalError):
+        approve_candidate(config.controller.state_dir, config.controller.catalog_dir, WREN.taxon_id)
+
+    assert (pending / "profile.json").is_symlink()
+    species_root = config.controller.catalog_dir / "species"
+    assert not species_root.exists() or not list(species_root.iterdir())
+
+
+def test_symlinked_pending_directory_is_refused(tmp_path: Path) -> None:
+    config = load_test_config(tmp_path)
+    pending = write_pending(config, WREN)
+    real = tmp_path / "elsewhere"
+    pending.rename(real)
+    pending.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(CandidateApprovalError):
+        approve_candidate(config.controller.state_dir, config.controller.catalog_dir, WREN.taxon_id)
+
+    assert pending.is_symlink()
+    assert (real / "manifest.json").is_file()
+    species_root = config.controller.catalog_dir / "species"
+    assert not species_root.exists() or not list(species_root.iterdir())
+
+
+def test_pending_is_kept_until_the_approved_entry_validates(tmp_path: Path) -> None:
+    config = load_test_config(tmp_path)
+    pending = write_pending(config, WREN)
+    before = tree(pending)
+    destination = config.controller.catalog_dir / "species" / pending.name
+    real_manifest_entry = catalog_module._manifest_entry
+
+    def fail_for_destination(manifest_path: Path, catalog_dir: Path) -> object:
+        if manifest_path == destination / "manifest.json":
+            raise CatalogError("destination failed validation")
+        return real_manifest_entry(manifest_path, catalog_dir)
+
+    with (
+        patch.object(catalog_module, "_manifest_entry", side_effect=fail_for_destination),
+        pytest.raises(CatalogError, match="destination failed validation"),
+    ):
+        approve_candidate(config.controller.state_dir, config.controller.catalog_dir, WREN.taxon_id)
+
+    assert tree(pending) == before
+    assert not destination.exists()
+
+
+def test_retry_archives_an_invalid_approval_whose_manifest_names_another_bird(
+    tmp_path: Path,
+) -> None:
+    config = load_test_config(tmp_path)
+    approved = approve(config, WREN)
+    manifest_path = approved / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["taxon_id"] = CARDINAL.taxon_id
+    manifest_path.write_text(json.dumps(manifest))
+    _write_generation_queue(config, [WREN])
+
+    result = retry_species(config, WREN.taxon_id)
+
+    assert result["status"] == "eligible"
+    assert not approved.exists()
+    archived = result["archived"]
+    assert isinstance(archived, list)
+    assert [Path(str(path)).name for path in archived] == ["invalid-approved-7513-carolina-wren"]
+    queued = read_generation_queue(config)
+    assert [(item.taxon_id, item.common_name) for item in queued] == [
+        (WREN.taxon_id, WREN.common_name)
+    ]

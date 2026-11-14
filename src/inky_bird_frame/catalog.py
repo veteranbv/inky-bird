@@ -25,6 +25,15 @@ from .timeutil import parse_utc_timestamp
 SCHEMA_VERSION = 1
 COLLECTION_SCHEMA_VERSION = 1
 ASSET_FILENAMES = {"portrait": "portrait.png", "display": "display.png"}
+SPECIES_FILENAMES = frozenset(
+    {
+        "display.png",
+        "manifest.json",
+        "portrait.png",
+        "profile.json",
+        "quality-review.json",
+    }
+)
 
 
 class CandidateApprovalError(CatalogError):
@@ -238,7 +247,7 @@ def read_json(path: Path) -> object:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise CatalogError(f"Invalid JSON in catalog file: {path}") from exc
     except OSError as exc:
-        raise CatalogError(f"Catalog file cannot be read: {path}") from exc
+        raise CatalogError(f"Catalog file cannot be read: {path.name}") from exc
 
 
 def fsync_directory(directory: Path) -> None:
@@ -674,6 +683,13 @@ def _validate_pending_candidate_files(
     source: Path, manifest: dict[str, object], taxon_id: int
 ) -> None:
     manifest_path = source / "manifest.json"
+    if source.is_symlink() or not source.is_dir():
+        raise CandidateApprovalError(f"Candidate {source.name} is not a regular directory")
+    # Publication accepts only these regular files, and copying follows
+    # symlinks, so anything else would leak into or block the catalog.
+    for path in source.iterdir():
+        if path.name not in SPECIES_FILENAMES or path.is_symlink() or not path.is_file():
+            raise CandidateApprovalError(f"Candidate {source.name} has an unexpected file")
     if (
         not isinstance(manifest.get("taxon_id"), int)
         or isinstance(manifest.get("taxon_id"), bool)
@@ -724,7 +740,7 @@ def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> Cata
     existing_approval = find_taxon_directory(catalog_dir / "species", taxon_id)
     if existing_approval is not None and existing_approval != destination:
         raise CandidateApprovalError(
-            f"Taxon {taxon_id} is already approved; use an explicit replacement workflow"
+            f"Taxon {taxon_id} already has a catalog entry; run retry for this bird first"
         )
     clear_catalog_staging(catalog_dir, destination.name)
     existing = _existing_destination_manifest(destination) if destination.exists() else None

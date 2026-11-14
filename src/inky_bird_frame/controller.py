@@ -2811,7 +2811,11 @@ def approve_passing_candidates(
 
 
 def _sweep_abandoned_generation_work(config: AppConfig) -> None:
-    """Remove work left by a generation that stopped; callers hold the cycle lock."""
+    """Remove work left by a generation that stopped; callers hold the cycle lock.
+
+    Every generation directory here is treated as abandoned, so generate_candidate
+    must only ever run while the same cycle lock is held.
+    """
     parents = (
         config.controller.state_dir / "work",
         config.controller.workspace_dir.resolve() / ".inky-bird-frame-generation",

@@ -476,7 +476,7 @@ class CatalogTests(unittest.TestCase):
             approve_candidate(state, catalog, species.taxon_id)
             candidate = make_candidate(state, renamed, review)
 
-            with self.assertRaisesRegex(CandidateApprovalError, "already approved"):
+            with self.assertRaisesRegex(CandidateApprovalError, "already has a catalog entry"):
                 approve_candidate(state, catalog, species.taxon_id)
 
             directories = sorted(path.name for path in (catalog / "species").iterdir())
