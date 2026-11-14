@@ -485,6 +485,22 @@ let browser,
     }
     return false;
   };
+  // Zoom must enlarge the drawn plate, not just widen its box; Fit restores
+  // the whole plate.
+  const plateScale = (target) =>
+    target.locator('.frame-art').evaluate((image) => {
+      const box = image.getBoundingClientRect();
+      return Math.min(box.width / image.naturalWidth, box.height / image.naturalHeight);
+    });
+  const zoomEnlarges = async (target) => {
+    await openMore(target);
+    const fit = await plateScale(target);
+    await target.getByRole('button', { name: 'Zoom', exact: true }).click();
+    const zoomed = await plateScale(target);
+    assert(zoomed > fit * 1.5, 'Zoom enlarges the plate');
+    await target.getByRole('button', { name: 'Fit whole plate', exact: true }).click();
+    assert(Math.abs((await plateScale(target)) - fit) < 0.001);
+  };
   // With More closed, the control bar sits fully below the bird name.
   const captionClear = async (target) => {
     await target.keyboard.press('Shift');
@@ -528,6 +544,8 @@ let browser,
   await screen.locator('.frame-art').waitFor();
   await screen.locator('.frame-art').evaluate((image) => image.decode());
   await captionClear(screen);
+  await zoomEnlarges(screen);
+  await screen.keyboard.press('Escape');
   await screen.setViewportSize({ width: 844, height: 390 });
   await captionClear(screen);
   await screen.setViewportSize({ width: 390, height: 844 });
@@ -775,9 +793,7 @@ let browser,
   await page.goto(origin + '/app?page=frame&view=' + imported.collection_id);
   await page.locator('.frame-art').waitFor();
   await page.locator('.frame-art').evaluate((image) => image.decode());
-  await openMore(page);
-  await page.getByRole('button', { name: 'Zoom', exact: true }).click();
-  await page.getByRole('button', { name: 'Fit whole plate', exact: true }).click();
+  await zoomEnlarges(page);
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   phase = 'frame-ambient-labels';
   // Toggles keep their names and report state through aria-pressed.
@@ -1021,6 +1037,7 @@ let browser,
   const wideBar = await page.locator('.frame-controls').boundingBox();
   assert(wideBar.y + wideBar.height <= 800);
   await captionClear(page);
+  await zoomEnlarges(page);
   await page.setViewportSize({ width: 844, height: 390 });
   await captionClear(page);
   await page.setViewportSize({ width: 390, height: 844 });
