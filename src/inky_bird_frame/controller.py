@@ -7,10 +7,10 @@ import hashlib
 import json
 import os
 import shutil
-from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -109,6 +109,18 @@ PROFILE_REFRESH_CORRECTION = (
 )
 HUMAN_REVIEW_SOURCE = "human-review"
 OWNER_SELECTION_SOURCE = "owner-selection"
+PROVIDER_SOURCE_LABELS: Mapping[str, str] = {
+    "inaturalist": "iNaturalist",
+    "ebird": "eBird",
+    "ebird-archive": "eBird Archive",
+    "birdweather": "BirdWeather",
+    "birdbuddy": "Bird Buddy",
+    "birdnet-go": "BirdNET-Go",
+    "birdnet-analyzer": "BirdNET Analyzer",
+}
+CARRY_FORWARD_REFRESHES = 3
+CARRY_FORWARD_MAXIMUM = timedelta(hours=24)
+NEW_SPECIES_NOTICE_NAMES = 10
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,7 @@ class DiscoverySnapshot:
     species: list[BirdSpecies]
     notification_baseline_taxa: frozenset[int] | None = None
     configuration_revision: str | None = None
+    provider_last_success: Mapping[str, datetime] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,6 +142,9 @@ class ProviderStatus:
     unresolved_count: int = 0
     error: str | None = None
     details: dict[str, object] | None = None
+    warning: str | None = None
+    last_success_at: str | None = None
+    carried_species_count: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -141,7 +157,18 @@ class ProviderStatus:
             value["error"] = self.error
         if self.details is not None:
             value["details"] = self.details
+        if self.warning is not None:
+            value["warning"] = self.warning
+        if self.last_success_at is not None:
+            value["last_success_at"] = self.last_success_at
+        if self.carried_species_count is not None:
+            value["carried_species_count"] = self.carried_species_count
         return value
+
+
+def _unexpected_source_error(exc: Exception) -> str:
+    # Unexpected exception text can carry paths or coordinates; keep only the type.
+    return f"The source failed unexpectedly ({type(exc).__name__})"
 
 
 @dataclass(frozen=True)
@@ -295,17 +322,25 @@ def discover_species(
     if location_provider_names:
         try:
             if latitude is None and longitude is None:
-                location = resolve_discovery_location(config.discovery)
+                location = resolve_discovery_location(
+                    config.discovery,
+                    cache_path=config.controller.state_dir / "geocode-cache.json",
+                    persist_cache=persist_taxonomy_cache,
+                )
             else:
                 location = resolve_discovery_location(
                     config.discovery,
                     latitude=latitude,
                     longitude=longitude,
                 )
-        except DataSourceError as exc:
+        except Exception as exc:
+            message = (
+                f"Location lookup failed: {exc}"
+                if isinstance(exc, DataSourceError)
+                else f"Location lookup failed unexpectedly ({type(exc).__name__})"
+            )
             providers.extend(
-                ProviderStatus(name, "error", 0, error=f"Location lookup failed: {exc}")
-                for name in location_provider_names
+                ProviderStatus(name, "error", 0, error=message) for name in location_provider_names
             )
             if record_activity:
                 for name in location_provider_names:
@@ -327,6 +362,10 @@ def discover_species(
                 )
             except DataSourceError as exc:
                 providers.append(ProviderStatus("inaturalist", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("inaturalist", "error", 0, error=_unexpected_source_error(exc))
+                )
             else:
                 provider_species.append(inaturalist)
                 providers.append(ProviderStatus("inaturalist", "ok", len(inaturalist)))
@@ -344,8 +383,8 @@ def discover_species(
             try:
                 api_key = config.discovery.ebird_api_key
                 if api_key is None and config.discovery.ebird_api_key_env is not None:
-                    environment_value = os.environ.get(config.discovery.ebird_api_key_env)
-                    api_key = environment_value.strip() if environment_value else None
+                    environment_value = os.environ.get(config.discovery.ebird_api_key_env, "")
+                    api_key = environment_value.strip() or None
                 if api_key is None:
                     raise DataSourceError("eBird API key is not configured")
                 request_started = monotonic()
@@ -373,6 +412,10 @@ def discover_species(
                 )
                 providers.append(
                     ProviderStatus("ebird", "error", 0, error=str(exc), details=details)
+                )
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("ebird", "error", 0, error=_unexpected_source_error(exc))
                 )
             else:
                 unresolved.extend(resolution.unresolved)
@@ -422,6 +465,10 @@ def discover_species(
                 )
             except (DataSourceError, ValueError) as exc:
                 providers.append(ProviderStatus("ebird-archive", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("ebird-archive", "error", 0, error=_unexpected_source_error(exc))
+                )
             else:
                 unresolved.extend(ebird_archive_unresolved)
                 if ebird_archive_history.species and not resolved:
@@ -462,8 +509,8 @@ def discover_species(
             try:
                 token = config.discovery.birdweather_token
                 if token is None and config.discovery.birdweather_token_env is not None:
-                    environment_value = os.environ.get(config.discovery.birdweather_token_env)
-                    token = environment_value.strip() if environment_value else None
+                    environment_value = os.environ.get(config.discovery.birdweather_token_env, "")
+                    token = environment_value.strip() or None
                 if token is None:
                     raise DataSourceError("BirdWeather station token is not configured")
                 detections = fetch_birdweather_species(
@@ -478,6 +525,10 @@ def discover_species(
                 )
             except (DataSourceError, ValueError) as exc:
                 providers.append(ProviderStatus("birdweather", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("birdweather", "error", 0, error=_unexpected_source_error(exc))
+                )
             else:
                 unresolved.extend(birdweather_unresolved)
                 if detections and not resolved:
@@ -526,6 +577,10 @@ def discover_species(
                 )
             except (DataSourceError, ValueError) as exc:
                 providers.append(ProviderStatus("birdbuddy", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("birdbuddy", "error", 0, error=_unexpected_source_error(exc))
+                )
             else:
                 unresolved.extend(birdbuddy_unresolved)
                 if sync.species and not resolved:
@@ -540,17 +595,22 @@ def discover_species(
                         )
                     )
                 else:
+                    complete = sync.stats.confirmed_history_complete
                     provider_species.append(resolved)
                     providers.append(
                         ProviderStatus(
                             "birdbuddy",
-                            "ok",
+                            "ok" if complete else "degraded",
                             len(resolved),
                             unresolved_count=len(birdbuddy_unresolved),
                             details=sync.stats.as_dict(),
+                            warning=None
+                            if complete
+                            else "Bird Buddy confirmed history was incomplete; "
+                            f"{sync.stats.confirmed_records_skipped} records were skipped",
                         )
                     )
-            activity.succeeded = providers[-1].status == "ok"
+            activity.succeeded = providers[-1].status != "error"
             activity.update(
                 species_count=providers[-1].species_count,
                 unresolved_count=providers[-1].unresolved_count,
@@ -576,6 +636,10 @@ def discover_species(
                 )
             except (DataSourceError, ValueError) as exc:
                 providers.append(ProviderStatus("birdnet-go", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus("birdnet-go", "error", 0, error=_unexpected_source_error(exc))
+                )
             else:
                 unresolved.extend(birdnet_go_unresolved)
                 if birdnet_go_detections and not resolved:
@@ -621,6 +685,12 @@ def discover_species(
                 )
             except (DataSourceError, ValueError) as exc:
                 providers.append(ProviderStatus("birdnet-analyzer", "error", 0, error=str(exc)))
+            except Exception as exc:
+                providers.append(
+                    ProviderStatus(
+                        "birdnet-analyzer", "error", 0, error=_unexpected_source_error(exc)
+                    )
+                )
             else:
                 unresolved.extend(birdnet_analyzer_unresolved)
                 if birdnet_analyzer_history.species and not resolved:
@@ -1214,6 +1284,16 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
                     title=f"{name} bird discovery is degraded",
                     body=f"The {name} provider failed; another configured provider supplied data.",
                 )
+            elif provider.get("status") == "degraded":
+                successful_providers.add(name)
+                warning = provider.get("warning")
+                safe_record_degradation(
+                    config,
+                    key=f"observation-provider-{name}",
+                    title=f"{name} bird discovery is degraded",
+                    body=(f"{warning}. " if isinstance(warning, str) else "")
+                    + "The birds it returned are still used.",
+                )
             else:
                 successful_providers.add(name)
                 safe_record_recovery(
@@ -1256,25 +1336,124 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
             )
     new_species = result.get("new_species")
     if isinstance(new_species, list) and new_species:
-        names: list[str] = []
-        taxon_ids: list[str] = []
-        for item in new_species:
-            if not isinstance(item, dict):
-                continue
-            common_name = item.get("common_name")
-            taxon_id = item.get("taxon_id")
-            if isinstance(common_name, str):
-                names.append(common_name)
-            if isinstance(taxon_id, int):
-                taxon_ids.append(str(taxon_id))
-        safe_notify(
-            config,
-            NotificationEvent.DISCOVERY,
-            dedupe_key=":".join(taxon_ids),
-            title=f"{len(names)} new bird species discovered",
-            body=", ".join(names),
-        )
+        _notify_new_species(config, new_species)
     return result
+
+
+def _new_species_notices_path(config: AppConfig) -> Path:
+    return config.controller.state_dir / "new-species-notices.json"
+
+
+def _announced_this_year(path: Path, year: int) -> set[int]:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or raw.get("year") != year:
+        return set()
+    taxon_ids = raw.get("taxon_ids")
+    if not isinstance(taxon_ids, list):
+        return set()
+    return {item for item in taxon_ids if type(item) is int and item > 0}
+
+
+def _notify_new_species(config: AppConfig, new_species: list[object]) -> None:
+    """Announce each species at most once per calendar year, naming a bounded list."""
+    year = datetime.now(UTC).year
+    path = _new_species_notices_path(config)
+    announced = _announced_this_year(path, year)
+    fresh: dict[int, str] = {}
+    for item in new_species:
+        if not isinstance(item, dict):
+            continue
+        common_name = item.get("common_name")
+        taxon_id = item.get("taxon_id")
+        if (
+            isinstance(common_name, str)
+            and type(taxon_id) is int
+            and taxon_id not in announced
+            and taxon_id not in fresh
+        ):
+            fresh[taxon_id] = common_name
+    if not fresh:
+        return
+    names = list(fresh.values())
+    shown = names[:NEW_SPECIES_NOTICE_NAMES]
+    remaining = len(names) - len(shown)
+    outcome = safe_notify(
+        config,
+        NotificationEvent.DISCOVERY,
+        dedupe_key=f"{year}:" + ":".join(str(taxon_id) for taxon_id in fresh),
+        title=f"{len(names)} new bird species discovered",
+        body=", ".join(shown) + (f", and {remaining} more" if remaining else ""),
+    )
+    if outcome.get("failed"):
+        return
+    # A lost record can repeat one notice this year; it must not fail a refresh
+    # whose results are already saved.
+    with suppress(OSError):
+        write_json_atomic(
+            path,
+            {
+                "schema_version": 1,
+                "year": year,
+                "taxon_ids": sorted(announced | fresh.keys()),
+            },
+            mode=0o600,
+        )
+
+
+def _carry_forward_failed_providers(
+    config: AppConfig,
+    previous: DiscoverySnapshot | None,
+    discovery: DiscoveryResult,
+    now: datetime,
+) -> tuple[list[BirdSpecies], list[ProviderStatus]]:
+    """Keep a failed provider's last species for a bounded time; empty successes count."""
+    limit = min(
+        timedelta(minutes=CARRY_FORWARD_REFRESHES * config.schedule.refresh_minutes),
+        CARRY_FORWARD_MAXIMUM,
+    )
+    history = (
+        previous
+        if previous is not None
+        and previous.configuration_revision is not None
+        and previous.configuration_revision == config.discovery_revision
+        else None
+    )
+    carried_lists: list[list[BirdSpecies]] = []
+    statuses: list[ProviderStatus] = []
+    for provider in discovery.providers:
+        if provider.status != "error":
+            statuses.append(replace(provider, last_success_at=now.isoformat()))
+            continue
+        last_success = (
+            history.provider_last_success.get(provider.name) if history is not None else None
+        )
+        if history is None or last_success is None:
+            statuses.append(provider)
+            continue
+        label = PROVIDER_SOURCE_LABELS.get(provider.name)
+        carried: list[BirdSpecies] = []
+        if label is not None and timedelta(0) <= now - last_success <= limit:
+            carried = [
+                replace(species, source=label, sources=(label,))
+                for species in history.species
+                if label in species.sources
+            ]
+            carried_lists.append(carried)
+        statuses.append(
+            replace(
+                provider,
+                last_success_at=last_success.isoformat(),
+                carried_species_count=len(carried),
+            )
+        )
+    if not carried_lists:
+        return discovery.species, statuses
+    species = _merge_provider_species([discovery.species, *carried_lists])
+    species.sort(key=lambda item: (item.common_name.casefold(), item.taxon_id))
+    return species, statuses
 
 
 def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
@@ -1285,6 +1464,7 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
         notification_baseline: frozenset[int] | None = frozenset()
         place_name = ""
         state = ""
+        previous: DiscoverySnapshot | None = None
         if _snapshot_path(config).exists():
             previous = _read_discovery_snapshot(config)
             notification_baseline = previous.notification_baseline_taxa
@@ -1293,15 +1473,20 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
         if location is not None:
             place_name = location.place_name
             state = location.state
-        species_list = discovery.species
+        species_list, provider_statuses = _carry_forward_failed_providers(
+            config,
+            previous,
+            discovery,
+            datetime.now(UTC).replace(microsecond=0),
+        )
         new_species = (
             [species for species in species_list if species.taxon_id not in notification_baseline]
             if notification_baseline is not None
             else []
         )
         current_taxa = {species.taxon_id for species in species_list}
-        # A failed provider cannot establish absence. Keep its prior taxa only
-        # for notification comparison; the active catalog uses current results.
+        # A failed provider cannot establish absence. Keep its prior taxa for
+        # notification comparison even after its carried species expire.
         if any(provider.status != "ok" for provider in discovery.providers):
             next_baseline = (
                 sorted(notification_baseline | current_taxa)
@@ -1320,7 +1505,7 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
                     "refreshed_at": refreshed_at.isoformat(),
                     "place_name": place_name,
                     "state": state,
-                    "providers": [provider.as_dict() for provider in discovery.providers],
+                    "providers": [provider.as_dict() for provider in provider_statuses],
                     "species": [_species_payload(species) for species in species_list],
                     "notification_baseline_taxon_ids": next_baseline,
                 },
@@ -1334,7 +1519,7 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
         "radius_km": config.discovery.radius_km,
         "source": discovery_source_label(config.discovery.sources),
         "sources": [provider.value for provider in config.discovery.sources],
-        "providers": [provider.as_dict() for provider in discovery.providers],
+        "providers": [provider.as_dict() for provider in provider_statuses],
         "unresolved_species": [
             _unresolved_species_payload(species) for species in discovery.unresolved
         ],
@@ -1370,6 +1555,23 @@ def _read_discovery_snapshot(config: AppConfig) -> DiscoverySnapshot:
         raise CatalogError(f"Invalid discovery timestamp: {path}")
 
     species = _parse_species_list(species_raw, path)
+    provider_last_success: dict[str, datetime] = {}
+    provider_rows = raw.get("providers")
+    if isinstance(provider_rows, list):
+        for row in provider_rows:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                continue
+            # Snapshots written before last_success_at existed only prove
+            # success for providers that reported ok in that refresh.
+            recorded = (
+                parse_utc_timestamp(row["last_success_at"])
+                if "last_success_at" in row
+                else refreshed
+                if row.get("status") in {"ok", "degraded"}
+                else None
+            )
+            if recorded is not None:
+                provider_last_success[row["name"]] = recorded
     if "notification_baseline_taxon_ids" in raw:
         baseline_raw = raw["notification_baseline_taxon_ids"]
         if baseline_raw is None:
@@ -1404,7 +1606,15 @@ def _read_discovery_snapshot(config: AppConfig) -> DiscoverySnapshot:
         or any(char not in "0123456789abcdef" for char in revision)
     ):
         raise CatalogError("Invalid discovery configuration revision")
-    return DiscoverySnapshot(refreshed, place_name, state, species, notification_baseline, revision)
+    return DiscoverySnapshot(
+        refreshed,
+        place_name,
+        state,
+        species,
+        notification_baseline,
+        revision,
+        provider_last_success,
+    )
 
 
 def current_discovery_species(config: AppConfig) -> list[BirdSpecies]:
