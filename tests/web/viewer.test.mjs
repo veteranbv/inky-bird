@@ -54,7 +54,7 @@ async function open(t, route) {
     window: { isSecureContext: false },
     location: { reload: () => reloads.push(doc.body.classList.contains('presenting')) },
     fetch: (path, options = {}) => {
-      requests.push({ path, method: options.method || 'GET' });
+      requests.push({ path, method: options.method || 'GET', cache: options.cache });
       return route(path, options);
     },
     Image: class {
@@ -256,4 +256,15 @@ test('a swipe on a faded wall screen steps, and Space still pauses', async (t) =
   assert.equal(play.getAttribute('aria-pressed'), 'true');
   screen.doc.fire('keydown', { target: screen.doc.body, key: ' ' });
   assert.equal(play.getAttribute('aria-pressed'), 'false', 'Space pauses after a tap on the plate');
+});
+
+test('the screen asks for the full revisioned plate and lets the browser cache it', async (t) => {
+  const screen = await open(t, (path) =>
+    path === '/v1/screen/view' ? Promise.resolve(json({ species: [bird] })) : Promise.resolve(png()),
+  );
+  const plates = screen.requests.filter((request) => request.path.startsWith('/v1/screen/plates/'));
+  assert.deepEqual(
+    plates.map((request) => [request.path, request.cache]),
+    [[bird.portrait_url, undefined]],
+  );
 });
