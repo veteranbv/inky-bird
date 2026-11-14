@@ -57,8 +57,8 @@ Each destination has its own `events` list:
 | `recovered` | A previously reported transient degradation succeeds again |
 | `publication_error` | Public catalog publication crosses the degradation threshold |
 | `publication_recovered` | Public catalog publication succeeds after a reported degradation |
-| `display_stale` | No display node has fetched the active catalog for three rotation intervals, with a 60-minute minimum |
-| `display_recovered` | Display catalog fetches resume after a `display_stale` notice |
+| `display_stale` | No display update has completed for three rotation intervals, with a 60-minute minimum, or a display keeps fetching the catalog without completing an update |
+| `display_recovered` | A display update completes again after a `display_stale` notice |
 
 The controller's HTTP server records the display's most recent catalog fetch
 in `display-last-fetch.json` through `POST /v1/display-fetch` and records a
@@ -79,6 +79,13 @@ upgrade from an older release has a temporary telemetry gap regardless of
 upgrade order. Update the controller first and then the display promptly, or
 move both roles through v0.7.0 first when uninterrupted heartbeat monitoring is
 required. `display_recovered` is sent once updates resume.
+
+The controller checks display staleness each time it runs `notifications
+dispatch`, so display monitoring runs only when `[notifications]` has
+`enabled = true`. With notifications off, nothing checks for a stale display.
+A stale display counts as a degradation, so the threshold and cooldown below
+also apply to it. A selected wall view that is empty pauses the panel without a
+completed update, so it is reported as stale too.
 
 Routine successes do not notify. Transient failures notify only after
 `degradation_failure_threshold` consecutive failures or
@@ -179,8 +186,9 @@ events = ["terminal_error", "degraded", "recovered"]
 ```
 
 Use `url_env` instead of `url` only when your service manager injects that environment variable
-into every application process. The supported macOS installer rejects `url_env` because launchd
-does not inherit the installer's shell environment; use the private mode-0600 TOML file there.
+into every application process, as Docker does from `controller.env`. Both native installers
+(macOS LaunchAgents and Linux systemd) reject `url_env` because their services do not inherit the
+installer's shell environment; use `url` in the private mode-0600 TOML file there.
 
 ### Home Assistant
 
@@ -207,7 +215,8 @@ Apprise plugin.
 - Never add a real service URL to `config.example.toml`, documentation, issues, logs, or catalog
   files.
 - Keep the deployed `config.toml` outside the Git checkout.
-- Use `url_env` when a service URL is injected by a secret manager or service manager.
+- Use `url_env` when a service URL is injected by a secret manager or service manager (Docker;
+  not the native installers).
 - URL-encode usernames, passwords, tokens, paths, and recipients when they contain URL-reserved
   characters.
 - Rotate a token immediately if its full URL appears in terminal output or version control.

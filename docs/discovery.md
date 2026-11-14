@@ -77,7 +77,7 @@ requires an exact country/postal-code match and rejects multiple coordinate
 results rather than guessing. Geoapify permits stored results and requires
 attribution; discovery output includes both Geoapify and source attribution.
 
-Existing `zip_code = "12345"` configurations remain supported unchanged through
+Existing `zip_code = "00000"` configurations remain supported unchanged through
 Zippopotam's US endpoint and need no key. This compatibility path is US-only;
 new worldwide configurations should use coordinates or Geoapify. No discovery
 location is written to a public catalog or rendered on a plate.
@@ -100,7 +100,7 @@ the private configuration:
 ```toml
 [discovery]
 sources = ["inaturalist", "ebird"]
-zip_code = "12345"
+zip_code = "00000"
 radius_km = 8
 species_limit = 50
 window = "last-30-days"
@@ -327,11 +327,16 @@ The proxy must expose the same unauthenticated BirdNET-Go API. After changing
 the URL, test the installed service instead of relying on a manual refresh:
 
 ```bash
-refresh_label="gui/$(id -u)/com.inky-bird-frame.refresh"
+refresh_label="gui/$(id -u)/com.$FAMILY.refresh"
 refresh_pid="$(launchctl kickstart -kp "$refresh_label")"
 while kill -0 "$refresh_pid" 2>/dev/null; do sleep 1; done
-tail -n 200 "$HOME/Library/Application Support/Inky Bird Frame/logs/refresh.log"
+tail -n 200 "$LOGS/refresh.log"
 ```
+
+Set `FAMILY` and `LOGS` first as in
+[Find your installation's names and paths](troubleshooting.md#find-your-installations-names-and-paths).
+An app-managed installation has no refresh LaunchAgent; read the next scheduled
+refresh in `$LOGS/scheduler.log` instead.
 
 The newest result should show the `birdnet-go` provider with `status` set to
 `ok`. If both the direct address and the proxy fail from LaunchAgent context,
@@ -475,7 +480,7 @@ Add the provider without putting credentials in TOML:
 [discovery]
 sources = ["inaturalist", "birdbuddy"]
 birdbuddy_include_manual_sightings = false
-zip_code = "12345"
+zip_code = "00000"
 radius_km = 8
 species_limit = 50
 window = "last-30-days"

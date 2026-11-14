@@ -49,6 +49,19 @@ timers use the scheduled queue. An unhealthy or stale source can delay
 preparation even when the scheduler is running. Check the saved request and
 the [source and work status](owner-operations.md) before submitting it again.
 
+### "This address is not approved for sign-in"
+
+The journal shows this when the address in the browser is not one Inky accepts
+for owner sign-in. In local mode, Inky accepts plain HTTP from a private-network
+or loopback client when the address is the controller's own IP address on the
+configured port, `localhost` on the controller itself, or an origin listed in
+`controller.owner_allowed_origins`. A hostname, a different port (for example a
+Docker port mapping) or an HTTPS address must be listed exactly. In HTTPS-only
+mode, only listed HTTPS origins work. Add the exact origin the browser shows,
+then restart the controller. On an app-managed Docker installation, follow the
+app-managed steps under [Docker update](docker.md#update) instead: rerunning
+`config-sync` does not change its running configuration.
+
 ### `config` fails
 
 Run the focused validator:
