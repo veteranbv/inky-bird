@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -102,8 +103,6 @@ def test_latest_release_download_keeps_the_supported_asset_name() -> None:
 def test_published_names_must_resolve_to_one_multiarch_attested_digest(
     tmp_path: Path, mismatch: bool
 ) -> None:
-    import json
-
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert workflow.count("uses: docker/build-push-action@") == 1
     assert "provenance: mode=max" in workflow
@@ -287,8 +286,6 @@ def test_release_requires_version_main_ancestry_and_passing_ci(
     runs: dict[str, list[dict[str, str]]],
     message: str | None,
 ) -> None:
-    import json
-
     script = _step_script("publish", "Verify release source")
     work = tmp_path / "work"
     fakes = tmp_path / "bin"
@@ -337,16 +334,82 @@ OTHER_DIGEST = "sha256:" + "b" * 64
 
 
 @pytest.mark.parametrize(
-    ("existing", "inspect_error", "created", "succeeds"),
+    ("event", "inspect", "expected", "message"),
     [
-        (None, "ERROR: ghcr.io/veteranbv/inky-bird:1.2.3: not found", True, True),
-        (DIGEST, "", False, True),
-        (OTHER_DIGEST, "", False, False),
-        (None, "ERROR: unexpected status from HEAD request: 503", False, False),
+        ("release", f'{{"digest": "{DIGEST}"}}', DIGEST, None),
+        ("release", None, None, "is not published"),
+        ("release", '{"digest": null}', None, None),
+        ("workflow_run", None, OTHER_DIGEST, None),
+    ],
+)
+def test_release_reads_the_digest_main_published(
+    tmp_path: Path, event: str, inspect: str | None, expected: str | None, message: str | None
+) -> None:
+    script = _step_script("publish", "Resolve published digest")
+    log = tmp_path / "docker.log"
+    _executable(
+        tmp_path,
+        "docker",
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'test "$1 $2 $3" = "buildx imagetools inspect" || exit 90\n'
+        + (
+            f"printf '%s\\n' '{inspect}'\n"
+            if inspect is not None
+            else "echo 'ERROR: not found' >&2; exit 1\n"
+        ),
+    )
+    output = tmp_path / "github-output"
+    result = _run(
+        script,
+        tmp_path,
+        tmp_path,
+        {
+            "EVENT_NAME": event,
+            "BUILT_DIGEST": OTHER_DIGEST if event != "release" else "",
+            "VERIFY_TAGS": f"ghcr.io/veteranbv/inky-bird:sha-{SOURCE_SHA}\n"
+            f"ghcr.io/veteranbv/inky-bird-frame:sha-{SOURCE_SHA}",
+            "GITHUB_OUTPUT": str(output),
+        },
+    )
+    if expected is None:
+        assert result.returncode != 0
+        assert not output.exists() or "digest=" not in output.read_text(encoding="utf-8")
+        if message is not None:
+            assert message in result.stdout + result.stderr
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text(encoding="utf-8").splitlines() == [f"digest={expected}"]
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    if event == "release":
+        assert calls == [
+            f"buildx imagetools inspect ghcr.io/veteranbv/inky-bird:sha-{SOURCE_SHA} "
+            "--format {{json .Manifest}}"
+        ]
+    else:
+        assert calls == []
+
+
+NOT_FOUND = "ERROR: ghcr.io/veteranbv/inky-bird:1.2.3: not found"
+
+
+@pytest.mark.parametrize(
+    ("existing", "inspect_error", "published", "creates_expected", "message"),
+    [
+        (None, NOT_FOUND, DIGEST, 2, None),
+        (DIGEST, "", DIGEST, 0, None),
+        (OTHER_DIGEST, "", DIGEST, 0, "is never moved"),
+        (None, "ERROR: unexpected status from HEAD request: 503", DIGEST, 0, "unpublished"),
+        # The registry stored the new tag at a digest other than the tested one.
+        (None, NOT_FOUND, OTHER_DIGEST, 1, f"resolves to {OTHER_DIGEST}, not {DIGEST}"),
     ],
 )
 def test_release_promotion_never_moves_a_published_version(
-    tmp_path: Path, existing: str | None, inspect_error: str, created: bool, succeeds: bool
+    tmp_path: Path,
+    existing: str | None,
+    inspect_error: str,
+    published: str,
+    creates_expected: int,
+    message: str | None,
 ) -> None:
     script = _step_script("promote-release", "Tag the tested digest")
     log = tmp_path / "docker.log"
@@ -361,7 +424,7 @@ def test_release_promotion_never_moves_a_published_version(
         'case "$3" in\n'
         "  inspect)\n"
         f'    if [ -e "{state}/$(printf %s "$4" | tr "/:" "__")" ]; then\n'
-        f"      printf '%s\\n' '{{\"digest\": \"{DIGEST}\"}}'; exit 0\n"
+        f"      printf '%s\\n' '{{\"digest\": \"{published}\"}}'; exit 0\n"
         "    fi\n"
         + (
             f"    printf '%s\\n' '{{\"digest\": \"{existing}\"}}'; exit 0 ;;\n"
@@ -385,22 +448,29 @@ def test_release_promotion_never_moves_a_published_version(
             "VERSION": "1.2.3",
         },
     )
-    assert (result.returncode == 0) is succeeds, result.stdout + result.stderr
+    if message is None:
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+        assert message in result.stdout + result.stderr
     calls = log.read_text(encoding="utf-8").splitlines()
     creates = [call for call in calls if call.startswith("buildx imagetools create")]
-    if created:
-        assert creates == [
+    assert (
+        creates
+        == [
             f"buildx imagetools create --tag ghcr.io/veteranbv/{name}:1.2.3 "
             f"ghcr.io/veteranbv/{name}@{DIGEST}"
             for name in ("inky-bird", "inky-bird-frame")
-        ]
-    else:
-        assert creates == []
+        ][:creates_expected]
+    )
 
 
-@pytest.mark.parametrize(("reported", "succeeds"), [("1.2.3", True), ("1.2.3rc1", False)])
-def test_arm64_smoke_requires_the_release_version(
-    tmp_path: Path, reported: str, succeeds: bool
+@pytest.mark.parametrize(
+    ("reported", "network", "succeeds"),
+    [("1.2.3", False, True), ("1.2.3rc1", False, False), ("1.2.3", True, False)],
+)
+def test_arm64_smoke_requires_the_release_version_and_a_closed_sandbox(
+    tmp_path: Path, reported: str, network: bool, succeeds: bool
 ) -> None:
     script = _step_script("smoke-arm64", "Run the published image natively")
     log = tmp_path / "docker.log"
@@ -411,8 +481,10 @@ def test_arm64_smoke_requires_the_release_version(
         'case "$1" in\n'
         "  pull) exit 0 ;;\n"
         "  image) printf '%s\\n' linux/arm64 ;;\n"
-        '  run) case "$*" in *" --version") '
-        f"printf '%s\\n' 'inky-bird {reported}' ;; esac ;;\n"
+        '  run) case "$*" in\n'
+        f"    *\" --version\") printf '%s\\n' 'inky-bird {reported}' ;;\n"
+        f"    *socket*) exit {0 if network else 1} ;;\n"
+        "  esac ;;\n"
         "  *) exit 90 ;;\n"
         "esac\n",
     )
@@ -428,13 +500,22 @@ def test_arm64_smoke_requires_the_release_version(
         assert (
             f"--platform linux/arm64 ghcr.io/veteranbv/inky-bird@{DIGEST} catalog validate" in calls
         )
+        assert f"ghcr.io/veteranbv/inky-bird@{DIGEST} sandbox -- /bin/true" in calls
+    if network:
+        assert "allowed network access on arm64" in result.stdout + result.stderr
 
 
 def test_release_promotes_instead_of_rebuilding_and_keeps_assets_immutable() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     build = workflow.split("      - name: Build and publish\n", 1)[1].split("\n      - name:", 1)[0]
     assert "if: github.event_name != 'release'" in build
-    assert "runs-on: ubuntu-24.04-arm" in workflow.split("\n  smoke-arm64:\n", 1)[1]
+    smoke = workflow.split("\n  smoke-arm64:\n", 1)[1].split("\n  promote-release:\n", 1)[0]
+    assert "runs-on: ubuntu-24.04-arm" in smoke
+    # The sandbox probe needs the same host profile the ci smoke test loads.
+    assert "ref: ${{ needs.publish.outputs.source_sha }}" in smoke
+    assert "sparse-checkout: deploy/apparmor" in smoke
+    assert "sudo apparmor_parser -r /etc/apparmor.d/inky-bird-frame-codex" in smoke
+    assert "source_sha: ${{ steps.image.outputs.source_sha }}" in workflow
     promote = workflow.split("\n  promote-release:\n", 1)[1].split("\n  release-bundle:\n", 1)[0]
     assert "if: github.event_name == 'release'" in promote
     assert "- smoke-arm64" in promote
