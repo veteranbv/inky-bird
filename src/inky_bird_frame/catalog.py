@@ -428,9 +428,18 @@ def _manifest_entry(manifest_path: Path, catalog_dir: Path) -> CatalogEntry:
 
 def read_catalog_entries(catalog_dir: Path) -> list[CatalogEntry]:
     species_dir = catalog_dir / "species"
-    entries = [
-        _manifest_entry(path, catalog_dir) for path in sorted(species_dir.glob("*/manifest.json"))
-    ]
+    entries: list[CatalogEntry] = []
+    directories: dict[int, str] = {}
+    for path in sorted(species_dir.glob("*/manifest.json")):
+        entry = _manifest_entry(path, catalog_dir)
+        # Displays refuse an index that lists one bird twice.
+        if entry.taxon_id in directories:
+            raise CatalogError(
+                f"Catalog has more than one entry for taxon {entry.taxon_id}: "
+                f"{directories[entry.taxon_id]} and {path.parent.name}"
+            )
+        directories[entry.taxon_id] = path.parent.name
+        entries.append(entry)
     entries.sort(key=lambda item: (item.common_name.casefold(), item.taxon_id))
     return entries
 

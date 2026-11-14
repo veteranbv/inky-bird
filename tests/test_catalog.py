@@ -346,6 +346,29 @@ class CatalogTests(unittest.TestCase):
         if isinstance(index, dict):
             self.assertNotIn(kept.taxon_id, [item["taxon_id"] for item in index["species"]])
 
+    def test_catalog_reads_reject_two_entries_for_one_taxon(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        for copy_name in ("7513-carolina-wren-old", "1-renamed-bird"):
+            with self.subTest(copy_name=copy_name), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = root / "state"
+                catalog = root / "catalog"
+                make_candidate(state, species, review)
+                approve_candidate(state, catalog, species.taxon_id)
+                index_before = (catalog / "index.json").read_bytes()
+                shutil.copytree(
+                    catalog / "species/7513-carolina-wren", catalog / "species" / copy_name
+                )
+
+                with self.assertRaisesRegex(CatalogError, "more than one entry for taxon 7513"):
+                    read_catalog_entries(catalog)
+                with self.assertRaises(CatalogError):
+                    rebuild_catalog_index(catalog)
+                index_after = (catalog / "index.json").read_bytes()
+
+                self.assertEqual(index_after, index_before)
+
     def test_truncated_pending_image_is_refused_before_anything_is_staged(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
         review = QualityReview(True, 4, 4, 4, 4, True, ())

@@ -55,7 +55,9 @@ def _run_git(repository: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _create_species(catalog: Path, taxon_id: int, common_name: str) -> Path:
+def _create_species(
+    catalog: Path, taxon_id: int, common_name: str, *, rebuild_index: bool = True
+) -> Path:
     slug = common_name.casefold().replace(" ", "-")
     directory = catalog / "species" / f"{taxon_id}-{slug}"
     directory.mkdir(parents=True)
@@ -123,7 +125,8 @@ def _create_species(catalog: Path, taxon_id: int, common_name: str) -> Path:
             },
         },
     )
-    rebuild_catalog_index(catalog)
+    if rebuild_index:
+        rebuild_catalog_index(catalog)
     return directory
 
 
@@ -1809,7 +1812,8 @@ class PublisherTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             catalog = Path(temporary) / "catalog"
             _create_species(catalog, 1, "Example Bird")
-            _create_species(catalog, 1, "Second Bird")
+            # The local reader refuses to index a duplicate, so only the files are made.
+            _create_species(catalog, 1, "Second Bird", rebuild_index=False)
 
             with self.assertRaisesRegex(CatalogPublishError, "duplicate taxon ID 1"):
                 validate_public_catalog(catalog)
