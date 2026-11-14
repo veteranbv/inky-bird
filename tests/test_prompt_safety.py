@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from inky_bird_frame.birds import BirdSpecies, TaxonContext
 from inky_bird_frame.models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from inky_bird_frame.prompts import plate_prompt, profile_prompt, review_prompt, strip_html
@@ -231,6 +233,7 @@ class UntrustedTextTests(unittest.TestCase):
 
 
 class CatalogCapTests(unittest.TestCase):
+    @pytest.mark.repository_catalog
     def test_caps_do_not_truncate_any_committed_profile(self) -> None:
         manifests = sorted(CATALOG.glob("*/manifest.json"))
         self.assertTrue(manifests)
