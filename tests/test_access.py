@@ -17,6 +17,7 @@ from inky_bird_frame.access import (
     BOOTSTRAP_SECONDS,
     LOGIN_WINDOW_SECONDS,
     MAX_LOGIN_FAILURES,
+    MAX_OIDC_TRANSACTIONS,
     MAX_OWNER_SESSIONS,
     OIDC_TRANSACTION_SECONDS,
     OWNER_ABSOLUTE_SECONDS,
@@ -830,3 +831,44 @@ def test_malformed_state_fails_closed(tmp_path: Path, value: object) -> None:
     os.chmod(store.path, 0o600)
     with pytest.raises(AccessError):
         store.owner_exists()
+
+
+def test_anonymous_sign_in_starts_cannot_lock_out_the_owner(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    anonymous = [
+        store.begin_oidc(now=NOW + timedelta(seconds=index))
+        for index in range(MAX_OIDC_TRANSACTIONS)
+    ]
+    later = NOW + timedelta(seconds=MAX_OIDC_TRANSACTIONS)
+    link, link_browser = store.begin_oidc(link_secret=local.secret, now=later)
+    confirm, confirm_browser = store.begin_oidc(
+        confirm_secret=local.secret, return_to_access=True, now=later
+    )
+    # Signed-in starts took the two oldest anonymous slots.
+    for tx, browser in anonymous[:2]:
+        with pytest.raises(AccessDeniedError, match="expired"):
+            store.consume_oidc(tx.state, browser, now=later)
+    # A further anonymous start replaces the oldest anonymous one, never a
+    # signed-in one, and is not refused.
+    newest, newest_browser = store.begin_oidc(now=later)
+    oldest, oldest_browser = anonymous[2]
+    with pytest.raises(AccessDeniedError, match="expired"):
+        store.consume_oidc(oldest.state, oldest_browser, now=later)
+    assert store.consume_oidc(link.state, link_browser, now=later) == link
+    assert store.consume_oidc(confirm.state, confirm_browser, now=later) == confirm
+    assert store.consume_oidc(newest.state, newest_browser, now=later) == newest
+    kept, kept_browser = anonymous[3]
+    assert store.consume_oidc(kept.state, kept_browser, now=later) == kept
+    # Anonymous starts still expire as before.
+    expired, expired_browser = anonymous[-1]
+    with pytest.raises(AccessDeniedError):
+        store.consume_oidc(
+            expired.state,
+            expired_browser,
+            now=expired_at(expired.created_at),
+        )
+
+
+def expired_at(created_at: float) -> datetime:
+    return datetime.fromtimestamp(created_at + OIDC_TRANSACTION_SECONDS, UTC)
