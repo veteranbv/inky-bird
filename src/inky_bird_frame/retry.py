@@ -119,6 +119,7 @@ class RetryStore:
         fixed_minutes: int | None = None,
         retry_at: datetime | None = None,
         species: BirdSpecies | None = None,
+        message: str | None = None,
     ) -> RetryRecord:
         previous = self.get(taxon_id)
         if species is not None and species.taxon_id != taxon_id:
@@ -149,11 +150,15 @@ class RetryStore:
                 else min(initial_minutes * (2 ** (attempts - 1)), maximum_minutes)
             )
             next_attempt_at = now + timedelta(minutes=delay)
+        error_text = message or str(error)
+        if not error_text.strip():
+            # The reader rejects empty error text, so never persist a record it refuses.
+            error_text = f"{type(error).__name__} without details"
         record = RetryRecord(
             taxon_id=taxon_id,
             attempts=attempts,
             error_type=type(error).__name__,
-            error=str(error),
+            error=error_text,
             first_failed_at=previous.first_failed_at if previous is not None else now,
             last_failed_at=now,
             next_attempt_at=next_attempt_at,
