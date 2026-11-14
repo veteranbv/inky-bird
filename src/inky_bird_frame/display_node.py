@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import random
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -23,6 +24,13 @@ from .selection import select_catalog_entry, select_shuffle_bag_entry
 from .timeutil import parse_utc_timestamp
 
 DISPLAY_STATE_SCHEMA_VERSION = 3
+# A detection jumps the queue only for a bird that is not among the last few
+# shown, and never more than twice in a row, so live detectors cannot starve
+# the configured rotation.
+RECENT_DISPLAY_WINDOW = 6
+MAX_CONSECUTIVE_DETECTION_DISPLAYS = 2
+_CACHE_FILE_NAME = re.compile(r"([0-9]+)-.+\.png")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,8 @@ class DisplayState:
     last_prioritized_detection_at: str | None = None
     prioritized_detection_taxa: tuple[int, ...] = ()
     last_display_size: tuple[int, int] | None = None
+    recent_taxon_ids: tuple[int, ...] = ()
+    consecutive_detection_displays: int = 0
 
 
 @contextmanager
@@ -130,6 +140,7 @@ def _latest_unseen_detection(
     entries: list[CatalogEntry],
     last_prioritized_at: str | None,
     prioritized_taxa: tuple[int, ...],
+    recently_shown: set[int],
 ) -> CatalogEntry | None:
     watermark = (
         _detection_datetime(last_prioritized_at, "display-node state")
@@ -139,7 +150,7 @@ def _latest_unseen_detection(
     candidates = [
         (_detection_datetime(entry.latest_detection_at, "controller catalog"), entry)
         for entry in entries
-        if entry.latest_detection_at is not None
+        if entry.latest_detection_at is not None and entry.taxon_id not in recently_shown
     ]
     consumed_taxa = set(prioritized_taxa)
     unseen = [
@@ -215,11 +226,16 @@ def _read_state(path: Path) -> DisplayState:
     last_prioritized_detection_at = raw.get("last_prioritized_detection_at")
     prioritized_detection_taxa = _state_taxon_ids(raw.get("prioritized_detection_taxa", []), path)
     last_display_size = _state_display_size(raw.get("last_display_size"), path)
+    recent_taxon_ids = _state_taxon_ids(raw.get("recent_taxon_ids", []), path)
+    consecutive_detection_displays = raw.get("consecutive_detection_displays", 0)
     if (
         not isinstance(next_index, int)
         or isinstance(next_index, bool)
         or next_index < 0
         or not isinstance(last_sha256, str)
+        or not isinstance(consecutive_detection_displays, int)
+        or isinstance(consecutive_detection_displays, bool)
+        or consecutive_detection_displays < 0
         or (
             last_taxon_id is not None
             and (
@@ -249,6 +265,8 @@ def _read_state(path: Path) -> DisplayState:
         last_prioritized_detection_at=last_prioritized_detection_at,
         prioritized_detection_taxa=prioritized_detection_taxa,
         last_display_size=last_display_size,
+        recent_taxon_ids=recent_taxon_ids,
+        consecutive_detection_displays=consecutive_detection_displays,
     )
 
 
@@ -264,6 +282,8 @@ def _write_state(
     last_prioritized_detection_at: str | None,
     prioritized_detection_taxa: list[int],
     last_display_size: tuple[int, int],
+    recent_taxon_ids: list[int],
+    consecutive_detection_displays: int,
 ) -> None:
     write_json_atomic(
         path,
@@ -278,6 +298,8 @@ def _write_state(
             "last_prioritized_detection_at": last_prioritized_detection_at,
             "prioritized_detection_taxa": prioritized_detection_taxa,
             "last_display_size": last_display_size,
+            "recent_taxon_ids": recent_taxon_ids,
+            "consecutive_detection_displays": consecutive_detection_displays,
         },
     )
 
@@ -300,11 +322,45 @@ def _advanced_priority_state(state: DisplayState, selected: CatalogEntry) -> tup
     return watermark, taxa
 
 
-def _evict_stale_cache_entries(current_image_path: Path, taxon_id: int) -> None:
-    for stale in current_image_path.parent.glob(f"{taxon_id}-*.png"):
-        if stale != current_image_path:
+def _recent_history(state: DisplayState) -> list[int]:
+    if state.recent_taxon_ids:
+        return list(state.recent_taxon_ids)
+    return [state.last_taxon_id] if state.last_taxon_id is not None else []
+
+
+def _recently_shown(history: list[int], entries: list[CatalogEntry]) -> set[int]:
+    window = min(RECENT_DISPLAY_WINDOW, len(entries) - 1)
+    if window <= 0:
+        return set()
+    active_taxa = {entry.taxon_id for entry in entries}
+    return set([taxon_id for taxon_id in history if taxon_id in active_taxa][-window:])
+
+
+def _history_after(history: list[int], taxon_id: int) -> list[int]:
+    updated = [*(item for item in history if item != taxon_id), taxon_id]
+    return updated[-RECENT_DISPLAY_WINDOW:]
+
+
+def _cached_image(image_path: Path, expected_sha256: str) -> bytes | None:
+    try:
+        cached = image_path.read_bytes()
+    except OSError:
+        return None
+    return cached if hashlib.sha256(cached).hexdigest() == expected_sha256 else None
+
+
+def _evict_stale_cache_entries(
+    current_image_path: Path, taxon_id: int, active_taxa: set[int]
+) -> None:
+    # Keep one plate per active bird; birds that left the catalog lose theirs.
+    for cached in current_image_path.parent.glob("*.png"):
+        match = _CACHE_FILE_NAME.fullmatch(cached.name)
+        if match is None or cached == current_image_path:
+            continue
+        cached_taxon_id = int(match.group(1))
+        if cached_taxon_id == taxon_id or cached_taxon_id not in active_taxa:
             with suppress(OSError):
-                stale.unlink(missing_ok=True)
+                cached.unlink(missing_ok=True)
 
 
 def _report_display_event(controller_url: str, event: str) -> None:
@@ -344,13 +400,16 @@ def run_display_cycle(
         shuffle_remaining = list(state.shuffle_remaining)
         shuffle_bag_remaining = list(state.shuffle_bag_remaining)
         shuffle_bag_seen = list(state.shuffle_bag_seen)
+        history = _recent_history(state)
         prioritized = (
             _latest_unseen_detection(
                 entries,
                 state.last_prioritized_detection_at,
                 state.prioritized_detection_taxa,
+                _recently_shown(history, entries),
             )
             if config.prioritize_latest_detection
+            and state.consecutive_detection_displays < MAX_CONSECUTIVE_DETECTION_DISPLAYS
             else None
         )
         prioritized_at = state.last_prioritized_detection_at
@@ -399,6 +458,10 @@ def run_display_cycle(
                 shuffle_remaining=shuffle_remaining,
                 rng=rng,
             )
+        recent_taxon_ids = _history_after(history, selected.taxon_id)
+        consecutive_detection_displays = (
+            state.consecutive_detection_displays + 1 if prioritized is not None else 0
+        )
         if (
             selected.display_sha256 == state.last_sha256
             and display_size == state.last_display_size
@@ -415,6 +478,8 @@ def run_display_cycle(
                 last_prioritized_detection_at=prioritized_at,
                 prioritized_detection_taxa=prioritized_taxa,
                 last_display_size=display_size,
+                recent_taxon_ids=recent_taxon_ids,
+                consecutive_detection_displays=consecutive_detection_displays,
             )
             # An unchanged selection means state.last_sha256 matches, and that
             # is only ever recorded after a successful panel update, so the
@@ -428,18 +493,27 @@ def run_display_cycle(
                 "selection_reason": ("latest_detection" if prioritized is not None else "rotation"),
             }
 
-        encoded_path = quote(selected.display_path, safe="/")
-        image_bytes = get_bytes(
-            f"{config.controller_url}/v1/assets/{encoded_path}?sha256={selected.display_sha256}",
-            60.0,
+        cache_dir = config.state_dir / "cache"
+        actual_hash = selected.display_sha256
+        # The catalog hash may name a cache file only once it is known to be hex.
+        image_path = (
+            cache_dir / f"{selected.taxon_id}-{actual_hash[:12]}.png"
+            if _SHA256_HEX.fullmatch(actual_hash) is not None
+            else None
         )
-        actual_hash = hashlib.sha256(image_bytes).hexdigest()
-        if actual_hash != selected.display_sha256:
-            raise CatalogError(
-                f"Downloaded asset checksum mismatch for {selected.common_name}: {actual_hash}"
+        if image_path is None or _cached_image(image_path, actual_hash) is None:
+            encoded_path = quote(selected.display_path, safe="/")
+            image_bytes = get_bytes(
+                f"{config.controller_url}/v1/assets/{encoded_path}?sha256={selected.display_sha256}",
+                60.0,
             )
-        image_path = config.state_dir / "cache" / f"{selected.taxon_id}-{actual_hash[:12]}.png"
-        write_bytes_atomic(image_path, image_bytes)
+            actual_hash = hashlib.sha256(image_bytes).hexdigest()
+            if actual_hash != selected.display_sha256:
+                raise CatalogError(
+                    f"Downloaded asset checksum mismatch for {selected.common_name}: {actual_hash}"
+                )
+            image_path = cache_dir / f"{selected.taxon_id}-{actual_hash[:12]}.png"
+            write_bytes_atomic(image_path, image_bytes)
         display_size = show_on_inky(image_path, display=display)
         _write_state(
             state_path,
@@ -452,8 +526,12 @@ def run_display_cycle(
             last_prioritized_detection_at=prioritized_at,
             prioritized_detection_taxa=prioritized_taxa,
             last_display_size=display_size,
+            recent_taxon_ids=recent_taxon_ids,
+            consecutive_detection_displays=consecutive_detection_displays,
         )
-        _evict_stale_cache_entries(image_path, selected.taxon_id)
+        _evict_stale_cache_entries(
+            image_path, selected.taxon_id, {entry.taxon_id for entry in entries}
+        )
         _report_display_event(config.controller_url, "success")
         return {
             "display_update": "sent",
