@@ -7,6 +7,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .errors import DataSourceError, InsufficientReferencesError, MissingDependencyError
@@ -200,6 +201,21 @@ def _validate_image(path: Path) -> None:
         raise DataSourceError(f"Downloaded reference is not a valid image: {path.name}") from exc
 
 
+PHOTO_GONE_STATUSES: Final = frozenset({404, 410})
+
+
+def _photo_specific(error: DataSourceError) -> bool:
+    """Whether a download failure concerns this photo rather than the photo host.
+
+    The downloader raises its own size and URL refusals without a cause, and
+    wraps every transport failure in its urllib or socket cause.
+    """
+    cause = error.__cause__
+    if isinstance(cause, HTTPError):
+        return cause.code in PHOTO_GONE_STATUSES
+    return cause is None
+
+
 def download_references(
     candidates: list[ReferenceCandidate],
     destination: Path,
@@ -207,9 +223,20 @@ def download_references(
 ) -> list[ReferencePhoto]:
     destination.mkdir(parents=True, exist_ok=True)
     spares = list(candidates.spares) if isinstance(candidates, ReferenceCandidates) else []
+    # At most one spare per selected photo, so a run of bad photos cannot turn
+    # into dozens of slow downloads.
+    fallbacks = len(candidates)
     references: list[ReferencePhoto] = []
     download_failure: DataSourceError | None = None
     invalid = 0
+
+    def next_spare() -> ReferenceCandidate | None:
+        nonlocal fallbacks
+        if not spares or fallbacks <= 0:
+            return None
+        fallbacks -= 1
+        return spares.pop(0)
+
     for index, selected in enumerate(candidates, start=1):
         candidate: ReferenceCandidate | None = selected
         while candidate is not None:
@@ -219,15 +246,19 @@ def download_references(
             try:
                 content = get_bytes(candidate.image_url, timeout_seconds)
             except DataSourceError as exc:
+                # Rate limits and outages affect every photo; stop so the
+                # job's normal retry backoff applies.
+                if not _photo_specific(exc):
+                    raise
                 download_failure = exc
-                candidate = spares.pop(0) if spares else None
+                candidate = next_spare()
                 continue
             write_bytes_atomic(path, content)
             try:
                 _validate_image(path)
             except DataSourceError:
                 invalid += 1
-                candidate = spares.pop(0) if spares else None
+                candidate = next_spare()
                 continue
             references.append(
                 ReferencePhoto(

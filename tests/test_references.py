@@ -4,13 +4,16 @@ import io
 import struct
 import unittest
 import zlib
+from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image
 
+from inky_bird_frame import http
 from inky_bird_frame.errors import DataSourceError, InsufficientReferencesError
 from inky_bird_frame.references import (
     REFERENCE_FIELDS,
@@ -44,6 +47,22 @@ def observation(
             }
         ],
     }
+
+
+def download_failure(error: BaseException) -> DataSourceError:
+    """Return the error the real downloader raises for one transport failure."""
+    url = "https://static.example/photos/9/large.png"
+    with patch("inky_bird_frame.http.build_opener") as build_opener:
+        build_opener.return_value.open.side_effect = error
+        try:
+            http.get_bytes(url)
+        except DataSourceError as exc:
+            return exc
+    raise AssertionError("the downloader did not fail")
+
+
+def http_error(code: int) -> HTTPError:
+    return HTTPError("https://static.example/photos/9/large.png", code, "error", Message(), None)
 
 
 class ReferenceTests(unittest.TestCase):
@@ -188,7 +207,7 @@ class ReferenceFallbackTests(unittest.TestCase):
     def test_bad_missing_or_oversized_photo_falls_back_to_next_candidate(self) -> None:
         responses: dict[int, bytes | DataSourceError] = {
             1: _png(),
-            2: DataSourceError("HTTP 404 from https://static.example/photos/2/large.png"),
+            2: download_failure(http_error(404)),
             3: _png_with_bad_idat_checksum(),
             4: DataSourceError("Response exceeds the supported size"),
             5: _png(),
@@ -240,13 +259,51 @@ class ReferenceFallbackTests(unittest.TestCase):
             TemporaryDirectory() as temporary,
             patch(
                 "inky_bird_frame.references.get_bytes",
-                side_effect=[_png(), DataSourceError("Timed out reading the photo")],
+                side_effect=[_png(), download_failure(TimeoutError())],
             ),
             self.assertRaises(DataSourceError) as raised,
         ):
             download_references(candidates, Path(temporary))
 
         self.assertNotIsInstance(raised.exception, InsufficientReferencesError)
+
+    def test_source_wide_download_failure_stops_without_fallback(self) -> None:
+        failures: dict[str, BaseException] = {
+            "rate limited": http_error(429),
+            "server error": http_error(503),
+            "unreachable": URLError("connection refused"),
+            "timed out": TimeoutError(),
+        }
+        payload = {"results": [observation(index, f"user-{index}", index) for index in range(1, 9)]}
+        for name, failure in failures.items():
+            with self.subTest(name), TemporaryDirectory() as temporary:
+                candidates = parse_reference_candidates(payload, 2)
+                fetch = MagicMock(side_effect=[_png(), download_failure(failure), _png(), _png()])
+                with (
+                    patch("inky_bird_frame.references.get_bytes", fetch),
+                    self.assertRaises(DataSourceError) as raised,
+                ):
+                    download_references(candidates, Path(temporary))
+
+                self.assertNotIsInstance(raised.exception, InsufficientReferencesError)
+                self.assertEqual(fetch.call_count, 2)
+
+    def test_photo_fallback_is_capped(self) -> None:
+        payload = {
+            "results": [observation(index, f"user-{index}", index) for index in range(1, 21)]
+        }
+        candidates = parse_reference_candidates(payload, 2)
+        missing = download_failure(http_error(404))
+        fetch = MagicMock(side_effect=[_png(), *([missing] * 19)])
+
+        with (
+            TemporaryDirectory() as temporary,
+            patch("inky_bird_frame.references.get_bytes", fetch),
+            self.assertRaises(DataSourceError),
+        ):
+            download_references(candidates, Path(temporary))
+
+        self.assertEqual(fetch.call_count, 4)
 
 
 if __name__ == "__main__":
