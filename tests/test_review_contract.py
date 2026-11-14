@@ -1,8 +1,10 @@
 """Conformance matrix for exact-version Codex review qualification.
 
-The positive fixture is real PR547 evidence (task links redacted); every
-counterexample mutates it, so each test isolates one failure mode against
-actual receipt formats rather than hand-written approximations.
+The positive fixture keeps the exact shape of real Codex receipts, with every
+repository, pull request, commit, comment and account value replaced by
+synthetic ones. Every counterexample mutates it, so each test isolates one
+failure mode against actual receipt formats rather than hand-written
+approximations.
 """
 
 from __future__ import annotations
@@ -30,12 +32,15 @@ else:
     _spec.loader.exec_module(rc)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex_review"
-HEAD = "5c2cd1412a42a909a1d4e00746cc72559d31e8f9"
+HEAD = "abcdef0123456789abcdef0123456789abcdef01"
 OTHER = "0" * 40
+OWNER = "example"
+REPOSITORY = "example/review-fixture"
+NUMBER = 7
 
 
 def _base() -> rc.Snapshot:
-    return cast(rc.Snapshot, json.loads((FIXTURES / "qualified_homelab_547.json").read_text()))
+    return cast(rc.Snapshot, json.loads((FIXTURES / "qualified_review_fixture.json").read_text()))
 
 
 def _shapes() -> dict[str, str]:
@@ -114,7 +119,7 @@ def test_no_request_blocks() -> None:
 
 @pytest.mark.parametrize(
     ("author", "author_type"),
-    [("github-actions[bot]", "Bot"), ("someone-else", "User"), ("veteranbv", "Bot")],
+    [("github-actions[bot]", "Bot"), ("someone-else", "User"), (OWNER, "Bot")],
 )
 def test_request_from_anyone_but_exact_owner_user_blocks(author: str, author_type: str) -> None:
     snapshot = _base()
@@ -211,7 +216,7 @@ def test_generated_request_body_is_a_valid_request() -> None:
         # Marker contradicting the commit the text names.
         f"@codex review {HEAD}\n\n" + rc.request_body(OTHER, "main", "d" * 40).split("\n\n", 2)[2],
         # Malformed marker never falls back to scanning the text.
-        f'@codex review {HEAD}\n\n<!-- homelab-review-request:v1 {{"head_sha":1}} -->',
+        rc.request_body(HEAD, "main", "d" * 40).rsplit(" {", 1)[0] + ' {"head_sha":1} -->',
     ],
 )
 def test_request_must_target_the_current_head(body: str) -> None:
@@ -408,9 +413,9 @@ def test_untrustworthy_receipt_blocks(mutation: str) -> None:
     elif mutation == "early":
         receipt["created_at"] = "2026-10-27T05:10:00Z"
     elif mutation == "other_commit":
-        receipt["body"] = receipt["body"].replace("5c2cd1412a", "0000000000")
+        receipt["body"] = receipt["body"].replace(HEAD[:10], "0000000000")
     elif mutation == "short_prefix":
-        receipt["body"] = receipt["body"].replace("5c2cd1412a", "5c2cd14")
+        receipt["body"] = receipt["body"].replace(HEAD[:10], HEAD[:7])
     else:
         receipt["author_type"] = "User"
     _blocked(snapshot, "code_review:receipt_missing")
@@ -490,13 +495,13 @@ def test_requests_not_in_the_owners_name_do_not_authorize(author: str, author_ty
 def test_owner_request_naming_head_by_commit_url_counts() -> None:
     """Real hand-typed shape: `head: https://github.com/<repo>/commit/<sha>`."""
     snapshot = _base()
-    body = f"@codex review\r\n\r\nhead: https://github.com/veteranbv/homelab/commit/{HEAD}"
+    body = f"@codex review\r\n\r\nhead: https://github.com/{REPOSITORY}/commit/{HEAD}"
     _request(snapshot)["body"] = body
     assert _verdict(snapshot).qualified
 
 
 def test_security_not_started_is_advisory() -> None:
-    """Real PR548 shape: code completed while security state was all null."""
+    """Observed shape: code completed while security state was all null."""
     snapshot = _base()
     _set_state(
         snapshot,
@@ -563,8 +568,8 @@ def _page(head: str, *, comments: list[dict[str, object]], next_page: bool) -> d
                     "commit": {
                         "oid": head,
                         "message": "Change",
-                        "author": {"email": "1+veteranbv@users.noreply.github.com"},
-                        "committer": {"email": "1+veteranbv@users.noreply.github.com"},
+                        "author": {"email": f"1+{OWNER}@users.noreply.github.com"},
+                        "committer": {"email": f"1+{OWNER}@users.noreply.github.com"},
                     }
                 }
             ],
@@ -577,7 +582,7 @@ def _page(head: str, *, comments: list[dict[str, object]], next_page: bool) -> d
     return {
         "data": {
             "repository": {
-                "owner": {"__typename": "User", "login": "veteranbv"},
+                "owner": {"__typename": "User", "login": OWNER},
                 "pullRequest": pull,
             }
         }
@@ -611,11 +616,11 @@ REOPENED: dict[str, object] = {"__typename": "ReopenedEvent", "createdAt": "2026
 def test_collect_pages_and_normalizes_bot_identity() -> None:
     pages = [
         _page(HEAD, comments=[_node(1, "chatgpt-codex-connector", "Bot")], next_page=True),
-        _page(HEAD, comments=[_node(2, "veteranbv", "User")], next_page=False),
+        _page(HEAD, comments=[_node(2, OWNER, "User")], next_page=False),
         _final(HEAD, [REOPENED]),
     ]
-    snapshot = rc.collect(lambda args: pages.pop(0), "veteranbv/homelab", 547)
-    assert [c["author"] for c in snapshot["comments"]] == [rc.BOT_LOGIN, "veteranbv"]
+    snapshot = rc.collect(lambda args: pages.pop(0), REPOSITORY, NUMBER)
+    assert [c["author"] for c in snapshot["comments"]] == [rc.BOT_LOGIN, OWNER]
     assert snapshot["unresolved_threads"] == 1
     assert snapshot["lifecycle_events"][0]["type"] == "ReopenedEvent"
     assert snapshot["complete"]
@@ -627,7 +632,7 @@ def test_collect_fails_closed_when_head_moves_between_pages() -> None:
         _page(OTHER, comments=[], next_page=False),
     ]
     with pytest.raises(rc.EvidenceError, match="changed while reading"):
-        rc.collect(lambda args: pages.pop(0), "veteranbv/homelab", 547)
+        rc.collect(lambda args: pages.pop(0), REPOSITORY, NUMBER)
 
 
 @pytest.mark.parametrize(
@@ -651,21 +656,21 @@ def test_collect_fails_closed_when_head_moves_between_pages() -> None:
 def test_collect_fails_closed_when_lifecycle_moves_during_pagination(
     events: list[dict[str, object]],
 ) -> None:
-    """flappy-bible#16 (Codex P2): identity alone missed resets between pages."""
+    """Identity alone missed resets between pages."""
     pages = [
         _page(HEAD, comments=[], next_page=True),
         _page(HEAD, comments=[], next_page=False),
         _final(HEAD, events),
     ]
     with pytest.raises(rc.EvidenceError, match="lifecycle changed"):
-        rc.collect(lambda args: pages.pop(0), "veteranbv/homelab", 547)
+        rc.collect(lambda args: pages.pop(0), REPOSITORY, NUMBER)
 
 
 def test_collect_marks_missing_cursor_incomplete() -> None:
     page = _page(HEAD, comments=[], next_page=True)
     comments = page["data"]["repository"]["pullRequest"]["comments"]  # type: ignore[index]
     comments["pageInfo"]["endCursor"] = None
-    snapshot = rc.collect(lambda args: page, "veteranbv/homelab", 547)
+    snapshot = rc.collect(lambda args: page, REPOSITORY, NUMBER)
     assert not snapshot["complete"]
     assert rc.evaluate(snapshot).reasons[0] == "evidence_incomplete"
 
@@ -710,8 +715,8 @@ def test_gate_entrypoint_answers_once_from_live_evidence(
     monkeypatch.setattr(contract, "collect", lambda gh, repo, number: snapshot)
     monkeypatch.setattr(gate, "_load_contract", lambda: contract)
     summary = tmp_path / "summary.md"
-    monkeypatch.setenv("GITHUB_REPOSITORY", "veteranbv/homelab")
-    monkeypatch.setenv("PR_NUMBER", "547")
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("PR_NUMBER", str(NUMBER))
     monkeypatch.setenv("PR_HEAD_SHA", event_head)
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     assert gate.main() == exit_code  # type: ignore[attr-defined]  # module loaded by path
@@ -733,7 +738,7 @@ def test_collect_treats_missing_or_null_data_as_incomplete(
     """Null connections must not read as 'no lifecycle resets' or 'no threads'."""
     page = _page(HEAD, comments=[], next_page=False)
     page["data"]["repository"]["pullRequest"][key] = value  # type: ignore[index]
-    snapshot = rc.collect(lambda args: page, "veteranbv/homelab", 547)
+    snapshot = rc.collect(lambda args: page, REPOSITORY, NUMBER)
     assert reason in snapshot["incomplete_reasons"]
     assert "evidence_incomplete" in rc.evaluate(snapshot).reasons
 
@@ -760,7 +765,7 @@ def test_completion_without_commit_identity_blocks() -> None:
     snapshot = _base()
     _set_state(snapshot, "code_review", commit_sha=None)
     code = _receipts(snapshot)[0]
-    code["body"] = code["body"].replace("**Reviewed commit:** `5c2cd1412a`", "")
+    code["body"] = code["body"].replace(f"**Reviewed commit:** `{HEAD[:10]}`", "")
     _blocked(snapshot, "code_review:summary_kind_unknown")
 
 
@@ -815,7 +820,7 @@ TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 def test_ai_attribution_in_a_commit_blocks(line: str) -> None:
     snapshot = _base()
     snapshot["commits"][0]["message"] += f"\n\n{line}"
-    _blocked(snapshot, "ai_attribution_in_commit:5c2cd14")
+    _blocked(snapshot, f"ai_attribution_in_commit:{HEAD[:7]}")
 
 
 @pytest.mark.parametrize("field", ["title", "body"])
@@ -845,7 +850,7 @@ def test_only_the_owner_or_dependabot_may_author_commits(email: str, blocked: bo
     snapshot = _base()
     snapshot["commits"][0]["author_email"] = email
     verdict = _verdict(snapshot)
-    assert ("non_owner_commit:5c2cd14" in verdict.reasons) is blocked
+    assert (f"non_owner_commit:{HEAD[:7]}" in verdict.reasons) is blocked
 
 
 def test_ordinary_generated_text_is_not_attribution() -> None:
