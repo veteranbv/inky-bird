@@ -439,6 +439,24 @@ def test_macos_failed_upgrade_reports_agents_it_could_not_restart(tmp_path: Path
     assert host.loaded_agents()["refresh"]["runtime"] == "old"
 
 
+def test_macos_rollback_keeps_the_runtime_of_an_agent_it_could_not_stop(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    host.fail("bootstrap-new:refresh", f"bootout:com.{host.family}.serve")
+
+    result = host.run("install-controller.sh", shell=MACOS_BASH)
+
+    assert result.returncode != 0
+    serve = host.loaded_agents()["serve"]
+    assert serve["runtime"] == "new"
+    runtimes = host.runtime_dirs()
+    assert len(runtimes) == 1
+    assert (runtimes[0] / ".venv/tag").read_text() == "new\n"
+    assert (runtimes[0] / "src/runtime-tag").read_text() == "new\n"
+    assert f"com.{host.family}.serve" in result.stderr
+    assert "may still be running" in result.stderr
+    assert "are not running" not in result.stderr
+
+
 def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
     host = Host(tmp_path, "Darwin")
     host.install_old_runtime("legacy")
@@ -684,6 +702,22 @@ def test_linux_rollback_stops_only_what_this_run_started(tmp_path: Path) -> None
     assert host.unit_state("controller.service") == {"active": False, "enabled": True}
     assert host.unit_state("refresh.timer") == {"active": False, "enabled": False}
     assert host.unit_state("generate.timer") == {"active": True, "enabled": True}
+
+
+def test_linux_rollback_keeps_the_runtime_of_a_service_it_could_not_stop(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    scheduler = f"{host.family}-scheduler.service"
+    host.fail(f"systemctl:restart:{host.family}-generate.timer", f"systemctl:disable:{scheduler}")
+
+    result = run_linux(host, f"{TIMER_UNITS} scheduler.service")
+
+    assert result.returncode != 0
+    assert host.unit_state("scheduler.service")["active"] is True
+    process = host.state_of("processes")[scheduler]
+    assert process["runtime"] == "new"
+    assert (Path(str(process["directory"])) / ".venv/tag").read_text() == "new\n"
+    assert scheduler in result.stderr and "may still" in result.stderr
+    assert "previous version is running again" not in result.stderr
 
 
 def test_linux_failure_after_install_says_the_new_version_is_running(tmp_path: Path) -> None:

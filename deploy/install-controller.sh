@@ -150,6 +150,7 @@ agents_recorded=false
 previously_loaded_labels=()
 stopped_labels=()
 unrestored=()
+still_running=()
 
 # Each runtime directory holds one source copy and the venv built from it.
 # ${app_dir}/.venv and ${app_dir}/src link to the active one, so the agents'
@@ -268,7 +269,7 @@ restore_agent() {
   if { [ "${stopped}" = true ] || [ "${loaded_before}" = false ]; } && \
       launchctl print "gui/${uid}/${agent}" >/dev/null 2>&1; then
     if ! launchctl bootout "gui/${uid}/${agent}"; then
-      unrestored+=("${agent}")
+      still_running+=("${agent}")
       return 0
     fi
   fi
@@ -308,13 +309,19 @@ cleanup() {
         restore_agent "${label}"
       done
     fi
-    if [ -n "${new_runtime}" ] && [ "${runtime_restored}" = true ]; then
+    # An agent this run started and could not stop still uses the new runtime.
+    if [ -n "${new_runtime}" ] && [ "${runtime_restored}" = true ] && \
+        [ "${#still_running[@]}" -eq 0 ]; then
       rm -rf "${new_runtime}"
+    fi
+    if [ "${#still_running[@]}" -gt 0 ]; then
+      echo "The upgrade failed and these agents could not be stopped, so they may still be running the new version: ${still_running[*]}." >&2
+      echo "Its runtime is kept in ${new_runtime}. Stop each with: launchctl bootout gui/${uid}/<agent>" >&2
     fi
     if [ "${#unrestored[@]}" -gt 0 ]; then
       echo "The upgrade failed and these agents are not running: ${unrestored[*]}." >&2
       echo "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist" >&2
-    elif [ "${#stopped_labels[@]}" -gt 0 ]; then
+    elif [ "${#stopped_labels[@]}" -gt 0 ] && [ "${#still_running[@]}" -eq 0 ]; then
       echo "The upgrade failed; the previous version is running again." >&2
     fi
   elif [ "${status}" -ne 0 ]; then

@@ -243,6 +243,18 @@ release_cycle_lock() {
   fi
 }
 
+# A service this run started and could not stop still uses the new runtime.
+keep_runtime_if_running() {
+  case "$1" in
+    *.service)
+      if systemctl is-active --quiet "$1"; then
+        runtime_restored=false
+        echo "Could not stop $1; it may still run the new version, kept in ${new_runtime}." >&2
+      fi
+      ;;
+  esac
+}
+
 restore_units() {
   local unit name
   local changed=false
@@ -264,6 +276,7 @@ restore_units() {
       if systemctl is-active --quiet "${name}" || systemctl is-enabled --quiet "${name}"; then
         sudo systemctl disable --now "${name}" || restored=false
       fi
+      keep_runtime_if_running "${name}"
       sudo rm -f "${unit_root}/${name}" || restored=false
     fi
   done
@@ -285,6 +298,7 @@ restore_units() {
     if ! contains "${name}" ${active_units[@]+"${active_units[@]}"} \
         ${stopped_units[@]+"${stopped_units[@]}"} && systemctl is-active --quiet "${name}"; then
       sudo systemctl stop "${name}" || restored=false
+      keep_runtime_if_running "${name}"
     fi
     if ! contains "${name}" ${enabled_units[@]+"${enabled_units[@]}"} && \
         systemctl is-enabled --quiet "${name}"; then
@@ -334,7 +348,8 @@ cleanup() {
     if [ "${#not_restarted[@]}" -gt 0 ]; then
       echo "The upgrade failed and these services are stopped: ${not_restarted[*]}." >&2
       echo "Start them with: sudo systemctl start ${not_restarted[*]}" >&2
-    elif [ "${#stopped_units[@]}" -gt 0 ] || [ "${controller_restarted}" = true ]; then
+    elif [ "${runtime_restored}" = true ] && \
+        { [ "${#stopped_units[@]}" -gt 0 ] || [ "${controller_restarted}" = true ]; }; then
       echo "The upgrade failed; the previous version is running again." >&2
     fi
   elif [ "${status}" -ne 0 ]; then
