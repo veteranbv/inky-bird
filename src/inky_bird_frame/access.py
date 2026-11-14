@@ -39,6 +39,9 @@ REMEMBERED_IDLE_SECONDS = 7 * 24 * 60 * 60
 REMEMBERED_ABSOLUTE_SECONDS = 30 * 24 * 60 * 60
 # Password confirmation authorizes account changes for ten minutes only.
 RECENT_AUTH_SECONDS = 10 * 60
+# Clocks on small controllers drift and may boot before time sync. Tolerate a
+# minute; a larger step back suspends sessions instead of deleting them.
+CLOCK_SKEW_SECONDS = 60
 OIDC_TRANSACTION_SECONDS = 10 * 60
 MAX_OIDC_TRANSACTIONS = 16
 BOOTSTRAP_SECONDS = 10 * 60
@@ -145,6 +148,31 @@ class AccessState:
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _recent(elapsed: float, limit: float) -> bool:
+    """Whether ``elapsed`` seconds is inside ``limit``, allowing for small clock skew."""
+    return -CLOCK_SKEW_SECONDS <= elapsed < limit
+
+
+def _usable(session: OwnerSession, now: float) -> bool:
+    # A session dated further ahead than the skew allowance means this clock
+    # is behind. It is not valid now, but it is kept until the clock is right.
+    return (
+        session.created_at - CLOCK_SKEW_SECONDS <= now
+        and now - session.last_active_at >= -CLOCK_SKEW_SECONDS
+    )
+
+
+def _find_session(state: AccessState, secret_hash: str, now: float) -> OwnerSession | None:
+    return next(
+        (
+            s
+            for s in state.sessions
+            if secrets.compare_digest(s.secret_hash, secret_hash) and _usable(s, now)
+        ),
+        None,
+    )
 
 
 def session_csrf_token(secret: str) -> str:
@@ -567,27 +595,28 @@ class AccessStore:
 
     def _prune(self, state: AccessState, now: float) -> None:
         counts = (len(state.sessions), len(state.login_failures), len(state.oidc_transactions))
+        # Only forward expiry deletes a session; see _usable for a clock behind.
         state.sessions = [
             s
             for s in state.sessions
-            if 0 <= now - s.last_active_at < s.idle_seconds
-            and s.created_at <= now < s.expires_at
+            if now - s.last_active_at < s.idle_seconds
+            and now < s.expires_at
             and (
                 (s.provider_id is None and self.password_login_enabled)
                 or (s.provider_id is not None and s.provider_id == self.oidc_provider_id)
             )
         ]
         state.login_failures = [
-            t for t in state.login_failures if 0 <= now - t < LOGIN_WINDOW_SECONDS
+            t for t in state.login_failures if _recent(now - t, LOGIN_WINDOW_SECONDS)
         ]
         state.oidc_transactions = [
             t
             for t in state.oidc_transactions
-            if 0 <= now - t.created_at < OIDC_TRANSACTION_SECONDS
+            if _recent(now - t.created_at, OIDC_TRANSACTION_SECONDS)
             and t.provider_id == self.oidc_provider_id
         ]
         if counts != (len(state.sessions), len(state.login_failures), len(state.oidc_transactions)):
-            # Expiry stays revoked if a later permission check fails or the clock rolls back.
+            # Expiry stays revoked if a later permission check fails or the clock moves back.
             self._save(state)
 
     def _credentials(
@@ -688,14 +717,7 @@ class AccessStore:
         with self._locked() as state:
             timestamp = (now or datetime.now(UTC)).timestamp()
             self._prune(state, timestamp)
-            session = next(
-                (
-                    s
-                    for s in state.sessions
-                    if secrets.compare_digest(s.secret_hash, _digest(secret))
-                ),
-                None,
-            )
+            session = _find_session(state, _digest(secret), timestamp)
             if session is None or (
                 csrf is not None and not secrets.compare_digest(session.csrf_hash, _digest(csrf))
             ):
@@ -717,16 +739,8 @@ class AccessStore:
                 raise AccessRateLimitError(
                     "Too many sign-in attempts; wait 15 minutes before trying again"
                 )
-            session = next(
-                (
-                    s
-                    for s in state.sessions
-                    if secrets.compare_digest(s.secret_hash, _digest(secret))
-                ),
-                None,
-            )
+            session = _find_session(state, _digest(secret), timestamp)
             if session is None:
-                self._save(state)
                 raise AccessDeniedError("Sign in again before changing your account")
             if state.owner_hash is None or not _verify_passphrase(state.owner_hash, passphrase):
                 state.login_failures.append(timestamp)
@@ -803,12 +817,10 @@ class AccessStore:
 
     @staticmethod
     def _recent_session(state: AccessState, secret_hash: str, timestamp: float) -> OwnerSession:
-        session = next(
-            (s for s in state.sessions if secrets.compare_digest(s.secret_hash, secret_hash)), None
-        )
+        session = _find_session(state, secret_hash, timestamp)
         if session is None:
             raise AccessDeniedError("Sign in again before changing account access")
-        if not 0 <= timestamp - session.authenticated_at < RECENT_AUTH_SECONDS:
+        if not _recent(timestamp - session.authenticated_at, RECENT_AUTH_SECONDS):
             raise AccessConfirmationRequiredError(
                 "Confirm your sign-in before changing account access"
             )
@@ -855,14 +867,7 @@ class AccessStore:
             if owner_hash:
                 remembered = self._recent_session(state, owner_hash, timestamp).remembered
             if confirmation_hash:
-                session = next(
-                    (
-                        s
-                        for s in state.sessions
-                        if secrets.compare_digest(s.secret_hash, confirmation_hash)
-                    ),
-                    None,
-                )
+                session = _find_session(state, confirmation_hash, timestamp)
                 if session is None:
                     raise AccessDeniedError("Sign in again before confirming your identity")
                 remembered = session.remembered
@@ -924,7 +929,6 @@ class AccessStore:
                 None,
             )
             if tx is None:
-                self._save(state)
                 raise AccessDeniedError(
                     "This sign-in request expired or was already used. Start sign-in again."
                 )
@@ -944,7 +948,7 @@ class AccessStore:
     ) -> SessionCredentials:
         with self._locked() as state:
             timestamp = (now or datetime.now(UTC)).timestamp()
-            if not 0 <= timestamp - authenticated_at < RECENT_AUTH_SECONDS:
+            if not _recent(timestamp - authenticated_at, RECENT_AUTH_SECONDS):
                 raise AccessDeniedError("Single sign-on needs recent provider authentication")
             self._prune(state, timestamp)
             if (
@@ -982,14 +986,7 @@ class AccessStore:
                 if allowed is None or not secrets.compare_digest(allowed, subject):
                     raise AccessDeniedError("This provider account is not linked to the Inky owner")
             if tx.confirmation_session_hash is not None:
-                rotated_session = next(
-                    (
-                        s
-                        for s in state.sessions
-                        if secrets.compare_digest(s.secret_hash, tx.confirmation_session_hash)
-                    ),
-                    None,
-                )
+                rotated_session = _find_session(state, tx.confirmation_session_hash, timestamp)
                 if rotated_session is None:
                     raise AccessDeniedError("This owner session ended; start sign-in again")
                 state.sessions.remove(rotated_session)

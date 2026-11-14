@@ -15,6 +15,7 @@ import pytest
 
 from inky_bird_frame.access import (
     BOOTSTRAP_SECONDS,
+    CLOCK_SKEW_SECONDS,
     LOGIN_WINDOW_SECONDS,
     MAX_LOGIN_FAILURES,
     MAX_OIDC_TRANSACTIONS,
@@ -577,7 +578,7 @@ def test_account_rotation_does_not_refresh_authentication(
             store.update_account(replacement.secret, "new-birder")
 
 
-@pytest.mark.parametrize("age", [RECENT_AUTH_SECONDS, -1, float("nan")])
+@pytest.mark.parametrize("age", [RECENT_AUTH_SECONDS, -CLOCK_SKEW_SECONDS - 1, float("nan")])
 def test_sso_return_rejects_old_or_invalid_authentication_before_mutating(
     tmp_path: Path, age: float
 ) -> None:
@@ -725,13 +726,49 @@ def test_owner_action_extends_idle_but_not_absolute_expiry(tmp_path: Path) -> No
         store.authenticate(secret, now=NOW + timedelta(seconds=OWNER_ABSOLUTE_SECONDS))
 
 
-def test_clock_rollback_cannot_resurrect_a_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("remembered", [False, True])
+def test_a_stale_boot_clock_suspends_sessions_without_deleting_them(
+    tmp_path: Path, remembered: bool
+) -> None:
+    store = AccessStore(tmp_path)
+    store.setup_owner("birder", PASSPHRASE)
+    credentials = store.login(PASSPHRASE, username="birder", remembered=remembered, now=NOW)
+    before = store.path.read_bytes()
+    # A controller without a real-time clock can boot days in the past.
+    for rollback in (timedelta(seconds=CLOCK_SKEW_SECONDS + 1), timedelta(days=400)):
+        with pytest.raises(AccessDeniedError):
+            store.authenticate(credentials.secret, active=True, now=NOW - rollback)
+        with pytest.raises(AccessDeniedError):
+            store.confirm_password(credentials.secret, PASSPHRASE, now=NOW - rollback)
+    assert store.path.read_bytes() == before
+    # Once time sync corrects the clock, the same sign-in works again.
+    assert (
+        AccessStore(tmp_path)
+        .authenticate(credentials.secret, now=NOW + timedelta(minutes=1))
+        .remembered
+        is remembered
+    )
+
+
+def test_small_clock_skew_is_tolerated(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path)
+    secret, csrf = _establish(store)
+    behind = NOW - timedelta(seconds=CLOCK_SKEW_SECONDS - 1)
+    store.authenticate(secret, csrf=csrf, active=True, now=behind)
+    store.authenticate(secret, now=NOW)
+    with patch("inky_bird_frame.access.datetime") as clock:
+        clock.now.return_value = behind
+        store.require_recent(secret)
+
+
+def test_clock_rollback_cannot_resurrect_an_expired_session(tmp_path: Path) -> None:
     store = AccessStore(tmp_path)
     secret, _ = _establish(store)
     with pytest.raises(AccessDeniedError):
-        store.authenticate(secret, now=NOW - timedelta(seconds=1))
-    with pytest.raises(AccessDeniedError):
-        AccessStore(tmp_path).authenticate(secret, now=NOW)
+        store.authenticate(secret, now=NOW + timedelta(seconds=OWNER_ABSOLUTE_SECONDS))
+    for moment in (NOW, NOW - timedelta(days=2)):
+        with pytest.raises(AccessDeniedError):
+            AccessStore(tmp_path).authenticate(secret, now=moment)
 
 
 def test_expiry_is_durable_even_after_the_clock_moves_back(tmp_path: Path) -> None:
@@ -892,3 +929,19 @@ def test_anonymous_sign_in_starts_never_displace_signed_in_ones(tmp_path: Path) 
         store.begin_oidc(now=later)
     for tx, browser in signed_in:
         assert store.consume_oidc(tx.state, browser, now=later) == tx
+
+
+def test_failed_unauthenticated_requests_do_not_rewrite_access_state(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    store.begin_oidc(now=NOW)
+    with patch("inky_bird_frame.access.write_json_atomic") as write:
+        for _ in range(3):
+            with pytest.raises(AccessDeniedError):
+                store.consume_oidc("forged-state", "forged-browser", now=NOW)
+            with pytest.raises(AccessDeniedError):
+                store.authenticate("forged-session-secret", now=NOW)
+            with pytest.raises(AccessDeniedError):
+                store.confirm_password("forged-session-secret", PASSPHRASE, now=NOW)
+        store.authenticate(local.secret, now=NOW)
+    write.assert_not_called()
