@@ -608,6 +608,29 @@ events = ["terminal_error"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+@pytest.mark.parametrize("content", [b"\xff", b"{not json", b"[]"])
+def test_doctor_reports_corrupt_notification_state(tmp_path: Path, content: bytes) -> None:
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = write_config(tmp_path, codex)
+    config.write_text(config.read_text() + NOTIFICATIONS_ENABLED)
+    (tmp_path / "workspace").mkdir()
+    state = tmp_path / "controller-state"
+    state.mkdir()
+    (state / "notifications.json").write_bytes(content)
+    passing = DiagnosticCheck("mock", CheckStatus.PASS, "ready")
+    with (
+        patch("inky_bird_frame.installation.platform.system", return_value="Darwin"),
+        patch("inky_bird_frame.installation._codex_auth_check", return_value=passing),
+        patch("inky_bird_frame.installation._launchd_checks", return_value=[passing]),
+        patch("inky_bird_frame.installation._controller_health_check", return_value=passing),
+    ):
+        report = doctor(InstallationRole.CONTROLLER, config)
+    check = {item.check_id: item for item in report.checks}["notification_dead_letters"]
+    assert check.status is CheckStatus.WARN
+    assert check.summary == "Notification delivery state could not be read"
+
+
 def test_doctor_reports_inaccessible_notification_state(tmp_path: Path) -> None:
     codex = tmp_path / "codex"
     codex.touch(mode=0o700)
