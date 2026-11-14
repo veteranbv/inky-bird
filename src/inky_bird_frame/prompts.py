@@ -371,10 +371,18 @@ field-journal plate for the species below.
 Species identity:
 - Common name, verbatim: "{species.common_name}"
 - Scientific name, verbatim: "{species.scientific_name}"
-- Family: the "family" value in the reference data
+- Family: the "family" value in the reference data, lettered on its own line beneath the
+  scientific name
 
-Species-specific field notes: the "field_notes" values in the reference data (length, wingspan,
-weight, habitat, behavior, field marks and plumage palette).
+Species-specific field notes: the "field_notes" values in the reference data. Letter them on the
+plate in this order, under these exact labels, each followed by its exact value:
+- "Length:", "Wingspan:" and "Weight:", followed by the "length", "wingspan" and "weight" values.
+- "Habitat:" followed by the "habitat" value.
+- "Behavior:" followed by the "behavior" value.
+- A "Field marks" heading, with each "field_marks" entry on its own line.
+- Color swatches, each labelled with one "plumage_palette" name.
+Never print a reference-data key name, such as "field_notes" or a lowercase "length:", on the
+plate.
 
 {data_block(data)}
 
@@ -390,9 +398,9 @@ identify each structure before editing it.{skimmer_bill}
 Style and composition:
 - Portrait 3:4 page on warm aged cream naturalist-notebook paper.
 - Fine graphite and confident ink linework with restrained transparent watercolor.
-- One full-body bird, large and centered-right, in a natural resting posture for the species
-  (perched, standing, swimming or in flight, as fits it). If perched, show a short plain twig or
-  bare ground and no other scenery.
+- One full-body bird, large and centered-right, in a natural resting posture for the species,
+  never in flight (perched, standing, clinging or swimming, as fits it). If perched or clinging,
+  show only a short plain twig, bare ground or a plain vertical surface, and no other scenery.
 - The bird remains the dominant page element and confidently uses the available space.
 - Left margin contains compact handwritten measurements and field marks.
 - Bottom margin contains a small wing-pattern study, a bill/head study, and color swatches.
@@ -402,9 +410,10 @@ Style and composition:
   number of roughly even, unlabeled interior ticks as visual subdivisions; their count and spacing
   do not encode measurement units. For a single value, use one dimension line labeled with that
   value. Use explicit units. Do not draw a zero-based or wider full-range axis, and do not add a
-  separate range bracket whose endpoints could disagree with the ruler. Label it
-  "BODY LENGTH: " followed by that exact length, and "SCHEMATIC — NOT TO SCALE". Keep it
-  separate from the bird; never imply that it measures the printed illustration.
+  separate range bracket whose endpoints could disagree with the ruler. Letter its label as the
+  words BODY LENGTH, a colon, a space and the exact "length" value, and add the words
+  "SCHEMATIC — NOT TO SCALE". Keep it separate from the bird; never imply that it measures the
+  printed illustration.
 - It should look like a carefully scanned scientific field-journal page, not Audubon, not a
   decorative poster, not a collage, and not photorealistic.
 - Quiet margins. No scenery, map, location, ZIP code, coordinates, date, logo, or watermark.

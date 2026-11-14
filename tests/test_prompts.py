@@ -228,7 +228,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Keep the accepted body proportions", prompt)
         self.assertIn("not a request to redraw a feature", normalized_prompt)
         self.assertIn("Do not shrink the bird", prompt)
-        self.assertIn('Label it "BODY LENGTH: " followed by that exact length', normalized_prompt)
+        self.assertIn(
+            "Letter its label as the words BODY LENGTH, a colon, a space and the exact"
+            ' "length" value',
+            normalized_prompt,
+        )
         self.assertIn('"length": "7 in"', prompt)
         self.assertIn("SCHEMATIC — NOT TO SCALE", prompt)
         self.assertIn("minimum at the bottom and maximum at the top", prompt)
@@ -426,7 +430,7 @@ def _rendered_prompts() -> list[str]:
 RENDERED_PROMPT_SHA256 = {
     "field-journal-v7": "84079b7217e69381494122bdee62257b08f9b216b2c9094e566e90239cf90816",
     "field-journal-v8": "9164b21301e4386d75ef442cb6a1db00f93443fbfbdd7f0bae9a45551975e877",
-    "field-journal-v9": "a968aa16fad7980af65de822ac3ba09660a29dd393fedda7283eeeac0297d1a5",
+    "field-journal-v9": "a46acbd1f99bd08ed9ee6e1d762e485083ca46e9c3b763446e73f9a5c4a14fee",
 }
 
 
@@ -446,12 +450,17 @@ class PlateWordingTests(unittest.TestCase):
 
         self.assertNotIn("natural perched posture", prompt)
         self.assertIn(
-            "a natural resting posture for the species (perched, standing, swimming or in flight,"
-            " as fits it)",
+            "a natural resting posture for the species, never in flight (perched, standing,"
+            " clinging or swimming, as fits it)",
             prompt,
         )
+        posture_options = prompt.split("never in flight (", 1)[1].split(")", 1)[0]
+        self.assertNotIn("flight", posture_options)
+        self.assertNotIn("or in flight", prompt)
         self.assertIn(
-            "If perched, show a short plain twig or bare ground and no other scenery.", prompt
+            "If perched or clinging, show only a short plain twig, bare ground or a plain vertical"
+            " surface, and no other scenery.",
+            prompt,
         )
         self.assertIn("Quiet margins. No scenery,", prompt)
 
@@ -569,6 +578,89 @@ class PlateWordingTests(unittest.TestCase):
                 Path("/elsewhere/generated.png"),
                 workspace=Path("/srv/example/workspace"),
             )
+
+
+class PlateLabelTests(unittest.TestCase):
+    LABEL_LINES = (
+        '- "Length:", "Wingspan:" and "Weight:", followed by the "length", "wingspan" and'
+        ' "weight" values.',
+        '- "Habitat:" followed by the "habitat" value.',
+        '- "Behavior:" followed by the "behavior" value.',
+        '- A "Field marks" heading, with each "field_marks" entry on its own line.',
+        '- Color swatches, each labelled with one "plumage_palette" name.',
+        'Never print a reference-data key name, such as "field_notes" or a lowercase "length:",'
+        " on the plate.",
+        '- Family: the "family" value in the reference data, lettered on its own line beneath'
+        " the scientific name",
+    )
+
+    @staticmethod
+    def _profile() -> SpeciesProfileData:
+        return SpeciesProfileData(
+            taxon_id=1,
+            common_name="Test Bird",
+            scientific_name="Avis test",
+            family="Sentinelidae",
+            measurements={"length": "11-12 qx", "wingspan": "21-22 qx", "weight": "31-32 qy"},
+            field_marks=["sentinel mark one", "sentinel mark two", "sentinel mark three", "four"],
+            habitat="Sentinel habitat",
+            behavior="Sentinel behavior",
+            palette=["sentinel red", "sentinel green", "sentinel blue"],
+            sources=[],
+        )
+
+    def _branches(self) -> dict[str, str]:
+        species, profile = _fixture_species(), self._profile()
+        return {
+            "first": plate_prompt(species, profile, [], Path("candidate.png")),
+            "regenerate": plate_prompt(
+                species,
+                profile,
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern",),
+            ),
+            "edit": plate_prompt(
+                species,
+                profile,
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern",),
+                has_correction_source=True,
+            ),
+            "skimmer": plate_prompt(_skimmer(), profile, [], Path("candidate.png")),
+        }
+
+    def test_every_plate_branch_names_the_printed_labels_outside_the_data(self) -> None:
+        for name, prompt in self._branches().items():
+            with self.subTest(branch=name):
+                outside = _normalized(prompt.split("<reference-data>", 1)[0])
+                for line in self.LABEL_LINES:
+                    self.assertIn(_normalized(line), outside)
+                self.assertIn(
+                    "Letter them on the plate in this order, under these exact labels, each"
+                    " followed by its exact value:",
+                    outside,
+                )
+
+    def test_label_instructions_carry_no_profile_value(self) -> None:
+        profile = self._profile()
+        values = [
+            profile["family"],
+            profile["habitat"],
+            profile["behavior"],
+            *profile["measurements"].values(),
+            *profile["field_marks"][:3],
+            *profile["palette"],
+        ]
+        for name, prompt in self._branches().items():
+            before, rest = prompt.split("<reference-data>\n", 1)
+            after = rest.split("\n</reference-data>", 1)[1]
+            for value in values:
+                with self.subTest(branch=name, value=value):
+                    self.assertNotIn(value, before + after)
 
 
 class PromptReferenceNumberingTests(unittest.TestCase):
