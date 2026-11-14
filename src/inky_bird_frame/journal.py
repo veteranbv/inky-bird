@@ -369,6 +369,14 @@ def _revision(value: object) -> int:
     return value
 
 
+JOURNAL_SCHEMA = 2
+PORTABLE_SCHEMA = 1
+
+
+def _newer_schema(value: object, supported: int) -> bool:
+    return type(value) is int and value > supported
+
+
 def read_journal(state_dir: Path) -> JournalState:
     path = state_dir / "journal.json"
     try:
@@ -383,6 +391,9 @@ def read_journal(state_dir: Path) -> JournalState:
         if len(encoded) > MAX_JOURNAL_BYTES:
             raise JournalError("Journal state exceeds the supported size")
         raw = json.loads(encoded)
+        # A newer release may add fields; never call its valid file damaged.
+        if isinstance(raw, dict) and _newer_schema(raw.get("schema_version"), JOURNAL_SCHEMA):
+            raise JournalError("This journal needs a newer Inky version")
         if not isinstance(raw, dict) or set(raw) != {"schema_version", "revision", "collections"}:
             raise JournalError("Journal state is invalid; restore its matching backup")
         if type(raw["schema_version"]) is not int or raw["schema_version"] not in {1, 2}:
@@ -979,6 +990,12 @@ class JournalService:
         }
 
     def prepare_collection_import(self, document: object) -> tuple[JournalCollection, str]:
+        if (
+            isinstance(document, dict)
+            and document.get("format") == "inky-collection"
+            and _newer_schema(document.get("schema_version"), PORTABLE_SCHEMA)
+        ):
+            raise JournalError("This collection needs a newer Inky version")
         if (
             not isinstance(document, dict)
             or set(document)

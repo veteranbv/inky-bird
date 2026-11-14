@@ -844,3 +844,29 @@ def test_collection_portability_routes_have_owner_and_csrf_guards(tmp_path: Path
         assert exported.status_code == 200
         assert exported.headers["cache-control"] == "no-store"
         assert "checklist_hash" not in exported.text
+
+
+def test_newer_journal_asks_for_a_newer_version(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    newer = {
+        "schema_version": 3,
+        "revision": 4,
+        "collections": [],
+        "notes": {"1": "A field a later release may add"},
+    }
+    write_json_atomic(controller.state_dir / "journal.json", newer, mode=0o600)
+    before = (controller.state_dir / "journal.json").read_bytes()
+    with pytest.raises(JournalError) as raised:
+        read_journal(controller.state_dir)
+    assert str(raised.value) == "This journal needs a newer Inky version"
+    assert "restore" not in str(raised.value)
+    assert (controller.state_dir / "journal.json").read_bytes() == before
+
+
+def test_newer_collection_export_asks_for_a_newer_version(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    document = {**portable_document(), "schema_version": 2, "note": "A later field"}
+    with pytest.raises(JournalError, match="^This collection needs a newer Inky version$"):
+        JournalService(controller).prepare_collection_import(document)
