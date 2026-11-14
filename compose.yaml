@@ -118,6 +118,8 @@ services:
       - path: ${INKY_BIRD_ENV:-./controller.env}
         required: false
     command: [scheduler, --config, /data/config.toml]
+    # Let an in-progress generation stop its agent and record the attempt.
+    stop_grace_period: 60s
     depends_on:
       bootstrap:
         condition: service_completed_successfully
