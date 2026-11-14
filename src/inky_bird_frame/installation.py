@@ -757,7 +757,7 @@ def _launchd_last_run_check(job: str, printed: str) -> DiagnosticCheck:
 
 def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
     try:
-        prefix = resolve_native_layout().family
+        prefix = resolve_native_layout(config_path=config.configuration_path).family
     except ValueError as exc:
         yield _fail("native_identity", str(exc))
         return
@@ -846,7 +846,7 @@ def _systemd_last_run_check(
 
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
     try:
-        prefix = resolve_native_layout().family
+        prefix = resolve_native_layout(config_path=config.configuration_path).family
     except ValueError as exc:
         yield _fail("native_identity", str(exc))
         return
@@ -980,7 +980,7 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
         checks.append(_display_hardware_check())
         if platform.system() == "Linux" and shutil.which("systemctl") is not None:
             try:
-                prefix = resolve_native_layout().family
+                prefix = resolve_native_layout(config_path=config.configuration_path).family
             except ValueError as exc:
                 checks.append(_fail("native_identity", str(exc)))
             else:

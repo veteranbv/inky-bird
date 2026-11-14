@@ -71,6 +71,33 @@ def _loaded(family: str, system: str) -> bool:
     return False
 
 
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root.expanduser().resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _display(path: Path, home: Path) -> str:
+    try:
+        return f"~/{path.relative_to(home)}"
+    except ValueError:
+        return str(path)
+
+
+def _ambiguity_message(found: dict[str, list[str]]) -> str:
+    listed = "; ".join(
+        f"{family}: {', '.join(evidence[:6])}" for family, evidence in sorted(found.items())
+    )
+    return (
+        "Both inky-bird and inky-bird-frame installations exist. No changes made. "
+        f"Found {listed}. Keep the installation you use. For the other one, remove its "
+        "services (see Uninstall in docs/installation.md) and move its folders aside, for "
+        "example by renaming them, once you no longer need their data. Then run this again."
+    )
+
+
 def resolve_native_layout(
     *,
     home: Path | None = None,
@@ -85,8 +112,11 @@ def resolve_native_layout(
     system = platform.system() if system is None else system
     if system not in ("Darwin", "Linux"):
         raise ValueError("Native setup supports macOS and Linux only")
-    present: set[str] = set()
     defaults: dict[str, tuple[Path, Path]] = {}
+    found: dict[str, list[str]] = {}
+    installed: set[str] = set()
+    owner: str | None = None
+    selected_config = None if config_path is None else config_path.expanduser().resolve()
     for family in (CANONICAL_NAME, LEGACY_NAME):
         support = (
             home
@@ -97,13 +127,18 @@ def resolve_native_layout(
         )
         app = home / "Services" / family
         defaults[family] = app, support
+        if selected_config is not None and _within(selected_config, support):
+            owner = family
         # A source checkout alone is not an installed runtime. Retain a support
         # root even if its config was lost: it may still contain private state.
         # A dangling link also counts; never silently adopt around it.
-        markers = [support, app / ".venv"]
+        data_markers = [support, app / ".venv"]
+        service_markers: list[Path] = []
         if system == "Darwin":
             for directory in (home / "Library/LaunchAgents", system_root / "Library/LaunchDaemons"):
-                markers.extend(directory / f"com.{family}.{job}.plist" for job in NATIVE_JOBS)
+                service_markers.extend(
+                    directory / f"com.{family}.{job}.plist" for job in NATIVE_JOBS
+                )
         else:
             for unit_directory in (
                 "etc/systemd/system",
@@ -111,19 +146,31 @@ def resolve_native_layout(
                 "lib/systemd/system",
             ):
                 for job in NATIVE_JOBS:
-                    markers.extend(
+                    service_markers.extend(
                         system_root / unit_directory / f"{family}-{job}.{suffix}"
                         for suffix in ("service", "timer")
                     )
-        if any(path.exists() or path.is_symlink() for path in markers) or (
-            check_services and _loaded(family, system)
-        ):
-            present.add(family)
+        evidence = [
+            _display(path, home)
+            for path in (*data_markers, *service_markers)
+            if path.exists() or path.is_symlink()
+        ]
+        has_services = any(path.exists() or path.is_symlink() for path in service_markers)
+        if not has_services and check_services and _loaded(family, system):
+            has_services = True
+            evidence.append("loaded services")
+        if evidence:
+            found[family] = evidence
+        if has_services:
+            installed.add(family)
+    present = set(found)
     if len(present) > 1:
-        raise ValueError(
-            "Both inky-bird and inky-bird-frame installations exist. No changes made; "
-            "resolve the duplicate native identities before setup or uninstall."
-        )
+        # Leftover data from an uninstalled family does not compete with the
+        # family whose services exist, or with the family the chosen config is in.
+        chosen = next(iter(installed)) if len(installed) == 1 else owner
+        if len(installed) > 1 or chosen is None or (owner is not None and owner != chosen):
+            raise ValueError(_ambiguity_message(found))
+        present = {chosen}
     family = next(iter(present), CANONICAL_NAME)
     default_app, default_support = defaults[family]
     selected_support = support_dir or default_support
