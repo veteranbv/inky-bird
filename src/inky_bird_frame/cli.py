@@ -555,7 +555,43 @@ def catalog_publish_command(args: argparse.Namespace) -> int:
                 event=NotificationEvent.PUBLICATION_ERROR,
             )
         raise
-    if not args.dry_run:
+    if args.dry_run:
+        print_result(result)
+        return 0
+    skipped = result.get("skipped")
+    skipped_items = skipped if isinstance(skipped, list) else []
+    if skipped_items:
+        # Only well-formed species directory names reach the notice; reasons can quote content.
+        shown: list[str] = []
+        for item in skipped_items:
+            name = item.get("species") if isinstance(item, dict) else None
+            if not isinstance(name, str):
+                continue
+            taxon, _, slug = name.partition("-")
+            if (
+                taxon.isdecimal()
+                and slug
+                and all(char.isalnum() or char == "-" for char in slug)
+                and slug.strip("-") == slug
+                and "--" not in slug
+            ):
+                shown.append(name)
+        listed = ", ".join(shown[:10])
+        hidden = len(skipped_items) - min(len(shown), 10)
+        if hidden and listed:
+            listed += f" and {hidden} more"
+        safe_record_degradation(
+            config,
+            key="catalog-publication",
+            title="Catalog publication is degraded",
+            body=(
+                f"Catalog publication left out {len(skipped_items)} species that did not pass "
+                f"the publication checks{': ' + listed if listed else ''}. "
+                "Check controller logs for details."
+            ),
+            event=NotificationEvent.PUBLICATION_ERROR,
+        )
+    else:
         safe_record_recovery(
             config,
             key="catalog-publication",
