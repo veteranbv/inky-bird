@@ -267,7 +267,14 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
             == 200
         )
         view = screen.get("/v1/screen/view").json()["data"]
-        assert screen.get(view["species"][0]["portrait_url"]).content == PNG
+        plate_url = view["species"][0]["portrait_url"]
+        assert (
+            plate_url.startswith("/v1/screen/plates/1?revision=") and "thumbnail" not in plate_url
+        )
+        plate = screen.get(plate_url)
+        assert plate.content == PNG and plate.headers["content-type"] == "image/png"
+        # The paired screen keeps the full plate; its revisioned URL may be cached.
+        assert plate.headers["cache-control"] == "private, max-age=31536000, immutable"
         assert screen.get("/v1/owner/journal").status_code == 401
         assert screen.get("/v1/screen/plates/999?revision=" + "a" * 64).status_code == 404
         assert screen.get("/v1/dashboard/art").status_code == 401
@@ -316,7 +323,10 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
         assert health.status_code == 200 and health.json()["ok"] is True
         assert health.json()["active_species"] == 1
         assert owner.get("/health").json()["active_species"] == 0
-        assert owner.get("/wall/v1/assets/species/1-robin/display.png").content == PNG
+        wall_asset = owner.get("/wall/v1/assets/species/1-robin/display.png")
+        assert wall_asset.content == PNG and wall_asset.headers["content-type"] == "image/png"
+        # Display-node assets are unchanged: the full approved bytes, never cached.
+        assert wall_asset.headers["cache-control"] == "no-store"
         report = owner.post("/wall/v1/display-success", json={"schema_version": 1})
         assert report.status_code == 200
         credentials = owner.post(

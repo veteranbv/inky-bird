@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
@@ -67,6 +68,7 @@ from .owner_operations import (
     OwnerOperations,
     execute_owner_operation,
 )
+from .plate_variants import PlateThumbnails
 from .presentation import GRANT_DAYS, PresentationAccess
 from .server import CatalogService
 from .settings import (
@@ -90,6 +92,34 @@ OWNER_CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
     "connect-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; "
     "frame-ancestors 'none'"
+)
+STATIC_PAGES = {
+    "/app": "index.html",
+    "/app/": "index.html",
+    "/app/app.js": "app.js",
+    "/app/app.css": "app.css",
+    "/app/journal.js": "journal.js",
+    "/app/ui.js": "ui.js",
+    "/app/icon-512.png": "icon-512.png",
+    "/app/icon-180.png": "icon-180.png",
+    "/app/icon-64.png": "icon-64.png",
+    "/app/icon-32.png": "icon-32.png",
+    "/favicon.ico": "favicon.ico",
+    "/app/settings.js": "settings.js",
+    "/app/imports.js": "imports.js",
+    "/app/viewer.js": "viewer.js",
+    "/app/presentation.js": "presentation.js",
+    "/app/frame-tools.js": "frame-tools.js",
+    "/app/work-status.js": "work-status.js",
+    "/screen": "screen.html",
+    "/app/access-guide": "access-guide.txt",
+}
+REVALIDATE = "no-cache"
+# Private browser cache only; the URL's revision is the plate checksum, so a
+# changed plate always has a different URL.
+IMMUTABLE_IMAGE = "private, max-age=31536000, immutable"
+REVISIONED_IMAGE = re.compile(
+    r"/v1/owner/journal/birds/\d+/(?:portrait|thumbnail)|/v1/screen/plates/\d+"
 )
 
 
@@ -156,6 +186,27 @@ def _result(data: object) -> JSONResponse:
     return JSONResponse({"ok": True, "data": data, "schema_version": 1})
 
 
+def _plate(request: Request, body: bytes, media_type: str, digest: str) -> Response:
+    """Let the browser keep a plate only when its URL names the bytes it receives."""
+    revisioned = request.query_params.getlist("revision") == [digest]
+    headers = {"Cache-Control": IMMUTABLE_IMAGE} if revisioned else None
+    return Response(body, media_type=media_type, headers=headers)
+
+
+def _cache_control(path: str, offered: list[bytes]) -> bytes:
+    allowed = (
+        REVALIDATE
+        if path in STATIC_PAGES
+        else IMMUTABLE_IMAGE
+        if REVISIONED_IMAGE.fullmatch(path)
+        else None
+    )
+    # Only a route that chose its allowed policy keeps it; everything else is no-store.
+    if allowed is not None and offered == [allowed.encode()]:
+        return allowed.encode()
+    return b"no-store"
+
+
 async def _json_body(
     request: Request,
     fields: set[str],
@@ -217,9 +268,11 @@ class OwnerBoundary:
                 or request.url.path in {"/v1/access", "/screen"}
             ):
                 headers = cast(list[tuple[bytes, bytes]], message.setdefault("headers", []))
+                offered = [value for key, value in headers if key == b"cache-control"]
+                headers[:] = [(key, value) for key, value in headers if key != b"cache-control"]
                 headers.extend(
                     [
-                        (b"cache-control", b"no-store"),
+                        (b"cache-control", _cache_control(request.url.path, offered)),
                         (b"referrer-policy", b"no-referrer"),
                         (b"x-content-type-options", b"nosniff"),
                         (b"content-security-policy", OWNER_CSP.encode()),
@@ -277,6 +330,10 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     community = CommunityHistory(config.state_dir)
     presentation = PresentationAccess(config.state_dir, journal)
     operations = OwnerOperations(config.state_dir)
+    thumbnails = PlateThumbnails(config.state_dir, journal)
+    # Decoding a full plate is the expensive step; bound it so a cold grid
+    # cannot occupy every worker thread.
+    thumbnail_slots = asyncio.Semaphore(2)
     assets = Path(__file__).parent / "web"
 
     @asynccontextmanager
@@ -882,7 +939,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 entry["portrait_sha256"]
             ]:
                 return _error(404, "not_found", "This approved image is outside the screen's view")
-            return Response(await run_in_threadpool(journal.portrait, id), media_type="image/png")
+            body = await run_in_threadpool(journal.portrait, id)
+            return _plate(request, body, "image/png", cast(str, entry["portrait_sha256"]))
         return _result(
             {
                 "name": grant.name,
@@ -1250,9 +1308,14 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         await authorized(request)
         taxon_id = request.path_params["taxon_id"]
         if request.path_params["kind"] == "portrait":
-            return Response(
-                await run_in_threadpool(journal.portrait, taxon_id), media_type="image/png"
-            )
+            body = await run_in_threadpool(journal.portrait, taxon_id)
+            return _plate(request, body, "image/png", hashlib.sha256(body).hexdigest())
+        if request.path_params["kind"] == "thumbnail":
+            thumbnail = await run_in_threadpool(thumbnails.cached, taxon_id)
+            if thumbnail is None:
+                async with thumbnail_slots:
+                    thumbnail = await run_in_threadpool(thumbnails.generate, taxon_id)
+            return _plate(request, thumbnail.body, thumbnail.media_type, thumbnail.portrait_sha256)
         if request.path_params["kind"] == "profile":
             return _result(await run_in_threadpool(journal.profile, taxon_id))
         return _error(404, "not_found", "This bird page does not exist")
@@ -1406,34 +1469,31 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     async def page(request: Request) -> Response:
         from starlette.responses import FileResponse
 
-        filename = {
-            "/app": "index.html",
-            "/app/": "index.html",
-            "/app/app.js": "app.js",
-            "/app/app.css": "app.css",
-            "/app/journal.js": "journal.js",
-            "/app/ui.js": "ui.js",
-            "/app/icon-512.png": "icon-512.png",
-            "/app/icon-180.png": "icon-180.png",
-            "/app/icon-64.png": "icon-64.png",
-            "/app/icon-32.png": "icon-32.png",
-            "/favicon.ico": "favicon.ico",
-            "/app/settings.js": "settings.js",
-            "/app/imports.js": "imports.js",
-            "/app/viewer.js": "viewer.js",
-            "/app/presentation.js": "presentation.js",
-            "/app/frame-tools.js": "frame-tools.js",
-            "/app/work-status.js": "work-status.js",
-            "/screen": "screen.html",
-            "/app/access-guide": "access-guide.txt",
-        }[request.url.path]
+        filename = STATIC_PAGES[request.url.path]
+        path = assets / filename
+        download = None
         if filename == "access-guide.txt":
-            guide = assets / filename
-            if not guide.is_file():
+            download = "Inky-access-guide.md"
+            if not path.is_file():
                 # Editable installs use the same source document that a wheel bundles.
-                guide = Path(__file__).resolve().parents[2] / "docs" / "browser-access.md"
-            return FileResponse(guide, media_type="text/plain", filename="Inky-access-guide.md")
-        return FileResponse(assets / filename)
+                path = Path(__file__).resolve().parents[2] / "docs" / "browser-access.md"
+        response = FileResponse(
+            path,
+            stat_result=await run_in_threadpool(os.stat, path),
+            headers={"Cache-Control": REVALIDATE},
+            media_type="text/plain" if download else None,
+            filename=download,
+        )
+        # FileResponse sets an ETag but never answers a conditional request itself.
+        tags = request.headers.get("if-none-match", "")
+        if tags.strip() == "*" or response.headers["etag"] in {
+            tag.strip().removeprefix("W/") for tag in tags.split(",")
+        }:
+            return Response(
+                status_code=304,
+                headers={"ETag": response.headers["etag"], "Cache-Control": REVALIDATE},
+            )
+        return response
 
     async def root(request: Request) -> Response:
         return RedirectResponse("/app")

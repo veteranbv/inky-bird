@@ -646,7 +646,8 @@ def test_bundled_owner_page_uses_external_assets_and_cannot_frame(tmp_path: Path
         for path in ("/app", "/app/app.js", "/app/app.css"):
             response = client.get(path)
             assert response.status_code == 200
-            assert response.headers["cache-control"] == "no-store"
+            # Static files revalidate through their ETag; owner data stays no-store.
+            assert response.headers["cache-control"] == "no-cache"
             assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
         for size in (512, 180, 64, 32):
             icon = client.get(f"/app/icon-{size}.png")
