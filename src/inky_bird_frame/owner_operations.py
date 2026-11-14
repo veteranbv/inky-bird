@@ -118,13 +118,18 @@ def _encode(receipts: list[OperationReceipt]) -> bytes:
     ).encode()
 
 
+# Column names such as "State/Province" contain a slash; only path- or
+# URL-shaped tokens mark a message as unsafe.
+_PATH_OR_URL = re.compile(r"://|(?:^|[\s:'\"(=])(?:/|~/|\\\\|[A-Za-z]:\\)")
+
+
 def _safe_import_message(kind: str, exc: Exception) -> bool:
     # History parsers name only columns, rows and file names. Lookups during an
     # import can name a local path or upstream URL; those stay generic.
     return (
         kind in IMPORT_KINDS
         and isinstance(exc, DataSourceError)
-        and not any(char in str(exc) for char in "/\\")
+        and _PATH_OR_URL.search(str(exc)) is None
         and len(str(exc)) <= 512
     )
 
@@ -230,17 +235,19 @@ class OwnerOperations:
                 "do not replay unknown work."
             ) from exc
 
-    def _write(self, receipts: list[OperationReceipt], *, keep: str | None = None) -> None:
+    def _write(
+        self, receipts: list[OperationReceipt], *, keep: frozenset[str] = frozenset()
+    ) -> None:
         """Write receipts, evicting the oldest finished ones to fit the store.
 
-        Pending and running receipts, and ``keep`` (the receipt this request
-        created or is finishing), are never evicted.
+        Pending and running receipts, and ``keep`` (receipts this request
+        created, is finishing or is polling), are never evicted.
         """
         evictable = sorted(
             (
                 index
                 for index, row in enumerate(receipts)
-                if row.status not in {"pending", "running"} and row.operation_id != keep
+                if row.status not in {"pending", "running"} and row.operation_id not in keep
             ),
             key=lambda index: (
                 cast(datetime, parse_utc_timestamp(receipts[index].updated_at)),
@@ -279,10 +286,10 @@ class OwnerOperations:
                 raise OwnerOperationError("Owner receipt was removed while work was running")
             self._write(
                 [receipt if row.operation_id == receipt.operation_id else row for row in receipts],
-                keep=receipt.operation_id,
+                keep=frozenset({receipt.operation_id}),
             )
 
-    def _reconcile(self) -> None:
+    def _reconcile(self, polled: str | None = None) -> None:
         if self._active:
             return
         try:
@@ -313,7 +320,12 @@ class OwnerOperations:
                             if row.status in {"pending", "running"}
                             else row
                             for row in receipts
-                        ]
+                        ],
+                        keep=frozenset(
+                            row.operation_id
+                            for row in receipts
+                            if row.status in {"pending", "running"} or row.operation_id == polled
+                        ),
                     )
         except OwnerOperationBusyError:
             # Another service process holds the operation lock. It owns recovery.
@@ -344,7 +356,7 @@ class OwnerOperations:
 
     def status(self, operation_id: str | None = None) -> dict[str, object]:
         with self._guard:
-            self._reconcile()
+            self._reconcile(operation_id)
             with catalog_state_lock(self.state_dir):
                 receipts = self._read()
         if operation_id is not None:

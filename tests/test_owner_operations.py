@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -18,6 +19,7 @@ from starlette.testclient import TestClient
 from inky_bird_frame import settings as settings_module
 from inky_bird_frame.config import load_config
 from inky_bird_frame.controller import exclusive_cycle_lock
+from inky_bird_frame.ebird_archive import CSV_FILENAME, preview_ebird_checklists
 from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.owner_operations import (
     MAX_RECEIPT_BYTES,
@@ -511,6 +513,35 @@ def test_finished_receipt_survives_eviction_after_the_clock_moves_back(tmp_path:
         worker.close()
 
 
+def test_status_poll_after_a_crash_never_evicts_the_polled_receipt(tmp_path: Path) -> None:
+    # A store just under the size limit with one receipt left running by a
+    # crash. Recording "Interrupted" during a status poll must not evict the
+    # finished receipt being polled, even though it is the oldest.
+    seeded = _finished_receipts(60, result_bytes=16_000, age=timedelta(hours=1))
+    rows = cast(list[dict[str, object]], seeded["receipts"])
+    rows[-1].update(status="running", result=None)
+
+    def size() -> int:
+        return len(json.dumps(seeded, indent=2, sort_keys=True).encode())
+
+    first = cast(dict[str, object], rows[0]["result"])
+    first["message"] = str(first["message"]) + "x" * (MAX_RECEIPT_BYTES - 16 - size())
+    assert MAX_RECEIPT_BYTES - 32 < size() <= MAX_RECEIPT_BYTES
+    path = tmp_path / "owner-operations.json"
+    path.write_text(json.dumps(seeded, indent=2, sort_keys=True))
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        polled = worker.status(str(rows[0]["operation_id"]))
+        assert polled["status"] == "succeeded"
+        saved = {row["operation_id"]: row for row in json.loads(path.read_text())["receipts"]}
+        assert saved[rows[0]["operation_id"]]["status"] == "succeeded"
+        assert saved[rows[-1]["operation_id"]]["status"] == "interrupted"
+        assert len(path.read_bytes()) <= MAX_RECEIPT_BYTES
+    finally:
+        worker.close()
+
+
 def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
     worker = OwnerOperations(tmp_path)
     old = datetime.now(UTC) - timedelta(days=1)
@@ -527,7 +558,7 @@ def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
         for index in range(MAX_RECEIPTS)
     ]
     newest = replace(rows[-1], operation_id="f" * 32, key_hash="f" * 64, status="pending")
-    worker._write([*rows, newest], keep=newest.operation_id)
+    worker._write([*rows, newest], keep=frozenset({newest.operation_id}))
     kept = {row.operation_id for row in worker._read()}
     assert rows[0].operation_id in kept  # oldest, but still running
     assert newest.operation_id in kept
@@ -535,7 +566,7 @@ def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
     assert len(kept) == MAX_RECEIPTS
     unfinished = [replace(row, status="running") for row in rows]
     with pytest.raises(OwnerOperationError, match="unfinished"):
-        worker._write([*unfinished, newest], keep=newest.operation_id)
+        worker._write([*unfinished, newest], keep=frozenset({newest.operation_id}))
     worker.close()
 
 
@@ -579,5 +610,55 @@ def test_receipts_keep_safe_import_and_settings_messages(
         else:
             assert message == shown
         assert cast(dict[str, object], result["result"])["error_type"] == type(error).__name__
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Could not open ~/exports/MyEBirdData.csv",
+        "Lookup failed at https://api.example.test/v2/ref",
+        "Invalid taxonomy crosswalk: C:\\state\\crosswalk.json",
+        "Invalid taxonomy crosswalk (/state/crosswalk.json)",
+    ],
+)
+def test_receipts_hide_import_messages_that_name_a_path_or_url(
+    tmp_path: Path, message: str
+) -> None:
+    worker = OwnerOperations(tmp_path)
+
+    def fail() -> dict[str, object]:
+        raise DataSourceError(message)
+
+    try:
+        receipt = worker.submit(
+            "import-preview", key="path-message-synthetic", inputs={}, execute=fail
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        shown = str(cast(dict[str, object], result["result"])["message"])
+        assert shown.startswith("The operation did not finish.")
+    finally:
+        worker.close()
+
+
+def test_receipts_show_real_missing_column_list_from_a_wrong_upload(tmp_path: Path) -> None:
+    archive = tmp_path / "upload.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(CSV_FILENAME, "Name,Value\na,b\n")
+    worker = OwnerOperations(tmp_path / "state")
+    try:
+        receipt = worker.submit(
+            "import-preview",
+            key="wrong-upload-synthetic",
+            inputs={},
+            execute=lambda: {"rows": len(preview_ebird_checklists(archive))},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "failed"
+        message = str(cast(dict[str, object], result["result"])["message"])
+        assert message.startswith("eBird archive is missing required columns: ")
+        assert "State/Province" in message
+        assert "Date" in message
     finally:
         worker.close()
