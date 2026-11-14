@@ -1,6 +1,7 @@
 // Saved birds, collections, history imports and operation outcomes.
 // Run through journal.e2e.cjs only: phases run in its order and hand state
-// to later phases through t.
+// to later phases through t. historyAndCollections leaves t.trip and
+// t.imported, which frame and manage phases read.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -310,3 +311,8 @@ async function largeUpload(t) {
 }
 
 module.exports = { historyAndCollections, collectionFilter, community, savedBirds, largeUpload };
+
+if (require.main === module) {
+  console.error('Run tests/web/journal.e2e.cjs');
+  process.exitCode = 2;
+}

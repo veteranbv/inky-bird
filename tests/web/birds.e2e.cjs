@@ -81,3 +81,8 @@ async function artDelivery(t) {
 }
 
 module.exports = { unreadableNotice, artDelivery };
+
+if (require.main === module) {
+  console.error('Run tests/web/journal.e2e.cjs');
+  process.exitCode = 2;
+}

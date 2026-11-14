@@ -1,6 +1,7 @@
 // Frame, Displays and paired screens.
 // Run through journal.e2e.cjs only: phases run in its order and hand state
-// to later phases through t.
+// to later phases through t. pairedScreen leaves t.screenContext and
+// t.replacement, which save and manage phases read.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -524,3 +525,8 @@ async function ownerFrame(t) {
 }
 
 module.exports = { pairedScreen, ownerFrame };
+
+if (require.main === module) {
+  console.error('Run tests/web/journal.e2e.cjs');
+  process.exitCode = 2;
+}

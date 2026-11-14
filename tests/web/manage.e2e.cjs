@@ -171,3 +171,8 @@ async function health(t) {
 }
 
 module.exports = { birdBuddySettings, candidates, integrations, health };
+
+if (require.main === module) {
+  console.error('Run tests/web/journal.e2e.cjs');
+  process.exitCode = 2;
+}
