@@ -48,7 +48,8 @@ def test_one_bad_entry_or_newer_field_does_not_silence_activity(tmp_path: Path) 
     assert view["available"] is True
     entries = view["entries"]
     assert isinstance(entries, dict)
-    assert set(entries) == {"refresh"}
+    assert set(entries) == {"refresh", "generation"}
+    assert entries["generation"] == {"status": "unknown"}
     assert entries["refresh"]["status"] == "succeeded"
     assert "added_in_a_later_release" not in entries["refresh"]
 
@@ -56,3 +57,22 @@ def test_one_bad_entry_or_newer_field_does_not_silence_activity(tmp_path: Path) 
     with activity_run(tmp_path, "generation"):
         pass
     assert _entries(tmp_path)["generation"]["status"] == "succeeded"
+
+
+def test_one_invalid_field_keeps_the_rest_of_its_entry(tmp_path: Path) -> None:
+    with activity_run(tmp_path, "refresh"):
+        pass
+    path = tmp_path / "activity.json"
+    raw = json.loads(path.read_text())
+    success = raw["entries"]["refresh"]["last_success_at"]
+    raw["entries"]["refresh"]["finished_at"] = "not a time"
+    raw["entries"]["refresh"]["species_count"] = -3
+    path.write_text(json.dumps(raw))
+    path.chmod(0o600)
+
+    entries = read_activity(tmp_path)["entries"]
+    assert isinstance(entries, dict)
+    refresh = entries["refresh"]
+    assert refresh["status"] == "succeeded"
+    assert refresh["last_success_at"] == success
+    assert "finished_at" not in refresh and "species_count" not in refresh

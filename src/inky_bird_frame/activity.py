@@ -85,14 +85,16 @@ def _rows(state_dir: Path) -> dict[str, dict[str, object]]:
     rows = raw.get("entries")
     if raw.get("schema_version") != 1 or not isinstance(rows, dict):
         raise CatalogError("Activity state is invalid")
-    # Observations only: drop an invalid entry, or a field from a newer
-    # release, instead of hiding every other entry.
+    # Observations only: drop an invalid value, or a field from a newer
+    # release, instead of hiding the rest of its entry or every other entry.
     return {
-        key: {field: value for field, value in row.items() if field in _FIELDS}
+        key: {
+            field: value
+            for field, value in row.items()
+            if field in _FIELDS and _valid(field, value)
+        }
         for key, row in rows.items()
-        if key in _KEYS
-        and isinstance(row, dict)
-        and all(_valid(field, value) for field, value in row.items() if field in _FIELDS)
+        if key in _KEYS and isinstance(row, dict)
     }
 
 
