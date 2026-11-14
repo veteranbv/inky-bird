@@ -123,6 +123,32 @@ def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _snapshot_catalog(source: Path, destination: Path) -> None:
+    """Snapshot the live catalog while holding its lock, without copying every plate.
+
+    Catalog files are only ever replaced by rename, never rewritten in place, so a hard
+    link keeps the snapshot's bytes; where linking is not possible the files are copied.
+    """
+    linking = True
+
+    def place(source_file: str, destination_file: str) -> object:
+        nonlocal linking
+        if linking:
+            try:
+                os.link(source_file, destination_file, follow_symlinks=False)
+                return destination_file
+            except OSError:
+                linking = False
+        return shutil.copy2(source_file, destination_file, follow_symlinks=False)
+
+    shutil.copytree(source, destination, symlinks=True, copy_function=place)
+    # Snapshot directories are its own: keep them writable, so removing the snapshot never
+    # resorts to changing permissions on a file it shares with the live catalog.
+    for directory, _, _ in os.walk(destination):
+        mode = os.lstat(directory).st_mode
+        os.chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU)
+
+
 def _abandoned_publish_work(work_parent: Path) -> tuple[Path, ...]:
     return tuple(
         candidate
@@ -1623,11 +1649,7 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                 # Approval staging debris would fail the snapshot root check.
                 clear_catalog_staging(config.controller.catalog_dir)
                 try:
-                    shutil.copytree(
-                        config.controller.catalog_dir,
-                        source_snapshot,
-                        symlinks=True,
-                    )
+                    _snapshot_catalog(config.controller.catalog_dir, source_snapshot)
                 except FileNotFoundError as exc:
                     raise CatalogPublishError("Approved local catalog does not exist") from exc
             result["skipped"] = _exclude_unpublishable_species(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -34,6 +35,7 @@ from inky_bird_frame.publisher import (
     _git,
     _remote_repository,
     _run,
+    _snapshot_catalog,
     _validate_checkout,
     _validate_image,
     publication_privacy_patterns,
@@ -1808,6 +1810,48 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaisesRegex(CatalogPublishError, "Local path"):
                 validate_public_catalog(catalog)
 
+    def test_catalog_snapshot_links_files_instead_of_copying_them(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "catalog"
+            directory = _create_species(catalog, 1, "Example Bird")
+            snapshot = root / "snapshot"
+            (directory / "portrait.png").chmod(0o444)
+            directory.chmod(0o555)
+            try:
+                _snapshot_catalog(catalog, snapshot)
+            finally:
+                directory.chmod(0o755)
+
+            copied = snapshot / "species/1-example-bird/portrait.png"
+            self.assertTrue(copied.samefile(directory / "portrait.png"))
+            shutil.rmtree(snapshot / "species")
+            self.assertEqual(stat.S_IMODE((directory / "portrait.png").stat().st_mode), 0o444)
+            shutil.rmtree(snapshot)
+            _snapshot_catalog(catalog, snapshot)
+            self.assertEqual(len(validate_public_catalog(snapshot)), 1)
+            write_json_atomic(snapshot / "index.json", {"species": []})
+            self.assertEqual(len(validate_public_catalog(catalog)), 1)
+
+    def test_catalog_snapshot_copies_when_files_cannot_be_linked(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "catalog"
+            directory = _create_species(catalog, 1, "Example Bird")
+            snapshot = root / "snapshot"
+
+            with patch(
+                "inky_bird_frame.publisher.os.link",
+                side_effect=OSError(errno.EXDEV, "Cross-device link"),
+            ) as link:
+                _snapshot_catalog(catalog, snapshot)
+
+            copied = snapshot / "species/1-example-bird/portrait.png"
+            self.assertFalse(copied.samefile(directory / "portrait.png"))
+            self.assertEqual(copied.read_bytes(), (directory / "portrait.png").read_bytes())
+            self.assertEqual(len(validate_public_catalog(snapshot)), 1)
+            self.assertEqual(link.call_count, 1)
+
     def test_rejects_duplicate_taxon_ids(self) -> None:
         with TemporaryDirectory() as temporary:
             catalog = Path(temporary) / "catalog"
@@ -2057,9 +2101,15 @@ class PublicationRunTests(unittest.TestCase):
             _create_species(catalog, 1, "Good Bird")
             broken = _create_species(catalog, 2, "Broken Bird")
             Image.new("RGB", (1600, 1200), "black").save(broken / "display.png")
+            local_index = (catalog / "index.json").read_bytes()
 
             with _github(fake):
                 result = run_catalog_publish(config)
+
+            # The snapshot shares files with the live catalog; dropping a species there
+            # must leave the local catalog as it was.
+            self.assertEqual((catalog / "index.json").read_bytes(), local_index)
+            self.assertTrue((broken / "manifest.json").is_file())
 
             self.assertTrue(result["merged"])
             published = [item["taxon_id"] for item in _result_items(result, "published")]
