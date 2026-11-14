@@ -6,15 +6,16 @@ import fcntl
 import json
 import stat
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Final
 from urllib.error import HTTPError
 
 from .birds import BirdBuddySpecies, ObservationWindow
 from .errors import DataSourceError
+from .history_summary import SpeciesSummary, load_summary, parse_species_rows, write_summary
 from .http import post_json, write_bytes_atomic, write_json_atomic
 from .timeutil import parse_utc_timestamp
 
@@ -30,6 +31,7 @@ BIRDBUDDY_MAX_CONFIRMED_PAGES: Final = 100
 BIRDBUDDY_HISTORY_DAYS: Final = 366
 AUTH_SCHEMA_VERSION: Final = 1
 HISTORY_SCHEMA_VERSION: Final = 1
+SUMMARY_SOURCE: Final = "birdbuddy"
 AUTHORIZED_ACCESS_ATTESTATION: Final = (
     "I confirm that Bird Buddy has authorized automated API access for this account."
 )
@@ -1855,7 +1857,24 @@ def _update_history(
                 not previous_path.exists() or _history_content(histories) != content_before
             ):
                 write_bytes_atomic(previous_path, path.read_bytes(), mode=0o600)
-            write_json_atomic(path, _history_payload(histories), mode=0o600)
+            payload = _history_payload(histories)
+            write_json_atomic(path, payload, mode=0o600)
+            feeders = payload["feeders"]
+            # Summarize what was written, in its stored order, so a rebuild from
+            # the file gives the same rows. Never fail a sync whose history is
+            # saved: the next read rebuilds a missing summary.
+            with suppress(DataSourceError):
+                if isinstance(feeders, dict):
+                    write_summary(
+                        path,
+                        SUMMARY_SOURCE,
+                        _summary_body(
+                            {
+                                feeder: _parse_feeder_history(stored)
+                                for feeder, stored in feeders.items()
+                            }
+                        ),
+                    )
     return _HistoryUpdate(
         history,
         duplicates,
@@ -1922,6 +1941,121 @@ def sync_birdbuddy_detections(
         confirmed_history_complete=confirmed.complete,
     )
     return BirdBuddySyncResult(species, stats)
+
+
+def _noted_on(timestamp: str) -> date:
+    observed = parse_utc_timestamp(timestamp)
+    if observed is None:
+        raise DataSourceError("Invalid Bird Buddy detection timestamp")
+    # The controller's local date when the summary is written; a time-zone
+    # change shows from the next history write.
+    return observed.astimezone().date()
+
+
+def _summary_rows(
+    history: FeederHistory, *, include_manual_sightings: bool
+) -> list[dict[str, object]]:
+    first: dict[str, date] = {}
+    last: dict[str, date] = {}
+
+    def note(species_id: str, timestamp: str) -> None:
+        noted = _noted_on(timestamp)
+        first[species_id] = min(first.get(species_id, noted), noted)
+        last[species_id] = max(last.get(species_id, noted), noted)
+
+    for postcard in history.postcards.values():
+        for species in postcard.species:
+            note(species.species_id, postcard.observed_at)
+    for evidence in history.confirmed_species.values():
+        if evidence.source != _CONFIRMED_MANUAL_SOURCE or include_manual_sightings:
+            note(evidence.species.species_id, evidence.observed_at)
+    for archived in history.archived_species.values():
+        note(archived.species_id, archived.latest_detection_at)
+    return [
+        SpeciesSummary(
+            item.common_name,
+            item.scientific_name,
+            item.detection_count,
+            # Archived postcards keep only their newest date, so the first is unknown.
+            None
+            if item.species_id in history.archived_species
+            else first[item.species_id].isoformat(),
+            last[item.species_id].isoformat(),
+        ).as_dict()
+        for item in _aggregate_species(
+            history,
+            ObservationWindow.ALL_TIME,
+            datetime.now(UTC),
+            None,
+            include_manual_sightings=include_manual_sightings,
+        )
+    ]
+
+
+def _summary_body(histories: dict[str, FeederHistory]) -> dict[str, object]:
+    return {
+        "unit": "postcards or confirmed presence",
+        "feeders": {
+            feeder_id: {
+                "automatic": _summary_rows(history, include_manual_sightings=False),
+                "with_manual": _summary_rows(history, include_manual_sightings=True),
+            }
+            for feeder_id, history in sorted(histories.items())
+        },
+    }
+
+
+def _parse_summary_feeders(
+    payload: dict[str, object],
+) -> dict[str, tuple[list[SpeciesSummary], list[SpeciesSummary]]]:
+    feeders = payload.get("feeders")
+    if not isinstance(feeders, dict):
+        raise DataSourceError("Invalid history summary")
+    parsed: dict[str, tuple[list[SpeciesSummary], list[SpeciesSummary]]] = {}
+    for feeder_id, rows in feeders.items():
+        if (
+            not isinstance(feeder_id, str)
+            or not feeder_id
+            or not isinstance(rows, dict)
+            or set(rows) != {"automatic", "with_manual"}
+        ):
+            raise DataSourceError("Invalid history summary")
+        parsed[feeder_id] = (
+            parse_species_rows(rows["automatic"]),
+            parse_species_rows(rows["with_manual"]),
+        )
+    return parsed
+
+
+def read_birdbuddy_history_summary(
+    state_dir: Path, *, include_manual_sightings: bool = False
+) -> tuple[list[SpeciesSummary], str]:
+    """Like read_birdbuddy_history_species, from the small summary; adds dates."""
+    path = _history_path(state_dir)
+    with _state_errors():
+        with _history_lock(state_dir):
+            feeders = load_summary(
+                path,
+                SUMMARY_SOURCE,
+                _parse_summary_feeders,
+                lambda: _summary_body(_read_history(state_dir)),
+            )
+        if not feeders:
+            return [], "No retained feeder history"
+        auth_present = _auth_path(state_dir).exists()
+        selected_state = _read_auth_state(state_dir) if auth_present else None
+    if selected_state is not None:
+        selected = selected_state.feeder.feeder_id
+    elif len(feeders) == 1:
+        selected = next(iter(feeders))
+    else:
+        raise DataSourceError("Select a feeder with Bird Buddy login to inspect retained history")
+    rows = feeders.get(selected)
+    if rows is None:
+        return [], "No retained history for the selected feeder"
+    return (
+        rows[1] if include_manual_sightings else rows[0]
+    ), "Since integration began; confirmed presence is not an exact visit count"
 
 
 def read_birdbuddy_history_species(

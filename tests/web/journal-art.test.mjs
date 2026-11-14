@@ -269,3 +269,83 @@ test('an unchanged check after an outage clears the offline notice', async (t) =
   assert.equal(status(), '');
   assert.equal(plates(requests).length, 1, 'the plate on screen is not fetched again');
 });
+
+// Parts the controller could not read reach the owner as plain text.
+function nodes(node, found = []) {
+  for (const child of node.children) {
+    found.push(child);
+    nodes(child, found);
+  }
+  return found;
+}
+const notices = (main) =>
+  nodes(main).filter((node) => node.classList.contains('notice') && node.getAttribute('role') === 'status');
+const withState = (change) => () => Object.assign(journal(), change);
+const markup = 'Plates waiting for review could not be read. <img src=x onerror=alert(1)>';
+
+for (const page of ['home', 'birds'])
+  test(page + ' shows each unreadable part as text', async (t) => {
+    const { main } = await open(t, { page }, {
+      state: withState({
+        notices: [
+          { part: 'plates-in-review', message: markup },
+          { part: 'plate-queue', message: 'The list of birds waiting for plates could not be read.' },
+        ],
+        history_coverage: [
+          { source: 'ebird-archive', status: 'unavailable', coverage: 'Retained history needs attention.' },
+          { source: 'birdbuddy', status: 'available', coverage: 'Retained postcards', species_count: 1, unit: 'postcards' },
+        ],
+      }),
+    });
+    const [box, ...extra] = notices(main);
+    assert(box, 'a notice is shown');
+    assert.equal(extra.length, 0, 'one notice holds every message');
+    assert.deepEqual(
+      box.children.map((line) => line.textContent),
+      [markup, 'The list of birds waiting for plates could not be read.', 'eBird Archive: Retained history needs attention.'],
+    );
+    for (const node of [box, ...nodes(box)]) {
+      assert.equal(node.html, undefined, 'no markup is parsed');
+      assert(node.children.every((child) => child.tagName === 'P'), 'messages stay text');
+    }
+  });
+
+for (const [name, change] of [
+  ['an empty list', { notices: [] }],
+  ['an older controller without notices', {}],
+])
+  for (const page of ['home', 'birds'])
+    test(page + ' shows no notice for ' + name, async (t) => {
+      const { main } = await open(t, { page }, { state: withState(change) });
+      assert.deepEqual(notices(main), []);
+    });
+
+test('plate work that could not be read says so instead of asking for setup', async (t) => {
+  const message = 'Plate work could not be read. Manage shows it again once its files are readable.';
+  const { main } = await open(t, { page: 'work' }, {
+    state: withState({
+      management: { available: false, reason: 'unreadable' },
+      notices: [{ part: 'plate-work', message }],
+    }),
+  });
+  const text = main.textContent;
+  assert(!text.includes('Full configuration unavailable'));
+  assert(!text.includes('documented serve command'));
+  const [box] = notices(main);
+  assert.equal(box?.textContent, message);
+});
+
+test('unreadable plate work without its notice still says it could not be read', async (t) => {
+  const { main } = await open(t, { page: 'sources' }, {
+    state: withState({ management: { available: false, reason: 'unreadable' } }),
+  });
+  assert(!main.textContent.includes('Full configuration unavailable'));
+  assert.equal(notices(main)[0]?.textContent, 'Plate work could not be read.');
+});
+
+test('an install without plate work configured keeps its setup message', async (t) => {
+  const { main } = await open(t, { page: 'work' });
+  assert(main.textContent.includes('Full configuration unavailable'));
+  assert(main.textContent.includes('Start Inky through its documented serve command'));
+  assert.deepEqual(notices(main), []);
+});

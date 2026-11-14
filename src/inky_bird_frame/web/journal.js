@@ -198,6 +198,22 @@ export async function openJournal(ui, message = '') {
       }
     }
   }
+  // Parts the controller could not read; the rest of the journal still works.
+  function unreadable(messages) {
+    const box = el('div', '', 'notice');
+    box.setAttribute('role', 'status');
+    for (const text of messages) box.append(el('p', text));
+    return box;
+  }
+  function problems() {
+    const messages = [
+      ...(data.notices || []).map((notice) => notice.message),
+      ...(data.history_coverage || [])
+        .filter((source) => source.status === 'unavailable')
+        .map((source) => (sourceNames[source.source]?.[0] || source.source) + ': ' + source.coverage),
+    ];
+    if (messages.length) main.append(unreadable(messages));
+  }
   function empty(title, text) {
     const section = el('section', '', 'journal-card');
     section.append(el('h2', title), el('p', text));
@@ -343,6 +359,7 @@ export async function openJournal(ui, message = '') {
   }
   if (area === 'home') {
     base('Your field journal', 'Birds worth keeping close.');
+    problems();
     const featured = byId.get(data.featured_taxon_id);
     if (featured) {
       const hero = link('', 'bird', { bird: featured.taxon_id }, 'featured-art');
@@ -441,6 +458,7 @@ export async function openJournal(ui, message = '') {
       scopes.append(option);
     }
     main.append(scopes);
+    problems();
     const label = el('label', 'Find a bird');
     label.htmlFor = 'bird-search';
     const search = el('input');
@@ -1810,10 +1828,15 @@ export async function openJournal(ui, message = '') {
     main.append(link('Back to Manage', 'manage'));
     if (!management.available) {
       main.append(
-        empty(
-          'Full configuration unavailable',
-          'Start Inky through its documented serve command to include controller settings.',
-        ),
+        management.reason === 'unreadable'
+          ? unreadable([
+              (data.notices || []).find((notice) => notice.part === 'plate-work')?.message ||
+                'Plate work could not be read.',
+            ])
+          : empty(
+              'Full configuration unavailable',
+              'Start Inky through its documented serve command to include controller settings.',
+            ),
       );
       return;
     }
