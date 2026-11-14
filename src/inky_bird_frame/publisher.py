@@ -15,10 +15,12 @@ from contextlib import contextmanager, suppress
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
+from time import time_ns
 from typing import Literal, cast
 
 from PIL import Image
 
+from . import __version__
 from .catalog import (
     CatalogEntry,
     catalog_index_data,
@@ -1621,6 +1623,95 @@ def _create_pull_request(
     ).stdout.strip()
 
 
+_VERIFICATION_RECORD = "catalog-publish-verified.json"
+_SETTLED_NS = 2_000_000_000
+_VERIFIED_RESULT_FIELDS = (
+    "published",
+    "replaced",
+    "retained_newer",
+    "retained_independent",
+    "already_present",
+    "skipped",
+)
+
+
+def _local_catalog_fingerprint(catalog_dir: Path) -> str | None:
+    """Identify the local catalog by its listing and file metadata.
+
+    Change time is left out because the publication snapshot's hard links change it. A
+    catalog written within the last moments gets no fingerprint, since coarse
+    timestamps cannot tell two writes in the same tick apart.
+    """
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    digest = hashlib.sha256()
+    newest = 0
+    for directory, directories, files in os.walk(catalog_dir, onerror=fail):
+        directories.sort()
+        for name in sorted([*directories, *files]):
+            path = Path(directory) / name
+            info = path.lstat()
+            newest = max(newest, info.st_mtime_ns)
+            digest.update(path.relative_to(catalog_dir).as_posix().encode())
+            fields = (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev)
+            digest.update(f"\0{fields}\0".encode())
+    if time_ns() - newest <= _SETTLED_NS:
+        return None
+    return digest.hexdigest()
+
+
+def _verification_key(
+    config: AppConfig, remote_catalog_tree: str, private_patterns: tuple[re.Pattern[str], ...]
+) -> str | None:
+    local_catalog = _local_catalog_fingerprint(config.controller.catalog_dir)
+    if local_catalog is None:
+        return None
+    publication = config.public_catalog
+    payload = {
+        "version": __version__,
+        "repository": publication.repository,
+        "remote": publication.remote,
+        "base_branch": publication.base_branch,
+        "remote_catalog_tree": remote_catalog_tree,
+        "local_catalog": local_catalog,
+        "private_patterns": [pattern.pattern for pattern in private_patterns],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _reusable_verification(state_dir: Path, key: str) -> dict[str, object] | None:
+    """Return the outcome of the last fully validated no-change run for exactly this state."""
+    path = state_dir / _VERIFICATION_RECORD
+    if not path.is_file():
+        return None
+    try:
+        record = read_json(path)
+    except CatalogError:
+        return None
+    if not isinstance(record, dict) or record.get("key") != key:
+        return None
+    outcome = record.get("outcome")
+    if not isinstance(outcome, dict) or set(outcome) != set(_VERIFIED_RESULT_FIELDS):
+        return None
+    if any(not isinstance(outcome[field], list) for field in _VERIFIED_RESULT_FIELDS):
+        return None
+    return cast(dict[str, object], outcome)
+
+
+def _record_verification(state_dir: Path, key: str, result: dict[str, object]) -> None:
+    write_json_atomic(
+        state_dir / _VERIFICATION_RECORD,
+        {
+            "schema_version": 1,
+            "key": key,
+            "outcome": {field: result[field] for field in _VERIFIED_RESULT_FIELDS},
+        },
+        mode=0o600,
+    )
+
+
 def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str, object]:
     publication = config.public_catalog
     if not publication.enabled:
@@ -1647,7 +1738,15 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             timeout=_TRANSFER_TIMEOUT_SECONDS,
         )
         _git(checkout, "worktree", "prune")
-        remote_species = _remote_catalog_species(checkout, remote_ref)
+        # Pin the fetched commit: the checkout's remote ref can move while this run works.
+        remote_commit = _git(checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}").stdout
+        remote_commit = remote_commit.strip()
+        remote_tree = _git(
+            checkout, "rev-parse", "--verify", "--quiet", f"{remote_commit}:catalog", check=False
+        )
+        remote_catalog_tree = remote_tree.stdout.strip() if remote_tree.returncode == 0 else None
+        remote_species = _remote_catalog_species(checkout, remote_commit)
+        private_patterns = publication_privacy_patterns(config)
         result: dict[str, object] = {
             "published": [],
             "replaced": [],
@@ -1664,20 +1763,40 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             "abandoned_work_directories": abandoned_work_directories,
             "cleaned_work_directories": cleaned_work_directories,
             "cleaned_publication_branches": [],
+            "verification_reused": False,
         }
         with TemporaryDirectory(prefix="publish-", dir=work_parent) as temporary:
             source_snapshot = Path(temporary) / "source-catalog"
+            verification_key: str | None = None
+            reused: dict[str, object] | None = None
             with catalog_state_lock(config.controller.state_dir):
                 # Approval staging debris would fail the snapshot root check.
                 clear_catalog_staging(config.controller.catalog_dir)
-                try:
-                    _snapshot_catalog(config.controller.catalog_dir, source_snapshot)
-                except FileNotFoundError as exc:
-                    raise CatalogPublishError("Approved local catalog does not exist") from exc
+                if not dry_run and remote_catalog_tree is not None:
+                    with suppress(FileNotFoundError):
+                        verification_key = _verification_key(
+                            config, remote_catalog_tree, private_patterns
+                        )
+                if verification_key is not None:
+                    reused = _reusable_verification(config.controller.state_dir, verification_key)
+                if reused is None:
+                    try:
+                        _snapshot_catalog(config.controller.catalog_dir, source_snapshot)
+                    except FileNotFoundError as exc:
+                        raise CatalogPublishError("Approved local catalog does not exist") from exc
+            if reused is not None:
+                # Neither the remote catalog tree nor any local catalog file changed since a
+                # run that validated both in full and found nothing to publish.
+                result.update(reused)
+                result["verification_reused"] = True
+                result["cleaned_publication_branches"] = _cleanup_stale_publications(
+                    checkout, publication, repository, publisher, keep=None
+                )
+                return result
             result["skipped"] = _exclude_unpublishable_species(
                 source_snapshot,
                 _published_directory_names(remote_species),
-                publication_privacy_patterns(config),
+                private_patterns,
             )
             validate_public_catalog(source_snapshot)
 
@@ -1688,11 +1807,11 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                 "add",
                 "--detach",
                 str(worktree),
-                remote_ref,
+                remote_commit,
                 timeout=_CHECKOUT_TIMEOUT_SECONDS,
             )
             try:
-                return _publish_from_worktree(
+                outcome = _publish_from_worktree(
                     checkout,
                     worktree,
                     source_snapshot,
@@ -1702,6 +1821,9 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                     result,
                     dry_run=dry_run,
                 )
+                if verification_key is not None and outcome["changed"] is False:
+                    _record_verification(config.controller.state_dir, verification_key, outcome)
+                return outcome
             finally:
                 # Cleanup is best effort; the next run prunes, and it must not mask the outcome.
                 with suppress(CatalogPublishError):

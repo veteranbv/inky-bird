@@ -11,14 +11,17 @@ import subprocess
 import unittest
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time_ns
+from typing import cast
 from unittest.mock import call, patch
 
 import pytest
 from PIL import Image, PngImagePlugin
 
+from inky_bird_frame import publisher as publisher_module
 from inky_bird_frame.catalog import rebuild_catalog_index, sha256_file
 from inky_bird_frame.cli import build_parser, catalog_sync_command
 from inky_bird_frame.config import AppConfig, PublicCatalogConfig, load_config
@@ -278,6 +281,35 @@ def _remote_files(remote: Path) -> list[str]:
     return _run_git(
         remote, "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "main"
     ).splitlines()
+
+
+def _settled() -> AbstractContextManager[object]:
+    """Treat files written by the test as older than the publisher's settling window."""
+    return patch("inky_bird_frame.publisher.time_ns", return_value=time_ns() + 10**10)
+
+
+def _commit_to_remote(root: Path, remote: Path, change: Callable[[Path], None]) -> None:
+    """Change the remote main branch from a separate clone, as another publisher would."""
+    other = root / "other-clone"
+    shutil.rmtree(other, ignore_errors=True)
+    subprocess.run(
+        ["git", "clone", "--branch", "main", str(remote), str(other)],
+        check=True,
+        capture_output=True,
+    )
+    change(other)
+    _run_git(other, "add", "-A")
+    _run_git(
+        other,
+        "-c",
+        "user.name=Other",
+        "-c",
+        "user.email=other@example.test",
+        "commit",
+        "-m",
+        "Change the catalog elsewhere",
+    )
+    _run_git(other, "push", "origin", "main")
 
 
 def _result_items(result: dict[str, object], key: str) -> list[dict[str, object]]:
@@ -2111,6 +2143,126 @@ class PublicationRunTests(unittest.TestCase):
             self.assertIn("catalog/species/1-rüppell-warbler/manifest.json", paths)
             self.assertIn("catalog/species/1-rüppell-warbler/display.png", _remote_files(remote))
             self.assertEqual(fake.merged_commits, [result["commit"]])
+
+    def _counting_snapshots(self) -> tuple[list[Path], object]:
+        snapshots: list[Path] = []
+        original = publisher_module._snapshot_catalog
+
+        def counting(source: Path, destination: Path) -> None:
+            snapshots.append(destination)
+            original(source, destination)
+
+        return snapshots, patch("inky_bird_frame.publisher._snapshot_catalog", side_effect=counting)
+
+    def test_unchanged_run_reuses_the_last_full_verification(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Good Bird")
+            broken = _create_species(catalog, 2, "Broken Bird")
+            Image.new("RGB", (1600, 1200), "black").save(broken / "display.png")
+            snapshots, counting = self._counting_snapshots()
+
+            with _github(fake), cast(AbstractContextManager[object], counting):
+                published = run_catalog_publish(config)
+                # Files written moments ago are never trusted by their metadata alone.
+                for _ in range(2):
+                    self.assertFalse(run_catalog_publish(config)["verification_reused"])
+                with _settled():
+                    verified = run_catalog_publish(config)
+                    reused = run_catalog_publish(config)
+
+            self.assertTrue(published["merged"])
+            self.assertFalse(verified["changed"])
+            self.assertFalse(verified["verification_reused"])
+            self.assertEqual(len(snapshots), 4)
+            self.assertTrue(reused["verification_reused"])
+            self.assertFalse(reused["changed"])
+            for field in ("skipped", "already_present", "published"):
+                self.assertEqual(reused[field], verified[field], field)
+            self.assertEqual(
+                [item["species"] for item in _result_items(reused, "skipped")], ["2-broken-bird"]
+            )
+            record = config.controller.state_dir / "catalog-publish-verified.json"
+            self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
+
+    def test_a_changed_remote_catalog_is_validated_in_full_again(self) -> None:
+        def damage(clone: Path) -> None:
+            (clone / "catalog/species/1-good-bird/display.png").write_bytes(b"not a png")
+
+        def add_species(clone: Path) -> None:
+            _create_species(clone / "catalog", 3, "Other Bird")
+
+        for change, failure in ((damage, "checksum"), (add_species, None)):
+            with self.subTest(change=change.__name__), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                remote, _, config, fake = self._environment(root)
+                _create_species(config.controller.catalog_dir, 1, "Good Bird")
+                with _github(fake), _settled():
+                    run_catalog_publish(config)
+                    run_catalog_publish(config)
+                    self.assertTrue(run_catalog_publish(config)["verification_reused"])
+                _commit_to_remote(root, remote, change)
+                snapshots, counting = self._counting_snapshots()
+
+                with _github(fake), _settled(), cast(AbstractContextManager[object], counting):
+                    if failure is not None:
+                        with self.assertRaisesRegex(CatalogPublishError, failure):
+                            run_catalog_publish(config)
+                    else:
+                        result = run_catalog_publish(config)
+                        self.assertFalse(result["verification_reused"])
+                        self.assertFalse(result["changed"])
+
+                self.assertEqual(len(snapshots), 1)
+
+    def test_changed_privacy_terms_validate_skipped_species_again(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            config.controller.state_dir.mkdir(parents=True)
+            discovery = config.controller.state_dir / "discovery.json"
+            write_json_atomic(discovery, {"place_name": "Exampleville", "state": "Example State"})
+            _create_species(catalog, 1, "Good Bird")
+            leaky = _create_species(catalog, 2, "Leaky Bird")
+            _set_profile_field(leaky, "habitat", "Parks of exampleville, example state.")
+            rebuild_catalog_index(catalog)
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+                run_catalog_publish(config)
+                held = run_catalog_publish(config)
+                write_json_atomic(discovery, {"place_name": "Otherton", "state": "Example State"})
+                moved = run_catalog_publish(config)
+
+            self.assertTrue(held["verification_reused"])
+            self.assertEqual(
+                [item["species"] for item in _result_items(held, "skipped")], ["2-leaky-bird"]
+            )
+            self.assertFalse(moved["verification_reused"])
+            self.assertEqual([item["taxon_id"] for item in _result_items(moved, "published")], [2])
+            self.assertIn("catalog/species/2-leaky-bird/manifest.json", _remote_files(remote))
+
+    def test_a_changed_local_catalog_is_validated_in_full_again(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Good Bird")
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+                run_catalog_publish(config)
+                self.assertTrue(run_catalog_publish(config)["verification_reused"])
+            _create_species(catalog, 2, "New Bird")
+            snapshots, counting = self._counting_snapshots()
+
+            with _github(fake), _settled(), cast(AbstractContextManager[object], counting):
+                result = run_catalog_publish(config)
+                dry_run = run_catalog_publish(config, dry_run=True)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual([item["taxon_id"] for item in _result_items(result, "published")], [2])
+            self.assertFalse(dry_run["verification_reused"])
+            self.assertEqual(len(snapshots), 2)
+            self.assertIn("catalog/species/2-new-bird/manifest.json", _remote_files(remote))
 
     def test_finder_metadata_in_the_local_catalog_does_not_block_or_get_published(self) -> None:
         with TemporaryDirectory() as temporary:
