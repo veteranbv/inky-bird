@@ -408,10 +408,11 @@ class CatalogService:
             },
         )
 
-    def _record_event(self, filename: str, field: str) -> bool:
+    def _record_event(self, filename: str, field: str, route: str) -> bool:
         try:
             write_json_atomic(
-                self.config.state_dir / filename, {"schema_version": 1, field: utc_now()}
+                self.config.state_dir / filename,
+                {"schema_version": 1, field: utc_now(), "route": route},
             )
         except OSError:
             print(
@@ -434,6 +435,9 @@ class CatalogService:
             "/v1/display-success": ("display-last-success.json", "succeeded_at"),
         }
         event = events.get(request.url.path.removeprefix("/wall"))
+        # Only wall-route displays pause on an empty wall view; the controller
+        # needs the route to tell that pause from a failed update.
+        route = "wall" if request.url.path.startswith("/wall/") else "catalog"
         if event is None:
             return self._json(request, 404, {"ok": False, "error": "not found"})
         if request.headers.getlist("origin"):
@@ -492,7 +496,7 @@ class CatalogService:
                 400,
                 {"ok": False, "error": "invalid telemetry payload", "schema_version": 1},
             )
-        if not await run_in_threadpool(self._record_event, *event):
+        if not await run_in_threadpool(self._record_event, *event, route):
             return self._json(
                 request,
                 503,

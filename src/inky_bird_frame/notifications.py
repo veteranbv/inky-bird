@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .config import AppConfig, NotificationDestination, NotificationEvent
+from .config import AppConfig, NotificationDestination, NotificationEvent, NotificationsConfig
 from .errors import CatalogError, ConfigurationError, MissingDependencyError
 from .http import write_json_atomic
 from .timeutil import parse_utc_timestamp
@@ -66,6 +66,31 @@ def display_heartbeat_path(config: AppConfig) -> Path:
 
 def display_success_path(config: AppConfig) -> Path:
     return config.controller.state_dir / "display-last-success.json"
+
+
+MAX_RETRY_DELAY_MINUTES = 360
+
+
+def retry_delay(settings: NotificationsConfig, attempts: int) -> timedelta:
+    """Wait after a failed attempt: doubles from the configured interval to a cap."""
+
+    base = settings.delivery_retry_minutes
+    cap = max(base, MAX_RETRY_DELAY_MINUTES)
+    # Bound the exponent; any delay past the cap is clamped anyway.
+    return timedelta(minutes=min(base * 2 ** min(max(attempts - 1, 0), 32), cap))
+
+
+def retry_policy(settings: NotificationsConfig) -> dict[str, int]:
+    span = sum(
+        (retry_delay(settings, attempt) for attempt in range(1, settings.max_delivery_attempts)),
+        timedelta(),
+    )
+    return {
+        "first_delay_minutes": settings.delivery_retry_minutes,
+        "max_delay_minutes": max(settings.delivery_retry_minutes, MAX_RETRY_DELAY_MINUTES),
+        "max_delivery_attempts": settings.max_delivery_attempts,
+        "dead_letter_after_minutes": int(span.total_seconds() // 60),
+    }
 
 
 def display_stale_threshold(config: AppConfig) -> timedelta:
@@ -233,8 +258,7 @@ def _deliver_notification_state(
             body=item.body,
             created_at=item.created_at,
             attempts=attempts,
-            next_attempt_at=current
-            + timedelta(minutes=config.notifications.delivery_retry_minutes),
+            next_attempt_at=current + retry_delay(config.notifications, attempts),
             delivered_to=tuple(delivered_to),
             last_error="; ".join(errors) if errors else "No configured destination accepts event",
         )
@@ -292,6 +316,12 @@ def notification_status(config: AppConfig) -> dict[str, object]:
         "pending": len(state.pending),
         "dead_letters": len(state.dead_letters),
         "oldest_pending_at": state.pending[0].created_at.isoformat() if state.pending else None,
+        "next_attempt_at": (
+            min(item.next_attempt_at for item in state.pending).isoformat()
+            if state.pending
+            else None
+        ),
+        "retry": retry_policy(config.notifications),
     }
 
 
@@ -400,10 +430,10 @@ def safe_record_recovery(
 
 def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -> dict[str, object]:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
-    success_at, success_warning = _read_display_heartbeat(
+    success_at, success_warning, _ = _read_display_heartbeat(
         display_success_path(config), "succeeded_at"
     )
-    fetched_at, fetch_warning = _read_display_heartbeat(
+    fetched_at, fetch_warning, fetch_route = _read_display_heartbeat(
         display_heartbeat_path(config), "fetched_at"
     )
     warning = success_warning or fetch_warning
@@ -429,7 +459,24 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         seen_at = fetched_at
         stale = True
         described = f"fetched the catalog at {fetched_at.isoformat()} but never completed an update"
-    if stale:
+    # A display pointed at an empty wall view keeps fetching but deliberately
+    # leaves the panel unchanged. That is a pause, not a failure. Only a fetch
+    # recorded on the wall route proves such a display; a record without a
+    # route (older controllers) or from /v1/catalog keeps the stale alert.
+    paused = (
+        stale
+        and fetched_at is not None
+        and fetch_route == "wall"
+        and current - fetched_at <= threshold
+        and _wall_view_is_empty(config)
+    )
+    if paused:
+        assert fetched_at is not None
+        stale = False
+        signal = "catalog-fetch"
+        seen_at = fetched_at
+        notice: dict[str, object] = {"queued": False}
+    elif stale:
         notice = safe_record_degradation(
             config,
             key="display-heartbeat",
@@ -452,6 +499,7 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
     result: dict[str, object] = {
         "checked": True,
         "stale": stale,
+        "paused": paused,
         "signal": signal,
         "seen_at": seen_at.isoformat(),
         "threshold_minutes": int(threshold.total_seconds() // 60),
@@ -460,6 +508,17 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
     if warning is not None:
         result["warning"] = warning
     return result
+
+
+def _wall_view_is_empty(config: AppConfig) -> bool:
+    try:
+        from .journal import JournalService
+        from .presentation import PresentationAccess
+
+        journal = JournalService(config.controller)
+        return not PresentationAccess(config.controller.state_dir, journal).selected("wall")
+    except Exception:  # Fail open: an unreadable selection keeps the stale alert.
+        return False
 
 
 def requeue_dead_letters(config: AppConfig, *, now: datetime | None = None) -> int:
@@ -622,7 +681,7 @@ def _read_state(path: Path) -> NotificationState:
         return NotificationState()
     try:
         raw = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise CatalogError(f"Invalid notification state: {path}") from exc
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
         raise CatalogError(f"Unsupported notification state: {path}")
@@ -718,20 +777,25 @@ def _health_datetime(value: object) -> datetime | None:
     return parse_utc_timestamp(value)
 
 
-def _read_display_heartbeat(path: Path, field: str) -> tuple[datetime | None, str | None]:
+def _read_display_heartbeat(
+    path: Path, field: str
+) -> tuple[datetime | None, str | None, str | None]:
+    """Return the timestamp, any warning, and the optional route the display used."""
+
     # A missing file is a valid no-signal state; a corrupt file is reported, never fatal.
     if not path.exists():
-        return None, None
+        return None, None, None
     try:
         raw = json.loads(path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, f"Invalid display heartbeat: {path}"
+        return None, f"Invalid display heartbeat: {path}", None
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        return None, f"Unsupported display heartbeat: {path}"
+        return None, f"Unsupported display heartbeat: {path}", None
     seen_at = _health_datetime(raw.get(field))
     if seen_at is None:
-        return None, f"Invalid display heartbeat timestamp: {path}"
-    return seen_at, None
+        return None, f"Invalid display heartbeat timestamp: {path}", None
+    route = raw.get("route")
+    return seen_at, None, route if isinstance(route, str) else None
 
 
 def _read_health(path: Path) -> dict[str, dict[str, object]]:

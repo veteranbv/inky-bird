@@ -19,7 +19,7 @@ from inky_bird_frame.cli import (
     main,
     notifications_test_command,
 )
-from inky_bird_frame.errors import ConfigurationError
+from inky_bird_frame.errors import ConfigurationError, DataSourceError
 from inky_bird_frame.http import write_bytes_atomic
 
 VALID = """
@@ -356,7 +356,7 @@ def test_notifications_test_names_the_destination_that_failed() -> None:
         patch("inky_bird_frame.cli._config"),
         patch("inky_bird_frame.cli.send_notification_test", return_value=result),
         redirect_stdout(io.StringIO()),
-        pytest.raises(ValueError, match=r"every configured destination: phone$"),
+        pytest.raises(DataSourceError, match=r"every configured destination: phone$"),
     ):
         notifications_test_command(
             build_parser().parse_args(["notifications", "test", "--config", "instance.toml"])
