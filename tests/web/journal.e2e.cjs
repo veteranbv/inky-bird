@@ -34,18 +34,19 @@ execFileSync(
   python,
   [
     '-c',
-    `import csv,json,tomllib
+    `import csv,json,sys,tomllib
 from pathlib import Path
 from inky_bird_frame.settings import initialize_config,_toml
-from inky_bird_frame.ebird_archive import REQUIRED_COLUMNS
+sys.path.insert(0,'tests')
+from ebird_fixtures import EXPORT_COLUMNS
 root=Path(${JSON.stringify(fixture)})
 p=root/'config.toml'
 raw=tomllib.loads(p.read_text());raw['controller'].update(catalog_dir=str(root/'catalog'),port=18796,bind_host='127.0.0.1');p.write_bytes(_toml(raw))
 birds=json.loads(${JSON.stringify(JSON.stringify([cardinal, robin]))})
 with (root/'archive.csv').open('w',newline='') as handle:
- writer=csv.DictWriter(handle,fieldnames=REQUIRED_COLUMNS);writer.writeheader()
+ writer=csv.DictWriter(handle,fieldnames=EXPORT_COLUMNS,restval='');writer.writeheader()
  for n,bird in enumerate(birds):
-  row=dict.fromkeys(REQUIRED_COLUMNS,'');row.update({'Submission ID':f'S-SYNTHETIC-{n}','Date':['2001-03-01','2001-03-02'][n],'Location':f'Fixture garden {n}','Scientific Name':bird['scientific_name'],'Common Name':bird['common_name']});writer.writerow(row)
+  writer.writerow({'Submission ID':f'S-SYNTHETIC-{n}','Date':['2001-03-01','2001-03-02'][n],'Location':f'Fixture garden {n}','Scientific Name':bird['scientific_name'],'Common Name':bird['common_name']})
 state=root/'var/controller';state.mkdir(parents=True,exist_ok=True)
 cache={'schema_version':1,'entries':{bird['scientific_name']:{'taxon_id':bird['taxon_id'],'common_name':bird['common_name'],'scientific_name':bird['scientific_name']} for bird in birds}}
 (state/'ebird-archive-taxonomy-crosswalk.json').write_text(json.dumps(cache))
@@ -424,6 +425,22 @@ let browser,
     .getByText('Taxon 9999993: incomplete or unsafe pending state. Use operator recovery before retrying.', { exact: true })
     .waitFor();
   assert.equal(await page.getByRole('link', { name: /Inspect .*9999993/ }).count(), 0);
+  phase = 'unreadable-part-notice';
+  // A damaged state file degrades its part to a notice; the journal still opens.
+  const queuePath = path.join(fixture, 'var/controller/generation-queue.json');
+  const queueBefore = fs.existsSync(queuePath) ? fs.readFileSync(queuePath) : null;
+  fs.writeFileSync(queuePath, '{ damaged');
+  const queueNotice = 'The list of birds waiting for plates could not be read.';
+  for (const [query, title] of [['', 'Your field journal'], ['?page=birds', 'Your birds']]) {
+    await page.goto(origin + '/app' + query);
+    await heading(title);
+    await page.getByRole('status').filter({ hasText: queueNotice }).waitFor();
+  }
+  if (queueBefore) fs.writeFileSync(queuePath, queueBefore);
+  else fs.rmSync(queuePath);
+  await page.goto(origin + '/app');
+  await heading('Your field journal');
+  assert.equal(await page.getByText(queueNotice).count(), 0);
   phase = 'collection-filter';
   await page.goto(origin + '/app?page=edit-collection');
   await heading('New collection');

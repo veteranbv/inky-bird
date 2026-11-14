@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -9,10 +10,11 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
+from ebird_fixtures import EXPORT_COLUMNS as EBIRD_COLUMNS
 from starlette.testclient import TestClient
 
 from inky_bird_frame.access import AccessStore
-from inky_bird_frame.birds import BirdSpecies, EbirdArchiveSpecies, ObservationWindow
+from inky_bird_frame.birds import BirdSpecies, ObservationWindow
 from inky_bird_frame.catalog import (
     CollectionEntry,
     CollectionOrigin,
@@ -27,7 +29,7 @@ from inky_bird_frame.config import (
     DisplayNodeConfig,
 )
 from inky_bird_frame.controller import GenerationWork, TerminalQueueEntry
-from inky_bird_frame.ebird_archive import EbirdArchiveHistory
+from inky_bird_frame.ebird_archive import import_ebird_archive
 from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.journal import (
@@ -140,48 +142,60 @@ def test_manual_selection_retains_names_and_rejects_unknown_ids(tmp_path: Path) 
     assert read_journal(controller.state_dir) == state
 
 
+def _import_archive(state_dir: Path, root: Path, rows: list[tuple[str, str, str, str]]) -> None:
+    path = root / "MyEBirdData.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EBIRD_COLUMNS, restval="")
+        writer.writeheader()
+        for submission, common, scientific, observed in rows:
+            writer.writerow(
+                {
+                    "Submission ID": submission,
+                    "Common Name": common,
+                    "Scientific Name": scientific,
+                    "Date": observed,
+                    "Location": "Fixture place",
+                }
+            )
+    import_ebird_archive(path, state_dir)
+
+
 def test_retained_library_does_not_truncate_or_publish_partial_source_coverage(
     tmp_path: Path,
 ) -> None:
     controller = config(tmp_path)
     catalog(controller)
-    controller.state_dir.mkdir(parents=True)
-    (controller.state_dir / "ebird-archive-observations.json").write_text("{}")
-    history = EbirdArchiveHistory(
+    _import_archive(
+        controller.state_dir,
+        tmp_path,
         [
-            EbirdArchiveSpecies("Robin", "Turdus migratorius", 4),
-            EbirdArchiveSpecies("Unmatched", "Fixture unknown", 2),
-            EbirdArchiveSpecies("Another", "Fixture another", 1),
+            *[(f"S{day}", "Robin", "Turdus migratorius", f"2020-01-0{day}") for day in range(1, 5)],
+            ("S5", "Unmatched", "Fixture unknown", "2020-01-05"),
+            ("S6", "Unmatched", "Fixture unknown", "2020-01-06"),
+            ("S7", "Another", "Fixture another", "2020-01-07"),
         ],
-        7,
-        7,
-        3,
-        7,
-        0,
-        STAMP,
-        STAMP,
-        "2020-01-01",
-        "2020-01-07",
     )
     service = JournalService(controller)
-    with patch(
-        "inky_bird_frame.ebird_archive.read_ebird_archive_history", return_value=history
-    ) as reader:
-        snapshot = service.snapshot()
-    assert reader.call_args.kwargs["limit"] is None
+    snapshot = service.snapshot()
     birds = cast(list[dict[str, object]], snapshot["birds"])
     assert birds[0]["known"] and birds[0]["retained_evidence"] == [
-        {"source": "ebird-archive", "count": 4, "unit": "checklists"}
+        {
+            "source": "ebird-archive",
+            "count": 4,
+            "unit": "checklists",
+            "first_noted": "2020-01-01",
+            "last_noted": "2020-01-04",
+        }
     ]
     assert len(cast(list[object], snapshot["unresolved_history"])) == 2
     assert not (controller.state_dir / "generation-queue.json").exists()
-    history.species[1] = EbirdArchiveSpecies("Bad\nname", "Fixture unknown", 2)
-    with patch("inky_bird_frame.ebird_archive.read_ebird_archive_history", return_value=history):
-        snapshot = service.snapshot()
-    assert len(cast(list[object], snapshot["history_coverage"])) == 1
-    assert cast(list[dict[str, object]], snapshot["history_coverage"])[0]["status"] == "unavailable"
-    assert cast(list[dict[str, object]], snapshot["birds"])[0]["retained_evidence"] == []
-    assert snapshot["unresolved_history"] == []
+    summary = controller.state_dir / "ebird-archive-observations-summary.json"
+    payload = json.loads(summary.read_text())
+    payload["species"][1]["common_name"] = "Bad\nname"
+    write_json_atomic(summary, payload, mode=0o600)
+    # The history itself is sound, so an unshowable summary is rebuilt from it.
+    assert service.snapshot() == snapshot
+    assert "Bad" not in summary.read_text()
 
 
 def test_browsing_art_never_claims_private_evidence_or_writes_state(tmp_path: Path) -> None:
@@ -844,3 +858,249 @@ def test_collection_portability_routes_have_owner_and_csrf_guards(tmp_path: Path
         assert exported.status_code == 200
         assert exported.headers["cache-control"] == "no-store"
         assert "checklist_hash" not in exported.text
+
+
+def test_newer_journal_asks_for_a_newer_version(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    newer = {
+        "schema_version": 3,
+        "revision": 4,
+        "collections": [],
+        "notes": {"1": "A field a later release may add"},
+    }
+    write_json_atomic(controller.state_dir / "journal.json", newer, mode=0o600)
+    before = (controller.state_dir / "journal.json").read_bytes()
+    with pytest.raises(JournalError) as raised:
+        read_journal(controller.state_dir)
+    assert str(raised.value) == "This journal needs a newer Inky version"
+    assert "restore" not in str(raised.value)
+    assert (controller.state_dir / "journal.json").read_bytes() == before
+
+
+def test_newer_collection_export_asks_for_a_newer_version(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    document = {**portable_document(), "schema_version": 2, "note": "A later field"}
+    with pytest.raises(JournalError, match="^This collection needs a newer Inky version$"):
+        JournalService(controller).prepare_collection_import(document)
+
+
+def _app_config(controller: ControllerConfig, tmp_path: Path) -> AppConfig:
+    return AppConfig(
+        DiscoveryConfig(
+            "12345",
+            None,
+            None,
+            None,
+            None,
+            8,
+            20,
+            ObservationWindow.LAST_30_DAYS,
+            (),
+        ),
+        controller,
+        DisplayNodeConfig("http://localhost:8000", tmp_path / "display"),
+    )
+
+
+@pytest.mark.parametrize("part", ["current-birds", "plate-queue", "plates-in-review"])
+def test_one_unreadable_operator_file_degrades_only_its_part(tmp_path: Path, part: str) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    app = _app_config(controller, tmp_path)
+    save_collection(controller.state_dir, revision=0, label="Kept", taxon_ids=[1])
+    controller.state_dir.mkdir(parents=True, exist_ok=True)
+    if part == "current-birds":
+        (controller.state_dir / "active-catalog.json").write_bytes(b'{"species": "\xff"}')
+    elif part == "plate-queue":
+        (controller.state_dir / "generation-queue.json").write_bytes(b"\xff\xfe")
+    service = JournalService(controller, app_config=app)
+    with patch("inky_bird_frame.journal.current_config", side_effect=lambda value: value):
+        if part == "plates-in-review":
+            with patch(
+                "inky_bird_frame.recovery.pending_inventory",
+                side_effect=PermissionError("private path"),
+            ):
+                snapshot = service.snapshot()
+        else:
+            snapshot = service.snapshot()
+    parts = [notice["part"] for notice in cast(list[dict[str, str]], snapshot["notices"])]
+    # Plate work reads the same queue, so it is withheld with it.
+    assert parts == ([part, "plate-work"] if part == "plate-queue" else [part])
+    assert "private path" not in json.dumps(snapshot)
+    assert cast(list[dict[str, object]], snapshot["collections"])[0]["label"] == "Kept"
+    assert [bird["taxon_id"] for bird in cast(list[dict[str, object]], snapshot["birds"])] == [1]
+
+
+def test_unreadable_queue_refuses_changes_that_need_every_known_bird(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    app = _app_config(controller, tmp_path)
+    save_collection(controller.state_dir, revision=0, label="Kept", taxon_ids=[1])
+    (controller.state_dir / "generation-queue.json").write_bytes(b"\xff\xfe")
+    before = (controller.state_dir / "journal.json").read_bytes()
+    service = JournalService(controller, app_config=app)
+    unreadable = "^The list of birds waiting for plates could not be read.$"
+    with patch("inky_bird_frame.journal.current_config", side_effect=lambda value: value):
+        with pytest.raises(JournalError, match=unreadable):
+            service.collection_import_preview(portable_document())
+        with pytest.raises(JournalError, match=unreadable):
+            service.import_collection(
+                document=portable_document(),
+                revision=1,
+                preview_hash="0" * 64,
+                collection_id="a" * 32,
+            )
+        with pytest.raises(JournalError, match=unreadable):
+            service.favorite(revision=1, taxon_id=900, favorite=True)
+        with pytest.raises(JournalError, match=unreadable):
+            service.save_selection(revision=1, label="Later", taxon_ids=[900])
+    assert (controller.state_dir / "journal.json").read_bytes() == before
+
+
+def test_unreadable_crosswalk_refuses_changes_that_need_every_known_bird(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    (controller.state_dir / "ebird-archive-taxonomy-crosswalk.json").write_bytes(b"\xff")
+    with pytest.raises(JournalError, match="^Saved species matches for this history"):
+        JournalService(controller).collection_import_preview(portable_document())
+
+
+def test_unrelated_unavailable_history_still_allows_changes_for_listed_birds(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    controller.state_dir.mkdir(parents=True, exist_ok=True)
+    damaged = controller.state_dir / "birdnet-analyzer-detections.json"
+    damaged.write_text("not json")
+    damaged.chmod(0o600)
+    service = JournalService(controller)
+    assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
+    assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
+    # A bird missing from the list may be in the unreadable history: say so.
+    with pytest.raises(JournalError, match="^Retained history needs attention"):
+        service.favorite(revision=2, taxon_id=900, favorite=True)
+    with pytest.raises(JournalError, match="^Retained history needs attention"):
+        service.save_selection(revision=2, label="Later", taxon_ids=[1, 900])
+
+
+def test_unreadable_plate_work_never_refuses_bird_changes(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    app = _app_config(controller, tmp_path)
+    service = JournalService(controller, app_config=app)
+    with (
+        patch("inky_bird_frame.journal.current_config", side_effect=lambda value: value),
+        patch.object(JournalService, "management", side_effect=PermissionError("private path")),
+    ):
+        snapshot = service.snapshot()
+        assert snapshot["management"] == {"available": False, "reason": "unreadable"}
+        assert [n["part"] for n in cast(list[dict[str, str]], snapshot["notices"])] == [
+            "plate-work"
+        ]
+        assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
+        assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
+        service.collection_import_preview(portable_document())
+        with pytest.raises(JournalError, match="^Choose a bird from your journal"):
+            service.favorite(revision=2, taxon_id=900, favorite=True)
+
+
+def test_unshowable_name_in_history_marks_the_source_unavailable_without_partial_rows(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir,
+        tmp_path,
+        [
+            ("S1", "Robin", "Turdus migratorius", "2020-01-01"),
+            ("S2", "Unmatched", "Fixture unknown", "2020-01-02"),
+        ],
+    )
+    history = controller.state_dir / "ebird-archive-observations.json"
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        for species in checklist["species"]:
+            if species["scientific_name"] == "Fixture unknown":
+                species["common_name"] = "Bad\u200bname"
+    write_json_atomic(history, payload, mode=0o600)
+    snapshot = JournalService(controller).snapshot()
+    coverage = cast(list[dict[str, object]], snapshot["history_coverage"])
+    assert [row["status"] for row in coverage] == ["unavailable"]
+    assert cast(list[dict[str, object]], snapshot["birds"])[0]["retained_evidence"] == []
+    assert snapshot["unresolved_history"] == []
+
+
+def test_unusual_name_on_a_matched_history_row_still_shows_like_before(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    history = controller.state_dir / "ebird-archive-observations.json"
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        checklist["species"][0]["common_name"] = "Rob\u200din" + "x" * 300
+    write_json_atomic(history, payload, mode=0o600)
+    service = JournalService(controller)
+    snapshot = service.snapshot()
+    coverage = cast(list[dict[str, object]], snapshot["history_coverage"])
+    assert [row["status"] for row in coverage] == ["available"]
+    bird = cast(list[dict[str, object]], snapshot["birds"])[0]
+    assert bird["common_name"] == "Robin"
+    assert [row["count"] for row in cast(list[dict[str, object]], bird["retained_evidence"])] == [1]
+    # Such a summary is rebuilt on each read, the full parse every read did before.
+    assert service.snapshot() == snapshot
+
+
+def test_unreadable_crosswalk_marks_only_its_source_unavailable(tmp_path: Path) -> None:
+    from inky_bird_frame.birdnet_analyzer import import_birdnet_analyzer_csv
+
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    analyzer = tmp_path / "analyzer.csv"
+    analyzer.write_text(
+        "Start (s),End (s),Scientific name,Common name,Confidence,File\n"
+        "0,3,Turdus migratorius,Robin,0.9,fixture.wav\n"
+    )
+    import_birdnet_analyzer_csv(analyzer, controller.state_dir)
+    (controller.state_dir / "ebird-archive-taxonomy-crosswalk.json").write_bytes(b"\xff")
+    snapshot = JournalService(controller).snapshot()
+    coverage = {
+        row["source"]: row for row in cast(list[dict[str, object]], snapshot["history_coverage"])
+    }
+    assert coverage["ebird-archive"]["status"] == "unavailable"
+    assert "species matches" in cast(str, coverage["ebird-archive"]["coverage"])
+    assert coverage["birdnet-analyzer"]["status"] == "available"
+    bird = cast(list[dict[str, object]], snapshot["birds"])[0]
+    assert [row["source"] for row in cast(list[dict[str, object]], bird["retained_evidence"])] == [
+        "birdnet-analyzer"
+    ]
+
+
+def test_non_utf8_analyzer_history_marks_only_that_source_unavailable(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    history = controller.state_dir / "birdnet-analyzer-detections.json"
+    history.write_bytes(b'{"schema_version": 1, "detections": {"\xff": 1}}')
+    history.chmod(0o600)
+    snapshot = JournalService(controller).snapshot()
+    coverage = {
+        row["source"]: row["status"]
+        for row in cast(list[dict[str, object]], snapshot["history_coverage"])
+    }
+    assert coverage == {"ebird-archive": "available", "birdnet-analyzer": "unavailable"}

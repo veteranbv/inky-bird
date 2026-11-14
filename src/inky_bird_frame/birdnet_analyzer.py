@@ -17,9 +17,18 @@ from pathlib import Path
 
 from .birds import BirdNetAnalyzerSpecies, ObservationWindow, date_range_for_window
 from .errors import DataSourceError
+from .history_summary import (
+    SpeciesSummary,
+    count_field,
+    load_summary,
+    parse_species_rows,
+    summarize,
+    write_summary,
+)
 from .http import write_bytes_atomic, write_json_atomic
 
 STATE_FILENAME = "birdnet-analyzer-detections.json"
+SUMMARY_SOURCE = "birdnet-analyzer"
 REQUIRED_COLUMNS = (
     "Start (s)",
     "End (s)",
@@ -398,7 +407,35 @@ def import_birdnet_analyzer_csv(
                 },
                 mode=0o600,
             )
+            write_summary(path, SUMMARY_SOURCE, _summary_body(detections))
         return stats
+
+
+def _summary_body(detections: dict[str, _StoredDetection]) -> dict[str, object]:
+    records = [
+        (detection.common_name, detection.scientific_name, detection.observed_on)
+        for _, detection in sorted(detections.items())
+    ]
+    return {
+        "unit": "recording segments",
+        "undated": sum(item.observed_on is None for item in detections.values()),
+        "species": [row.as_dict() for row in summarize(records, name_from_latest=False)],
+    }
+
+
+def read_birdnet_analyzer_summary(state_dir: Path) -> tuple[list[SpeciesSummary], int]:
+    """All retained species and the undated segment total; dates from dated segments."""
+    path = _state_path(state_dir)
+    with _state_errors(), _history_lock(state_dir):
+        return load_summary(
+            path,
+            SUMMARY_SOURCE,
+            lambda payload: (
+                parse_species_rows(payload.get("species")),
+                count_field(payload, "undated"),
+            ),
+            lambda: _summary_body(_read_state(path, required=True)[0]),
+        )
 
 
 def _revision(state_dir: Path) -> str:

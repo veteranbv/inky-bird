@@ -32,6 +32,13 @@ export class Element {
   set className(value) {
     this.classes = new Set(value.split(' ').filter(Boolean));
   }
+  // Recorded, never parsed: tests check that owner text is not set as markup.
+  get innerHTML() {
+    return this.html;
+  }
+  set innerHTML(value) {
+    this.html = String(value);
+  }
   get textContent() {
     return this.children.length ? this.children.map((node) => node.textContent).join('') : this.text;
   }

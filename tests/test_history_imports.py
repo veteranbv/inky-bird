@@ -9,15 +9,12 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from ebird_fixtures import EXPORT_COLUMNS
 from starlette.testclient import TestClient
 
 from inky_bird_frame.birds import ArchiveResolution, BirdSpecies, EbirdArchiveSpecies
 from inky_bird_frame.config import AppConfig, load_config
-from inky_bird_frame.ebird_archive import (
-    REQUIRED_COLUMNS,
-    import_ebird_archive,
-    read_ebird_checklists,
-)
+from inky_bird_frame.ebird_archive import import_ebird_archive, read_ebird_checklists
 from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.imports import HistoryImports, recover_import
 from inky_bird_frame.journal import (
@@ -49,7 +46,7 @@ def configuration(root: Path) -> AppConfig:
 
 def archive(*, extra: bool = True, correction: bool = False) -> bytes:
     out = io.StringIO(newline="")
-    writer = csv.DictWriter(out, fieldnames=REQUIRED_COLUMNS)
+    writer = csv.DictWriter(out, fieldnames=EXPORT_COLUMNS, restval="")
     writer.writeheader()
     records = [
         (
@@ -62,7 +59,7 @@ def archive(*, extra: bool = True, correction: bool = False) -> bytes:
     if extra:
         records.append(("S-private-two", "2026-05-02", "Unmatched species", "Private backyard"))
     for identifier, observed, scientific, location in records:
-        row = dict.fromkeys(REQUIRED_COLUMNS, "")
+        row = dict.fromkeys(EXPORT_COLUMNS, "")
         row.update(
             {
                 "Submission ID": identifier,
@@ -626,11 +623,11 @@ def test_analyzer_marker_written_before_removal_counts_still_recovers(tmp_path: 
 
 def large_archive(checklists: int, species: int) -> bytes:
     out = io.StringIO(newline="")
-    writer = csv.DictWriter(out, fieldnames=REQUIRED_COLUMNS)
+    writer = csv.DictWriter(out, fieldnames=EXPORT_COLUMNS, restval="")
     writer.writeheader()
     for checklist in range(checklists):
         for index in range(species):
-            row = dict.fromkeys(REQUIRED_COLUMNS, "")
+            row = dict.fromkeys(EXPORT_COLUMNS, "")
             row.update(
                 {
                     "Submission ID": f"S-synthetic-{checklist}",
