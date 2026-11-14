@@ -1369,83 +1369,6 @@ def _published_directory_names(remote_species: list[dict[str, object]] | None) -
     }
 
 
-def _git_blob_id(object_format: str, data: bytes) -> str:
-    blob = hashlib.new(object_format, usedforsecurity=False)
-    blob.update(f"blob {len(data)}\0".encode())
-    blob.update(data)
-    return blob.hexdigest()
-
-
-def _remote_catalog_matches(
-    checkout: Path, remote_ref: str, catalog_dir: Path, directories: set[str]
-) -> bool:
-    """Return whether the remote catalog tree is byte-identical to the local catalog."""
-    object_format = _git(checkout, "rev-parse", "--show-object-format").stdout.strip()
-    if object_format not in {"sha1", "sha256"}:
-        return False
-    listing = _git(
-        checkout, "ls-tree", "-r", "-z", "--full-tree", remote_ref, "--", "catalog"
-    ).stdout
-    remote: dict[str, tuple[str, str, str]] = {}
-    for record in listing.split("\0"):
-        if not record:
-            continue
-        metadata, _, path = record.partition("\t")
-        fields = metadata.split()
-        if len(fields) != 3:
-            return False
-        remote[path] = (fields[0], fields[1], fields[2])
-    local: dict[str, tuple[str, str, str]] = {
-        "catalog/index.json": (
-            "100644",
-            "blob",
-            _git_blob_id(object_format, (catalog_dir / "index.json").read_bytes()),
-        )
-    }
-    for name in directories:
-        for file in (catalog_dir / "species" / name).iterdir():
-            local[f"catalog/species/{name}/{file.name}"] = (
-                "100644",
-                "blob",
-                _git_blob_id(object_format, file.read_bytes()),
-            )
-    return remote == local
-
-
-def _already_published_taxa(
-    checkout: Path,
-    remote_ref: str,
-    catalog_dir: Path,
-    remote_species: list[dict[str, object]] | None,
-) -> list[int] | None:
-    """Return the local taxa when the remote catalog already equals the local catalog."""
-    if remote_species is None:
-        return None
-    try:
-        # A damaged local approval must take the snapshot path, which reports it.
-        validate_public_catalog(catalog_dir)
-        local_index = read_json(catalog_dir / "index.json")
-        directories = {path.name for path in _species_directories(catalog_dir / "species")}
-        local_species = local_index.get("species") if isinstance(local_index, dict) else None
-        if not isinstance(local_species, list):
-            return None
-        if not directories <= _published_directory_names(remote_species) or any(
-            item not in remote_species for item in local_species
-        ):
-            return None
-        # Any remote difference must take the worktree path, which validates and reports it.
-        if not _remote_catalog_matches(checkout, remote_ref, catalog_dir, directories):
-            return None
-    except (CatalogError, CatalogPublishError, OSError):
-        return None
-    taxa = [item.get("taxon_id") for item in local_species if isinstance(item, dict)]
-    if len(taxa) != len(local_species) or any(
-        not isinstance(taxon_id, int) or isinstance(taxon_id, bool) for taxon_id in taxa
-    ):
-        return None
-    return sorted(cast(list[int], taxa))
-
-
 def _exclude_unpublishable_species(
     snapshot: Path,
     published_names: set[str],
@@ -1675,18 +1598,6 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             "cleaned_work_directories": cleaned_work_directories,
             "cleaned_publication_branches": [],
         }
-        with catalog_state_lock(config.controller.state_dir):
-            already_published = _already_published_taxa(
-                checkout, remote_ref, config.controller.catalog_dir, remote_species
-            )
-        if already_published is not None:
-            result["already_present"] = already_published
-            if not dry_run:
-                result["cleaned_publication_branches"] = _cleanup_stale_publications(
-                    checkout, publication, repository, keep=None
-                )
-            return result
-
         with TemporaryDirectory(prefix="publish-", dir=work_parent) as temporary:
             source_snapshot = Path(temporary) / "source-catalog"
             with catalog_state_lock(config.controller.state_dir):

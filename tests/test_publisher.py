@@ -2142,36 +2142,6 @@ class PublicationRunTests(unittest.TestCase):
             self.assertEqual(_remote_branches(remote), ["main"])
             self.assertNotIn(("pr", "create"), [call_[:2] for call_ in fake.calls])
 
-    def test_returns_before_copying_when_the_remote_already_has_everything(self) -> None:
-        with TemporaryDirectory() as temporary:
-            _, _, config, fake = self._environment(Path(temporary))
-            _create_species(config.controller.catalog_dir, 1, "Example Bird")
-            with _github(fake):
-                run_catalog_publish(config)
-            git_calls: list[tuple[str, ...]] = []
-
-            def recording_git(
-                repository: Path,
-                *arguments: str,
-                check: bool = True,
-                timeout: float = _COMMAND_TIMEOUT_SECONDS,
-            ) -> subprocess.CompletedProcess[str]:
-                git_calls.append(arguments)
-                return _git(repository, *arguments, check=check, timeout=timeout)
-
-            with (
-                _github(fake),
-                patch("inky_bird_frame.publisher._git", side_effect=recording_git),
-                patch("inky_bird_frame.publisher.shutil.copytree") as copytree,
-            ):
-                result = run_catalog_publish(config)
-
-            copytree.assert_not_called()
-            self.assertNotIn(("worktree", "add"), [item[:2] for item in git_calls])
-            self.assertFalse(result["changed"])
-            self.assertEqual(result["published"], [])
-            self.assertEqual(result["already_present"], [1])
-
     def _assert_damaged_published_species_is_reported(
         self, damage: Callable[[Path], None], reason: str
     ) -> None:
