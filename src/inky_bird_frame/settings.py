@@ -71,6 +71,10 @@ def _read(path: Path) -> tuple[bytes, dict[str, object], AppConfig]:
         ) from exc
 
 
+def _original(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".original")
+
+
 def _revision(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -128,6 +132,9 @@ def settings_status(initial: AppConfig) -> dict[str, object]:
     content, raw, config = _read(path)
     _installation_boundary(initial, config)
     discovery = cast(dict[str, object], raw["discovery"])
+    original = _original(path)
+    previous = path.with_suffix(path.suffix + ".previous")
+    managed = config.controller.configuration_ownership == "managed"
     fields = {
         key: value
         for key, value in discovery.items()
@@ -162,7 +169,26 @@ def settings_status(initial: AppConfig) -> dict[str, object]:
                 for item in config.notifications.destinations
             ],
         },
-        "backup_available": path.with_suffix(path.suffix + ".previous").is_file(),
+        "backup_available": previous.is_file(),
+        # The name the first browser save keeps (or has kept) the operator's
+        # file under; whether that copy exists yet is reported separately.
+        "original_backup": original.name
+        if managed or original.is_file() or original.is_symlink()
+        else None,
+        "original_backup_available": original.is_file(),
+        "adoption_notice": (
+            (
+                f"An earlier copy is already kept in {original.name}. "
+                f"This version is kept only until the next save, in {previous.name}."
+            )
+            if original.exists() or original.is_symlink()
+            else (
+                f"Inky also keeps this file as it is now in {original.name}. "
+                "Later saves never change that copy."
+            )
+        )
+        if managed
+        else None,
     }
 
 
@@ -306,9 +332,21 @@ def save_settings(
             raise SettingsError(
                 "Settings are not valid. Check the selected sources and fields."
             ) from exc
+        # Browser saves drop comments and formatting, and .previous keeps one
+        # generation. The first adoption keeps the operator's own file forever.
+        original = _original(path)
+        if adopt and not (original.exists() or original.is_symlink()):
+            write_bytes_atomic(original, content, mode=0o600)
         write_bytes_atomic(path.with_suffix(path.suffix + ".previous"), content, mode=0o600)
         write_bytes_atomic(path, encoded, mode=0o600)
-    return {"saved": True, "revision": _revision(encoded), "restart_required": adopt}
+    result: dict[str, object] = {
+        "saved": True,
+        "revision": _revision(encoded),
+        "restart_required": adopt,
+    }
+    if adopt:
+        result["original_backup"] = original.name
+    return result
 
 
 def initialize_config(path: Path, *, container: bool = False) -> bool:
