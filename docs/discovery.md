@@ -44,9 +44,12 @@ retained unless a provider section below documents an explicit removal step.
 iNaturalist and eBird need a point and radius. Choose exactly one location
 form; eBird Archive-, BirdWeather-, BirdNET-Go-, BirdNET Analyzer-, and Bird
 Buddy-only setups need none.
+Every `[discovery]` table still needs `radius_km`, `species_limit` and
+`window`, even when no selected source uses a location.
 
 Direct coordinates are the provider-independent option. They work worldwide,
-do not disclose a postal code to a geocoder, and cannot become ambiguous:
+do not disclose a postal code to a geocoder, and cannot become ambiguous. These
+keys replace the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -56,7 +59,8 @@ longitude = 0.0
 
 For postal-code convenience, use [Geoapify's Postcode API](https://apidocs.geoapify.com/docs/postcode/).
 It supports ISO 3166-1 alpha-2 country codes and international postal formats.
-Create a Geoapify key and keep it in the private configuration:
+Create a Geoapify key and keep it in the private configuration. These keys
+also replace the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -73,7 +77,7 @@ requires an exact country/postal-code match and rejects multiple coordinate
 results rather than guessing. Geoapify permits stored results and requires
 attribution; discovery output includes both Geoapify and source attribution.
 
-Existing `zip_code = "12345"` configurations remain supported unchanged through
+Existing five-digit `zip_code` configurations remain supported unchanged through
 Zippopotam's US endpoint and need no key. This compatibility path is US-only;
 new worldwide configurations should use coordinates or Geoapify. No discovery
 location is written to a public catalog or rendered on a plate.
@@ -96,7 +100,7 @@ the private configuration:
 ```toml
 [discovery]
 sources = ["inaturalist", "ebird"]
-zip_code = "12345"
+zip_code = "00000"
 radius_km = 8
 species_limit = 50
 window = "last-30-days"
@@ -151,6 +155,8 @@ inky-bird-frame ebird archive import \
 ```toml
 [discovery]
 sources = ["ebird-archive"]
+radius_km = 8
+species_limit = 50
 window = "all-time"
 ```
 
@@ -286,6 +292,7 @@ controller:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
 species_limit = 50
 window = "last-30-days"
 birdnet_go_url = "http://birdnet-go.local:8080"
@@ -310,6 +317,9 @@ base URL:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 birdnet_go_url = "https://birdnet.example.net"
 ```
 
@@ -317,11 +327,16 @@ The proxy must expose the same unauthenticated BirdNET-Go API. After changing
 the URL, test the installed service instead of relying on a manual refresh:
 
 ```bash
-refresh_label="gui/$(id -u)/com.inky-bird-frame.refresh"
+refresh_label="gui/$(id -u)/com.$FAMILY.refresh"
 refresh_pid="$(launchctl kickstart -kp "$refresh_label")"
 while kill -0 "$refresh_pid" 2>/dev/null; do sleep 1; done
-tail -n 200 "$HOME/Library/Application Support/Inky Bird Frame/logs/refresh.log"
+tail -n 200 "$LOGS/refresh.log"
 ```
+
+Set `FAMILY` and `LOGS` first as in
+[Find your installation's names and paths](troubleshooting.md#find-your-installations-names-and-paths).
+An app-managed installation has no refresh LaunchAgent; read the next scheduled
+refresh in `$LOGS/scheduler.log` instead.
 
 The newest result should show the `birdnet-go` provider with `status` set to
 `ok`. If both the direct address and the proxy fail from LaunchAgent context,
@@ -388,6 +403,8 @@ inky-bird-frame birdnet-analyzer import \
 ```toml
 [discovery]
 sources = ["birdnet-analyzer"]
+radius_km = 8
+species_limit = 50
 window = "all-time"
 ```
 
@@ -463,7 +480,7 @@ Add the provider without putting credentials in TOML:
 [discovery]
 sources = ["inaturalist", "birdbuddy"]
 birdbuddy_include_manual_sightings = false
-zip_code = "12345"
+zip_code = "00000"
 radius_km = 8
 species_limit = 50
 window = "last-30-days"
@@ -527,6 +544,9 @@ you use the account:
 [discovery]
 sources = ["birdbuddy"]
 birdbuddy_include_manual_sightings = true
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 ```
 
 The choice is reversible. Manual evidence remains in the private history so it
@@ -592,7 +612,8 @@ The legacy singular values `source = "inaturalist"`, `"ebird"`, `"combined"`,
 and `"birdweather"` remain accepted. Do not set both `source` and `sources`.
 Version 0.5.0 removed `source = "all"` because its frozen three-provider meaning
 became misleading as new providers were added. Replace it without changing
-behavior:
+behavior. This fragment replaces only that one line; keep the rest of your
+`[discovery]` table:
 
 ```toml
 [discovery]

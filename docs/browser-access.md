@@ -229,13 +229,16 @@ use your existing proxy; Inky does not require one for ordinary local setup.
 | --- | --- | --- |
 | Existing Traefik homelab | Keep Traefik and its certificate setup. Use the private route below. | Traefik 3.7.14 completed real Authentik owner linking, sign-in, confirmation, denial and logout. Callback-log privacy passed a forced upstream failure. |
 | New optional HTTPS setup | Caddy can issue a private certificate. Each device must trust it deliberately. | Caddy 2.11.7 completed real Authentik sign-in. Separate tests checked certificate rejection, restart and callback error-log privacy. |
-| Existing Nginx | Keep Nginx with the private route and logging policy below. | Nginx 1.30.6 completed the same real sign-in flow, header checks, blocked routes and upstream-failure privacy test. |
+| Existing Nginx | Keep Nginx with the private route and logging policy below. | Nginx 1.30.6 passed header checks, blocked routes and the upstream-failure privacy test. Its route list then omitted app files the journal loads, so the corrected route below has not completed a real sign-in. |
 | Nginx Proxy Manager | Do not use a location-only logging override for OIDC. | Version 2.16.0 passed sign-in, but a malformed request retained synthetic callback query values in its server error log. It does not pass this candidate's privacy gate. |
 
 These checks used a disposable identity service, synthetic accounts and verified
 TLS in Chromium. They qualify the access checkpoint, not the finished journal,
 every phone's certificate trust or your installation. Repeat the checks after
-changing proxy versions, routes or logging policy.
+changing proxy versions, routes or logging policy. The `/wall/*` routes were
+added to all three recipes later and have not been tested through a proxy.
+Owner sign-in does not protect `/wall/*`, so keep the proxy's private address
+allowlist on this route.
 
 These are proxy setups, not separate Inky providers or login systems. Your
 proxy supplies HTTPS. Inky still owns account setup, sign-in and optional OIDC.
@@ -254,10 +257,12 @@ X-Forwarded-Proto from the real connection and replace client-supplied
 forwarding headers. Inky ignores headers from all other peers.
 
 Route `/app`, `/app/*`, `/screen`, `/v1/access`, `/v1/owner/*`,
-`/v1/screen/*`, `/v1/integrations/*` and `/v1/dashboard/*` through the private
-endpoint. Dashboard art stays off until the owner explicitly enables it.
-Keep catalog, assets, health, embed and telemetry within their separate
-trusted-network boundary. Owner sign-in does not authenticate those legacy
+`/v1/screen/*`, `/v1/integrations/*`, `/v1/dashboard/*` and `/wall/*` through
+the private endpoint. `/app/*` covers every journal file; do not list them one
+by one. `/wall/*` serves a display that uses the selected-wall address over
+HTTPS. Dashboard art stays off until the owner explicitly enables it.
+Keep the legacy catalog, assets, health, embed and telemetry routes within their
+separate trusted-network boundary. Owner sign-in does not authenticate those legacy
 routes. Keep the proxy-to-controller hop private too.
 
 HTTPS-only mode rejects insecure owner access, including direct loopback or
@@ -276,7 +281,7 @@ http:
   routers:
     inky-owner:
       entryPoints: [websecure]
-      rule: "Host(`inky.example.test`) && (Path(`/app`) || PathPrefix(`/app/`) || Path(`/screen`) || Path(`/v1/access`) || PathPrefix(`/v1/screen/`) || PathPrefix(`/v1/integrations/`) || PathPrefix(`/v1/dashboard/`) || (PathPrefix(`/v1/owner/`) && !Path(`/v1/owner/oidc/callback`)))"
+      rule: "Host(`inky.example.test`) && (Path(`/app`) || PathPrefix(`/app/`) || Path(`/screen`) || Path(`/v1/access`) || PathPrefix(`/v1/screen/`) || PathPrefix(`/v1/integrations/`) || PathPrefix(`/v1/dashboard/`) || PathPrefix(`/wall/`) || (PathPrefix(`/v1/owner/`) && !Path(`/v1/owner/oidc/callback`)))"
       middlewares: [inky-private]
       service: inky-owner
       tls: {}
@@ -339,7 +344,8 @@ startup; Inky does not start an HTTP replacement. Update the files and restart
 Inky after certificate renewal. Inky does not issue or renew certificates.
 
 If the browser address differs from the backend certificate name or port, set
-the direct probe address separately:
+the direct probe address separately. This fragment loads only in a controller
+section that already serves HTTPS on that port:
 
 ~~~toml
 [controller]
@@ -430,7 +436,7 @@ A Caddy instance on the controller can use this Caddyfile:
 
 https://inky.home {
     tls internal
-    @owner path /app /app/* /screen /v1/access /v1/owner/* /v1/screen/* /v1/integrations/* /v1/dashboard/*
+    @owner path /app /app/* /screen /v1/access /v1/owner/* /v1/screen/* /v1/integrations/* /v1/dashboard/* /wall/*
     handle @owner {
         reverse_proxy 127.0.0.1:8793
     }
@@ -483,7 +489,7 @@ server {
     access_log /var/log/nginx/inky-status.log inky_status;
     error_log /dev/null;
 
-    location ~ ^/(app(/(app\.js|journal\.js|settings\.js|imports\.js|frame-tools\.js|presentation\.js|viewer\.js|app\.css|access-guide))?/?|screen|v1/access|v1/(owner|screen|integrations|dashboard)/.*)$ {
+    location ~ ^/(app(/.*)?|screen|v1/access|v1/(owner|screen|integrations|dashboard)/.*|wall/.*)$ {
         proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -533,6 +539,8 @@ intended owner at the identity service. Use Authorization Code, PKCE S256,
 an asymmetric RS256 or ES256 signing key and the openid scope. Do not request
 offline_access. Set authorization_code explicitly when using the Authentik API.
 Use a strict, exact HTTPS callback; never leave the allowed callback empty.
+This fragment loads only with the HTTPS `owner_allowed_origins` setting shown
+in the reverse-proxy section.
 
 ~~~toml
 [controller.oidc]

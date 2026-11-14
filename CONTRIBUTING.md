@@ -84,15 +84,26 @@ uv run ruff check .
 uv run mypy
 uv run pytest
 uv run inky-bird catalog validate --catalog catalog
+for source in src/inky_bird_frame/web/*.js; do
+  node --input-type=module --check < "$source"
+done
 node --test tests/web/*.test.mjs
 ```
 
 Run `uv run ruff format .` before the checks when Python files need formatting.
-CI also validates GitHub Actions and shell deployment scripts.
-Browser interaction regressions use Node.js 20 or newer's built-in test runner;
-there is no Node service or frontend package installation in the user runtime.
+`uv run pytest` reads the committed catalog images; without them, run
+`uv run pytest -m "not repository_catalog"`. CI runs all of the checks above
+on Python 3.11. It also lints workflows with actionlint and `deploy/*.sh` with
+ShellCheck, checks that workflow actions are pinned, rejects changes to approved
+catalog entries, validates the Compose files, builds and smoke-tests the
+controller container, and runs the tests without catalog images on Python 3.12
+to 3.14. Browser interaction regressions use Node.js 20 or newer's built-in
+test runner; there is no Node service or frontend package installation in the
+user runtime.
 
 ### Full browser acceptance
+
+This journey is a manual check; no CI workflow runs it.
 
 `tests/web/journal.e2e.cjs` starts a temporary loopback installation. It uses
 random test credentials, synthetic history and candidates, and public approved
@@ -212,13 +223,13 @@ not hand-edit generated JSON or checksums.
 
 ### Correct a published plate
 
-Published taxa remain immutable by default. After a replacement has completed
-the controller's explicit human-review workflow, a maintainer can prepare the
-approved correction with a required reason:
+Published taxa remain immutable by default. Before proposing a replacement,
+open a published plate problem with the exact plate and supporting evidence. Do
+not upload copyrighted field-guide or reference images.
 
-Before proposing a replacement, open a published plate problem with the exact
-plate and supporting evidence. Do not upload copyrighted field-guide or
-reference images.
+After a replacement has completed the controller's explicit human-review
+workflow, a maintainer can prepare the approved correction with a required
+reason:
 
 ```bash
 uv run inky-bird catalog prepare <taxon-id> \
@@ -300,8 +311,8 @@ commits must come from a person's identity rather than an app or bot account
 Review changes against the contribution requirements above. Check that public
 files contain no private configuration, observation data, local paths or
 credentials; that approved catalog entries remain immutable unless an
-explicit migration is included; and that pull requests cannot reach trusted
-runner credentials or deploy software. Treat contributed files as untrusted
+explicit migration is included; and that pull requests cannot reach repository
+credentials or deploy software. Treat contributed files as untrusted
 data. Never execute a contributor branch on the private controller.
 
 Report concrete problems introduced by the change, with a file, line and

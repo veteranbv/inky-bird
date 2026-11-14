@@ -3,9 +3,36 @@
 Run the role-specific doctor first. It is read-only and continues after a failed
 check so one report can expose independent problems.
 
+## Find your installation's names and paths
+
+The commands on this page use a few variables. Clean installs use the
+`inky-bird` service names; installs that began under the old repository name
+keep `inky-bird-frame`. Ask the installer's own name resolver which one this
+computer has. Run it from the Inky source checkout on the controller or display
+node, as the account that runs Inky:
+
 ```bash
-inky-bird-frame doctor controller --config /path/to/config.toml
-inky-bird-frame doctor display --config /path/to/config.toml
+cd /path/to/your/inky-bird/checkout
+NATIVE_NAMES=$(python3 src/inky_bird_frame/native_names.py) &&
+  eval "$NATIVE_NAMES" &&
+  printf 'family: %s\napplication: %s\nconfig: %s\n' \
+    "$service_prefix" "$app_dir" "$config_path"
+FAMILY="$service_prefix"
+CONFIG="$config_path"
+LOGS="$support_dir/logs"                         # macOS controller logs
+IBF="$app_dir/.venv/bin/inky-bird"               # controller command
+INKY="$HOME/.virtualenvs/pimoroni/bin/inky-bird" # display node command
+```
+
+If setup used `--app-dir`, `--support-dir`, `--venv` or a different `--config`
+path, use those values instead. Use the full command paths: a bare `inky-bird`
+command is not on the service account's `PATH`. On Docker, run the same
+application commands inside the controller container instead, for example
+`docker compose exec controller inky-bird status --config /data/config.toml`.
+
+```bash
+"$IBF" doctor controller --config "$CONFIG"   # controller
+"$INKY" doctor display --config "$CONFIG"     # display node
 ```
 
 The command exits `0` only when no check has status `fail`. Warnings do not make
@@ -22,12 +49,38 @@ timers use the scheduled queue. An unhealthy or stale source can delay
 preparation even when the scheduler is running. Check the saved request and
 the [source and work status](owner-operations.md) before submitting it again.
 
+### "This address is not approved for sign-in"
+
+The journal shows this when the address in the browser is not one Inky accepts
+for owner sign-in. In local mode, Inky accepts plain HTTP from a private-network
+or loopback client when the address is the controller's own IP address on the
+configured port, `localhost` on the controller itself, or an origin listed in
+`controller.owner_allowed_origins`. A hostname, a different port (for example a
+Docker port mapping) or an HTTPS address must be listed exactly. In HTTPS-only
+mode, only listed HTTPS origins work. Add the exact origin the browser shows
+to `[controller]`. An `http://` origin also needs `owner_access_mode = "local"`
+in the same table: once any origin is listed, the mode defaults to HTTPS-only,
+and the controller then refuses to load a configuration with an HTTP origin.
+
+```toml
+[controller]
+owner_access_mode = "local"
+owner_allowed_origins = ["http://inky.home:8793"]
+```
+
+Merge it with any origins already listed. If your installation is HTTPS-only,
+list an HTTPS origin instead; switching to local mode allows HTTP owner
+sign-in. Run `"$IBF" config validate --config "$CONFIG"` and restart the
+controller only after it passes. On an app-managed Docker installation,
+follow the app-managed steps under [Docker update](docker.md#update) instead:
+rerunning `config-sync` does not change its running configuration.
+
 ### `config` fails
 
 Run the focused validator:
 
 ```bash
-inky-bird-frame config validate --config /path/to/config.toml
+"$IBF" config validate --config "$CONFIG"
 ```
 
 Start from `config.example.toml`. Do not paste YAML or JSON into the TOML file.
@@ -61,15 +114,15 @@ display node.
 On macOS:
 
 ```bash
-launchctl print "gui/$(id -u)/com.inky-bird-frame.serve"
-tail -n 100 "$HOME/Library/Application Support/Inky Bird Frame/logs/serve.error.log"
+launchctl print "gui/$(id -u)/com.$FAMILY.serve"
+tail -n 100 "$LOGS/serve.error.log"
 ```
 
 On systemd Linux:
 
 ```bash
-systemctl status inky-bird-frame-controller.service
-journalctl -u inky-bird-frame-controller.service -n 100 --no-pager
+systemctl status "$FAMILY-controller.service"
+journalctl -u "$FAMILY-controller.service" -n 100 --no-pager
 ```
 
 Confirm that another process is not using the configured port:
@@ -84,8 +137,8 @@ lsof -nP -iTCP:8793 -sTCP:LISTEN           # macOS
 Run the command interactively to get its structured error:
 
 ```bash
-inky-bird-frame discover --config /path/to/config.toml
-inky-bird-frame refresh --config /path/to/config.toml
+"$IBF" discover --config "$CONFIG"
+"$IBF" refresh --config "$CONFIG"
 ```
 
 Check DNS, outbound HTTPS, the configured location, and the controller clock.
@@ -112,9 +165,9 @@ interactively, `refresh` saves the result and rebuilds the active catalog, and
 `status` shows the approved catalog and any retained generation work:
 
 ```bash
-inky-bird-frame discover --config /path/to/config.toml
-inky-bird-frame refresh --config /path/to/config.toml
-inky-bird-frame status --config /path/to/config.toml
+"$IBF" discover --config "$CONFIG"
+"$IBF" refresh --config "$CONFIG"
+"$IBF" status --config "$CONFIG"
 ```
 
 If `discover` or `refresh` returns `"ok": false`, start with its top-level
@@ -145,8 +198,7 @@ previously rejected or an interrupted pending directory without a manifest
 appears in `generation.terminal_blocked`; inspect the taxon and run
 `retry TAXON_ID` to make it eligible again. When `generation.actionable` is
 nonempty, let the scheduled generator run or invoke
-`inky-bird-frame generate --config /path/to/config.toml` for an immediate
-attempt.
+`"$IBF" generate --config "$CONFIG"` for an immediate attempt.
 
 If `generation.manual_retry_required` is nonempty, an earlier transient failure
 is no longer in the current observation or durable queue. The controller keeps
@@ -169,15 +221,21 @@ summary will exclude detections marked false-positive.
 On macOS 15 or later, compare manual and scheduled refreshes before changing
 the BirdNET-Go server. If a manual refresh succeeds but the LaunchAgent reports
 `[Errno 65] No route to host`, macOS Local Network privacy may be blocking the
-background process:
+background process. On an installation with a refresh LaunchAgent:
 
 ```bash
-inky-bird-frame refresh --config "/path/to/config.toml"
-refresh_label="gui/$(id -u)/com.inky-bird-frame.refresh"
+"$IBF" refresh --config "$CONFIG"
+refresh_label="gui/$(id -u)/com.$FAMILY.refresh"
 refresh_pid="$(launchctl kickstart -kp "$refresh_label")"
 while kill -0 "$refresh_pid" 2>/dev/null; do sleep 1; done
-tail -n 200 "$HOME/Library/Application Support/Inky Bird Frame/logs/refresh.log"
+tail -n 200 "$LOGS/refresh.log"
 ```
+
+App-managed installations (the default from `config init`) have no refresh
+LaunchAgent. Their scheduler runs refresh every `schedule.refresh_minutes` and
+writes the result to `$LOGS/scheduler.log`; wait for the next refresh and read
+that log instead of restarting the scheduler, which would also start any other
+due job.
 
 An unauthenticated HTTPS reverse proxy on a routed network path can avoid the
 direct-subnet restriction. Set `birdnet_go_url` to the proxy's base URL and
@@ -222,7 +280,7 @@ CONTROLLER_URL="http://127.0.0.1:8793"
 curl --fail --silent "${CONTROLLER_URL}/v1/catalog"
 
 # On a systemd display node
-journalctl -u inky-bird-frame-display.service -n 100 --no-pager
+journalctl -u "$FAMILY-display.service" -n 100 --no-pager
 ```
 
 When `prioritize_latest_detection` is enabled, the display shows the newest
@@ -249,7 +307,7 @@ failure as a persistent problem.
 ### Generation fails or keeps retrying
 
 ```bash
-inky-bird-frame status --config /path/to/config.toml
+"$IBF" status --config "$CONFIG"
 codex login status
 ```
 
@@ -280,9 +338,9 @@ Inspect the structured command result first. On macOS it is written to the
 standard-output log:
 
 ```bash
-tail -n 100 "$HOME/Library/Application Support/Inky Bird Frame/logs/catalog-publish.log"
+tail -n 100 "$LOGS/catalog-publish.log"
 gh auth status --hostname github.com
-inky-bird-frame catalog-publish --config /path/to/config.toml --dry-run
+"$IBF" catalog-publish --config "$CONFIG" --dry-run
 ```
 
 Run GitHub CLI as the same OS account that owns the publisher service. The
@@ -335,9 +393,10 @@ extra into that same environment.
 Use the committed `display.png`, not `portrait.png`:
 
 ```bash
-"$HOME/.virtualenvs/pimoroni/bin/inky-bird-frame" display-image \
-  catalog/species/12942-eastern-bluebird/display.png
+"$INKY" display-image catalog/species/12942-eastern-bluebird/display.png
 ```
+
+Run it from the source checkout, where that path exists.
 
 The catalog's display asset is already rotated left for a portrait-mounted
 panel. PIM773 fitting preserves that orientation automatically. Do not add a
@@ -358,15 +417,15 @@ it remains a useful recovery path when connected.
 ### The timer is active but the image does not change
 
 ```bash
-systemctl status inky-bird-frame-display.timer
-systemctl status inky-bird-frame-display.service
-journalctl -u inky-bird-frame-display.service -n 100 --no-pager
+systemctl status "$FAMILY-display.timer"
+systemctl status "$FAMILY-display.service"
+journalctl -u "$FAMILY-display.service" -n 100 --no-pager
 ```
 
 Force one foreground-equivalent cycle through systemd:
 
 ```bash
-sudo systemctl start inky-bird-frame-display.service
+sudo systemctl start "$FAMILY-display.service"
 ```
 
 If the controller has no active approved species, its health response reports
@@ -380,10 +439,13 @@ After correcting configuration or paths, rerun setup. It is designed to
 converge an existing installation rather than create duplicate services.
 
 ```bash
-inky-bird-frame setup controller --config /path/to/config.toml --yes
-inky-bird-frame setup display --config /path/to/config.toml \
-  --source-dir /path/to/inky-bird-frame \
-  --venv "$HOME/.virtualenvs/pimoroni" --yes
+uv run inky-bird setup controller --config "$CONFIG" --yes   # controller
+"$INKY" setup display --config "$CONFIG" \
+  --source-dir "$PWD" \
+  --venv "$HOME/.virtualenvs/pimoroni" --yes               # display node
 ```
 
-Use only the command for the role on that machine.
+Run setup from the source checkout of the release you intend to keep. Use only
+the command for the role on that machine. Stop the display timer and let its
+service finish before rerunning display setup; see
+[Update](installation.md#update).
