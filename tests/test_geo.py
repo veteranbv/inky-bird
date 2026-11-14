@@ -303,6 +303,20 @@ class GeocodeCacheTests(unittest.TestCase):
         self.assertEqual(cached, moved)
         lookup.assert_not_called()
 
+    def test_entry_dated_in_the_future_is_looked_up_again(self) -> None:
+        config = discovery_config(zip_code="12345")
+        moved = DiscoveryLocation("12345", "Newville", "XY", 3.0, 4.0, "us", "zippopotam")
+        with TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "geocode-cache.json"
+            # Written under a clock that ran ahead, or restored from elsewhere.
+            with patch("inky_bird_frame.geo.lookup_us_zip", return_value=ZIP_LOCATION):
+                resolve_discovery_location(config, cache_path=cache, now=NOW + GEOCODE_CACHE_TTL)
+            with patch("inky_bird_frame.geo.lookup_us_zip", return_value=moved) as lookup:
+                location = resolve_discovery_location(config, cache_path=cache, now=NOW)
+
+        lookup.assert_called_once_with("12345")
+        self.assertEqual(location, moved)
+
     def test_changed_query_does_not_reuse_another_entry(self) -> None:
         other = DiscoveryLocation("54321", "Otherville", "XY", 3.0, 4.0, "us", "zippopotam")
         with TemporaryDirectory() as temporary:

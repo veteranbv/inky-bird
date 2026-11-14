@@ -274,7 +274,8 @@ def _cached_lookup(
     current = (now or datetime.now(UTC)).astimezone(UTC)
     key = _cache_key(geocoder, query)
     cached = _read_cached_location(cache_path, key)
-    if cached is not None and current - cached[1] <= GEOCODE_CACHE_TTL:
+    # An entry dated in the future (clock skew, a restored backup) is not fresh.
+    if cached is not None and timedelta(0) <= current - cached[1] <= GEOCODE_CACHE_TTL:
         return cached[0]
     try:
         location = lookup()
