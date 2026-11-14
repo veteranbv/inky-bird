@@ -384,3 +384,37 @@ def test_settings_http_auth_origin_csrf_redaction_and_revision(tmp_path: Path) -
         assert client.post("/v1/owner/settings", json=body, headers=headers).status_code == 200
         assert client.post("/v1/owner/settings", json=body, headers=headers).status_code == 409
         assert client.get("/app/settings.js").status_code == 200
+
+
+def test_adoption_keeps_the_operator_file_unchanged_across_later_saves(tmp_path: Path) -> None:
+    path = fixture(tmp_path, owned=False)
+    path.write_text("# Operator notes stay in this copy.\n" + path.read_text())
+    original = path.read_bytes()
+    initial = load_config(path)
+    status = settings_status(initial)
+    assert status["original_backup"] == "config.toml.original"
+    assert "config.toml.original" in str(status["adoption_notice"])
+    result = save_settings(initial, revision=str(status["revision"]), changes={}, adopt=True)
+    assert result["original_backup"] == "config.toml.original"
+    kept = tmp_path / "config.toml.original"
+    assert kept.read_bytes() == original
+    assert kept.stat().st_mode & 0o777 == 0o600
+    adopted = load_config(path)
+    for window in ("all-time", "last-30-days"):
+        status = settings_status(adopted)
+        save_settings(
+            adopted, revision=str(status["revision"]), changes={"discovery": {"window": window}}
+        )
+    assert kept.read_bytes() == original
+    assert path.with_suffix(".toml.previous").read_bytes() != original
+
+
+def test_adoption_never_replaces_an_existing_original_copy(tmp_path: Path) -> None:
+    path = fixture(tmp_path, owned=False)
+    kept = tmp_path / "config.toml.original"
+    kept.write_bytes(b"# earlier copy\n")
+    kept.chmod(0o600)
+    initial = load_config(path)
+    status = settings_status(initial)
+    save_settings(initial, revision=str(status["revision"]), changes={}, adopt=True)
+    assert kept.read_bytes() == b"# earlier copy\n"
