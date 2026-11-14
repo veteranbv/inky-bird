@@ -12,16 +12,17 @@ from unittest.mock import patch
 
 from inky_bird_frame import birds
 from inky_bird_frame.birdbuddy import BirdBuddySyncResult, BirdBuddySyncStats
-from inky_bird_frame.birds import BirdBuddySpecies, BirdSpecies
+from inky_bird_frame.birds import BirdBuddySpecies, BirdSpecies, ObservationWindow
 from inky_bird_frame.catalog import CatalogEntry
 from inky_bird_frame.config import AppConfig, DiscoveryProvider, load_config
 from inky_bird_frame.controller import (
     PROVIDER_SOURCE_LABELS,
     discover_species,
+    enqueue_seed_species,
     refresh_observations,
     run_refresh_cycle,
 )
-from inky_bird_frame.errors import DataSourceError
+from inky_bird_frame.errors import CatalogError, DataSourceError
 from inky_bird_frame.geo import DiscoveryLocation
 
 CONFIG = """
@@ -164,6 +165,155 @@ class ProviderIsolationTests(unittest.TestCase):
         self.assertIn("Location lookup failed", error)
         self.assertIn("RuntimeError", error)
         self.assertNotIn("1.0", error)
+
+    def test_each_provider_isolates_its_own_unexpected_exception(self) -> None:
+        # Each provider's entry point, and the settings it needs beside BirdNET-Go
+        # (or iNaturalist, when BirdNET-Go is the one failing).
+        cases = {
+            "inaturalist": ("fetch_inaturalist_birds", ""),
+            "ebird": ("fetch_ebird_observations", 'ebird_api_key_env = "TEST_EBIRD_KEY"\n'),
+            "ebird-archive": ("read_ebird_archive_history", ""),
+            "birdweather": (
+                "fetch_birdweather_species",
+                'birdweather_token_env = "TEST_BIRDWEATHER_TOKEN"\n',
+            ),
+            "birdbuddy": ("sync_birdbuddy_detections", ""),
+            "birdnet-go": ("fetch_birdnet_go_species", ""),
+            "birdnet-analyzer": ("read_birdnet_analyzer_history", ""),
+        }
+        self.assertEqual(set(cases), {item.value for item in DiscoveryProvider})
+        secrets = {"TEST_EBIRD_KEY": "example-key", "TEST_BIRDWEATHER_TOKEN": "example-token"}
+        for failing, (entry_point, settings) in cases.items():
+            survivor = "inaturalist" if failing == "birdnet-go" else "birdnet-go"
+            replacement = (
+                f'[discovery]\nsources = ["{failing}", "{survivor}"]\n'
+                'birdnet_go_url = "http://birdnet-go.example.test:8080"\n' + settings
+            )
+            survivor_bird = FIELD_BIRD if survivor == "inaturalist" else YARD_BIRD
+            with (
+                self.subTest(provider=failing),
+                TemporaryDirectory() as temporary,
+                patch.dict(os.environ, secrets),
+            ):
+                config = load(temporary, replacement, load_secrets=False)
+                with (
+                    patch(
+                        "inky_bird_frame.controller.resolve_discovery_location",
+                        return_value=LOCATION,
+                    ),
+                    patch(
+                        "inky_bird_frame.controller.fetch_inaturalist_birds",
+                        return_value=[FIELD_BIRD],
+                    ),
+                    patch(
+                        "inky_bird_frame.controller.fetch_birdnet_go_species",
+                        return_value=[object()],
+                    ),
+                    patch(
+                        "inky_bird_frame.controller.resolve_birdnet_go_species",
+                        return_value=([YARD_BIRD], []),
+                    ),
+                    patch(
+                        f"inky_bird_frame.controller.{entry_point}",
+                        side_effect=KeyError("/private/state/source.json"),
+                    ),
+                    self.assertLogs("inky_bird_frame.controller", level="WARNING"),
+                ):
+                    result = discover_species(config)
+
+                self.assertEqual(result.species, [survivor_bird])
+                statuses = {provider.name: provider for provider in result.providers}
+                self.assertEqual(statuses[survivor].status, "ok")
+                self.assertEqual(statuses[failing].status, "error")
+                self.assertEqual(
+                    statuses[failing].error, "The source failed unexpectedly (KeyError)"
+                )
+
+    def test_project_error_from_a_provider_keeps_its_safe_message(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            with (
+                patch(
+                    "inky_bird_frame.controller.resolve_discovery_location",
+                    return_value=LOCATION,
+                ),
+                patch(
+                    "inky_bird_frame.controller.fetch_inaturalist_birds",
+                    side_effect=CatalogError("Activity state is invalid"),
+                ),
+                patch(
+                    "inky_bird_frame.controller.fetch_birdnet_go_species",
+                    return_value=[object()],
+                ),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdnet_go_species",
+                    return_value=([YARD_BIRD], []),
+                ),
+                self.assertLogs("inky_bird_frame.controller", level="WARNING"),
+            ):
+                result = discover_species(config)
+
+        self.assertEqual(result.species, [YARD_BIRD])
+        self.assertEqual(result.providers[0].error, "Activity state is invalid")
+
+    def test_project_error_from_the_location_lookup_keeps_its_safe_message(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            with (
+                patch(
+                    "inky_bird_frame.controller.resolve_discovery_location",
+                    side_effect=CatalogError("Activity state is invalid"),
+                ),
+                patch(
+                    "inky_bird_frame.controller.fetch_birdnet_go_species",
+                    return_value=[object()],
+                ),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdnet_go_species",
+                    return_value=([YARD_BIRD], []),
+                ),
+                self.assertLogs("inky_bird_frame.controller", level="WARNING"),
+            ):
+                result = discover_species(config)
+
+        self.assertEqual(
+            result.providers[0].error, "Location lookup failed: Activity state is invalid"
+        )
+
+    def test_invalid_coordinate_override_is_still_a_usage_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                patch("inky_bird_frame.controller.fetch_inaturalist_birds") as fetch,
+                self.assertRaisesRegex(ValueError, "outside the valid range"),
+            ):
+                discover_species(config, latitude=200.0, longitude=0.0)
+
+        fetch.assert_not_called()
+
+    def test_invalid_coordinate_override_is_reported_beside_a_source_needing_no_location(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            with (
+                patch(
+                    "inky_bird_frame.controller.fetch_birdnet_go_species",
+                    return_value=[object()],
+                ),
+                patch(
+                    "inky_bird_frame.controller.resolve_birdnet_go_species",
+                    return_value=([YARD_BIRD], []),
+                ),
+                self.assertRaisesRegex(ValueError, "outside the valid range"),
+            ):
+                enqueue_seed_species(
+                    config,
+                    window=ObservationWindow.LAST_WEEK,
+                    latitude=200.0,
+                    longitude=0.0,
+                    dry_run=True,
+                )
 
     def test_whitespace_only_environment_secrets_count_as_missing(self) -> None:
         replacement = (
@@ -436,6 +586,25 @@ class CarryForwardTests(unittest.TestCase):
         self.assertEqual(result["species_count"], 1)
         inaturalist = next(row for row in final["providers"] if row["name"] == "inaturalist")
         self.assertEqual(inaturalist["last_success_at"], old)
+        self.assertEqual(inaturalist["carried_species_count"], 0)
+
+    def test_future_dated_last_success_does_not_carry_birds(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary, BIRDNET_GO_SOURCES)
+            self.refresh(config, inaturalist=[FIELD_BIRD], birdnet_go=[YARD_BIRD])
+            path = config.controller.state_dir / "discovery.json"
+            snapshot = json.loads(path.read_text())
+            future = (datetime.now(UTC) + timedelta(hours=1)).replace(microsecond=0).isoformat()
+            for row in snapshot["providers"]:
+                if row["name"] == "inaturalist":
+                    row["last_success_at"] = future
+            path.write_text(json.dumps(snapshot))
+            self.refresh(config, inaturalist=DataSourceError("timed out"), birdnet_go=[YARD_BIRD])
+            wall = self.wall(config)
+            final = json.loads(path.read_text())
+
+        self.assertEqual(wall, [YARD_BIRD.taxon_id])
+        inaturalist = next(row for row in final["providers"] if row["name"] == "inaturalist")
         self.assertEqual(inaturalist["carried_species_count"], 0)
 
     def test_empty_success_never_carries_birds_forward(self) -> None:

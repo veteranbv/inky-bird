@@ -190,9 +190,12 @@ def _birdbuddy_history_warning(stats: BirdBuddySyncStats) -> str | None:
 
 
 def _unexpected_source_error(exc: Exception) -> str:
-    # Unexpected exception text can carry paths or coordinates; the stored and
-    # displayed status keeps only the type, and the traceback goes to the log.
+    # Project errors carry messages written to be shown. Other exception text
+    # can carry paths or coordinates, so the stored and displayed status keeps
+    # only the type; the traceback goes to the log either way.
     _LOG.warning("Bird discovery source failed unexpectedly", exc_info=exc)
+    if isinstance(exc, InkyBirdFrameError):
+        return str(exc)
     return f"The source failed unexpectedly ({type(exc).__name__})"
 
 
@@ -358,6 +361,9 @@ def discover_species(
                     latitude=latitude,
                     longitude=longitude,
                 )
+        except ValueError:
+            # Invalid coordinates or location settings are the caller's error.
+            raise
         except Exception as exc:
             message = (
                 f"Location lookup failed: {exc}"
