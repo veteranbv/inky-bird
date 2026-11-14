@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import stat
 import unittest
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 from inky_bird_frame.birdbuddy import (
     _CONFIRMED_HISTORY,
@@ -398,7 +401,7 @@ class BirdBuddyTests(unittest.TestCase):
                 "SightingRecognizedBird",
             )
 
-    def test_feed_rejects_malformed_duplicate_across_query_variants(self) -> None:
+    def test_feed_excludes_postcard_malformed_in_one_query_variant(self) -> None:
         sighting = {
             "__typename": "SightingRecognizedBird",
             "species": {
@@ -428,11 +431,11 @@ class BirdBuddyTests(unittest.TestCase):
                 }
             },
         ]
-        with (
-            patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=responses),
-            self.assertRaisesRegex(DataSourceError, "invalid duplicate postcard"),
-        ):
-            _fetch_postcards("access-secret", "feeder-1")
+        with patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=responses):
+            postcards, _, processed, ignored = _fetch_postcards("access-secret", "feeder-1")
+
+        self.assertEqual(postcards, [])
+        self.assertEqual((processed, ignored), (1, 1))
 
     def test_feed_rejects_confidence_mismatch_across_query_variants(self) -> None:
         sighting = {
@@ -939,7 +942,7 @@ class BirdBuddyTests(unittest.TestCase):
                 include_manual_sightings=True,
             )
 
-    def test_confirmed_history_rejects_malformed_selected_feeder_record(self) -> None:
+    def test_confirmed_history_skips_malformed_selected_feeder_record(self) -> None:
         malformed = confirmed_node(origin="POSTCARD", feeder_id="feeder-1")
         malformed["species"] = [{"__typename": "SpeciesBird", "id": None}]
         page = {
@@ -950,15 +953,15 @@ class BirdBuddyTests(unittest.TestCase):
                 }
             }
         }
-        with (
-            patch("inky_bird_frame.birdbuddy._graphql_request", return_value=page),
-            self.assertRaisesRegex(DataSourceError, "record was incomplete"),
-        ):
-            _fetch_confirmed_history(
+        with patch("inky_bird_frame.birdbuddy._graphql_request", return_value=page):
+            fetched = _fetch_confirmed_history(
                 "access-secret",
                 "feeder-1",
                 include_manual_sightings=False,
             )
+
+        self.assertEqual((fetched.records_accepted, fetched.records_skipped), (0, 1))
+        self.assertFalse(fetched.complete)
 
     def test_confirmed_history_rejects_repeated_pagination_cursor(self) -> None:
         page = {
@@ -980,11 +983,12 @@ class BirdBuddyTests(unittest.TestCase):
             )
 
     def test_revoked_refresh_token_has_actionable_redacted_error(self) -> None:
+        opener = MagicMock()
+        opener.open.side_effect = HTTPError(
+            "https://example.test/graphql", 401, "Unauthorized", Message(), io.BytesIO()
+        )
         with (
-            patch(
-                "inky_bird_frame.birdbuddy._graphql_request",
-                side_effect=DataSourceError("HTTP 401 from Bird Buddy API"),
-            ),
+            patch("inky_bird_frame.http.build_opener", return_value=opener),
             self.assertRaisesRegex(DataSourceError, "run birdbuddy login again") as raised,
         ):
             _refresh_access_token("private-refresh-token")
@@ -1941,7 +1945,10 @@ class BirdBuddyTests(unittest.TestCase):
         feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")
         now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
         original = postcard("postcard-1", now - timedelta(hours=1))
-        withdrawn = BirdBuddyPostcard(original.postcard_id, original.observed_at, ())
+        # A complete feed postcard always carries its media identifiers.
+        withdrawn = BirdBuddyPostcard(
+            original.postcard_id, original.observed_at, (), media_ids=original.media_ids
+        )
         with TemporaryDirectory() as temporary:
             state_dir = Path(temporary)
             with patch(
@@ -1984,7 +1991,9 @@ class BirdBuddyTests(unittest.TestCase):
         self.assertEqual(len(first.species), 1)
         self.assertEqual(removed.species, [])
         self.assertEqual(removed.stats.reclassified_postcards, 1)
-        self.assertEqual(history["feeders"]["feeder-1"]["postcards"], [])
+        self.assertEqual(
+            [item["species"] for item in history["feeders"]["feeder-1"]["postcards"]], [[]]
+        )
 
     def test_sync_preserves_detection_when_postcard_preview_is_incomplete(self) -> None:
         feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")
