@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -38,6 +39,22 @@ class ReferenceCandidate:
     image_url: str
     width: int
     height: int
+
+
+class ReferenceCandidates(list[ReferenceCandidate]):
+    """The selected candidates, plus further distinct-observer spares in rank order.
+
+    Download falls back to a spare when a selected photo cannot be fetched or
+    decoded, so one bad photo does not fail the species.
+    """
+
+    def __init__(
+        self,
+        selected: list[ReferenceCandidate],
+        spares: list[ReferenceCandidate] | tuple[ReferenceCandidate, ...] = (),
+    ) -> None:
+        super().__init__(selected)
+        self.spares = tuple(spares)
 
 
 def photo_url_for_size(url: str, size: str = "large") -> str:
@@ -110,7 +127,7 @@ def _parse_candidate(observation: object) -> list[ReferenceCandidate]:
     return candidates
 
 
-def parse_reference_candidates(payload: object, count: int) -> list[ReferenceCandidate]:
+def parse_reference_candidates(payload: object, count: int) -> ReferenceCandidates:
     if not isinstance(payload, dict):
         raise DataSourceError("iNaturalist observations response was not an object")
     results = payload.get("results")
@@ -126,21 +143,19 @@ def parse_reference_candidates(payload: object, count: int) -> list[ReferenceCan
             continue
         selected.append(candidate)
         observers.add(candidate.observer)
-        if len(selected) == count:
-            break
 
     if len(selected) < count:
         raise InsufficientReferencesError(
             f"Only {len(selected)} suitable licensed reference photos were found; {count} required"
         )
-    return selected
+    return ReferenceCandidates(selected[:count], selected[count:])
 
 
 def fetch_reference_candidates(
     taxon_id: int,
     count: int,
     timeout_seconds: float = 20.0,
-) -> list[ReferenceCandidate]:
+) -> ReferenceCandidates:
     if taxon_id <= 0:
         raise ValueError("taxon_id must be greater than zero")
     if count <= 0:
@@ -168,9 +183,19 @@ def _validate_image(path: Path) -> None:
     except ModuleNotFoundError as exc:
         raise MissingDependencyError("Pillow is required to validate reference images") from exc
     try:
-        with Image.open(path) as image:
-            image.verify()
-    except OSError as exc:
+        with warnings.catch_warnings():
+            # A reference photo is never large enough to warrant Pillow's
+            # decompression-bomb warning; treat it as invalid.
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                image.verify()
+            # verify() checks structure only; a full decode rejects truncated
+            # or undecodable pixel data.
+            with Image.open(path) as image:
+                image.load()
+    # Pillow reports malformed input with many exception types (SyntaxError,
+    # struct.error, ValueError, DecompressionBombError, ...).
+    except Exception as exc:
         path.unlink(missing_ok=True)
         raise DataSourceError(f"Downloaded reference is not a valid image: {path.name}") from exc
 
@@ -181,27 +206,50 @@ def download_references(
     timeout_seconds: float = 30.0,
 ) -> list[ReferencePhoto]:
     destination.mkdir(parents=True, exist_ok=True)
+    spares = list(candidates.spares) if isinstance(candidates, ReferenceCandidates) else []
     references: list[ReferencePhoto] = []
-    for index, candidate in enumerate(candidates, start=1):
-        suffix = Path(urlsplit(candidate.image_url).path).suffix.lower() or ".jpg"
-        filename = f"{index:02d}-{candidate.photo_id}{suffix}"
-        path = destination / filename
-        content = get_bytes(candidate.image_url, timeout_seconds)
-        write_bytes_atomic(path, content)
-        _validate_image(path)
-        references.append(
-            ReferencePhoto(
-                photo_id=candidate.photo_id,
-                observation_id=candidate.observation_id,
-                observer=candidate.observer,
-                attribution=candidate.attribution,
-                license_code=candidate.license_code,
-                source_url=candidate.source_url,
-                image_url=candidate.image_url,
-                width=candidate.width,
-                height=candidate.height,
-                filename=filename,
-                sha256=hashlib.sha256(content).hexdigest(),
+    download_failure: DataSourceError | None = None
+    invalid = 0
+    for index, selected in enumerate(candidates, start=1):
+        candidate: ReferenceCandidate | None = selected
+        while candidate is not None:
+            suffix = Path(urlsplit(candidate.image_url).path).suffix.lower() or ".jpg"
+            filename = f"{index:02d}-{candidate.photo_id}{suffix}"
+            path = destination / filename
+            try:
+                content = get_bytes(candidate.image_url, timeout_seconds)
+            except DataSourceError as exc:
+                download_failure = exc
+                candidate = spares.pop(0) if spares else None
+                continue
+            write_bytes_atomic(path, content)
+            try:
+                _validate_image(path)
+            except DataSourceError:
+                invalid += 1
+                candidate = spares.pop(0) if spares else None
+                continue
+            references.append(
+                ReferencePhoto(
+                    photo_id=candidate.photo_id,
+                    observation_id=candidate.observation_id,
+                    observer=candidate.observer,
+                    attribution=candidate.attribution,
+                    license_code=candidate.license_code,
+                    source_url=candidate.source_url,
+                    image_url=candidate.image_url,
+                    width=candidate.width,
+                    height=candidate.height,
+                    filename=filename,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
             )
-        )
+            break
+    if len(references) < len(candidates):
+        message = f"Only {len(references)} of {len(candidates)} reference photos could be used"
+        if download_failure is not None:
+            raise DataSourceError(f"{message}; last download error: {download_failure}") from (
+                download_failure
+            )
+        raise InsufficientReferencesError(f"{message}; {invalid} were not valid images")
     return references

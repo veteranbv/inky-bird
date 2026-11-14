@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import io
+import struct
 import unittest
+import zlib
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
-from inky_bird_frame.errors import InsufficientReferencesError
+from PIL import Image
+
+from inky_bird_frame.errors import DataSourceError, InsufficientReferencesError
 from inky_bird_frame.references import (
     REFERENCE_FIELDS,
+    ReferenceCandidate,
+    download_references,
     fetch_reference_candidates,
     parse_reference_candidates,
     photo_url_for_size,
@@ -86,6 +95,158 @@ class ReferenceTests(unittest.TestCase):
     def test_photo_url_size_is_validated(self) -> None:
         with self.assertRaises(ValueError):
             photo_url_for_size("https://example.test/1/square.jpg", "enormous")
+
+
+def _png(width: int = 64, height: int = 64) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 20, 30)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def _jpeg() -> bytes:
+    buffer = io.BytesIO()
+    Image.effect_noise((900, 900), 64).convert("RGB").save(buffer, "JPEG", quality=90)
+    return buffer.getvalue()
+
+
+def _png_with_bad_idat_checksum() -> bytes:
+    content = _png()
+    index = content.index(b"IDAT")
+    return content[: index + 4] + bytes([content[index + 4] ^ 0xFF]) + content[index + 5 :]
+
+
+def _png_with_undecodable_idat() -> bytes:
+    content = _png()
+    index = content.index(b"IDAT")
+    length = struct.unpack(">I", content[index - 4 : index])[0]
+    data = b"not compressed image data"
+    chunk = (
+        struct.pack(">I", len(data))
+        + b"IDAT"
+        + data
+        + struct.pack(">I", zlib.crc32(b"IDAT" + data))
+    )
+    return content[: index - 4] + chunk + content[index + 4 + length + 4 :]
+
+
+def _candidate(photo_id: int) -> ReferenceCandidate:
+    return ReferenceCandidate(
+        photo_id=photo_id,
+        observation_id=photo_id + 1000,
+        observer=f"observer-{photo_id}",
+        attribution=f"Photo by observer-{photo_id}",
+        license_code="cc-by",
+        source_url=f"https://www.inaturalist.org/observations/{photo_id + 1000}",
+        image_url=f"https://static.example/photos/{photo_id}/large.png",
+        width=1600,
+        height=1200,
+    )
+
+
+class ReferenceValidationTests(unittest.TestCase):
+    def _download_one(self, content: bytes) -> None:
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            with patch("inky_bird_frame.references.get_bytes", return_value=content):
+                try:
+                    download_references([_candidate(1)], destination)
+                finally:
+                    self.assertEqual(list(destination.iterdir()), [])
+
+    def test_invalid_images_raise_data_source_errors(self) -> None:
+        jpeg = _jpeg()
+        cases = {
+            "bad chunk checksum": _png_with_bad_idat_checksum(),
+            "undecodable pixel data": _png_with_undecodable_idat(),
+            "truncated jpeg": jpeg[: len(jpeg) // 3],
+            "not an image": b"plain text",
+        }
+        for name, content in cases.items():
+            with self.subTest(name), self.assertRaises(DataSourceError):
+                self._download_one(content)
+
+    def test_decompression_bomb_raises_data_source_error(self) -> None:
+        for limit in (100, 3000):
+            with (
+                self.subTest(limit=limit),
+                patch.object(Image, "MAX_IMAGE_PIXELS", limit),
+                self.assertRaises(DataSourceError),
+            ):
+                self._download_one(_png(64, 64))
+
+    def test_valid_image_is_accepted(self) -> None:
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            with patch("inky_bird_frame.references.get_bytes", return_value=_png()):
+                references = download_references([_candidate(1)], destination)
+
+            self.assertEqual([item.filename for item in references], ["01-1.png"])
+            self.assertTrue((destination / "01-1.png").is_file())
+
+
+class ReferenceFallbackTests(unittest.TestCase):
+    def test_bad_missing_or_oversized_photo_falls_back_to_next_candidate(self) -> None:
+        responses: dict[int, bytes | DataSourceError] = {
+            1: _png(),
+            2: DataSourceError("HTTP 404 from https://static.example/photos/2/large.png"),
+            3: _png_with_bad_idat_checksum(),
+            4: DataSourceError("Response exceeds the supported size"),
+            5: _png(),
+            6: _png(),
+        }
+
+        def fetch(url: str, _timeout: float) -> bytes:
+            photo_id = int(urlsplit(url).path.split("/")[2])
+            response = responses[photo_id]
+            if isinstance(response, DataSourceError):
+                raise response
+            return response
+
+        payload = {"results": [observation(index, f"user-{index}", index) for index in range(1, 7)]}
+        candidates = parse_reference_candidates(payload, 3)
+        self.assertEqual([item.photo_id for item in candidates], [1, 2, 3])
+
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary)
+            with patch("inky_bird_frame.references.get_bytes", side_effect=fetch):
+                references = download_references(candidates, destination)
+
+            self.assertEqual([item.photo_id for item in references], [1, 5, 6])
+            self.assertEqual(
+                sorted(path.name for path in destination.iterdir()),
+                sorted(item.filename for item in references),
+            )
+        self.assertEqual(len({item.observer for item in references}), 3)
+
+    def test_exhausted_candidates_with_only_bad_images_are_insufficient(self) -> None:
+        payload = {"results": [observation(index, f"user-{index}", index) for index in range(1, 4)]}
+        candidates = parse_reference_candidates(payload, 2)
+
+        with (
+            TemporaryDirectory() as temporary,
+            patch(
+                "inky_bird_frame.references.get_bytes",
+                side_effect=[_png(), b"plain text", _png_with_bad_idat_checksum()],
+            ),
+            self.assertRaises(InsufficientReferencesError),
+        ):
+            download_references(candidates, Path(temporary))
+
+    def test_exhausted_candidates_after_download_failure_stay_retryable(self) -> None:
+        payload = {"results": [observation(index, f"user-{index}", index) for index in range(1, 3)]}
+        candidates = parse_reference_candidates(payload, 2)
+
+        with (
+            TemporaryDirectory() as temporary,
+            patch(
+                "inky_bird_frame.references.get_bytes",
+                side_effect=[_png(), DataSourceError("Timed out reading the photo")],
+            ),
+            self.assertRaises(DataSourceError) as raised,
+        ):
+            download_references(candidates, Path(temporary))
+
+        self.assertNotIsInstance(raised.exception, InsufficientReferencesError)
 
 
 if __name__ == "__main__":
