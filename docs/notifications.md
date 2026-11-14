@@ -12,6 +12,11 @@ bird catalog.
 
 ## Basic setup
 
+The commands below use `inky-bird-frame`, the older name of the `inky-bird`
+command; both run the same program. On a native installation, run the managed
+copy instead, as shown in
+[Find your installation's names and paths](troubleshooting.md#find-your-installations-names-and-paths).
+
 1. Copy one destination example from `config.example.toml` into your private `config.toml`.
 2. Replace the placeholders with the credentials supplied by that service.
 3. Set `enabled = true` under `[notifications]`.
@@ -50,15 +55,15 @@ Each destination has its own `events` list:
 
 | Event | Sent when |
 | --- | --- |
-| `discovery` | A refresh finds species absent from the last reliable comparison; names are aggregated |
+| `discovery` | A refresh finds species absent from the last complete refresh. One notice names them all; the first refresh names every species found |
 | `generation_approved` | A new plate passes factual and visual review |
 | `terminal_error` | A taxon exhausts automated quality review and needs an explicit retry |
 | `degraded` | A transient operation crosses the configured count or duration threshold |
 | `recovered` | A previously reported transient degradation succeeds again |
 | `publication_error` | Public catalog publication crosses the degradation threshold |
 | `publication_recovered` | Public catalog publication succeeds after a reported degradation |
-| `display_stale` | No display node has fetched the active catalog for three rotation intervals, with a 60-minute minimum |
-| `display_recovered` | Display catalog fetches resume after a `display_stale` notice |
+| `display_stale` | No display update has completed for three rotation intervals, with a 60-minute minimum, or a display keeps fetching the catalog without completing an update |
+| `display_recovered` | A display update completes again after a `display_stale` notice |
 
 The controller's HTTP server records the display's most recent catalog fetch
 in `display-last-fetch.json` through `POST /v1/display-fetch` and records a
@@ -80,6 +85,13 @@ upgrade order. Update the controller first and then the display promptly, or
 move both roles through v0.7.0 first when uninterrupted heartbeat monitoring is
 required. `display_recovered` is sent once updates resume.
 
+The controller checks display staleness each time it runs `notifications
+dispatch`, so display monitoring runs only when `[notifications]` has
+`enabled = true`. With notifications off, nothing checks for a stale display.
+A stale display counts as a degradation, so the threshold and cooldown below
+also apply to it. A selected wall view that is empty pauses the panel without a
+completed update, so it is reported as stale too.
+
 Routine successes do not notify. Transient failures notify only after
 `degradation_failure_threshold` consecutive failures or
 `degradation_window_minutes` has elapsed. `cooldown_minutes` suppresses repeat
@@ -92,6 +104,13 @@ all configured providers succeed again. Their return is not a new discovery;
 genuinely new taxa from healthy providers can still notify. If upgrading while
 the previous refresh was degraded, the first complete refresh establishes a
 reliable comparison without a discovery notice.
+
+The first refresh of a new installation names every species it finds in one
+notice, however many there are. Later, a notice that matches one still queued
+or already delivered is not sent again; the outbox remembers the last 1,000
+delivered notices. A plate approval notifies once per species. A discovery notice is
+skipped when it names exactly the same species as an earlier one, so a species
+that returns on its own next season may not be announced again.
 
 ## Delivery reliability
 
@@ -179,8 +198,9 @@ events = ["terminal_error", "degraded", "recovered"]
 ```
 
 Use `url_env` instead of `url` only when your service manager injects that environment variable
-into every application process. The supported macOS installer rejects `url_env` because launchd
-does not inherit the installer's shell environment; use the private mode-0600 TOML file there.
+into every application process, as Docker does from `controller.env`. Both native installers
+(macOS LaunchAgents and Linux systemd) reject `url_env` because their services do not inherit the
+installer's shell environment; use `url` in the private mode-0600 TOML file there.
 
 ### Home Assistant
 
@@ -207,7 +227,8 @@ Apprise plugin.
 - Never add a real service URL to `config.example.toml`, documentation, issues, logs, or catalog
   files.
 - Keep the deployed `config.toml` outside the Git checkout.
-- Use `url_env` when a service URL is injected by a secret manager or service manager.
+- Use `url_env` when a service URL is injected by a secret manager or service manager (Docker;
+  not the native installers).
 - URL-encode usernames, passwords, tokens, paths, and recipients when they contain URL-reserved
   characters.
 - Rotate a token immediately if its full URL appears in terminal output or version control.

@@ -1,9 +1,9 @@
 """Short exact-version review verdict for the required `review-gate` check.
 
-Runs from a checkout of the PR's BASE commit, never PR content, and reads only
-live GitHub metadata with a read-only token. It never waits for a model: the
-verdict is computed once from current evidence and the job ends. Late review
-events are reconciled by re-running this job in place (the maintainer's `pr recheck`).
+Runs from a checkout of the default-branch tip, never the PR head or the PR's
+base branch, and reads only live GitHub metadata with a read-only token. It
+never waits for a model: the verdict is computed once from current evidence and
+the job ends. Late review events are reconciled by re-running this job in place.
 
 Standard-library only, executed with `python3 -I` beside the trusted
 `review_contract.py`.

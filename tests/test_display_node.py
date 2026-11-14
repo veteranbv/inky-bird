@@ -298,8 +298,8 @@ class DisplayNodeTests(unittest.TestCase):
 
         get_json.assert_not_called()
 
-    def test_successful_cycle_evicts_stale_cache_for_same_taxon_only(self) -> None:
-        images = {1: b"one"}
+    def test_successful_cycle_evicts_stale_and_departed_cache_entries(self) -> None:
+        images = {1: b"one", 2: b"two"}
         payload = catalog_payload(images)
         digest = hashlib.sha256(images[1]).hexdigest()
         with TemporaryDirectory() as temporary:
@@ -307,8 +307,12 @@ class DisplayNodeTests(unittest.TestCase):
             cache_dir.mkdir(parents=True)
             stale = cache_dir / "1-oldhash00000.png"
             stale.write_bytes(b"stale")
-            other_taxon = cache_dir / "13-otherhash00.png"
-            other_taxon.write_bytes(b"other")
+            other_active_taxon = cache_dir / "2-otherhash00.png"
+            other_active_taxon.write_bytes(b"other")
+            departed_taxon = cache_dir / "13-otherhash00.png"
+            departed_taxon.write_bytes(b"departed")
+            unrelated = cache_dir / "notes.png"
+            unrelated.write_bytes(b"unrelated")
             config = DisplayNodeConfig("http://controller.test", Path(temporary))
             with (
                 patch("inky_bird_frame.display_node.get_json", return_value=payload),
@@ -319,8 +323,83 @@ class DisplayNodeTests(unittest.TestCase):
 
             self.assertEqual(result["display_update"], "sent")
             self.assertFalse(stale.exists())
-            self.assertTrue(other_taxon.exists())
+            self.assertFalse(departed_taxon.exists())
+            self.assertTrue(other_active_taxon.exists())
+            self.assertTrue(unrelated.exists())
             self.assertTrue((cache_dir / f"1-{digest[:12]}.png").exists())
+
+    def test_verified_cached_plate_is_shown_without_downloading_again(self) -> None:
+        images = {1: b"one", 2: b"two"}
+        payload = catalog_payload(images)
+        shown: list[bytes] = []
+
+        def record_panel(path: Path, *, display: SimpleNamespace) -> tuple[int, int]:
+            del display
+            shown.append(path.read_bytes())
+            return 1600, 1200
+
+        with TemporaryDirectory() as temporary:
+            config = DisplayNodeConfig("http://controller.test", Path(temporary))
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch(
+                    "inky_bird_frame.display_node.get_bytes", side_effect=asset_response(images)
+                ) as get_bytes,
+                patch("inky_bird_frame.display_node.show_on_inky", side_effect=record_panel),
+            ):
+                results = [run_display_cycle(config) for _ in range(3)]
+
+        self.assertEqual([result["taxon_id"] for result in results], [1, 2, 1])
+        self.assertEqual([result["display_update"] for result in results], ["sent"] * 3)
+        self.assertEqual(get_bytes.call_count, 2)
+        self.assertEqual(shown, [b"one", b"two", b"one"])
+
+    def test_corrupt_cached_plate_is_downloaded_again_before_display(self) -> None:
+        images = {1: b"one"}
+        payload = catalog_payload(images)
+        digest = hashlib.sha256(images[1]).hexdigest()
+        with TemporaryDirectory() as temporary:
+            cached = Path(temporary) / "cache" / f"1-{digest[:12]}.png"
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"corrupt")
+            config = DisplayNodeConfig("http://controller.test", Path(temporary))
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch(
+                    "inky_bird_frame.display_node.get_bytes", side_effect=asset_response(images)
+                ) as get_bytes,
+                patch("inky_bird_frame.display_node.show_on_inky", return_value=(1600, 1200)),
+            ):
+                result = run_display_cycle(config)
+            repaired = cached.read_bytes()
+
+        self.assertEqual(result["display_update"], "sent")
+        get_bytes.assert_called_once()
+        self.assertEqual(repaired, b"one")
+
+    def test_non_hex_catalog_hash_never_reads_a_cache_path(self) -> None:
+        payload = catalog_payload({1: b"one"})
+        species = payload["species"]
+        assert isinstance(species, list)
+        species[0]["display_sha256"] = "../../outside"
+        with TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            config = DisplayNodeConfig("http://controller.test", Path(temporary) / "state")
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch("inky_bird_frame.display_node.get_bytes", return_value=b"one") as get_bytes,
+                patch(
+                    "inky_bird_frame.display_node._cached_image", return_value=None
+                ) as cached_image,
+                patch("inky_bird_frame.display_node.show_on_inky") as show_on_inky,
+                self.assertRaisesRegex(CatalogError, "checksum mismatch"),
+            ):
+                run_display_cycle(config)
+
+        cached_image.assert_not_called()
+        get_bytes.assert_called_once()
+        show_on_inky.assert_not_called()
 
     def test_unicode_display_path_is_percent_encoded_in_asset_url(self) -> None:
         image = b"unicode-plate"
@@ -520,7 +599,7 @@ class DisplayNodeTests(unittest.TestCase):
         self.assertEqual(first["display_update"], "sent")
         self.assertEqual(second["display_update"], "sent")
         self.assertEqual(third["display_update"], "unchanged")
-        self.assertEqual(get_bytes.call_count, 2)
+        get_bytes.assert_called_once()
         self.assertEqual(show_on_inky.call_count, 2)
         self.assertEqual(state["last_display_size"], [800, 480])
 
@@ -592,6 +671,127 @@ class DisplayNodeTests(unittest.TestCase):
         self.assertEqual((second["taxon_id"], second["selection_reason"]), (2, "latest_detection"))
         self.assertEqual(third["selection_reason"], "rotation")
         self.assertEqual(state["prioritized_detection_taxa"], [1, 2])
+
+    def test_continuously_redetected_bird_does_not_freeze_rotation(self) -> None:
+        images = {taxon_id: f"plate-{taxon_id}".encode() for taxon_id in range(1, 6)}
+        payload = catalog_payload(images)
+        species = payload["species"]
+        assert isinstance(species, list)
+        shown: list[object] = []
+        reasons: list[object] = []
+        with TemporaryDirectory() as temporary:
+            config = DisplayNodeConfig("http://controller.test", Path(temporary))
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch("inky_bird_frame.display_node.get_bytes", side_effect=asset_response(images)),
+                patch("inky_bird_frame.display_node.show_on_inky", return_value=(1600, 1200)),
+            ):
+                for minute in range(8):
+                    species[4]["latest_detection_at"] = f"2026-07-13T08:{minute:02d}:00+00:00"
+                    result = run_display_cycle(config)
+                    shown.append(result["taxon_id"])
+                    reasons.append(result["selection_reason"])
+
+        self.assertEqual(shown, [5, 1, 2, 3, 4, 5, 1, 2])
+        self.assertEqual(reasons[0], "latest_detection")
+        self.assertEqual(reasons[1:5], ["rotation"] * 4)
+
+    def test_many_redetected_birds_cannot_crowd_out_rotation(self) -> None:
+        images = {taxon_id: f"plate-{taxon_id}".encode() for taxon_id in range(1, 9)}
+        payload = catalog_payload(images)
+        species = payload["species"]
+        assert isinstance(species, list)
+        reasons: list[object] = []
+        with TemporaryDirectory() as temporary:
+            config = DisplayNodeConfig("http://controller.test", Path(temporary))
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch("inky_bird_frame.display_node.get_bytes", side_effect=asset_response(images)),
+                patch("inky_bird_frame.display_node.show_on_inky", return_value=(1600, 1200)),
+            ):
+                for cycle in range(12):
+                    for offset, entry in enumerate(species):
+                        entry["latest_detection_at"] = (
+                            f"2026-07-13T{8 + cycle:02d}:{offset:02d}:00+00:00"
+                        )
+                    reasons.append(run_display_cycle(config)["selection_reason"])
+
+        self.assertEqual(reasons[:2], ["latest_detection"] * 2)
+        for start in range(len(reasons) - 2):
+            self.assertIn("rotation", reasons[start : start + 3])
+
+    def test_recent_display_history_is_optional_and_validated(self) -> None:
+        version_three_state = {
+            "schema_version": 3,
+            "next_index": 2,
+            "last_sha256": "",
+            "last_taxon_id": 4,
+            "shuffle_remaining": [],
+            "shuffle_bag_remaining": [],
+            "shuffle_bag_seen": [],
+            "last_prioritized_detection_at": None,
+            "prioritized_detection_taxa": [],
+        }
+        with TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            state_path.write_text(json.dumps(version_three_state))
+            old = _read_state(state_path)
+            state_path.write_text(json.dumps({"next_index": 0}))
+            legacy = _read_state(state_path)
+            for invalid in (
+                {"recent_taxon_ids": [1, 1]},
+                {"recent_taxon_ids": [0]},
+                {"recent_taxon_ids": "1"},
+                {"consecutive_detection_displays": -1},
+                {"consecutive_detection_displays": True},
+                {"consecutive_detection_displays": "1"},
+            ):
+                state_path.write_text(json.dumps({**version_three_state, **invalid}))
+                with self.assertRaises(CatalogError):
+                    _read_state(state_path)
+
+        self.assertEqual(old.next_index, 2)
+        self.assertEqual(old.recent_taxon_ids, ())
+        self.assertEqual(old.consecutive_detection_displays, 0)
+        self.assertEqual(legacy.recent_taxon_ids, ())
+        self.assertEqual(legacy.consecutive_detection_displays, 0)
+
+    def test_state_without_display_history_treats_the_current_plate_as_recent(self) -> None:
+        images = {1: b"one", 2: b"two", 3: b"three"}
+        payload = catalog_payload(images)
+        species = payload["species"]
+        assert isinstance(species, list)
+        species[2]["latest_detection_at"] = "2026-07-13T08:10:00+00:00"
+        with TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "next_index": 0,
+                        "last_sha256": hashlib.sha256(images[3]).hexdigest(),
+                        "last_taxon_id": 3,
+                        "shuffle_remaining": [],
+                        "shuffle_bag_remaining": [],
+                        "shuffle_bag_seen": [],
+                        "last_prioritized_detection_at": None,
+                        "prioritized_detection_taxa": [],
+                        "last_display_size": [1600, 1200],
+                    }
+                )
+            )
+            config = DisplayNodeConfig("http://controller.test", Path(temporary))
+            with (
+                patch("inky_bird_frame.display_node.get_json", return_value=payload),
+                patch("inky_bird_frame.display_node.get_bytes", side_effect=asset_response(images)),
+                patch("inky_bird_frame.display_node.show_on_inky", return_value=(1600, 1200)),
+            ):
+                result = run_display_cycle(config)
+                state = json.loads(state_path.read_text())
+
+        self.assertEqual((result["taxon_id"], result["selection_reason"]), (1, "rotation"))
+        self.assertEqual(state["recent_taxon_ids"], [3, 1])
+        self.assertEqual(state["consecutive_detection_displays"], 0)
 
     def test_latest_detection_seeds_empty_shuffle_without_selected_taxon(self) -> None:
         images = {1: b"one", 2: b"two", 3: b"three"}
