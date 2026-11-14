@@ -5,9 +5,12 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import unittest
-from contextlib import redirect_stdout
+import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import call, patch
@@ -17,16 +20,22 @@ from PIL import Image, PngImagePlugin
 
 from inky_bird_frame.catalog import rebuild_catalog_index, sha256_file
 from inky_bird_frame.cli import build_parser, catalog_sync_command
-from inky_bird_frame.config import PublicCatalogConfig, load_config
+from inky_bird_frame.config import AppConfig, PublicCatalogConfig, load_config
 from inky_bird_frame.errors import CatalogPublishError
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.publisher import (
+    _COMMAND_TIMEOUT_SECONDS,
     _abandoned_publish_work,
     _catalog_transaction_prefix,
     _check_json_privacy,
     _cleanup_abandoned_publish_work_locked,
+    _gh,
+    _git,
     _remote_repository,
+    _run,
     _validate_checkout,
+    _validate_image,
+    publication_privacy_patterns,
     replace_public_catalog_taxon,
     run_catalog_publish,
     sync_public_catalog,
@@ -137,12 +146,12 @@ def _create_portrait_replacement(
     return directory
 
 
-def _write_config(root: Path, checkout: Path) -> Path:
+def _write_config(root: Path, checkout: Path, *, location: str = 'zip_code = "12345"') -> Path:
     path = root / "config.toml"
     path.write_text(
         f"""
 [discovery]
-zip_code = "12345"
+{location}
 radius_km = 8
 species_limit = 12
 window = "last-week"
@@ -196,6 +205,175 @@ def _initialize_remote(root: Path) -> tuple[Path, Path]:
     )
     _run_git(checkout, "push", "-u", "origin", "main")
     return remote, checkout
+
+
+_REPOSITORY = "example/inky-bird-frame"
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data))
+    )
+
+
+def _insert_png_chunk_before_end(path: Path, chunk: bytes) -> None:
+    raw = path.read_bytes()
+    end = raw.rindex(b"IEND") - 4
+    path.write_bytes(raw[:end] + chunk + raw[end:])
+
+
+def _refresh_asset_checksums(directory: Path) -> None:
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for name in ("portrait", "display"):
+        manifest["assets"][name]["sha256"] = sha256_file(directory / f"{name}.png")
+    write_json_atomic(manifest_path, manifest)
+    rebuild_catalog_index(directory.parent.parent)
+
+
+def _set_profile_field(directory: Path, key: str, value: str) -> None:
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["profile"][key] = value
+    write_json_atomic(manifest_path, manifest)
+    write_json_atomic(directory / "profile.json", manifest["profile"])
+
+
+def _remote_branches(remote: Path) -> list[str]:
+    return _run_git(remote, "for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines()
+
+
+def _remote_files(remote: Path) -> list[str]:
+    return _run_git(
+        remote, "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "main"
+    ).splitlines()
+
+
+def _result_items(result: dict[str, object], key: str) -> list[dict[str, object]]:
+    value = result[key]
+    assert isinstance(value, list)
+    items = [item for item in value if isinstance(item, dict)]
+    assert len(items) == len(value)
+    return items
+
+
+class _FakeGitHub:
+    """A `gh` stand-in that keeps pull requests against the local bare remote."""
+
+    def __init__(self, test: unittest.TestCase, remote: Path) -> None:
+        self.test = test
+        self.remote = remote
+        self.calls: list[tuple[str, ...]] = []
+        self.pull_requests: list[dict[str, object]] = []
+        self.merged_commits: list[str] = []
+        self.fail_next_merge = False
+
+    def add_pull_request(self, branch: str, *, author: str = "example") -> dict[str, object]:
+        number = len(self.pull_requests) + 1
+        pull_request: dict[str, object] = {
+            "number": number,
+            "url": f"https://github.com/{_REPOSITORY}/pull/{number}",
+            "state": "OPEN",
+            "headRefName": branch,
+            "headRefOid": _run_git(self.remote, "rev-parse", f"refs/heads/{branch}"),
+            "isCrossRepository": False,
+            "author": {"login": author},
+        }
+        self.pull_requests.append(pull_request)
+        return pull_request
+
+    def _by_url(self, url: str) -> dict[str, object]:
+        matches = [item for item in self.pull_requests if item["url"] == url]
+        self.test.assertEqual(len(matches), 1, url)
+        return matches[0]
+
+    def __call__(
+        self,
+        _publication: object,
+        *arguments: str,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        del input_text, check
+        self.calls.append(arguments)
+        stdout = ""
+        if arguments[:2] == ("api", "user"):
+            stdout = "example\n"
+        elif arguments[:2] == ("pr", "list"):
+            self.test.assertEqual(arguments[arguments.index("--repo") + 1], _REPOSITORY)
+            state = arguments[arguments.index("--state") + 1]
+            matches = [
+                item
+                for item in self.pull_requests
+                if state == "all" or item["state"] == state.upper()
+            ]
+            if "--head" in arguments:
+                head = arguments[arguments.index("--head") + 1]
+                matches = [item for item in matches if item["headRefName"] == head]
+            stdout = json.dumps(matches)
+        elif arguments[:2] == ("pr", "create"):
+            branch = arguments[arguments.index("--head") + 1]
+            self.test.assertEqual(arguments[arguments.index("--base") + 1], "main")
+            stdout = str(self.add_pull_request(branch)["url"]) + "\n"
+        elif arguments[:2] == ("pr", "merge"):
+            pull_request = self._by_url(arguments[2])
+            for flag in ("--admin", "--squash", "--delete-branch"):
+                self.test.assertIn(flag, arguments)
+            commit = arguments[arguments.index("--match-head-commit") + 1]
+            branch = str(pull_request["headRefName"])
+            self.test.assertEqual(
+                _run_git(self.remote, "rev-parse", f"refs/heads/{branch}"), commit
+            )
+            self.test.assertEqual(pull_request["headRefOid"], commit)
+            if self.fail_next_merge:
+                self.fail_next_merge = False
+                raise CatalogPublishError("gh pr merge failed: simulated outage")
+            tree = _run_git(self.remote, "rev-parse", f"{commit}^{{tree}}")
+            squashed = _run_git(
+                self.remote,
+                "-c",
+                "user.name=Merge",
+                "-c",
+                "user.email=merge@example.test",
+                "commit-tree",
+                tree,
+                "-p",
+                "refs/heads/main",
+                "-m",
+                "Squash publication",
+            )
+            _run_git(self.remote, "update-ref", "refs/heads/main", squashed)
+            _run_git(self.remote, "update-ref", "-d", f"refs/heads/{branch}")
+            pull_request["state"] = "MERGED"
+            self.merged_commits.append(commit)
+        elif arguments[:2] == ("pr", "view"):
+            stdout = str(self._by_url(arguments[2])["state"]) + "\n"
+        elif arguments[:2] == ("pr", "close"):
+            pull_request = self._by_url(arguments[2])
+            self.test.assertIn("--delete-branch", arguments)
+            self.test.assertEqual(pull_request["state"], "OPEN")
+            pull_request["state"] = "CLOSED"
+            _run_git(self.remote, "update-ref", "-d", f"refs/heads/{pull_request['headRefName']}")
+        else:
+            self.test.fail(f"Unexpected gh call: {arguments}")
+        return subprocess.CompletedProcess(["gh", *arguments], 0, stdout, "")
+
+
+@contextmanager
+def _github(fake: _FakeGitHub) -> Iterator[None]:
+    """Run the real checkout validation, mapping only the local remote to GitHub."""
+
+    def remote_repository(url: str) -> str | None:
+        return _REPOSITORY if Path(url) == fake.remote else None
+
+    with (
+        patch("inky_bird_frame.publisher._gh", side_effect=fake),
+        patch("inky_bird_frame.publisher._remote_repository", side_effect=remote_repository),
+    ):
+        yield
 
 
 class PublisherTests(unittest.TestCase):
@@ -1229,6 +1407,62 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(result["already_present"], [1, 2])
             self.assertEqual(len(validate_public_catalog(destination)), 2)
 
+    def test_sync_recovery_ignores_finder_metadata(self) -> None:
+        for interrupted_index in (True, False):
+            with (
+                self.subTest(interrupted_index=interrupted_index),
+                TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                source = root / "source"
+                destination = root / "destination"
+                _create_species(source, 1, "First Bird")
+                _create_species(source, 2, "Second Bird")
+                if interrupted_index:
+                    _create_species(destination, 1, "First Bird")
+                    active_prefix = _catalog_transaction_prefix(destination, committed=False)
+                    (root / f"{active_prefix}interrupted").mkdir()
+                else:
+                    (destination / "species").mkdir(parents=True)
+                    shutil.copytree(
+                        source / "species/1-first-bird", destination / "species/1-first-bird"
+                    )
+                shutil.copytree(
+                    source / "species/2-second-bird", destination / "species/2-second-bird"
+                )
+                (destination / "species/.DS_Store").write_bytes(b"finder")
+
+                result = sync_public_catalog(source, destination)
+
+                self.assertEqual(result["already_present"], [1, 2])
+                self.assertEqual(len(validate_public_catalog(destination)), 2)
+
+    def test_replacement_recovery_ignores_finder_metadata_in_the_backup(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "destination"
+            replacement = root / "replacement"
+            approved = _create_species(destination, 1, "Existing Bird")
+            _create_portrait_replacement(
+                replacement,
+                1,
+                "Existing Bird",
+                approved_at="2026-07-10T00:00:00+00:00",
+                color="black",
+            )
+            active_prefix = _catalog_transaction_prefix(destination, committed=False)
+            backup = root / f"{active_prefix}interrupted/approved/1-existing-bird"
+            backup.parent.mkdir(parents=True)
+            (backup.parent / ".DS_Store").write_bytes(b"finder")
+            approved.replace(backup)
+
+            replace_public_catalog_taxon(
+                replacement, destination, 1, "Human review found incorrect proportions."
+            )
+
+            self.assertFalse(list(root.glob(f"{active_prefix}*")))
+            self.assertEqual(len(validate_public_catalog(destination)), 1)
+
     def test_sync_recovery_keeps_journal_until_index_rebuild_succeeds(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1690,74 +1924,59 @@ class PublisherTests(unittest.TestCase):
             abandoned_work = config.controller.state_dir / "catalog-publish-work/publish-abandoned"
             abandoned_work.mkdir(parents=True)
             (abandoned_work / "partial").write_text("scratch")
+            fake = _FakeGitHub(self, remote)
+            timeouts: dict[str, float] = {}
 
-            def fake_gh(
-                _publication: object,
-                *arguments: str,
+            def recording_run(
+                arguments: list[str],
+                *,
                 input_text: str | None = None,
+                check: bool = True,
+                timeout: float,
             ) -> subprocess.CompletedProcess[str]:
-                del input_text
-                if arguments[:2] == ("pr", "list"):
-                    stdout = "[]\n"
-                elif arguments[:2] == ("pr", "create"):
-                    stdout = "https://github.com/example/inky-bird-frame/pull/1\n"
-                elif arguments[:2] == ("pr", "merge"):
-                    refs = _run_git(
-                        remote,
-                        "for-each-ref",
-                        "--format=%(refname)",
-                        "refs/heads/catalog/publish-*",
-                    ).splitlines()
-                    self.assertEqual(len(refs), 1)
-                    commit = _run_git(remote, "rev-parse", refs[0])
-                    _run_git(remote, "update-ref", "refs/heads/main", commit)
-                    _run_git(remote, "update-ref", "-d", refs[0])
-                    stdout = ""
-                elif arguments[:2] == ("pr", "view"):
-                    stdout = "MERGED\n"
-                else:
-                    self.fail(f"Unexpected gh call: {arguments}")
-                return subprocess.CompletedProcess(["gh", *arguments], 0, stdout, "")
+                if arguments[0] == "git":
+                    subcommand = next(
+                        item
+                        for index, item in enumerate(arguments[1:], start=1)
+                        if not item.startswith("-") and arguments[index - 1] not in {"-C", "-c"}
+                    )
+                    timeouts[subcommand] = max(timeout, timeouts.get(subcommand, 0))
+                return _run(arguments, input_text=input_text, check=check, timeout=timeout)
 
             with (
-                patch(
-                    "inky_bird_frame.publisher._validate_checkout",
-                    return_value="example/inky-bird-frame",
-                ),
-                patch("inky_bird_frame.publisher._gh", side_effect=fake_gh),
+                _github(fake),
+                patch("inky_bird_frame.publisher._run", side_effect=recording_run),
             ):
                 first = run_catalog_publish(config)
 
             self.assertTrue(first["pushed"])
             self.assertTrue(first["merged"])
             self.assertTrue(first["changed"])
+            self.assertEqual(first["skipped"], [])
+            self.assertEqual(fake.merged_commits, [first["commit"]])
             self.assertEqual(first["abandoned_work_directories"], 1)
             self.assertEqual(first["cleaned_work_directories"], 1)
             self.assertFalse(abandoned_work.exists())
-            self.assertIsInstance(first["commit"], str)
-            self.assertIn(
-                "catalog/species/1-example-bird/manifest.json",
-                _run_git(remote, "ls-tree", "-r", "--name-only", "main"),
-            )
+            self.assertIn("catalog/species/1-example-bird/manifest.json", _remote_files(remote))
+            self.assertEqual(_remote_branches(remote), ["main"])
+            self.assertGreaterEqual(timeouts["push"], 1800)
+            self.assertGreaterEqual(timeouts["fetch"], 1800)
+            self.assertGreaterEqual(timeouts["worktree"], 600)
+            self.assertLess(timeouts["rev-parse"], timeouts["push"])
 
-            with patch(
-                "inky_bird_frame.publisher._validate_checkout",
-                return_value="example/inky-bird-frame",
-            ):
+            with _github(fake):
                 second = run_catalog_publish(config)
 
             self.assertFalse(second["pushed"])
             self.assertFalse(second["changed"])
+            self.assertEqual(second["already_present"], [1])
             self.assertEqual(second["abandoned_work_directories"], 0)
             self.assertEqual(second["cleaned_work_directories"], 0)
 
             _create_species(config.controller.catalog_dir, 2, "Second Bird")
             dry_run_abandoned = config.controller.state_dir / "catalog-publish-work/publish-dry-run"
             dry_run_abandoned.mkdir()
-            with patch(
-                "inky_bird_frame.publisher._validate_checkout",
-                return_value="example/inky-bird-frame",
-            ):
+            with _github(fake):
                 dry_run = run_catalog_publish(config, dry_run=True)
 
             self.assertTrue(dry_run["changed"])
@@ -1765,26 +1984,399 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(dry_run["abandoned_work_directories"], 1)
             self.assertEqual(dry_run["cleaned_work_directories"], 0)
             self.assertTrue(dry_run_abandoned.is_dir())
-            self.assertNotIn(
-                "2-second-bird", _run_git(remote, "ls-tree", "-r", "--name-only", "main")
-            )
+            self.assertNotIn("catalog/species/2-second-bird/manifest.json", _remote_files(remote))
 
-            with (
-                patch(
-                    "inky_bird_frame.publisher._validate_checkout",
-                    return_value="example/inky-bird-frame",
-                ),
-                patch("inky_bird_frame.publisher._gh", side_effect=fake_gh),
-            ):
+            with _github(fake):
                 final = run_catalog_publish(config)
 
             self.assertTrue(final["pushed"])
             self.assertEqual(final["cleaned_work_directories"], 1)
             self.assertFalse(dry_run_abandoned.exists())
-            self.assertIn(
-                "catalog/species/2-second-bird/manifest.json",
-                _run_git(remote, "ls-tree", "-r", "--name-only", "main"),
+            self.assertIn("catalog/species/2-second-bird/manifest.json", _remote_files(remote))
+            self.assertEqual(fake.merged_commits, [first["commit"], final["commit"]])
+
+
+class PublicationRunTests(unittest.TestCase):
+    def _environment(self, root: Path, **config: str) -> tuple[Path, Path, AppConfig, _FakeGitHub]:
+        remote, checkout = _initialize_remote(root)
+        app_config = load_config(_write_config(root, checkout, **config))
+        return remote, checkout, app_config, _FakeGitHub(self, remote)
+
+    def test_publishes_a_species_whose_slug_is_not_ascii(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Rüppell Warbler")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            paths = result["paths"]
+            assert isinstance(paths, list)
+            self.assertIn("catalog/species/1-rüppell-warbler/manifest.json", paths)
+            self.assertIn("catalog/species/1-rüppell-warbler/display.png", _remote_files(remote))
+            self.assertEqual(fake.merged_commits, [result["commit"]])
+
+    def test_skips_a_species_that_fails_publication_gates_and_publishes_the_rest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _, config, fake = self._environment(root)
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Good Bird")
+            broken = _create_species(catalog, 2, "Broken Bird")
+            Image.new("RGB", (1600, 1200), "black").save(broken / "display.png")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            published = [item["taxon_id"] for item in _result_items(result, "published")]
+            self.assertEqual(published, [1])
+            skipped = _result_items(result, "skipped")
+            self.assertEqual([item["species"] for item in skipped], ["2-broken-bird"])
+            reason = str(skipped[0]["reason"])
+            self.assertIn("display checksum", reason)
+            self.assertNotIn(str(root), reason)
+            files = _remote_files(remote)
+            self.assertIn("catalog/species/1-good-bird/manifest.json", files)
+            self.assertFalse(any("2-broken-bird" in path for path in files))
+            index = json.loads(_run_git(remote, "show", "main:catalog/index.json"))
+            self.assertEqual([item["taxon_id"] for item in index["species"]], [1])
+            self.assertTrue((broken / "display.png").is_file())
+
+    def test_skips_a_new_species_that_names_the_configured_place(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            config.controller.state_dir.mkdir(parents=True)
+            write_json_atomic(
+                config.controller.state_dir / "discovery.json",
+                {"place_name": "Exampleville", "state": "Example State"},
             )
+            _create_species(catalog, 1, "Good Bird")
+            leaky = _create_species(catalog, 2, "Leaky Bird")
+            _set_profile_field(leaky, "habitat", "Common in the parks of exampleville.")
+            rebuild_catalog_index(catalog)
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            published = [item["taxon_id"] for item in _result_items(result, "published")]
+            self.assertEqual(published, [1])
+            skipped = _result_items(result, "skipped")
+            self.assertEqual([item["species"] for item in skipped], ["2-leaky-bird"])
+            self.assertIn("Private location or path", str(skipped[0]["reason"]))
+            self.assertFalse(any("2-leaky-bird" in path for path in _remote_files(remote)))
+
+    def test_commit_ignores_hooks_and_signing_and_publishes_the_validated_tree(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, checkout, config, fake = self._environment(root)
+            hooks = root / "hooks"
+            hooks.mkdir()
+            (hooks / "pre-commit").write_text(
+                "#!/bin/sh\n"
+                "printf private > catalog/species/1-example-bird/notes.txt\n"
+                "git add catalog/species/1-example-bird/notes.txt\n"
+            )
+            (hooks / "prepare-commit-msg").write_text("#!/bin/sh\nexit 1\n")
+            (hooks / "pre-push").write_text("#!/bin/sh\nexit 1\n")
+            for hook in hooks.iterdir():
+                hook.chmod(0o755)
+            _run_git(checkout, "config", "core.hooksPath", str(hooks))
+            _run_git(checkout, "config", "commit.gpgSign", "true")
+            _run_git(checkout, "config", "gpg.program", "/usr/bin/false")
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            files = _remote_files(remote)
+            self.assertIn("catalog/species/1-example-bird/manifest.json", files)
+            self.assertNotIn("catalog/species/1-example-bird/notes.txt", files)
+
+    def test_rejects_a_commit_that_differs_from_the_validated_changes(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+
+            def altering_git(
+                repository: Path,
+                *arguments: str,
+                check: bool = True,
+                timeout: float = _COMMAND_TIMEOUT_SECONDS,
+            ) -> subprocess.CompletedProcess[str]:
+                result = _git(repository, *arguments, check=check, timeout=timeout)
+                if "commit" in arguments and "-m" in arguments:
+                    (repository / "catalog/extra.txt").write_text("unexpected")
+                    _run_git(repository, "add", "catalog/extra.txt")
+                    _run_git(
+                        repository,
+                        "-c",
+                        "user.name=Other",
+                        "-c",
+                        "user.email=other@example.test",
+                        "commit",
+                        "--amend",
+                        "--no-edit",
+                    )
+                return result
+
+            with (
+                _github(fake),
+                patch("inky_bird_frame.publisher._git", side_effect=altering_git),
+                self.assertRaisesRegex(CatalogPublishError, "unexpected change: catalog/extra.txt"),
+            ):
+                run_catalog_publish(config)
+
+            self.assertEqual(_remote_branches(remote), ["main"])
+            self.assertNotIn(("pr", "create"), [call_[:2] for call_ in fake.calls])
+
+    def test_returns_before_copying_when_the_remote_already_has_everything(self) -> None:
+        with TemporaryDirectory() as temporary:
+            _, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            with _github(fake):
+                run_catalog_publish(config)
+            git_calls: list[tuple[str, ...]] = []
+
+            def recording_git(
+                repository: Path,
+                *arguments: str,
+                check: bool = True,
+                timeout: float = _COMMAND_TIMEOUT_SECONDS,
+            ) -> subprocess.CompletedProcess[str]:
+                git_calls.append(arguments)
+                return _git(repository, *arguments, check=check, timeout=timeout)
+
+            with (
+                _github(fake),
+                patch("inky_bird_frame.publisher._git", side_effect=recording_git),
+                patch("inky_bird_frame.publisher.shutil.copytree") as copytree,
+            ):
+                result = run_catalog_publish(config)
+
+            copytree.assert_not_called()
+            self.assertNotIn(("worktree", "add"), [item[:2] for item in git_calls])
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["published"], [])
+            self.assertEqual(result["already_present"], [1])
+
+    def test_cleans_stale_owner_publication_branches_and_pull_requests(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            stale_without_pull = "catalog/publish-aaaaaaaa-bbbbbbbb"
+            stale_with_pull = "catalog/publish-cccccccc-dddddddd"
+            foreign_pull = "catalog/publish-eeeeeeee-ffffffff"
+            for branch in (stale_without_pull, stale_with_pull, foreign_pull, "feature/keep"):
+                _run_git(remote, "update-ref", f"refs/heads/{branch}", "refs/heads/main")
+            owner_pull = fake.add_pull_request(stale_with_pull)
+            other_pull = fake.add_pull_request(foreign_pull, author="contributor")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertEqual(
+                result["cleaned_publication_branches"], [stale_without_pull, stale_with_pull]
+            )
+            self.assertEqual(owner_pull["state"], "CLOSED")
+            self.assertEqual(other_pull["state"], "OPEN")
+            self.assertEqual(
+                sorted(_remote_branches(remote)), sorted([foreign_pull, "feature/keep", "main"])
+            )
+
+    def test_dry_run_does_not_clean_stale_publications(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            stale = "catalog/publish-aaaaaaaa-bbbbbbbb"
+            _run_git(remote, "update-ref", f"refs/heads/{stale}", "refs/heads/main")
+
+            with _github(fake):
+                result = run_catalog_publish(config, dry_run=True)
+
+            self.assertEqual(result["cleaned_publication_branches"], [])
+            self.assertIn(stale, _remote_branches(remote))
+
+    def test_retry_reuses_the_current_publication_branch_after_a_failed_merge(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            fake.fail_next_merge = True
+            with (
+                _github(fake),
+                self.assertRaisesRegex(CatalogPublishError, "simulated outage"),
+            ):
+                run_catalog_publish(config)
+            branches = [item for item in _remote_branches(remote) if item != "main"]
+            self.assertEqual(len(branches), 1)
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["branch"], branches[0])
+            self.assertEqual(result["cleaned_publication_branches"], [])
+            self.assertEqual(len(fake.pull_requests), 1)
+            self.assertEqual(fake.pull_requests[0]["state"], "MERGED")
+
+    def test_cleanup_failure_does_not_replace_the_original_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            _, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+
+            def failing_git(
+                repository: Path,
+                *arguments: str,
+                check: bool = True,
+                timeout: float = _COMMAND_TIMEOUT_SECONDS,
+            ) -> subprocess.CompletedProcess[str]:
+                if arguments[:1] == ("push",) and "--delete" not in arguments:
+                    raise CatalogPublishError("git push timed out after 3600 seconds")
+                if arguments[:2] == ("worktree", "remove"):
+                    raise CatalogPublishError("git worktree timed out after 900 seconds")
+                return _git(repository, *arguments, check=check, timeout=timeout)
+
+            with (
+                _github(fake),
+                patch("inky_bird_frame.publisher._git", side_effect=failing_git),
+                self.assertRaisesRegex(CatalogPublishError, "^git push timed out"),
+            ):
+                run_catalog_publish(config)
+
+
+class CommandErrorTests(unittest.TestCase):
+    def test_git_errors_name_the_subcommand(self) -> None:
+        cases: list[tuple[object, str]] = [
+            (subprocess.TimeoutExpired(["git"], 5), "^git push timed out after [0-9]+ seconds$"),
+            (FileNotFoundError("git"), "^Unable to run git push$"),
+            (
+                subprocess.CompletedProcess(["git"], 1, "", "fatal: boom\n"),
+                "^git push failed: fatal: boom$",
+            ),
+        ]
+        for outcome, message in cases:
+            side_effect = outcome if isinstance(outcome, BaseException) else None
+            return_value = None if side_effect is not None else outcome
+            with (
+                self.subTest(message=message),
+                patch(
+                    "inky_bird_frame.publisher.subprocess.run",
+                    side_effect=side_effect,
+                    return_value=return_value,
+                ),
+                self.assertRaisesRegex(CatalogPublishError, message),
+            ):
+                _git(Path("checkout"), "-c", "core.quotePath=false", "push", "origin", "HEAD")
+
+    def test_gh_errors_name_the_subcommand(self) -> None:
+        with (
+            patch(
+                "inky_bird_frame.publisher.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["gh"], 5),
+            ),
+            self.assertRaisesRegex(CatalogPublishError, "^gh pr merge timed out after"),
+        ):
+            _gh(PublicCatalogConfig(), "pr", "merge", "https://github.com/example/pull/1")
+
+
+class PublicationPrivacyTests(unittest.TestCase):
+    def test_rejects_png_chunks_after_the_image_data(self) -> None:
+        cases = {
+            "text after image data": _png_chunk(b"tEXt", b"Comment\x00lat 1.0 lon 2.0"),
+            "private chunk": _png_chunk(b"prVt", b"private"),
+            "time chunk": _png_chunk(b"tIME", b"\x07\xea\x01\x01\x00\x00\x00"),
+        }
+        for label, chunk in cases.items():
+            with self.subTest(label=label), TemporaryDirectory() as temporary:
+                catalog = Path(temporary) / "catalog"
+                directory = _create_species(catalog, 1, "Example Bird")
+                _insert_png_chunk_before_end(directory / "portrait.png", chunk)
+                _refresh_asset_checksums(directory)
+
+                with self.assertRaisesRegex(CatalogPublishError, "metadata is not allowed"):
+                    validate_public_catalog(catalog)
+
+    def test_rejects_bytes_after_the_png_end(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "display.png"
+            Image.new("RGB", (1600, 1200), "white").save(path)
+            path.write_bytes(path.read_bytes() + b"lat 1.0 lon 2.0")
+
+            with self.assertRaisesRegex(CatalogPublishError, "metadata is not allowed"):
+                _validate_image(path, (1600, 1200))
+
+    def test_accepts_a_plain_png(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "display.png"
+            Image.new("RGB", (1600, 1200), "white").save(path)
+            _validate_image(path, (1600, 1200))
+            Image.new("P", (1600, 1200), 3).save(path)
+            _validate_image(path, (1600, 1200))
+
+    def _config(self, root: Path, location: str) -> AppConfig:
+        checkout = root / "checkout"
+        checkout.mkdir(exist_ok=True)
+        config = load_config(_write_config(root, checkout, location=location))
+        config.controller.state_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            config.controller.state_dir / "discovery.json",
+            {"place_name": "Exampleville", "state": "Example State"},
+        )
+        return config
+
+    def test_rejects_configured_location_and_paths_inside_free_text(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            postal_config = self._config(root, 'zip_code = "12345"')
+            postal = publication_privacy_patterns(postal_config)
+            coordinates = publication_privacy_patterns(
+                self._config(root, "latitude = 1.234567\nlongitude = -2.345678")
+            )
+            state_dir = postal_config.controller.state_dir
+            rejected = {
+                "place": (postal, "Often seen near exampleville in winter."),
+                "postal code": (postal, "Area 12345 survey"),
+                "state path": (postal, f"Saved under {state_dir}/pending"),
+                "home path": (postal, f"Copied from {Path.home()}/Pictures"),
+                "rounded latitude": (coordinates, "lat 1.2346, lon 0"),
+                "truncated longitude": (coordinates, "lon -2.345 here"),
+                "longitude digits": (coordinates, "at 2.345678 degrees"),
+            }
+            for label, (patterns, text) in rejected.items():
+                with (
+                    self.subTest(label=label),
+                    self.assertRaisesRegex(CatalogPublishError, "Private location or path"),
+                ):
+                    _check_json_privacy(
+                        {"profile": {"sources": [{"title": text}]}},
+                        Path("manifest.json"),
+                        patterns,
+                    )
+
+            for text in (
+                "ab12345cd",
+                "Wingspan 12.345 cm",
+                "https://doi.org/10.1234/example",
+                "Example State woodland",
+                "https://example.test/one",
+            ):
+                with self.subTest(allowed=text):
+                    _check_json_privacy({"habitat": text}, Path("profile.json"), postal)
+                    _check_json_privacy({"habitat": text}, Path("profile.json"), coordinates)
+
+    def test_privacy_patterns_tolerate_missing_discovery_state(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            config = load_config(_write_config(root, checkout))
+            patterns = publication_privacy_patterns(config)
+            with self.assertRaisesRegex(CatalogPublishError, "Private location or path"):
+                _check_json_privacy("zip 12345", Path("profile.json"), patterns)
+            _check_json_privacy("exampleville", Path("profile.json"), patterns)
 
 
 if __name__ == "__main__":

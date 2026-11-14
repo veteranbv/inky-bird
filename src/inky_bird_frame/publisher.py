@@ -5,13 +5,14 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import stat
 import subprocess
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Literal, cast
@@ -32,7 +33,7 @@ from .catalog import (
 )
 from .codex_runner import parse_species_profile
 from .config import AppConfig, PublicCatalogConfig
-from .errors import CatalogPublishError, GenerationError
+from .errors import CatalogError, CatalogPublishError, GenerationError
 from .http import write_json_atomic
 from .timeutil import parse_utc_timestamp
 
@@ -95,6 +96,14 @@ _GITHUB_REMOTE = re.compile(
 )
 _IMAGE_DIMENSIONS = {"portrait.png": (1200, 1600), "display.png": (1600, 1200)}
 _COMMAND_TIMEOUT_SECONDS = 180
+# A first publication of a large backlog moves hundreds of megabytes over a home uplink.
+_TRANSFER_TIMEOUT_SECONDS = 3600
+_CHECKOUT_TIMEOUT_SECONDS = 900
+_PUBLICATION_BRANCH = re.compile(r"catalog/publish-[0-9a-f]{8}-[0-9a-f]{8}")
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IMAGE_CHUNKS = frozenset({b"IHDR", b"PLTE", b"IDAT", b"IEND"})
+_FINDER_METADATA = ".DS_Store"
+_MINIMUM_PRIVATE_TERM_LENGTH = 3
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -136,7 +145,72 @@ def _cleanup_abandoned_publish_work_locked(work_parent: Path) -> int:
     return removed
 
 
-def _check_json_privacy(value: object, source: Path) -> None:
+def _word_pattern(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<!\w){re.escape(term.casefold())}(?!\w)")
+
+
+def _coordinate_terms(value: float) -> set[str]:
+    magnitude = abs(value)
+    terms: set[str] = set()
+    # Two decimals would also match common DOI prefixes such as "10.12" in source links.
+    for digits in range(3, 7):
+        scale = 10**digits
+        terms.add(f"{magnitude:.{digits}f}")
+        terms.add(f"{math.floor(magnitude * scale) / scale:.{digits}f}")
+    return terms
+
+
+def _discovered_place_name(state_dir: Path) -> str | None:
+    try:
+        discovery = json.loads((state_dir / "discovery.json").read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    place_name = discovery.get("place_name") if isinstance(discovery, dict) else None
+    return place_name.strip() if isinstance(place_name, str) else None
+
+
+def publication_privacy_patterns(config: AppConfig) -> tuple[re.Pattern[str], ...]:
+    """Build matchers for this controller's location and paths, rejected anywhere in JSON text."""
+    discovery = config.discovery
+    words: set[str] = set()
+    for code in (discovery.zip_code, discovery.postal_code):
+        if code is not None:
+            words.add(code.strip())
+            words.add(re.sub(r"[\s-]", "", code))
+    place_name = _discovered_place_name(config.controller.state_dir)
+    if place_name is not None:
+        words.add(place_name)
+    patterns = [
+        _word_pattern(word) for word in sorted(words) if len(word) >= _MINIMUM_PRIVATE_TERM_LENGTH
+    ]
+    coordinates: set[str] = set()
+    for coordinate in (discovery.latitude, discovery.longitude):
+        if coordinate is not None:
+            coordinates |= _coordinate_terms(coordinate)
+    patterns.extend(re.compile(rf"(?<![0-9]){re.escape(term)}") for term in sorted(coordinates))
+
+    paths: list[Path] = [
+        config.controller.workspace_dir,
+        config.controller.state_dir,
+        config.controller.catalog_dir,
+    ]
+    if config.public_catalog.checkout_dir is not None:
+        paths.append(config.public_catalog.checkout_dir)
+    with suppress(RuntimeError, KeyError):
+        paths.append(Path.home())
+    path_terms: set[str] = set()
+    for path in paths:
+        for candidate in (path, path.resolve()):
+            # A root-level path such as "/" or "/root" would match ordinary URLs.
+            if candidate.is_absolute() and len(candidate.parts) >= 3:
+                path_terms.add(str(candidate).casefold())
+    patterns.extend(re.compile(re.escape(term)) for term in sorted(path_terms))
+    return tuple(patterns)
+
+
+def _check_json_privacy(
+    value: object, source: Path, private_patterns: tuple[re.Pattern[str], ...] = ()
+) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if not isinstance(key, str):
@@ -144,12 +218,16 @@ def _check_json_privacy(value: object, source: Path) -> None:
             identifier = re.sub(r"[^a-z0-9]", "", key.casefold())
             if identifier in _PRIVATE_KEY_IDENTIFIERS:
                 raise CatalogPublishError(f"Private field {key!r} found in {source}")
-            _check_json_privacy(child, source)
+            _check_json_privacy(child, source, private_patterns)
         return
     if isinstance(value, list):
         for child in value:
-            _check_json_privacy(child, source)
+            _check_json_privacy(child, source, private_patterns)
         return
+    if isinstance(value, str) and private_patterns:
+        folded = value.casefold()
+        if any(pattern.search(folded) is not None for pattern in private_patterns):
+            raise CatalogPublishError(f"Private location or path text found in {source}")
     if isinstance(value, str) and (
         value.startswith("file://")
         or Path(value).is_absolute()
@@ -157,6 +235,22 @@ def _check_json_privacy(value: object, source: Path) -> None:
         or _WINDOWS_UNC_PATH.match(value) is not None
     ):
         raise CatalogPublishError(f"Local path found in catalog JSON: {source}")
+
+
+def _png_has_only_image_chunks(path: Path) -> bool:
+    data = path.read_bytes()
+    if not data.startswith(_PNG_SIGNATURE):
+        return False
+    offset = len(_PNG_SIGNATURE)
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        offset += 12 + length
+        if chunk_type not in _PNG_IMAGE_CHUNKS or offset > len(data):
+            return False
+        if chunk_type == b"IEND":
+            return offset == len(data)
+    return False
 
 
 def _validate_image(path: Path, expected_size: tuple[int, int]) -> None:
@@ -170,6 +264,9 @@ def _validate_image(path: Path, expected_size: tuple[int, int]) -> None:
         with Image.open(path) as image:
             if image.info or image.getexif():
                 raise CatalogPublishError(f"Image metadata is not allowed in {path}")
+        # Pillow reads only the chunks before the image data and ignores unknown ones.
+        if not _png_has_only_image_chunks(path):
+            raise CatalogPublishError(f"Image metadata is not allowed in {path}")
     except CatalogPublishError:
         raise
     except (OSError, RuntimeError, SyntaxError) as exc:
@@ -229,7 +326,10 @@ def _validate_catalog_root(catalog_dir: Path, *, allow_create: bool) -> None:
 
 
 def _validate_species_directory(
-    directory: Path, *, expected_status: Literal["approved", "pending"] = "approved"
+    directory: Path,
+    *,
+    expected_status: Literal["approved", "pending"] = "approved",
+    private_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> tuple[int, str]:
     if directory.is_symlink() or not directory.is_dir():
         raise CatalogPublishError(f"Species path must be a directory, not a symlink: {directory}")
@@ -295,7 +395,7 @@ def _validate_species_directory(
 
     for path in directory.glob("*.json"):
         payload = read_json(path)
-        _check_json_privacy(payload, path)
+        _check_json_privacy(payload, path, private_patterns)
         if path.name == "profile.json" and payload != manifest.get("profile"):
             raise CatalogPublishError(f"Profile does not match the manifest: {directory}")
         if path.name == "quality-review.json" and payload != review:
@@ -332,7 +432,7 @@ def validate_public_catalog(catalog_dir: Path) -> list[CatalogEntry]:
     if index_path.is_symlink() or not index_path.is_file():
         raise CatalogPublishError(f"Catalog index must be a regular file: {index_path}")
     species_root = catalog_dir / "species"
-    directories = sorted(path for path in species_root.iterdir() if path.name != ".DS_Store")
+    directories = _species_directories(species_root)
     seen_taxa: set[int] = set()
     for directory in directories:
         taxon_id, _ = _validate_species_directory(directory)
@@ -728,6 +828,10 @@ def replace_public_catalog_taxon(
     }
 
 
+def _species_directories(species_root: Path) -> list[Path]:
+    return sorted(path for path in species_root.iterdir() if path.name != _FINDER_METADATA)
+
+
 def _restore_catalog_replacements(transaction: Path, destination_species: Path) -> None:
     backup_root = transaction / "approved"
     if not backup_root.exists():
@@ -735,6 +839,8 @@ def _restore_catalog_replacements(transaction: Path, destination_species: Path) 
     if backup_root.is_symlink() or not backup_root.is_dir():
         raise CatalogPublishError(f"Invalid catalog sync backup path: {backup_root}")
     for backup in sorted(backup_root.iterdir()):
+        if backup.name == _FINDER_METADATA:
+            continue
         _validate_species_directory(backup)
         destination = destination_species / backup.name
         if destination.is_symlink() or destination.is_file():
@@ -914,12 +1020,12 @@ def sync_public_catalog(
         except CatalogPublishError:
             if not recovered_transaction:
                 raise
-            for directory in destination_species.iterdir():
+            for directory in _species_directories(destination_species):
                 _validate_species_directory(directory)
             rebuild_catalog_index(destination_catalog)
             validate_public_catalog(destination_catalog)
-    elif any(destination_species.iterdir()):
-        for directory in destination_species.iterdir():
+    elif _species_directories(destination_species):
+        for directory in _species_directories(destination_species):
             _validate_species_directory(directory)
         rebuild_catalog_index(destination_catalog)
         validate_public_catalog(destination_catalog)
@@ -1032,33 +1138,59 @@ def _redact_command_output(value: str) -> str:
     return _CREDENTIALS_IN_URL.sub(r"\1[REDACTED]@", value.strip())
 
 
+def _command_label(arguments: list[str]) -> str:
+    program = Path(arguments[0]).name
+    word_count = 1 if program == "git" else 2
+    words: list[str] = []
+    index = 1
+    while index < len(arguments) and len(words) < word_count:
+        item = arguments[index]
+        if program == "git" and item in {"-C", "-c"}:
+            index += 2
+            continue
+        if item.startswith("-"):
+            break
+        words.append(item)
+        index += 1
+    return " ".join([program, *words])
+
+
 def _run(
     arguments: list[str],
     *,
     input_text: str | None = None,
     check: bool = True,
+    timeout: float = _COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
+    label = _command_label(arguments)
     try:
         result = subprocess.run(
             arguments,
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             input=input_text,
-            timeout=_COMMAND_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CatalogPublishError(f"Unable to run {Path(arguments[0]).name}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CatalogPublishError(f"{label} timed out after {timeout:g} seconds") from exc
+    except OSError as exc:
+        raise CatalogPublishError(f"Unable to run {label}") from exc
     if check and result.returncode != 0:
         detail = _redact_command_output(result.stderr or result.stdout)
-        raise CatalogPublishError(
-            f"{Path(arguments[0]).name} {arguments[1]} failed: {detail or 'unknown error'}"
-        )
+        raise CatalogPublishError(f"{label} failed: {detail or 'unknown error'}")
     return result
 
 
-def _git(repository: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return _run(["git", "-C", str(repository), *arguments], check=check)
+def _git(
+    repository: Path,
+    *arguments: str,
+    check: bool = True,
+    timeout: float = _COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    return _run(["git", "-C", str(repository), *arguments], check=check, timeout=timeout)
 
 
 def _gh(
@@ -1134,8 +1266,28 @@ def _catalog_digest(catalog_dir: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_staged_catalog(
-    worktree: Path,
+def _catalog_changes(worktree: Path, *diff_arguments: str) -> list[tuple[str, str]]:
+    # NUL-separated, unquoted paths keep non-ASCII species slugs byte-exact.
+    output = _git(
+        worktree,
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        *diff_arguments,
+    ).stdout
+    fields = output.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2 != 0:
+        raise CatalogPublishError("Unable to parse staged catalog changes")
+    return list(zip(fields[0::2], fields[1::2], strict=True))
+
+
+def _validate_catalog_changes(
+    changes: list[tuple[str, str]],
     published: list[dict[str, object]],
 ) -> list[str]:
     expected_directories = {
@@ -1143,19 +1295,8 @@ def _validate_staged_catalog(
         for item in published
         if isinstance(item.get("taxon_id"), int) and isinstance(item.get("slug"), str)
     }
-    output = _git(
-        worktree,
-        "diff",
-        "--cached",
-        "--name-status",
-        "--no-renames",
-    ).stdout
     paths: list[str] = []
-    for line in output.splitlines():
-        try:
-            status, path = line.split("\t", maxsplit=1)
-        except ValueError as exc:
-            raise CatalogPublishError("Unable to parse staged catalog changes") from exc
+    for status, path in changes:
         paths.append(path)
         if path == "catalog/index.json":
             if status not in {"A", "M"}:
@@ -1168,6 +1309,191 @@ def _validate_staged_catalog(
     if published and "catalog/index.json" not in paths:
         raise CatalogPublishError("Catalog publication did not update catalog/index.json")
     return paths
+
+
+def _validate_staged_catalog(
+    worktree: Path,
+    published: list[dict[str, object]],
+) -> list[str]:
+    return _validate_catalog_changes(_catalog_changes(worktree, "--cached"), published)
+
+
+def _validate_publication_commit(
+    worktree: Path,
+    commit: str,
+    *,
+    base_commit: str,
+    staged_tree: str,
+    staged_paths: list[str],
+    published: list[dict[str, object]],
+) -> None:
+    """Check the commit that will be pushed, not only the index it was made from."""
+    paths = _validate_catalog_changes(_catalog_changes(worktree, base_commit, commit), published)
+    if sorted(paths) != sorted(staged_paths):
+        raise CatalogPublishError("Publication commit does not match the validated changes")
+    parents = _git(worktree, "rev-list", "--parents", "-n", "1", commit).stdout.split()
+    tree = _git(worktree, "rev-parse", f"{commit}^{{tree}}").stdout.strip()
+    if parents != [commit, base_commit] or tree != staged_tree:
+        raise CatalogPublishError("Publication commit does not match the validated changes")
+
+
+def _remote_catalog_species(checkout: Path, remote_ref: str) -> list[dict[str, object]] | None:
+    shown = _git(checkout, "show", f"{remote_ref}:catalog/index.json", check=False)
+    if shown.returncode != 0:
+        return None
+    try:
+        index = json.loads(shown.stdout)
+    except json.JSONDecodeError:
+        return None
+    species = index.get("species") if isinstance(index, dict) else None
+    if not isinstance(species, list) or any(not isinstance(item, dict) for item in species):
+        return None
+    return cast(list[dict[str, object]], species)
+
+
+def _published_directory_names(remote_species: list[dict[str, object]] | None) -> set[str]:
+    return {
+        f"{item.get('taxon_id')}-{item.get('slug')}"
+        for item in (remote_species or [])
+        if isinstance(item.get("taxon_id"), int) and isinstance(item.get("slug"), str)
+    }
+
+
+def _already_published_taxa(
+    catalog_dir: Path, remote_species: list[dict[str, object]] | None
+) -> list[int] | None:
+    """Return the local taxa when the remote index already holds every local approval."""
+    if remote_species is None:
+        return None
+    try:
+        local_index = read_json(catalog_dir / "index.json")
+        directories = {path.name for path in _species_directories(catalog_dir / "species")}
+    except (CatalogError, OSError):
+        return None
+    local_species = local_index.get("species") if isinstance(local_index, dict) else None
+    if not isinstance(local_species, list):
+        return None
+    if not directories <= _published_directory_names(remote_species) or any(
+        item not in remote_species for item in local_species
+    ):
+        return None
+    taxa = [item.get("taxon_id") for item in local_species if isinstance(item, dict)]
+    if len(taxa) != len(local_species) or any(
+        not isinstance(taxon_id, int) or isinstance(taxon_id, bool) for taxon_id in taxa
+    ):
+        return None
+    return sorted(cast(list[int], taxa))
+
+
+def _exclude_unpublishable_species(
+    snapshot: Path,
+    published_names: set[str],
+    private_patterns: tuple[re.Pattern[str], ...],
+) -> list[dict[str, str]]:
+    """Drop local approvals that fail publication gates so the rest can still publish."""
+    species_root = snapshot / "species"
+    if species_root.is_symlink() or not species_root.is_dir():
+        return []
+    skipped: list[tuple[Path, dict[str, str]]] = []
+    for directory in _species_directories(species_root):
+        patterns = () if directory.name in published_names else private_patterns
+        try:
+            _validate_species_directory(directory, private_patterns=patterns)
+        except (CatalogError, CatalogPublishError) as exc:
+            reason = str(exc).replace(f"{snapshot}{os.sep}", "")
+            skipped.append((directory, {"species": directory.name, "reason": reason}))
+    for directory, _ in skipped:
+        if directory.is_symlink() or not directory.is_dir():
+            directory.unlink()
+        else:
+            shutil.rmtree(directory)
+    if skipped:
+        rebuild_catalog_index(snapshot)
+    return [report for _, report in skipped]
+
+
+def _cleanup_stale_publications(
+    checkout: Path,
+    publication: PublicCatalogConfig,
+    repository: str,
+    *,
+    keep: str | None,
+) -> list[str]:
+    """Close the owner's abandoned publication PRs and delete their branches."""
+    heads = _git(
+        checkout,
+        "ls-remote",
+        "--heads",
+        publication.remote,
+        "refs/heads/catalog/publish-*",
+    ).stdout
+    branches: set[str] = set()
+    for line in heads.splitlines():
+        _, _, ref = line.partition("\t")
+        name = ref.removeprefix("refs/heads/")
+        if _PUBLICATION_BRANCH.fullmatch(name) is not None and name != keep:
+            branches.add(name)
+
+    raw = _gh(
+        publication,
+        "pr",
+        "list",
+        "--repo",
+        repository,
+        "--state",
+        "open",
+        "--limit",
+        "200",
+        "--json",
+        "url,headRefName,isCrossRepository,author",
+    ).stdout
+    try:
+        pull_requests = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CatalogPublishError("GitHub CLI returned invalid pull request data") from exc
+    if not isinstance(pull_requests, list) or any(
+        not isinstance(item, dict) for item in pull_requests
+    ):
+        raise CatalogPublishError("GitHub CLI returned invalid pull request data")
+
+    owner = repository.split("/", maxsplit=1)[0].casefold()
+    owner_pull_requests: list[tuple[str, str]] = []
+    protected: set[str] = set()
+    for item in cast(list[dict[str, object]], pull_requests):
+        head = item.get("headRefName")
+        if (
+            not isinstance(head, str)
+            or _PUBLICATION_BRANCH.fullmatch(head) is None
+            or head == keep
+            or item.get("isCrossRepository") is not False
+        ):
+            continue
+        author = item.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        url = item.get("url")
+        if isinstance(login, str) and login.casefold() == owner and isinstance(url, str):
+            owner_pull_requests.append((head, url))
+        else:
+            protected.add(head)
+
+    cleaned: set[str] = set()
+    for head, url in owner_pull_requests:
+        if head in protected:
+            continue
+        _gh(publication, "pr", "close", url, "--repo", repository, "--delete-branch")
+        cleaned.add(head)
+    for name in sorted(branches - protected - cleaned):
+        _git(
+            checkout,
+            "push",
+            "--no-verify",
+            publication.remote,
+            "--delete",
+            f"refs/heads/{name}",
+            timeout=_TRANSFER_TIMEOUT_SECONDS,
+        )
+        cleaned.add(name)
+    return sorted(cleaned)
 
 
 def _pull_request(
@@ -1256,8 +1582,39 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             "--prune",
             publication.remote,
             f"+refs/heads/{publication.base_branch}:{remote_ref}",
+            timeout=_TRANSFER_TIMEOUT_SECONDS,
         )
         _git(checkout, "worktree", "prune")
+        remote_species = _remote_catalog_species(checkout, remote_ref)
+        result: dict[str, object] = {
+            "published": [],
+            "replaced": [],
+            "retained_newer": [],
+            "retained_independent": [],
+            "already_present": [],
+            "skipped": [],
+            "changed": False,
+            "dry_run": dry_run,
+            "pushed": False,
+            "merged": False,
+            "commit": None,
+            "pull_request": None,
+            "abandoned_work_directories": abandoned_work_directories,
+            "cleaned_work_directories": cleaned_work_directories,
+            "cleaned_publication_branches": [],
+        }
+        with catalog_state_lock(config.controller.state_dir):
+            already_published = _already_published_taxa(
+                config.controller.catalog_dir, remote_species
+            )
+        if already_published is not None:
+            result["already_present"] = already_published
+            if not dry_run:
+                result["cleaned_publication_branches"] = _cleanup_stale_publications(
+                    checkout, publication, repository, keep=None
+                )
+            return result
+
         with TemporaryDirectory(prefix="publish-", dir=work_parent) as temporary:
             source_snapshot = Path(temporary) / "source-catalog"
             with catalog_state_lock(config.controller.state_dir):
@@ -1271,146 +1628,203 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                     )
                 except FileNotFoundError as exc:
                     raise CatalogPublishError("Approved local catalog does not exist") from exc
+            result["skipped"] = _exclude_unpublishable_species(
+                source_snapshot,
+                _published_directory_names(remote_species),
+                publication_privacy_patterns(config),
+            )
             validate_public_catalog(source_snapshot)
 
             worktree = Path(temporary) / "checkout"
-            _git(checkout, "worktree", "add", "--detach", str(worktree), remote_ref)
+            _git(
+                checkout,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                remote_ref,
+                timeout=_CHECKOUT_TIMEOUT_SECONDS,
+            )
             try:
-                sync = sync_public_catalog(source_snapshot, worktree / "catalog")
-                published = sync["published"]
-                if not isinstance(published, list) or any(
-                    not isinstance(item, dict) for item in published
-                ):
-                    raise CatalogPublishError("Publisher produced an invalid change summary")
-                typed_published = cast(list[dict[str, object]], published)
-                changed = bool(
-                    _git(
-                        worktree,
-                        "status",
-                        "--porcelain",
-                        "--untracked-files=all",
-                        "--",
-                        "catalog",
-                    ).stdout.strip()
-                )
-                result: dict[str, object] = {
-                    **sync,
-                    "changed": changed,
-                    "dry_run": dry_run,
-                    "pushed": False,
-                    "merged": False,
-                    "commit": None,
-                    "pull_request": None,
-                    "abandoned_work_directories": abandoned_work_directories,
-                    "cleaned_work_directories": cleaned_work_directories,
-                }
-                if not changed:
-                    return result
-                if not typed_published:
-                    raise CatalogPublishError("Catalog changed without adding an approved species")
-
-                _git(worktree, "add", "--", "catalog")
-                _git(worktree, "diff", "--cached", "--check")
-                result["paths"] = _validate_staged_catalog(worktree, typed_published)
-                if dry_run:
-                    return result
-
-                base_commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
-                branch = f"catalog/publish-{_catalog_digest(source_snapshot)[:8]}-{base_commit[:8]}"
-                remote_branch = _git(
+                return _publish_from_worktree(
                     checkout,
-                    "ls-remote",
-                    "--heads",
-                    publication.remote,
-                    f"refs/heads/{branch}",
-                ).stdout.strip()
-                if remote_branch:
-                    remote_commit = remote_branch.split(maxsplit=1)[0]
-                    branch_ref = f"refs/remotes/{publication.remote}/catalog-publication"
+                    worktree,
+                    source_snapshot,
+                    publication,
+                    repository,
+                    result,
+                    dry_run=dry_run,
+                )
+            finally:
+                # Cleanup is best effort; the next run prunes, and it must not mask the outcome.
+                with suppress(CatalogPublishError):
                     _git(
                         checkout,
-                        "fetch",
-                        publication.remote,
-                        f"+refs/heads/{branch}:{branch_ref}",
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(worktree),
+                        check=False,
+                        timeout=_CHECKOUT_TIMEOUT_SECONDS,
                     )
-                    staged_tree = _git(worktree, "write-tree").stdout.strip()
-                    remote_tree = _git(
-                        checkout, "rev-parse", f"{branch_ref}^{{tree}}"
-                    ).stdout.strip()
-                    if remote_tree != staged_tree:
-                        raise CatalogPublishError(
-                            f"Existing publication branch {branch!r} has unexpected content"
-                        )
-                    commit = remote_commit
-                else:
-                    _git(
-                        worktree,
-                        "-c",
-                        f"user.name={publication.commit_name}",
-                        "-c",
-                        f"user.email={publication.commit_email}",
-                        "commit",
-                        "-m",
-                        _commit_message(typed_published),
-                    )
-                    commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
-                    _git(worktree, "push", publication.remote, f"HEAD:refs/heads/{branch}")
-                result["pushed"] = True
-                result["commit"] = commit
-                result["branch"] = branch
+                with suppress(CatalogPublishError):
+                    _git(checkout, "worktree", "prune", check=False)
 
-                pull_request = _pull_request(publication, repository, branch)
-                if pull_request is None:
-                    pull_request_url = _create_pull_request(
-                        publication,
-                        repository,
-                        branch,
-                        _commit_message(typed_published),
-                        typed_published,
-                    )
-                else:
-                    existing_url = pull_request.get("url")
-                    if not isinstance(existing_url, str):
-                        raise CatalogPublishError("Existing publication PR has no URL")
-                    pull_request_url = existing_url
-                    if pull_request.get("state") == "CLOSED":
-                        raise CatalogPublishError(
-                            "Existing publication PR was closed without merge"
-                        )
-                    head_sha = pull_request.get("headRefOid")
-                    if head_sha != commit:
-                        raise CatalogPublishError("Existing publication PR has an unexpected head")
-                result["pull_request"] = pull_request_url
 
-                _gh(
-                    publication,
-                    "pr",
-                    "merge",
-                    pull_request_url,
-                    "--repo",
-                    repository,
-                    "--admin",
-                    "--squash",
-                    "--delete-branch",
-                    "--match-head-commit",
-                    commit,
-                )
-                state = _gh(
-                    publication,
-                    "pr",
-                    "view",
-                    pull_request_url,
-                    "--repo",
-                    repository,
-                    "--json",
-                    "state",
-                    "--jq",
-                    ".state",
-                ).stdout.strip()
-                if state != "MERGED":
-                    raise CatalogPublishError(f"Catalog pull request did not merge: {state}")
-                result["merged"] = True
-                return result
-            finally:
-                _git(checkout, "worktree", "remove", "--force", str(worktree), check=False)
-                _git(checkout, "worktree", "prune", check=False)
+def _publish_from_worktree(
+    checkout: Path,
+    worktree: Path,
+    source_snapshot: Path,
+    publication: PublicCatalogConfig,
+    repository: str,
+    result: dict[str, object],
+    *,
+    dry_run: bool,
+) -> dict[str, object]:
+    sync = sync_public_catalog(source_snapshot, worktree / "catalog")
+    published = sync["published"]
+    if not isinstance(published, list) or any(not isinstance(item, dict) for item in published):
+        raise CatalogPublishError("Publisher produced an invalid change summary")
+    typed_published = cast(list[dict[str, object]], published)
+    changed = bool(
+        _git(
+            worktree,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "catalog",
+        ).stdout.strip()
+    )
+    result.update(sync)
+    result["changed"] = changed
+    if not changed:
+        return result
+    if not typed_published:
+        raise CatalogPublishError("Catalog changed without adding an approved species")
+
+    _git(worktree, "add", "--", "catalog")
+    _git(worktree, "diff", "--cached", "--check")
+    staged_paths = _validate_staged_catalog(worktree, typed_published)
+    result["paths"] = staged_paths
+    if dry_run:
+        return result
+
+    base_commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    staged_tree = _git(worktree, "write-tree").stdout.strip()
+    branch = f"catalog/publish-{_catalog_digest(source_snapshot)[:8]}-{base_commit[:8]}"
+    result["cleaned_publication_branches"] = _cleanup_stale_publications(
+        checkout, publication, repository, keep=branch
+    )
+    remote_branch = _git(
+        checkout,
+        "ls-remote",
+        "--heads",
+        publication.remote,
+        f"refs/heads/{branch}",
+    ).stdout.strip()
+    if remote_branch:
+        commit = remote_branch.split(maxsplit=1)[0]
+        branch_ref = f"refs/remotes/{publication.remote}/catalog-publication"
+        _git(
+            checkout,
+            "fetch",
+            publication.remote,
+            f"+refs/heads/{branch}:{branch_ref}",
+            timeout=_TRANSFER_TIMEOUT_SECONDS,
+        )
+        remote_tree = _git(checkout, "rev-parse", f"{branch_ref}^{{tree}}").stdout.strip()
+        if remote_tree != staged_tree:
+            raise CatalogPublishError(
+                f"Existing publication branch {branch!r} has unexpected content"
+            )
+    else:
+        _git(
+            worktree,
+            "-c",
+            f"user.name={publication.commit_name}",
+            "-c",
+            f"user.email={publication.commit_email}",
+            # Checkout hooks and signing settings must not change or block the validated tree.
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            _commit_message(typed_published),
+        )
+        commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    _validate_publication_commit(
+        worktree,
+        commit,
+        base_commit=base_commit,
+        staged_tree=staged_tree,
+        staged_paths=staged_paths,
+        published=typed_published,
+    )
+    if not remote_branch:
+        _git(
+            worktree,
+            "push",
+            "--no-verify",
+            publication.remote,
+            f"{commit}:refs/heads/{branch}",
+            timeout=_TRANSFER_TIMEOUT_SECONDS,
+        )
+    result["pushed"] = True
+    result["commit"] = commit
+    result["branch"] = branch
+
+    pull_request = _pull_request(publication, repository, branch)
+    if pull_request is None:
+        pull_request_url = _create_pull_request(
+            publication,
+            repository,
+            branch,
+            _commit_message(typed_published),
+            typed_published,
+        )
+    else:
+        existing_url = pull_request.get("url")
+        if not isinstance(existing_url, str):
+            raise CatalogPublishError("Existing publication PR has no URL")
+        pull_request_url = existing_url
+        if pull_request.get("state") == "CLOSED":
+            raise CatalogPublishError("Existing publication PR was closed without merge")
+        head_sha = pull_request.get("headRefOid")
+        if head_sha != commit:
+            raise CatalogPublishError("Existing publication PR has an unexpected head")
+    result["pull_request"] = pull_request_url
+
+    _gh(
+        publication,
+        "pr",
+        "merge",
+        pull_request_url,
+        "--repo",
+        repository,
+        "--admin",
+        "--squash",
+        "--delete-branch",
+        "--match-head-commit",
+        commit,
+    )
+    state = _gh(
+        publication,
+        "pr",
+        "view",
+        pull_request_url,
+        "--repo",
+        repository,
+        "--json",
+        "state",
+        "--jq",
+        ".state",
+    ).stdout.strip()
+    if state != "MERGED":
+        raise CatalogPublishError(f"Catalog pull request did not merge: {state}")
+    result["merged"] = True
+    return result
