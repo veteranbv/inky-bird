@@ -215,7 +215,7 @@ class _GraphQLRejectedError(DataSourceError):
 
 
 class _RefreshRejectedError(DataSourceError):
-    """Bird Buddy rejected the refresh token itself, not the request."""
+    """Bird Buddy answered the token renewal with HTTP 401 or 403."""
 
 
 _SESSION_INVALID: Final = "Bird Buddy session is invalid; run birdbuddy login again"
@@ -227,7 +227,7 @@ class BirdBuddyAuthState:
     feeder: BirdBuddyFeeder
     refresh_token: str
     # The last token Bird Buddy accepted, kept for one retry when the current
-    # token is rejected. Absent in state written by earlier releases.
+    # token gets HTTP 401 or 403. Absent in state written by earlier releases.
     previous_refresh_token: str | None = None
 
 
@@ -639,9 +639,9 @@ def _refresh_access_token(refresh_token: str) -> tuple[str, str]:
             "token refresh",
         )
     except _GraphQLRejectedError as exc:
-        # The API gives no typed reason; a rejected renewal may also be a
-        # temporary refusal, so it does not claim the session is gone.
-        raise _RefreshRejectedError(
+        # The API gives no typed reason and this may be a temporary refusal,
+        # so it neither claims the session is gone nor tries an older token.
+        raise DataSourceError(
             "Bird Buddy did not renew the sign-in. If this continues, run birdbuddy login again"
         ) from exc
     except DataSourceError as exc:
@@ -664,8 +664,10 @@ def _renew_session(state: BirdBuddyAuthState) -> tuple[str, str, str]:
         previous = state.previous_refresh_token
         if previous is None or previous == state.refresh_token:
             raise
-        # One retry covers a renewal Bird Buddy did not complete; a second
-        # rejection reports the current token's failure.
+        # One retry covers a renewal Bird Buddy did not complete. It runs only
+        # after a typed refusal of the current token, because sending a rotated
+        # token can make a server revoke the whole sign-in. A second refusal
+        # reports the current token's failure.
         try:
             access_token, replacement = _refresh_access_token(previous)
         except _RefreshRejectedError:

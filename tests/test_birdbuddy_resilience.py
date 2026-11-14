@@ -709,7 +709,7 @@ class TokenRefreshTests(BirdBuddyResilienceTestCase):
                 self.assertNotIn("session is invalid", str(raised.exception))
                 self.assertEqual(auth_state(state_dir)["refresh_token"], "refresh-0")
 
-    def test_graphql_rejection_is_retried_and_not_reported_as_a_lost_session(self) -> None:
+    def test_graphql_rejection_is_not_retried_or_reported_as_a_lost_session(self) -> None:
         sent: list[str] = []
 
         def post_json(url: str, value: object, **_: object) -> object:
@@ -727,8 +727,12 @@ class TokenRefreshTests(BirdBuddyResilienceTestCase):
                 self.assertRaisesRegex(DataSourceError, "did not renew the sign-in") as raised,
             ):
                 sync(state_dir)
+            after = auth_state(state_dir)
 
-        self.assertEqual(sent, ["refresh-0", "older-token"])
+        # The refusal may be temporary; sending an already rotated token could
+        # make Bird Buddy revoke the whole sign-in.
+        self.assertEqual(sent, ["refresh-0"])
+        self.assertEqual(after, state)
         self.assertNotIn("session is invalid", str(raised.exception))
         self.assertNotIn("private upstream detail", str(raised.exception))
 
