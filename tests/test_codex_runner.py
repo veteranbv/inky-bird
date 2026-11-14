@@ -110,6 +110,31 @@ class CodexRunnerSubprocessTests(unittest.TestCase):
             self.assertIn("stub stdout marker", log)
             self.assertIn("stub stderr marker", log)
 
+    def test_plate_prompt_names_the_output_relative_to_the_workspace(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(root, 'cat > "$PWD/prompt.txt"\nexit 3')
+            runner = CodexRunner(stub, root)
+            output = root / ".inky-bird-frame-generation" / "attempt" / "generated.png"
+
+            with self.assertRaises(GenerationError):
+                runner.generate_plate(_species(), _profile(), [], [], output, root / "plate.log")
+
+            prompt = (root.resolve() / "prompt.txt").read_text()
+            self.assertIn("\n.inky-bird-frame-generation/attempt/generated.png\n", prompt)
+            self.assertNotIn(str(root), prompt)
+            self.assertNotIn(str(root.resolve()), prompt)
+
+    def test_plate_output_outside_the_workspace_is_refused(self) -> None:
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as elsewhere:
+            root = Path(temporary)
+            runner = CodexRunner(_stub_executable(root, "exit 0"), root)
+
+            with self.assertRaisesRegex(GenerationError, "inside the workspace"):
+                runner.generate_plate(
+                    _species(), _profile(), [], [], Path(elsewhere) / "plate.png", root / "p.log"
+                )
+
     def test_timeout_raises_generation_error(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

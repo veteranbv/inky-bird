@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from inky_bird_frame.birds import BirdSpecies, TaxonContext
+from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from inky_bird_frame.prompts import PROMPT_VERSION, plate_prompt, profile_prompt, review_prompt
 
@@ -560,7 +561,7 @@ class PlateWordingTests(unittest.TestCase):
         )
 
     def test_output_outside_the_workspace_is_refused(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(GenerationError):
             plate_prompt(
                 _fixture_species(),
                 _fixture_profile(),

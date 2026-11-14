@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Final
 
 from .birds import BirdSpecies, TaxonContext
+from .errors import GenerationError
 from .models import ProfileConflict, ReferencePhoto, SourceLink, SpeciesProfileData
 
 PROMPT_VERSION = "field-journal-v9"
@@ -163,7 +164,7 @@ def _workspace_name(output_path: Path, workspace: Path | None) -> str:
     try:
         return output_path.relative_to(workspace).as_posix()
     except ValueError:
-        raise ValueError("The plate output path must be inside the workspace") from None
+        raise GenerationError("The plate output path must be inside the workspace") from None
 
 
 def profile_prompt(
