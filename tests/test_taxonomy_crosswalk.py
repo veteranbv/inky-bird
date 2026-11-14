@@ -105,6 +105,22 @@ def test_interrupted_resolution_keeps_completed_lookups_and_checkpoints(tmp_path
     assert [item.common_name for item in result.species][:2] == ["Common 1", "Common 2"]
 
 
+def test_a_failed_checkpoint_does_not_hide_the_interruption(tmp_path: Path) -> None:
+    cache = tmp_path / "crosswalk.json"
+
+    def lookup(name: str, timeout_seconds: float) -> BirdSpecies:
+        if name.endswith("number1"):
+            raise RuntimeError("process interrupted")
+        return _species(name, 1)
+
+    with (
+        patch("inky_bird_frame.birds.fetch_inaturalist_taxon_match", side_effect=lookup),
+        patch("inky_bird_frame.birds.write_json_atomic", side_effect=OSError("disk full")),
+        pytest.raises(RuntimeError, match="interrupted"),
+    ):
+        resolve_ebird_species(_observations(3), cache, now=NOW)
+
+
 def test_resolution_releases_the_lock_after_its_hold_time(tmp_path: Path) -> None:
     cache = tmp_path / "crosswalk.json"
     clock = [0.0]

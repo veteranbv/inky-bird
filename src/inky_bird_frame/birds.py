@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -663,9 +663,14 @@ def _resolve_external_species(
                         outcomes[index] = species
                     added += 1
                     pending.pop(0)
-            finally:
+            except BaseException:
                 if added and persist_cache:
-                    _write_taxonomy_crosswalk(cache_path, cache)
+                    # Keep the interruption visible if the checkpoint also fails.
+                    with suppress(OSError):
+                        _write_taxonomy_crosswalk(cache_path, cache)
+                raise
+            if added and persist_cache:
+                _write_taxonomy_crosswalk(cache_path, cache)
 
     resolved: list[BirdSpecies] = []
     unresolved: list[EbirdSpecies] = []
