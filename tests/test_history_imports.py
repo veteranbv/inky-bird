@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 from starlette.testclient import TestClient
 
-from inky_bird_frame.birds import BirdSpecies, EbirdArchiveSpecies
+from inky_bird_frame.birds import ArchiveResolution, BirdSpecies, EbirdArchiveSpecies
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.ebird_archive import (
     REQUIRED_COLUMNS,
@@ -23,9 +23,11 @@ from inky_bird_frame.imports import HistoryImports, recover_import
 from inky_bird_frame.journal import (
     CollectionKind,
     JournalConflictError,
+    JournalError,
     JournalService,
     read_journal,
     save_collection,
+    save_imported_collection,
 )
 from inky_bird_frame.owner_operations import OwnerOperationError, OwnerOperations
 from inky_bird_frame.settings import initialize_config, settings_status
@@ -343,13 +345,16 @@ def test_trip_keeps_complete_members_and_unresolved_names_without_implicit_work(
     }
 
     def resolve(
-        species: list[EbirdArchiveSpecies], _path: Path
-    ) -> tuple[list[BirdSpecies], list[EbirdArchiveSpecies]]:
-        if species[0].scientific_name == "Turdus migratorius":
-            return [BirdSpecies(1, "Robin", "Turdus migratorius", 1, "eBird Archive")], []
-        return [], species
+        species: list[EbirdArchiveSpecies], _path: Path, **_bounds: object
+    ) -> ArchiveResolution:
+        robin = BirdSpecies(1, "Robin", "Turdus migratorius", 1, "eBird Archive")
+        return ArchiveResolution(
+            {"Turdus migratorius": robin},
+            [item for item in species if item.scientific_name != "Turdus migratorius"],
+            [],
+        )
 
-    with patch("inky_bird_frame.imports.resolve_ebird_archive_species", side_effect=resolve):
+    with patch("inky_bird_frame.imports.resolve_ebird_archive_names", side_effect=resolve):
         imports.preview_trip(identifier, **selection)
         trip = status(imports)["trip"]["preview"]
         assert trip["matched"] == 1 and len(trip["unresolved"]) == 1
@@ -617,3 +622,97 @@ def test_analyzer_marker_written_before_removal_counts_still_recovers(tmp_path: 
     assert recovered is not None
     assert "removed" not in recovered
     assert recovered["imported"] == 2
+
+
+def large_archive(checklists: int, species: int) -> bytes:
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=REQUIRED_COLUMNS)
+    writer.writeheader()
+    for checklist in range(checklists):
+        for index in range(species):
+            row = dict.fromkeys(REQUIRED_COLUMNS, "")
+            row.update(
+                {
+                    "Submission ID": f"S-synthetic-{checklist}",
+                    "Date": "2026-04-29",
+                    "Scientific Name": f"Avis number{index}",
+                    "Common Name": f"Bird {index}",
+                    "Location": "Exampleville",
+                }
+            )
+            writer.writerow(row)
+    return out.getvalue().encode()
+
+
+def committed_selection(
+    config: AppConfig, imports: HistoryImports, content: bytes
+) -> tuple[str, dict[str, Any]]:
+    identifier = staged(imports, content)
+    revision = str(settings_status(config)["revision"])
+    preview = checked(imports, identifier, revision)
+    imports.commit(
+        identifier,
+        revision=revision,
+        preview_hash=preview["preview_hash"],
+        key="synthetic-trip-commit",
+        allow_reduction=False,
+    )
+    choices = cast(
+        dict[str, Any],
+        imports.checklist_choices(identifier, start_date="2026-04-29", end_date="2026-04-29"),
+    )
+    return identifier, {
+        "history_revision": choices["history_revision"],
+        "checklist_keys": [item["key"] for item in choices["checklists"]],
+        "start_date": "2026-04-29",
+        "end_date": "2026-04-29",
+        "label": "Synthetic trip",
+        "collection_id": "b" * 32,
+        "revision": 0,
+    }
+
+
+def test_trip_preview_bounds_name_lookups_and_save_adds_none(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    imports = HistoryImports(config)
+    identifier, selection = committed_selection(config, imports, large_archive(1, 45))
+    looked_up: list[str] = []
+
+    def lookup(name: str, timeout_seconds: float) -> BirdSpecies:
+        looked_up.append(name)
+        return BirdSpecies(len(looked_up), f"Bird {len(looked_up)}", name, 1, "eBird")
+
+    with patch("inky_bird_frame.birds.fetch_inaturalist_taxon_match", side_effect=lookup):
+        result = imports.preview_trip(identifier, **selection)
+        trip = status(imports)["trip"]["preview"]
+        assert len(looked_up) == 30
+        assert trip["matched"] == 30
+        assert trip["unresolved_for_now"] == 15
+        assert len(trip["unresolved"]) == 15
+        assert "15 species were not looked up" in str(result["message"])
+        imports.save_trip(identifier, preview_hash=trip["preview_hash"])
+        assert len(looked_up) == 30
+
+    group = read_journal(config.controller.state_dir).collections[0]
+    assert sum(member.taxon_id is not None for member in group.members) == 30
+    assert len(group.members) == 45
+
+
+def test_trip_preview_refuses_a_trip_too_large_for_the_journal(tmp_path: Path) -> None:
+    config = configuration(tmp_path)
+    imports = HistoryImports(config)
+    identifier, selection = committed_selection(config, imports, large_archive(150, 40))
+
+    def unresolved(
+        species: list[EbirdArchiveSpecies], _path: Path, **_bounds: object
+    ) -> ArchiveResolution:
+        return ArchiveResolution({}, list(species), [])
+
+    with patch("inky_bird_frame.imports.resolve_ebird_archive_names", side_effect=unresolved):
+        with pytest.raises(JournalError, match="Journal storage is full"):
+            imports.preview_trip(identifier, **selection)
+        assert "trip" not in status(imports)
+        # The same group is refused by the journal itself, so preview and save agree.
+        group, _ = imports._trip_group(**selection)
+        with pytest.raises(JournalError, match="Journal storage is full"):
+            save_imported_collection(config.controller.state_dir, revision=0, collection=group)
