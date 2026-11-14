@@ -529,6 +529,21 @@ let browser,
   await screen.getByRole('button', { name: 'Pair this screen', exact: true }).click();
   await screen.getByRole('heading', { name: 'Pair this screen', exact: true }).waitFor();
   const pairCode = await screen.locator('.pairing-code').innerText();
+  // A failed Cancel keeps the code, and its message survives the next
+  // approval check instead of being replaced within seconds.
+  await screenContext.route('**/v1/screen/forget', (route) => route.abort());
+  await screen.getByRole('button', { name: 'Cancel pairing', exact: true }).click();
+  const cancelFailure = screen.getByText(/Pairing was not cancelled\./);
+  await cancelFailure.waitFor();
+  const approvalCheck = screen.waitForResponse((response) =>
+    response.url().endsWith('/v1/screen/view'),
+  );
+  await screen.clock.runFor(15100);
+  await approvalCheck;
+  await screen.getByText(/Waiting for owner approval\./).waitFor();
+  assert(await cancelFailure.isVisible(), 'the Cancel failure stays visible');
+  assert.equal(await screen.locator('.pairing-code').innerText(), pairCode);
+  await screenContext.unroute('**/v1/screen/forget');
   await page.reload();
   await page.getByRole('heading', { name: 'Pairing request · ' + pairCode, exact: true }).waitFor();
   await page.getByLabel('Screen name', { exact: true }).fill('Synthetic tablet');

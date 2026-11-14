@@ -110,11 +110,15 @@ async function pair() {
     code.className = 'pairing-code';
     const status = el('p', 'Waiting for the owner. This request lasts ten minutes.');
     status.setAttribute('role', 'status');
+    // A failed Cancel stays on screen until Cancel is tried again.
+    let cancelFailure = '';
     const cancel = button('Cancel pairing', async () => {
       cancel.disabled = true;
+      cancelFailure = '';
       try {
         await forget(status, 'Pairing was not cancelled.');
       } catch {
+        cancelFailure = status.textContent;
         cancel.disabled = false;
       }
     });
@@ -143,8 +147,12 @@ async function pair() {
         if (!stopped) present(view);
       } catch (error) {
         if (stopped) return;
-        status.textContent =
-          error.code === 'offline' ? error.message : 'Waiting for owner approval.';
+        status.textContent = [
+          cancelFailure,
+          error.code === 'offline' ? error.message : 'Waiting for owner approval.',
+        ]
+          .filter(Boolean)
+          .join(' ');
         timer = setTimeout(check, 15000);
       }
     };
