@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from inky_bird_frame.prompts import PROMPT_VERSION, plate_prompt, profile_prompt
 
 class PromptTests(unittest.TestCase):
     def test_prompt_contract_version(self) -> None:
-        self.assertEqual(PROMPT_VERSION, "field-journal-v7")
+        self.assertEqual(PROMPT_VERSION, "field-journal-v8")
 
     def test_edit_target_does_not_freeze_anatomy_flagged_for_redraw(self) -> None:
         species = BirdSpecies(1, "Test Bird", "Avis test", 1, "test")
@@ -288,6 +289,150 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Identity fields are not adjudicable", normalized_review)
         self.assertNotIn("exactly four evenly spaced", normalized_prompt)
         self.assertNotIn("exactly four evenly spaced", normalized_review)
+
+
+_FIXTURE_DOMAINS = ("birds.example", "field.example")
+
+
+def _fixture_species() -> BirdSpecies:
+    return BirdSpecies(1, "Test Bird", "Avis test", 1, "test")
+
+
+def _fixture_profile() -> SpeciesProfileData:
+    return SpeciesProfileData(
+        taxon_id=1,
+        common_name="Test Bird",
+        scientific_name="Avis test",
+        family="Testidae",
+        measurements={"length": "10 cm", "wingspan": "20 cm", "weight": "30 g"},
+        field_marks=["one", "two", "three", "four"],
+        habitat="Woods",
+        behavior="Perches",
+        palette=["red", "green", "blue"],
+        sources=[
+            {"title": "One", "url": "https://birds.example/one"},
+            {"title": "Two", "url": "https://field.example/two"},
+        ],
+    )
+
+
+def _fixture_references() -> list[ReferencePhoto]:
+    return [
+        ReferencePhoto(
+            index,
+            100 + index,
+            f"observer-{index}",
+            f"Photo by observer-{index}",
+            "cc-by",
+            f"https://example.test/observations/{100 + index}",
+            f"https://example.test/photos/{index}/large.jpg",
+            1600,
+            1200,
+            f"0{index}-{index}.jpg",
+            str(index) * 64,
+        )
+        for index in (1, 2, 3)
+    ]
+
+
+def _fixture_conflict() -> ProfileConflict:
+    return ProfileConflict(
+        field="measurements.length",
+        profile_value="10 cm",
+        observed_value="12 cm",
+        sources=[
+            {"title": "One", "url": "https://birds.example/length"},
+            {"title": "Two", "url": "https://field.example/length"},
+        ],
+    )
+
+
+def _rendered_prompts() -> list[str]:
+    species = _fixture_species()
+    profile = _fixture_profile()
+    references = _fixture_references()
+    context = TaxonContext(
+        taxon_id=1,
+        common_name="Test Bird",
+        scientific_name="Avis test",
+        family="Testidae",
+        summary="<p>A test bird.</p>",
+        source_url="https://birds.example/taxon/1",
+    )
+    return [
+        profile_prompt(species, context, references, _FIXTURE_DOMAINS),
+        profile_prompt(
+            species,
+            context,
+            references,
+            _FIXTURE_DOMAINS,
+            prior_profile=profile,
+            profile_conflicts=(_fixture_conflict(),),
+        ),
+        plate_prompt(species, profile, references, Path("candidate.png")),
+        plate_prompt(
+            species,
+            profile,
+            references,
+            Path("candidate.png"),
+            ("Shorten the tail",),
+            invariant_findings=("Keep the wing pattern",),
+            has_correction_source=True,
+        ),
+        review_prompt(species, profile, references, _FIXTURE_DOMAINS),
+        review_prompt(
+            species,
+            profile,
+            references,
+            _FIXTURE_DOMAINS,
+            prior_corrections=("Repair the visible leg",),
+            prior_profile_conflicts=(_fixture_conflict(),),
+        ),
+    ]
+
+
+# One entry per prompt version: the SHA-256 of the fixture prompts above.
+# Changing any prompt text needs a new PROMPT_VERSION and a new entry here.
+RENDERED_PROMPT_SHA256 = {
+    "field-journal-v7": "84079b7217e69381494122bdee62257b08f9b216b2c9094e566e90239cf90816",
+    "field-journal-v8": "9164b21301e4386d75ef442cb6a1db00f93443fbfbdd7f0bae9a45551975e877",
+}
+
+
+class PromptReferenceNumberingTests(unittest.TestCase):
+    def test_review_provenance_numbers_references_after_the_candidate(self) -> None:
+        references = _fixture_references()
+        prompt = review_prompt(_fixture_species(), _fixture_profile(), references, _FIXTURE_DOMAINS)
+
+        provenance = prompt.split("Reference provenance:\n", 1)[1].strip().splitlines()
+
+        self.assertTrue(provenance[0].startswith("Image 2: Photo by observer-1;"), provenance)
+        self.assertEqual(len(provenance), len(references))
+        self.assertTrue(
+            provenance[-1].startswith(f"Image {len(references) + 1}: Photo by observer-3;"),
+            provenance,
+        )
+        self.assertNotIn("Image 1: Photo by", prompt)
+
+
+class PromptVersionTests(unittest.TestCase):
+    def test_rendered_prompt_text_matches_its_version(self) -> None:
+        digest = hashlib.sha256("\n\0\n".join(_rendered_prompts()).encode("utf-8")).hexdigest()
+
+        self.assertIn(
+            PROMPT_VERSION,
+            RENDERED_PROMPT_SHA256,
+            "Add a RENDERED_PROMPT_SHA256 entry for the new PROMPT_VERSION",
+        )
+        self.assertEqual(
+            RENDERED_PROMPT_SHA256[PROMPT_VERSION],
+            digest,
+            "Prompt text changed: bump PROMPT_VERSION and record the new digest",
+        )
+
+    def test_each_prompt_version_has_distinct_text(self) -> None:
+        digests = list(RENDERED_PROMPT_SHA256.values())
+        self.assertEqual(len(digests), len(set(digests)))
 
 
 if __name__ == "__main__":

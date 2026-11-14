@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import errno
+import functools
 import json
+import os
+import select
+import signal
 import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Final, cast
+from types import FrameType
+from typing import IO, Final, cast
 from urllib.parse import urlsplit
 
 from .birds import BirdSpecies, TaxonContext
 from .errors import GenerationError
+from .http import write_bytes_atomic
 from .models import (
     PROFILE_CONFLICT_FIELDS,
     ProfileConflict,
@@ -131,6 +144,324 @@ REVIEW_SCHEMA: Final[dict[str, object]] = {
 }
 
 
+TERMINATE_GRACE_SECONDS: Final = 5.0
+MAX_CAPTURED_OUTPUT_BYTES: Final = 4 * 1024 * 1024
+
+# The agent reads third-party web pages, so it gets only what the Codex CLI and
+# its network stack need, never the job's provider keys, notification URLs or
+# OIDC secrets. Codex authenticates with its own ChatGPT login under CODEX_HOME
+# (default ~/.codex); API-key variables are deliberately not passed.
+# - PATH, HOME, USER, LOGNAME, SHELL: executable lookup, login and tool shells.
+# - LANG, LANGUAGE, LC_*, TZ: text encoding and local time.
+# - TMPDIR, TMP, TEMP: scratch files.
+# - SSL_CERT_FILE, SSL_CERT_DIR, NODE_EXTRA_CA_CERTS, CODEX_CA_CERTIFICATE:
+#   operator TLS trust for the native binary and its Node launcher.
+# - HTTP(S)_PROXY, ALL_PROXY, NO_PROXY and lowercase forms: outbound proxies.
+# - CODEX_HOME, XDG_*: Codex configuration, credentials and caches.
+# - DBUS_SESSION_BUS_ADDRESS: a keyring-backed Codex credential store on Linux.
+CHILD_ENVIRONMENT_NAMES: Final = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "CODEX_CA_CERTIFICATE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    }
+)
+CHILD_ENVIRONMENT_PREFIXES: Final = ("LC_",)
+
+
+def child_environment() -> dict[str, str]:
+    """Return the allowlisted subset of this process's environment for Codex."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in CHILD_ENVIRONMENT_NAMES or name.startswith(CHILD_ENVIRONMENT_PREFIXES)
+    }
+
+
+class _BoundedCapture(threading.Thread):
+    """Drain one pipe to EOF, keeping at most MAX_CAPTURED_OUTPUT_BYTES."""
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        super().__init__(daemon=True)
+        self._stream = stream
+        self._chunks: list[bytes] = []
+        self._kept = 0
+        self._dropped = 0
+
+    def run(self) -> None:
+        limit = MAX_CAPTURED_OUTPUT_BYTES
+        try:
+            while chunk := os.read(self._stream.fileno(), 65536):
+                room = max(limit - self._kept, 0)
+                if room:
+                    self._chunks.append(chunk[:room])
+                    self._kept += min(room, len(chunk))
+                self._dropped += max(len(chunk) - room, 0)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._stream.close()
+
+    def text(self) -> str:
+        text = b"".join(self._chunks).decode("utf-8", errors="replace")
+        if self._dropped:
+            text += f"\n[output truncated: {self._dropped} more bytes not kept]"
+        return text
+
+
+def _write_prompt(stream: IO[bytes], prompt: bytes) -> None:
+    try:
+        stream.write(prompt)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(BrokenPipeError, OSError):
+            stream.close()
+
+
+def _signal_group(group: int, stop_signal: signal.Signals) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(group, stop_signal)
+
+
+_POLL_INTERVAL_SECONDS: Final = 0.05
+
+if sys.platform == "darwin":
+    _PROC_PGRP_ONLY: Final = 2
+    _PROC_PIDTBSDINFO: Final = 3
+    # struct proc_bsdinfo from <sys/proc_info.h>: pbi_status at offset 4 and
+    # pbi_pgid at offset 100 of its 136 bytes.
+    _PROC_BSDINFO_SIZE: Final = 136
+    _SZOMB: Final = 5
+
+    @functools.cache
+    def _libproc() -> ctypes.CDLL:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_listpids.restype = ctypes.c_int
+        library.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_pidinfo.restype = ctypes.c_int
+        return library
+
+    def _wait_unreaped(pid: int, timeout: float | None) -> bool:
+        """Wait for a child to exit without reaping it; False on timeout."""
+        with contextlib.closing(select.kqueue()) as queue:
+            watch = select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            events = queue.control([watch], 1, timeout)
+        for event in events:
+            # Registration on a child that has already exited reports ESRCH.
+            if event.flags & select.KQ_EV_ERROR and event.data != errno.ESRCH:
+                raise OSError(event.data, os.strerror(event.data))
+        return bool(events)
+
+    def _live_member(pid: int, group: int) -> bool:
+        info = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+        size = _libproc().proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, info, _PROC_BSDINFO_SIZE)
+        if size != _PROC_BSDINFO_SIZE:
+            # Zombies and processes that have gone report ESRCH.
+            return ctypes.get_errno() == errno.EPERM
+        status = int.from_bytes(info.raw[4:8], sys.byteorder)
+        pgid = int.from_bytes(info.raw[100:104], sys.byteorder)
+        return status != _SZOMB and pgid == group
+
+    def _group_members(group: int) -> set[int] | None:
+        """Running members of a group other than its leader, or None if unknown."""
+        library = _libproc()
+        slots = 256
+        for _attempt in range(4):
+            pids = (ctypes.c_int * slots)()
+            size = library.proc_listpids(_PROC_PGRP_ONLY, group, pids, ctypes.sizeof(pids))
+            if size < 0:
+                return None
+            count = size // ctypes.sizeof(ctypes.c_int)
+            if count < slots:
+                return {
+                    pid
+                    for pid in pids[:count]
+                    if pid > 0 and pid != group and _live_member(pid, group)
+                }
+            slots *= 4
+        return None
+
+else:
+
+    def _wait_unreaped(pid: int, timeout: float | None) -> bool:
+        """Wait for a child to exit without reaping it; False on timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        delay = 0.001
+        while os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            time.sleep(delay if remaining is None else min(delay, remaining))
+            delay = min(delay * 2, _POLL_INTERVAL_SECONDS)
+        return True
+
+    def _group_members(group: int) -> set[int] | None:
+        """Running members of a group other than its leader, or None if unknown."""
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return None
+        members: set[int] = set()
+        for name in names:
+            if not name.isdigit() or int(name) == group:
+                continue
+            try:
+                stat = Path("/proc", name, "stat").read_bytes()
+            except OSError:
+                continue
+            # Fields after the parenthesised command: state, ppid, pgrp.
+            fields = stat[stat.rfind(b")") + 2 :].split()
+            if len(fields) > 2 and int(fields[2]) == group and fields[0] not in (b"Z", b"X"):
+                members.add(int(name))
+        return members
+
+
+def _wait_for_empty_group(group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if _group_members(group) == set():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _stop_group_members(group: int) -> None:
+    for stop_signal in (signal.SIGTERM, signal.SIGKILL):
+        if _wait_for_empty_group(group, 0):
+            return
+        _signal_group(group, stop_signal)
+        _wait_for_empty_group(group, TERMINATE_GRACE_SECONDS)
+
+
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop the agent and everything left in its process group, then reap it.
+
+    The group is signalled only while the agent is unreaped: until then its
+    process ID, which is also the group ID, cannot be reused by another process.
+    """
+    if process.returncode is not None:
+        return
+    group = process.pid
+    try:
+        exited = _wait_unreaped(group, 0)
+        if not exited:
+            _signal_group(group, signal.SIGTERM)
+            exited = _wait_unreaped(group, TERMINATE_GRACE_SECONDS)
+        if not exited:
+            _signal_group(group, signal.SIGKILL)
+            _wait_unreaped(group, None)
+    except ChildProcessError:
+        # Reaped outside this runner, so the group ID may already be reused.
+        pass
+    except OSError:
+        _signal_group(group, signal.SIGKILL)
+    else:
+        try:
+            _stop_group_members(group)
+        except Exception as exc:
+            _signal_group(group, signal.SIGKILL)
+            process.wait()
+            raise GenerationError("Codex could not be supervised after it started") from exc
+    process.wait()
+
+
+STOP_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
+
+
+class _StopSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _StopSignalForwarding:
+    """Turn the job's stop signals into an exception while the agent runs.
+
+    The agent leads its own session, so a stop sent to the job's process group
+    does not reach it. Raising lets the caller stop the agent's group before the
+    signal takes its previous effect.
+    """
+
+    def __init__(self) -> None:
+        self._previous: dict[int, Callable[[int, FrameType | None], object] | int] = {}
+        self._received = False
+
+    def __enter__(self) -> _StopSignalForwarding:
+        # Python delivers signals only to the main thread.
+        if threading.current_thread() is threading.main_thread():
+            for stop_signal in STOP_SIGNALS:
+                current = signal.getsignal(stop_signal)
+                if current is None or current == signal.SIG_IGN:
+                    continue
+                self._previous[stop_signal] = current
+                signal.signal(stop_signal, self._handle)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        for stop_signal, handler in self._previous.items():
+            signal.signal(stop_signal, handler)
+
+    def _handle(self, signum: int, _frame: FrameType | None) -> None:
+        # Later signals arrive while the agent is already being stopped.
+        if not self._received:
+            self._received = True
+            raise _StopSignal(signum)
+
+    def redeliver(self, signum: int) -> None:
+        handler = self._previous[signum]
+        if handler == signal.SIG_DFL:
+            os.kill(os.getpid(), signum)
+        elif callable(handler):
+            handler(signum, None)
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -171,24 +502,83 @@ class CodexRunner:
         log_path: Path,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            result = subprocess.run(
+            prompt_bytes = prompt.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise GenerationError("Codex prompt is not valid UTF-8 text") from exc
+        try:
+            # A new session makes the agent the leader of its own process group,
+            # so a timeout can stop every tool process it started.
+            process = subprocess.Popen(
                 command,
                 cwd=self.workspace,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=self.timeout_seconds,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_environment(),
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise GenerationError(f"Codex timed out after {self.timeout_seconds} seconds") from exc
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            f"COMMAND: {' '.join(command)}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        except OSError as exc:
+            raise GenerationError(f"Codex could not be started: {exc.strerror or exc}") from exc
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            _stop_process_group(process)
+            raise GenerationError("Codex could not be started with its input and output pipes")
+        stdout = _BoundedCapture(process.stdout)
+        stderr = _BoundedCapture(process.stderr)
+        writer = threading.Thread(
+            target=_write_prompt, args=(process.stdin, prompt_bytes), daemon=True
         )
-        if result.returncode != 0:
-            raise GenerationError(f"Codex exited with status {result.returncode}; see {log_path}")
-        return result
+        for thread in (stdout, stderr, writer):
+            thread.start()
+        timed_out = False
+        forwarding = _StopSignalForwarding()
+        try:
+            with forwarding:
+                try:
+                    timed_out = not _wait_unreaped(process.pid, self.timeout_seconds)
+                    _stop_process_group(process)
+                    # A tool that left the agent's group can still hold a pipe.
+                    stdout.join(TERMINATE_GRACE_SECONDS)
+                    stderr.join(TERMINATE_GRACE_SECONDS)
+                except BaseException:
+                    _stop_process_group(process)
+                    raise
+        except _StopSignal as stopped:
+            forwarding.redeliver(stopped.signum)
+            raise GenerationError(
+                f"Codex was stopped because the job received {signal.Signals(stopped.signum).name}"
+            ) from None
+        except OSError as exc:
+            raise GenerationError("Codex could not be supervised after it started") from exc
+        writer.join(TERMINATE_GRACE_SECONDS)
+        stdout_text = stdout.text()
+        stderr_text = stderr.text()
+        status = "timed out" if timed_out else f"exit status {process.returncode}"
+        try:
+            write_bytes_atomic(
+                log_path,
+                (
+                    f"COMMAND: {' '.join(command)}\n\nRESULT: {status}\n\n"
+                    f"STDOUT:\n{stdout_text}\n\nSTDERR:\n{stderr_text}"
+                ).encode("utf-8", errors="replace"),
+            )
+        except OSError as exc:
+            outcome = (
+                f"Codex timed out after {self.timeout_seconds} seconds"
+                if timed_out
+                else f"Codex finished with {status}"
+            )
+            raise GenerationError(
+                f"{outcome} and its log {log_path.name} could not be written"
+            ) from exc
+        if timed_out:
+            raise GenerationError(
+                f"Codex timed out after {self.timeout_seconds} seconds; see {log_path.name}"
+            )
+        if process.returncode != 0:
+            raise GenerationError(
+                f"Codex exited with status {process.returncode}; see {log_path.name}"
+            )
+        return subprocess.CompletedProcess(command, process.returncode, stdout_text, stderr_text)
 
     def _structured(
         self,
@@ -201,6 +591,12 @@ class CodexRunner:
         search: bool,
     ) -> object:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise GenerationError(
+                f"Previous Codex structured output could not be removed: {output_path.name}"
+            ) from exc
         with TemporaryDirectory(dir=output_path.parent) as temporary:
             schema_path = Path(temporary) / "schema.json"
             schema_path.write_text(json.dumps(schema, indent=2, sort_keys=True))
@@ -210,10 +606,14 @@ class CodexRunner:
             command.extend(["--output-schema", str(schema_path), "-o", str(output_path), "-"])
             self._run(command, prompt, log_path)
         try:
-            return cast(object, json.loads(output_path.read_text()))
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            with output_path.open("rb") as handle:
+                content = handle.read(MAX_STRUCTURED_OUTPUT_BYTES + 1)
+            if len(content) > MAX_STRUCTURED_OUTPUT_BYTES:
+                raise GenerationError(f"Codex structured output is too large: {output_path.name}")
+            return cast(object, json.loads(content.decode("utf-8")))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GenerationError(
-                f"Codex did not write valid structured output: {output_path}"
+                f"Codex did not write valid structured output: {output_path.name}"
             ) from exc
 
     def create_profile(
@@ -287,7 +687,7 @@ class CodexRunner:
             log_path,
         )
         if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise GenerationError(f"Codex did not create the requested plate: {output_path}")
+            raise GenerationError(f"Codex did not create the requested plate: {output_path.name}")
         return output_path
 
     def review_plate(
@@ -327,16 +727,54 @@ class CodexRunner:
         )
 
 
-def _non_empty_string(value: object, field: str) -> str:
+# Generous ceilings, roughly ten times the largest approved catalog value, so a
+# runaway model output cannot reach the manifest, later prompts or the catalog.
+MAX_STRUCTURED_OUTPUT_BYTES: Final = 1024 * 1024
+MAX_NAME_LENGTH: Final = 200
+MAX_MEASUREMENT_LENGTH: Final = 500
+MAX_PROSE_LENGTH: Final = 4000
+MAX_FIELD_MARK_LENGTH: Final = 1000
+MAX_PALETTE_LENGTH: Final = 300
+MAX_SOURCE_TITLE_LENGTH: Final = 500
+MAX_SOURCE_URL_LENGTH: Final = 2048
+MAX_PROFILE_LIST_ITEMS: Final = 32
+MAX_SOURCES: Final = 32
+MAX_FINDINGS: Final = 100
+MAX_CORRECTIONS: Final = 50
+MAX_CONFLICT_VALUE_LENGTH: Final = 40000
+
+
+def _non_empty_string(value: object, field: str, max_length: int = MAX_PROSE_LENGTH) -> str:
     if not isinstance(value, str) or not value.strip():
         raise GenerationError(f"Codex output field {field} must be a non-empty string")
-    return value.strip()
+    text = value.strip()
+    if len(text) > max_length:
+        raise GenerationError(
+            f"Codex output field {field} must contain at most {max_length} characters"
+        )
+    return text
 
 
-def _string_list(value: object, field: str, minimum: int) -> list[str]:
+def _bounded_list(value: object, field: str, max_items: int) -> list[object]:
     if not isinstance(value, list):
         raise GenerationError(f"Codex output field {field} must be a list")
-    items = [_non_empty_string(item, field) for item in value]
+    if len(value) > max_items:
+        raise GenerationError(f"Codex output field {field} must contain at most {max_items} items")
+    return cast(list[object], value)
+
+
+def _string_list(
+    value: object,
+    field: str,
+    minimum: int,
+    *,
+    max_items: int,
+    max_length: int = MAX_PROSE_LENGTH,
+) -> list[str]:
+    items = [
+        _non_empty_string(item, field, max_length)
+        for item in _bounded_list(value, field, max_items)
+    ]
     if len(items) < minimum:
         raise GenerationError(f"Codex output field {field} must contain at least {minimum} items")
     return items
@@ -391,10 +829,10 @@ def parse_species_profile(
         raise GenerationError("Codex profile sources must be a list")
     parsed_sources: list[SourceLink] = []
     source_hosts: set[str] = set()
-    for source in sources:
+    for source in _bounded_list(sources, "sources", MAX_SOURCES):
         if not isinstance(source, dict):
             raise GenerationError("Codex profile source must be an object")
-        url = _non_empty_string(source.get("url"), "sources.url")
+        url = _non_empty_string(source.get("url"), "sources.url", MAX_SOURCE_URL_LENGTH)
         if not url.startswith("https://"):
             raise GenerationError("Codex profile source URLs must use HTTPS")
         if not _allowed_source(url, allowed_domains):
@@ -403,7 +841,12 @@ def parse_species_profile(
         if source_identity is not None:
             source_hosts.add(source_identity)
         parsed_sources.append(
-            SourceLink(title=_non_empty_string(source.get("title"), "sources.title"), url=url)
+            SourceLink(
+                title=_non_empty_string(
+                    source.get("title"), "sources.title", MAX_SOURCE_TITLE_LENGTH
+                ),
+                url=url,
+            )
         )
     if len(parsed_sources) < 2:
         raise GenerationError("Codex profile must cite at least two sources")
@@ -411,18 +854,38 @@ def parse_species_profile(
         raise GenerationError("Codex profile must cite at least two independent source domains")
     return SpeciesProfileData(
         taxon_id=taxon_id,
-        common_name=_non_empty_string(raw.get("common_name"), "common_name"),
-        scientific_name=_non_empty_string(raw.get("scientific_name"), "scientific_name"),
-        family=_non_empty_string(raw.get("family"), "family"),
+        common_name=_non_empty_string(raw.get("common_name"), "common_name", MAX_NAME_LENGTH),
+        scientific_name=_non_empty_string(
+            raw.get("scientific_name"), "scientific_name", MAX_NAME_LENGTH
+        ),
+        family=_non_empty_string(raw.get("family"), "family", MAX_NAME_LENGTH),
         measurements={
-            "length": _non_empty_string(measurements.get("length"), "measurements.length"),
-            "wingspan": _non_empty_string(measurements.get("wingspan"), "measurements.wingspan"),
-            "weight": _non_empty_string(measurements.get("weight"), "measurements.weight"),
+            "length": _non_empty_string(
+                measurements.get("length"), "measurements.length", MAX_MEASUREMENT_LENGTH
+            ),
+            "wingspan": _non_empty_string(
+                measurements.get("wingspan"), "measurements.wingspan", MAX_MEASUREMENT_LENGTH
+            ),
+            "weight": _non_empty_string(
+                measurements.get("weight"), "measurements.weight", MAX_MEASUREMENT_LENGTH
+            ),
         },
-        field_marks=_string_list(raw.get("field_marks"), "field_marks", 4),
+        field_marks=_string_list(
+            raw.get("field_marks"),
+            "field_marks",
+            4,
+            max_items=MAX_PROFILE_LIST_ITEMS,
+            max_length=MAX_FIELD_MARK_LENGTH,
+        ),
         habitat=_non_empty_string(raw.get("habitat"), "habitat"),
         behavior=_non_empty_string(raw.get("behavior"), "behavior"),
-        palette=_string_list(raw.get("palette"), "palette", 3),
+        palette=_string_list(
+            raw.get("palette"),
+            "palette",
+            3,
+            max_items=MAX_PROFILE_LIST_ITEMS,
+            max_length=MAX_PALETTE_LENGTH,
+        ),
         sources=parsed_sources,
     )
 
@@ -445,7 +908,7 @@ def _parse_profile_conflicts(
         raise GenerationError("Codex review field profile_conflicts must be a list")
     conflicts: list[ProfileConflict] = []
     fields: set[str] = set()
-    for raw_conflict in value:
+    for raw_conflict in _bounded_list(value, "profile_conflicts", len(PROFILE_CONFLICT_FIELDS)):
         if not isinstance(raw_conflict, dict):
             raise GenerationError("Codex profile conflict must be an object")
         field = _non_empty_string(raw_conflict.get("field"), "profile_conflicts.field")
@@ -455,7 +918,9 @@ def _parse_profile_conflicts(
             raise GenerationError(f"Codex profile conflict field is duplicated: {field}")
         fields.add(field)
         profile_value = _non_empty_string(
-            raw_conflict.get("profile_value"), "profile_conflicts.profile_value"
+            raw_conflict.get("profile_value"),
+            "profile_conflicts.profile_value",
+            MAX_CONFLICT_VALUE_LENGTH,
         )
         expected_profile_value: str
         if field == "measurements.length":
@@ -492,7 +957,9 @@ def _parse_profile_conflicts(
             )
         profile_value = expected_profile_value
         observed_value = _non_empty_string(
-            raw_conflict.get("observed_value"), "profile_conflicts.observed_value"
+            raw_conflict.get("observed_value"),
+            "profile_conflicts.observed_value",
+            MAX_CONFLICT_VALUE_LENGTH if field == "field_marks" else MAX_PROSE_LENGTH,
         )
         if field == "field_marks":
             try:
@@ -511,6 +978,13 @@ def _parse_profile_conflicts(
                 raise GenerationError(
                     "Codex field_marks conflict observed_value must contain at least four strings"
                 )
+            _string_list(
+                observed_field_marks,
+                "profile_conflicts.observed_value",
+                4,
+                max_items=MAX_PROFILE_LIST_ITEMS,
+                max_length=MAX_FIELD_MARK_LENGTH,
+            )
             if observed_field_marks == current_profile["field_marks"]:
                 raise GenerationError("Codex profile conflict values must disagree")
             observed_value = json.dumps(
@@ -526,10 +1000,12 @@ def _parse_profile_conflicts(
         sources: list[SourceLink] = []
         urls: set[str] = set()
         domains: set[str] = set()
-        for raw_source in raw_sources:
+        for raw_source in _bounded_list(raw_sources, "profile_conflicts.sources", MAX_SOURCES):
             if not isinstance(raw_source, dict):
                 raise GenerationError("Codex profile conflict source must be an object")
-            url = _non_empty_string(raw_source.get("url"), "profile_conflicts.sources.url")
+            url = _non_empty_string(
+                raw_source.get("url"), "profile_conflicts.sources.url", MAX_SOURCE_URL_LENGTH
+            )
             if not url.startswith("https://"):
                 raise GenerationError("Codex profile conflict source URLs must use HTTPS")
             if not _allowed_source(url, allowed_domains):
@@ -545,7 +1021,9 @@ def _parse_profile_conflicts(
             sources.append(
                 SourceLink(
                     title=_non_empty_string(
-                        raw_source.get("title"), "profile_conflicts.sources.title"
+                        raw_source.get("title"),
+                        "profile_conflicts.sources.title",
+                        MAX_SOURCE_TITLE_LENGTH,
                     ),
                     url=url,
                 )
@@ -572,7 +1050,12 @@ def _parse_resolved_corrections(
 ) -> tuple[str, ...]:
     if value is None:
         return ()
-    items = _string_list(value, "resolved_corrections", 0)
+    items = _string_list(
+        value,
+        "resolved_corrections",
+        0,
+        max_items=max(MAX_CORRECTIONS, len(prior_corrections)),
+    )
     prior_by_key = {" ".join(item.split()).casefold(): item for item in prior_corrections}
     current_keys = {" ".join(item.split()).casefold() for item in current_corrections}
     resolved: list[str] = []
@@ -605,9 +1088,11 @@ def _parse_review(
     anatomy_accuracy = _score(raw, "anatomy_accuracy")
     text_accuracy = _score(raw, "text_accuracy")
     composition_quality = _score(raw, "composition_quality")
-    findings = tuple(_string_list(raw.get("findings"), "findings", 0))
+    findings = tuple(_string_list(raw.get("findings"), "findings", 0, max_items=MAX_FINDINGS))
     correction_findings = tuple(
-        _string_list(raw.get("correction_findings"), "correction_findings", 0)
+        _string_list(
+            raw.get("correction_findings"), "correction_findings", 0, max_items=MAX_CORRECTIONS
+        )
     )
     resolved_corrections = _parse_resolved_corrections(
         raw.get("resolved_corrections"),
@@ -625,10 +1110,12 @@ def _parse_review(
     verification_sources: list[SourceLink] = []
     source_urls: set[str] = set()
     source_hosts: set[str] = set()
-    for source in sources:
+    for source in _bounded_list(sources, "verification_sources", MAX_SOURCES):
         if not isinstance(source, dict):
             raise GenerationError("Codex review verification source must be an object")
-        url = _non_empty_string(source.get("url"), "verification_sources.url")
+        url = _non_empty_string(
+            source.get("url"), "verification_sources.url", MAX_SOURCE_URL_LENGTH
+        )
         if not url.startswith("https://"):
             raise GenerationError("Codex review source URLs must use HTTPS")
         if not _allowed_source(url, allowed_domains):
@@ -641,7 +1128,9 @@ def _parse_review(
             source_hosts.add(source_identity)
         verification_sources.append(
             SourceLink(
-                title=_non_empty_string(source.get("title"), "verification_sources.title"),
+                title=_non_empty_string(
+                    source.get("title"), "verification_sources.title", MAX_SOURCE_TITLE_LENGTH
+                ),
                 url=url,
             )
         )
