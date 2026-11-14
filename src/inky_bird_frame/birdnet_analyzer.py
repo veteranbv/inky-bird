@@ -28,6 +28,11 @@ REQUIRED_COLUMNS = (
     "Confidence",
     "File",
 )
+# Bounds for one uploaded table. Analyzer names are short; the File column is
+# a path. A combined table this large should be split into several imports.
+MAX_CSV_ROWS = 250_000
+MAX_NAME_LENGTH = 200
+MAX_FILE_LENGTH = 4096
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,16 @@ def _is_fingerprint(value: object) -> bool:
 
 
 @contextmanager
+def _state_errors() -> Iterator[None]:
+    try:
+        yield
+    except OSError as exc:
+        raise DataSourceError(
+            "BirdNET Analyzer could not use its state folder. Check its permissions and free space."
+        ) from exc
+
+
+@contextmanager
 def _history_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "birdnet-analyzer.lock").open("a+") as handle:
@@ -123,9 +138,9 @@ def _state_path(state_dir: Path) -> Path:
 
 def _require_private_file(path: Path) -> None:
     if path.is_symlink():
-        raise DataSourceError(f"Refusing symlinked BirdNET Analyzer state: {path}")
+        raise DataSourceError(f"Refusing symlinked BirdNET Analyzer state: {path.name}")
     if stat.S_IMODE(path.stat().st_mode) & 0o077:
-        raise DataSourceError(f"BirdNET Analyzer state must use mode 0600: {path}")
+        raise DataSourceError(f"BirdNET Analyzer state must use mode 0600: {path.name}")
 
 
 def _timestamp(value: object, label: str) -> str:
@@ -183,14 +198,14 @@ def _read_state(
         return {}, None, None
     _require_private_file(path)
     try:
-        payload: object = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DataSourceError(f"Invalid BirdNET Analyzer state: {path}") from exc
+        payload: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DataSourceError(f"Invalid BirdNET Analyzer state: {path.name}") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        raise DataSourceError(f"Unsupported BirdNET Analyzer state: {path}")
+        raise DataSourceError(f"Unsupported BirdNET Analyzer state: {path.name}")
     raw_detections = payload.get("detections")
     if not isinstance(raw_detections, dict):
-        raise DataSourceError(f"Invalid BirdNET Analyzer state: {path}")
+        raise DataSourceError(f"Invalid BirdNET Analyzer state: {path.name}")
     detections: dict[str, _StoredDetection] = {}
     for fingerprint, raw_detection in raw_detections.items():
         if not _is_fingerprint(fingerprint):
@@ -232,10 +247,13 @@ def _parse_csv_row(
         or not 0 <= confidence <= 1
         or not isinstance(common_name, str)
         or not common_name.strip()
+        or len(common_name.strip()) > MAX_NAME_LENGTH
         or not isinstance(scientific_name, str)
         or not scientific_name.strip()
+        or len(scientific_name.strip()) > MAX_NAME_LENGTH
         or not isinstance(source_file, str)
         or not source_file.strip()
+        or len(source_file.strip()) > MAX_FILE_LENGTH
     ):
         raise DataSourceError(f"Invalid BirdNET Analyzer CSV row {line}")
     # The segment fingerprint keeps the pre-1.0 formula so retained rows still
@@ -297,7 +315,7 @@ def import_birdnet_analyzer_csv(
     operation_id: str | None = None,
 ) -> BirdNetAnalyzerImportStats:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).isoformat()
-    with _history_lock(state_dir):
+    with _state_errors(), _history_lock(state_dir):
         detections, history_started_at, _ = _read_state(_state_path(state_dir), required=False)
         if expected_revision is not None and _revision(state_dir) != expected_revision:
             raise DataSourceError("Analyzer history changed. Preview the CSV again.")
@@ -321,6 +339,11 @@ def import_birdnet_analyzer_csv(
                     )
                 for line, row in enumerate(reader, start=2):
                     rows += 1
+                    if rows > MAX_CSV_ROWS:
+                        raise DataSourceError(
+                            f"BirdNET Analyzer CSV has more than {MAX_CSV_ROWS:,} rows. "
+                            "Split it into smaller files."
+                        )
                     segment, fingerprint, detection = _parse_csv_row(row, line, observed_on)
                     segment_rows = upload.setdefault(segment, {})
                     if fingerprint in segment_rows:
@@ -329,6 +352,10 @@ def import_birdnet_analyzer_csv(
                     segment_rows[fingerprint] = detection
             except csv.Error as exc:
                 raise DataSourceError("Invalid BirdNET Analyzer CSV") from exc
+            except UnicodeDecodeError as exc:
+                raise DataSourceError("BirdNET Analyzer CSV is not UTF-8 text") from exc
+            except OSError as exc:
+                raise DataSourceError("Could not read BirdNET Analyzer CSV") from exc
         if rows == 0:
             raise DataSourceError("BirdNET Analyzer CSV contains no detection rows")
         stored_by_segment: dict[str, list[str]] = {}
@@ -380,7 +407,7 @@ def _revision(state_dir: Path) -> str:
 
 
 def analyzer_history_revision(state_dir: Path) -> str:
-    with _history_lock(state_dir):
+    with _state_errors(), _history_lock(state_dir):
         _read_state(_state_path(state_dir), required=False)
         return _revision(state_dir)
 
@@ -394,7 +421,7 @@ def read_birdnet_analyzer_history(
 ) -> BirdNetAnalyzerHistory:
     if limit is not None and limit <= 0:
         raise ValueError("BirdNET Analyzer species_limit must be greater than zero")
-    with _history_lock(state_dir):
+    with _state_errors(), _history_lock(state_dir):
         detections, history_started_at, last_imported_at = _read_state(
             _state_path(state_dir), required=True
         )

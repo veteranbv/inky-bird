@@ -7,8 +7,10 @@ import unittest
 from datetime import UTC, date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from inky_bird_frame.birdnet_analyzer import (
+    analyzer_history_revision,
     import_birdnet_analyzer_csv,
     read_birdnet_analyzer_history,
 )
@@ -284,6 +286,132 @@ class BirdNetAnalyzerMultiSpeciesTests(unittest.TestCase):
 
         self.assertEqual((result.rows, result.imported, result.duplicates), (2, 1, 1))
         self.assertEqual(counts, {"Sialia sialis": 1})
+
+
+class BirdNetAnalyzerLocalFailureTests(unittest.TestCase):
+    def test_non_utf8_csv_is_a_data_source_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "results.csv"
+            csv_path.write_bytes(
+                HEADER.encode() + b"0,3,Sialia sialis,Eastern Bluebird \xff,0.9,one.wav\n"
+            )
+            with self.assertRaisesRegex(DataSourceError, "not UTF-8"):
+                import_birdnet_analyzer_csv(csv_path, root / "state")
+
+        self.assertFalse((root / "state/birdnet-analyzer-detections.json").exists())
+
+    def test_non_utf8_state_is_a_data_source_error_without_its_path(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            path = write_legacy_state(state_dir, {})
+            path.write_bytes(b'{"schema_version": 1, "detections": {"\xff": 1}}')
+            for read in (
+                lambda: read_birdnet_analyzer_history(
+                    state_dir, window=ObservationWindow.ALL_TIME, limit=None
+                ),
+                lambda: analyzer_history_revision(state_dir),
+            ):
+                with self.assertRaisesRegex(
+                    DataSourceError, "Invalid BirdNET Analyzer state"
+                ) as raised:
+                    read()
+                self.assertNotIn(temporary, str(raised.exception))
+
+    def test_state_errors_do_not_contain_absolute_paths(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            path = write_legacy_state(state_dir, {})
+            messages = []
+            path.chmod(0o644)
+            with self.assertRaises(DataSourceError) as insecure:
+                analyzer_history_revision(state_dir)
+            messages.append(str(insecure.exception))
+            path.chmod(0o600)
+            path.write_text("{}")
+            with self.assertRaises(DataSourceError) as unsupported:
+                analyzer_history_revision(state_dir)
+            messages.append(str(unsupported.exception))
+            path.write_text("[")
+            with self.assertRaises(DataSourceError) as invalid:
+                analyzer_history_revision(state_dir)
+            messages.append(str(invalid.exception))
+
+        for message in messages:
+            self.assertNotIn(temporary, message)
+
+    def test_unusable_state_folder_is_a_data_source_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "results.csv"
+            csv_path.write_text(HEADER + "0,3,Sialia sialis,Eastern Bluebird,0.91,one.wav\n")
+            (root / "state").write_text("not a folder")
+            for action in (
+                lambda: import_birdnet_analyzer_csv(csv_path, root / "state"),
+                lambda: analyzer_history_revision(root / "state"),
+                lambda: read_birdnet_analyzer_history(
+                    root / "state", window=ObservationWindow.ALL_TIME, limit=None
+                ),
+            ):
+                with self.assertRaisesRegex(DataSourceError, "could not use its state") as raised:
+                    action()
+                self.assertNotIn(temporary, str(raised.exception))
+
+    def test_failed_write_is_a_data_source_error_and_keeps_history(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "results.csv"
+            csv_path.write_text(HEADER + "0,3,Sialia sialis,Eastern Bluebird,0.91,one.wav\n")
+            import_birdnet_analyzer_csv(csv_path, root / "state")
+            before = (root / "state/birdnet-analyzer-detections.json").read_bytes()
+            csv_path.write_text(HEADER + "3,6,Sialia sialis,Eastern Bluebird,0.91,one.wav\n")
+            with (
+                patch(
+                    "inky_bird_frame.birdnet_analyzer.write_json_atomic",
+                    side_effect=OSError(28, "No space left on device"),
+                ),
+                self.assertRaisesRegex(DataSourceError, "could not use its state"),
+            ):
+                import_birdnet_analyzer_csv(csv_path, root / "state")
+            after = (root / "state/birdnet-analyzer-detections.json").read_bytes()
+
+        self.assertEqual(after, before)
+
+
+class BirdNetAnalyzerBoundsTests(unittest.TestCase):
+    def test_overlong_names_and_file_values_are_rejected(self) -> None:
+        for row in (
+            f"0,3,Sialia sialis,{'B' * 201},0.91,one.wav\n",
+            f"0,3,{'S' * 201},Eastern Bluebird,0.91,one.wav\n",
+            f"0,3,Sialia sialis,Eastern Bluebird,0.91,{'f' * 4097}.wav\n",
+        ):
+            with TemporaryDirectory() as temporary, self.subTest(length=len(row)):
+                root = Path(temporary)
+                csv_path = root / "results.csv"
+                csv_path.write_text(HEADER + row)
+                with self.assertRaisesRegex(DataSourceError, "CSV row 2"):
+                    import_birdnet_analyzer_csv(csv_path, root / "state")
+
+    def test_row_count_is_bounded(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "results.csv"
+            csv_path.write_text(
+                HEADER
+                + "".join(
+                    f"{start},{start + 3},Sialia sialis,Eastern Bluebird,0.9,one.wav\n"
+                    for start in range(0, 12, 3)
+                )
+            )
+            with (
+                patch("inky_bird_frame.birdnet_analyzer.MAX_CSV_ROWS", 3),
+                self.assertRaisesRegex(DataSourceError, "more than 3 rows"),
+            ):
+                import_birdnet_analyzer_csv(csv_path, root / "state")
+            with patch("inky_bird_frame.birdnet_analyzer.MAX_CSV_ROWS", 4):
+                accepted = import_birdnet_analyzer_csv(csv_path, root / "state")
+
+        self.assertEqual(accepted.imported, 4)
 
 
 class BirdNetAnalyzerHistoryTests(unittest.TestCase):
