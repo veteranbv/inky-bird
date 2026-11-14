@@ -48,8 +48,8 @@ Every `[discovery]` table still needs `radius_km`, `species_limit` and
 `window`, even when no selected source uses a location.
 
 Direct coordinates are the provider-independent option. They work worldwide,
-do not disclose a postal code to a geocoder, and cannot become ambiguous. This
-fragment replaces the location keys in your `[discovery]` table:
+do not disclose a postal code to a geocoder, and cannot become ambiguous. These
+keys replace the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -59,8 +59,8 @@ longitude = 0.0
 
 For postal-code convenience, use [Geoapify's Postcode API](https://apidocs.geoapify.com/docs/postcode/).
 It supports ISO 3166-1 alpha-2 country codes and international postal formats.
-Create a Geoapify key and keep it in the private configuration. This fragment
-also replaces the location keys in your `[discovery]` table:
+Create a Geoapify key and keep it in the private configuration. These keys
+also replace the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -77,7 +77,7 @@ requires an exact country/postal-code match and rejects multiple coordinate
 results rather than guessing. Geoapify permits stored results and requires
 attribution; discovery output includes both Geoapify and source attribution.
 
-Existing `zip_code = "00000"` configurations remain supported unchanged through
+Existing five-digit `zip_code` configurations remain supported unchanged through
 Zippopotam's US endpoint and need no key. This compatibility path is US-only;
 new worldwide configurations should use coordinates or Geoapify. No discovery
 location is written to a public catalog or rendered on a plate.

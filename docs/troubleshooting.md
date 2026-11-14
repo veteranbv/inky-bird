@@ -57,10 +57,23 @@ or loopback client when the address is the controller's own IP address on the
 configured port, `localhost` on the controller itself, or an origin listed in
 `controller.owner_allowed_origins`. A hostname, a different port (for example a
 Docker port mapping) or an HTTPS address must be listed exactly. In HTTPS-only
-mode, only listed HTTPS origins work. Add the exact origin the browser shows,
-then restart the controller. On an app-managed Docker installation, follow the
-app-managed steps under [Docker update](docker.md#update) instead: rerunning
-`config-sync` does not change its running configuration.
+mode, only listed HTTPS origins work. Add the exact origin the browser shows
+to `[controller]`. An `http://` origin also needs `owner_access_mode = "local"`
+in the same table: once any origin is listed, the mode defaults to HTTPS-only,
+and the controller then refuses to load a configuration with an HTTP origin.
+
+```toml
+[controller]
+owner_access_mode = "local"
+owner_allowed_origins = ["http://inky.home:8793"]
+```
+
+Merge it with any origins already listed. If your installation is HTTPS-only,
+list an HTTPS origin instead; switching to local mode allows HTTP owner
+sign-in. Run `"$IBF" config validate --config "$CONFIG"` and restart the
+controller only after it passes. On an app-managed Docker installation,
+follow the app-managed steps under [Docker update](docker.md#update) instead:
+rerunning `config-sync` does not change its running configuration.
 
 ### `config` fails
 
