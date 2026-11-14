@@ -1947,6 +1947,8 @@ def _noted_on(timestamp: str) -> date:
     observed = parse_utc_timestamp(timestamp)
     if observed is None:
         raise DataSourceError("Invalid Bird Buddy detection timestamp")
+    # The controller's local date when the summary is written; a time-zone
+    # change shows from the next history write.
     return observed.astimezone().date()
 
 

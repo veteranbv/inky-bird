@@ -10,10 +10,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from ebird_fixtures import EXPORT_COLUMNS
+
 from inky_bird_frame.birds import DateRange, EbirdArchiveSpecies, ObservationWindow
 from inky_bird_frame.ebird_archive import (
     CSV_FILENAME,
-    EXPORT_COLUMNS,
     MAX_NAME_LENGTH,
     MAX_ZIP_METADATA_BYTES,
     REQUIRED_COLUMNS,

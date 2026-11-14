@@ -17,6 +17,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
+from ebird_fixtures import EXPORT_COLUMNS
 from starlette.testclient import TestClient
 
 from inky_bird_frame import birdbuddy, birdnet_analyzer, ebird_archive
@@ -37,7 +38,6 @@ from inky_bird_frame.birdnet_analyzer import (
 from inky_bird_frame.birds import ObservationWindow
 from inky_bird_frame.config import ControllerConfig
 from inky_bird_frame.ebird_archive import (
-    EXPORT_COLUMNS,
     import_ebird_archive,
     read_ebird_archive_history,
     read_ebird_archive_summary,

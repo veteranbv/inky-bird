@@ -38,32 +38,6 @@ CSV_FILENAME = "MyEBirdData.csv"
 REQUIRED_COLUMNS = ("Submission ID", "Common Name", "Scientific Name", "Date", "Location")
 # Species names longer than this are not real eBird taxa.
 MAX_NAME_LENGTH = 200
-# The columns of an official "Download My Data" export, for reference.
-EXPORT_COLUMNS = (
-    "Submission ID",
-    "Common Name",
-    "Scientific Name",
-    "Taxonomic Order",
-    "Count",
-    "State/Province",
-    "County",
-    "Location ID",
-    "Location",
-    "Latitude",
-    "Longitude",
-    "Date",
-    "Time",
-    "Protocol",
-    "Duration (Min)",
-    "All Obs Reported",
-    "Distance Traveled (km)",
-    "Area Covered (ha)",
-    "Number of Observers",
-    "Breeding Code",
-    "Observation Details",
-    "Checklist Comments",
-    "ML Catalog Numbers",
-)
 # A streamed 512 MiB ceiling accommodates millions of personal observations while
 # bounding decompression and parsing work for an untrusted or damaged archive.
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
