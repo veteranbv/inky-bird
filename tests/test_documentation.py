@@ -14,6 +14,7 @@ import pytest
 from PIL import Image
 
 from inky_bird_frame.config import DiscoveryProvider, parse_config
+from inky_bird_frame.errors import ConfigurationError
 
 ROOT = Path(__file__).resolve().parents[1]
 FENCED_BLOCK = re.compile(r"^\s*```.*?^\s*```\s*$", re.MULTILINE | re.DOTALL)
@@ -636,3 +637,66 @@ def test_proxy_recipes_route_every_owner_and_wall_path_and_no_legacy_path(proxy:
 
     assert not missing, f"{proxy} recipe does not route: {missing}"
     assert not exposed, f"{proxy} recipe exposes legacy routes: {exposed}"
+
+
+TOML_EXAMPLE = re.compile(
+    r"^(?P<indent>[ ]*)(?P<fence>```|~~~)toml\n(?P<body>.*?)^(?P=indent)(?P=fence)[ ]*$",
+    re.MULTILINE | re.DOTALL,
+)
+LOCATION_KEYS = ("zip_code", "postal_code", "country_code", "latitude", "longitude")
+
+
+def _merge(target: dict[str, object], update: dict[str, object]) -> None:
+    for key, value in update.items():
+        current = target.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            _merge(current, value)
+        else:
+            target[key] = value
+
+
+def _documented_toml_examples() -> list[tuple[str, str, dict[str, object]]]:
+    examples = []
+    for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
+        text = path.read_text(encoding="utf-8")
+        for match in TOML_EXAMPLE.finditer(text):
+            indent = match.group("indent")
+            body = "\n".join(line.removeprefix(indent) for line in match.group("body").splitlines())
+            lead_in = text[: match.start()].rstrip().rsplit("\n\n", 1)[-1]
+            line = text.count("\n", 0, match.start()) + 1
+            examples.append((f"{path.relative_to(ROOT)}:{line}", lead_in, tomllib.loads(body)))
+    return examples
+
+
+def test_documented_configuration_examples_load_or_say_they_are_fragments(
+    tmp_path: Path,
+) -> None:
+    """Load each example into config.example.toml the way an owner would apply it.
+
+    A [discovery] table that selects sources replaces the whole table; anything
+    else is merged, and a new location form replaces the old one.
+    """
+    examples = _documented_toml_examples()
+    assert len(examples) > 20
+    failures = []
+    for where, lead_in, example in examples:
+        if "fragment" in lead_in.lower():
+            continue
+        raw: dict[str, object] = tomllib.loads(
+            (ROOT / "config.example.toml").read_text(encoding="utf-8")
+        )
+        discovery = example.get("discovery")
+        base_discovery = raw["discovery"]
+        assert isinstance(base_discovery, dict)
+        if isinstance(discovery, dict) and "sources" in discovery:
+            raw["discovery"] = discovery
+            example = {key: value for key, value in example.items() if key != "discovery"}
+        elif isinstance(discovery, dict) and any(key in discovery for key in LOCATION_KEYS):
+            for key in LOCATION_KEYS:
+                base_discovery.pop(key, None)
+        _merge(raw, example)
+        try:
+            parse_config(raw, path=tmp_path / "config.toml", load_secrets=False)
+        except ConfigurationError as exc:
+            failures.append(f"{where}: {exc}")
+    assert not failures, "\n" + "\n".join(failures)

@@ -84,17 +84,23 @@ controller_url = "http://inky-controller:8793/wall"
 
 Use your actual reachable private address. Retain HTTPS and certificate trust
 when required. This HTTP hostname also needs its exact origin in the existing
-controller configuration:
+controller configuration, with local access mode. A list of allowed origins
+without `owner_access_mode` defaults to HTTPS-only, which rejects an HTTP
+origin and stops the controller from loading its configuration:
 
 ```toml
 [controller]
+owner_access_mode = "local"
 owner_allowed_origins = ["http://inky-controller:8793"]
 ```
 
 Merge it with any existing origins; do not replace an HTTPS or OIDC origin.
-Keep HTTPS-only mode unchanged and use its configured HTTPS address instead
-if that is your installation's policy. Docker also needs the actual published
-origin, even for a literal IP; see [Docker address setup](docker.md#what-runs).
+If your installation is HTTPS-only, keep that mode and use its configured HTTPS
+address instead; switching it to local mode allows HTTP owner sign-in. Behind a
+reverse proxy, that address must route `/wall/*`, as the
+[reverse-proxy recipes](browser-access.md#advanced-https-through-a-reverse-proxy)
+do. Docker also needs the actual published origin, even for a literal IP; see
+[Docker address setup](docker.md#what-runs).
 The origin permits that address, not arbitrary clients or internet exposure.
 
 Validate the file, rerun display setup and restart its service

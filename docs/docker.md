@@ -253,7 +253,8 @@ access to the workspace directory, not the private configuration, approved
 catalog, or controller state directories.
 
 Secrets can stay in the mode-`0600` TOML file or come from `controller.env`.
-For environment-backed values, name the variable in TOML:
+For environment-backed values, name the variable in TOML. This fragment shows
+only the changed keys; keep the rest of each table:
 
 ```toml
 [discovery]
@@ -280,6 +281,9 @@ host-only loopback address:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 birdnet_go_url = "http://birdnet-go.local:8080"
 ```
 

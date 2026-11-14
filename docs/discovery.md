@@ -44,9 +44,12 @@ retained unless a provider section below documents an explicit removal step.
 iNaturalist and eBird need a point and radius. Choose exactly one location
 form; eBird Archive-, BirdWeather-, BirdNET-Go-, BirdNET Analyzer-, and Bird
 Buddy-only setups need none.
+Every `[discovery]` table still needs `radius_km`, `species_limit` and
+`window`, even when no selected source uses a location.
 
 Direct coordinates are the provider-independent option. They work worldwide,
-do not disclose a postal code to a geocoder, and cannot become ambiguous:
+do not disclose a postal code to a geocoder, and cannot become ambiguous. This
+fragment replaces the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -56,7 +59,8 @@ longitude = 0.0
 
 For postal-code convenience, use [Geoapify's Postcode API](https://apidocs.geoapify.com/docs/postcode/).
 It supports ISO 3166-1 alpha-2 country codes and international postal formats.
-Create a Geoapify key and keep it in the private configuration:
+Create a Geoapify key and keep it in the private configuration. This fragment
+also replaces the location keys in your `[discovery]` table:
 
 ```toml
 [discovery]
@@ -151,6 +155,8 @@ inky-bird-frame ebird archive import \
 ```toml
 [discovery]
 sources = ["ebird-archive"]
+radius_km = 8
+species_limit = 50
 window = "all-time"
 ```
 
@@ -286,6 +292,7 @@ controller:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
 species_limit = 50
 window = "last-30-days"
 birdnet_go_url = "http://birdnet-go.local:8080"
@@ -310,6 +317,9 @@ base URL:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 birdnet_go_url = "https://birdnet.example.net"
 ```
 
@@ -388,6 +398,8 @@ inky-bird-frame birdnet-analyzer import \
 ```toml
 [discovery]
 sources = ["birdnet-analyzer"]
+radius_km = 8
+species_limit = 50
 window = "all-time"
 ```
 
@@ -527,6 +539,9 @@ you use the account:
 [discovery]
 sources = ["birdbuddy"]
 birdbuddy_include_manual_sightings = true
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 ```
 
 The choice is reversible. Manual evidence remains in the private history so it
@@ -592,7 +607,8 @@ The legacy singular values `source = "inaturalist"`, `"ebird"`, `"combined"`,
 and `"birdweather"` remain accepted. Do not set both `source` and `sources`.
 Version 0.5.0 removed `source = "all"` because its frozen three-provider meaning
 became misleading as new providers were added. Replace it without changing
-behavior:
+behavior. This fragment replaces only that one line; keep the rest of your
+`[discovery]` table:
 
 ```toml
 [discovery]

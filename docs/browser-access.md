@@ -342,7 +342,8 @@ startup; Inky does not start an HTTP replacement. Update the files and restart
 Inky after certificate renewal. Inky does not issue or renew certificates.
 
 If the browser address differs from the backend certificate name or port, set
-the direct probe address separately:
+the direct probe address separately. This fragment loads only in a controller
+section that already serves HTTPS on that port:
 
 ~~~toml
 [controller]
@@ -536,6 +537,8 @@ intended owner at the identity service. Use Authorization Code, PKCE S256,
 an asymmetric RS256 or ES256 signing key and the openid scope. Do not request
 offline_access. Set authorization_code explicitly when using the Authentik API.
 Use a strict, exact HTTPS callback; never leave the allowed callback empty.
+This fragment loads only with the HTTPS `owner_allowed_origins` setting shown
+in the reverse-proxy section.
 
 ~~~toml
 [controller.oidc]
