@@ -9,9 +9,10 @@ import os
 import signal
 import sys
 import threading
+import time
 import tomllib
 import warnings
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -98,6 +99,8 @@ from .settings import SettingsError, initialize_config
 
 CATALOG_SYNC_REVIEWED_MIGRATIONS_ENV = "INKY_CATALOG_SYNC_APPLY_REVIEWED_MIGRATIONS"
 CATALOG_SYNC_RETAIN_INDEPENDENT_ENV = "INKY_CATALOG_SYNC_RETAIN_INDEPENDENT_APPROVALS"
+SCHEDULER_CONFIG_ALERT = "scheduler-configuration"
+SCHEDULER_LOCK_WAIT_SECONDS = 2.0
 
 
 def print_result(data: object) -> None:
@@ -1064,13 +1067,42 @@ def controller_jobs(config: AppConfig, config_path: Path) -> list[ScheduledJob]:
     return jobs
 
 
+def _config_snapshot(path: Path) -> tuple[AppConfig, bytes]:
+    """Load the scheduler's view of the config and keep the bytes it came from."""
+
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigurationError(f"Configuration file not found: {path}") from exc
+    return parse_config_bytes(content, path=path, load_secrets=False), content
+
+
+def _hold_scheduler_lock(stack: ExitStack, path: Path) -> None:
+    from .runtime_state import state_lock
+
+    # Status readers probe this lock for an instant, so retry briefly before
+    # concluding that another scheduler owns it.
+    deadline = time.monotonic() + SCHEDULER_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            stack.enter_context(state_lock(path, nonblocking=True))
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                raise BusyError(
+                    "Another scheduler is already running for this installation"
+                ) from exc
+            time.sleep(0.05)
+        else:
+            return
+
+
 def scheduler_command(args: argparse.Namespace) -> int:
     from .activity import activity_run, next_job_run
     from .retry_requests import RETRY_WAKE_LISTENER, retry_wake_token
-    from .runtime_state import state_lock
 
-    config = load_config(args.config, load_secrets=False)
+    config, content = _config_snapshot(args.config)
     jobs = controller_jobs(config, args.config)
+    last_good_config, last_good_content = config, content
     stop = threading.Event()
 
     command_runner = SubprocessCommandRunner((sys.executable, "-m", "inky_bird_frame.cli"))
@@ -1091,20 +1123,50 @@ def scheduler_command(args: argparse.Namespace) -> int:
             activity.succeeded = result == 0
             return result
 
+    def current_jobs() -> list[ScheduledJob]:
+        nonlocal last_good_config, last_good_content
+        current, current_content = _config_snapshot(args.config)
+        updated = controller_jobs(current, args.config)
+        last_good_config, last_good_content = current, current_content
+        return updated
+
+    def config_failed(_exc: Exception) -> None:
+        safe_record_degradation(
+            last_good_config,
+            key=SCHEDULER_CONFIG_ALERT,
+            title="Inky settings could not be loaded",
+            body="The configuration file has an error, so scheduled bird updates stop "
+            "until it is fixed. Run config validate to see the problem.",
+        )
+        # Child jobs cannot load the broken file, so deliver through the
+        # destinations of the last configuration that loaded.
+        dispatch_notifications(
+            parse_config_bytes(last_good_content, path=args.config, load_secrets=True)
+        )
+
+    def config_recovered() -> None:
+        safe_record_recovery(
+            last_good_config,
+            key=SCHEDULER_CONFIG_ALERT,
+            title="Inky settings load again",
+            body="Scheduled bird updates use the configuration file again.",
+        )
+
     try:
-        with state_lock(config.controller.state_dir / RETRY_WAKE_LISTENER, nonblocking=True):
+        with ExitStack() as stack:
+            _hold_scheduler_lock(stack, config.controller.state_dir / RETRY_WAKE_LISTENER)
             run_scheduler(
                 jobs,
                 observed_runner,
                 stop_requested=stop.is_set,
                 wait=wait,
-                jobs_provider=lambda: controller_jobs(
-                    load_config(args.config, load_secrets=False), args.config
-                ),
+                jobs_provider=current_jobs,
                 wake_provider=lambda: retry_wake_token(config.controller.state_dir),
                 on_schedule=lambda name, seconds: next_job_run(
                     config.controller.state_dir, name, seconds
                 ),
+                on_jobs_error=config_failed,
+                on_jobs_recovered=config_recovered,
             )
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
