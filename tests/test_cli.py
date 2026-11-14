@@ -3971,5 +3971,16 @@ def test_status_survives_unreadable_notification_state(tmp_path: Path) -> None:
     assert json.loads(output.getvalue())["data"]["notifications"] == {"available": False}
 
 
+def test_status_survives_a_notification_outbox_that_is_not_utf8(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    (state_dir / "notifications.json").write_bytes(b"\xff\xfe not json")
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {"available": False}
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -678,7 +678,7 @@ def _read_state(path: Path) -> NotificationState:
         return NotificationState()
     try:
         raw = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise CatalogError(f"Invalid notification state: {path}") from exc
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
         raise CatalogError(f"Unsupported notification state: {path}")
