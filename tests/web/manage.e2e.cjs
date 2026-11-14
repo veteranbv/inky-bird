@@ -1,4 +1,6 @@
 // Manage, Sources, Settings, Plate work and candidate review.
+// Run through journal.e2e.cjs only: phases run in its order and hand state
+// to later phases through t.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
