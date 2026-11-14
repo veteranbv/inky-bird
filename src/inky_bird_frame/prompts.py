@@ -9,7 +9,7 @@ from pathlib import Path
 from .birds import BirdSpecies, TaxonContext
 from .models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 
-PROMPT_VERSION = "field-journal-v7"
+PROMPT_VERSION = "field-journal-v8"
 
 
 class _TextExtractor(HTMLParser):
@@ -356,5 +356,5 @@ resolved_corrections may contain only exact earlier requests that this image now
 only the requested JSON.
 
 Reference provenance:
-{reference_list(references)}
+{reference_list(references, start_index=2)}
 """
