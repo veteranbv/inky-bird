@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Container tag to publish
+        description: Container tag to publish (releases own version and sha- tags)
         required: true
         default: latest
         type: string
@@ -23,6 +23,8 @@ permissions:
   contents: read
 
 # Both names receive the SAME build, including provenance and SBOM manifests.
+# A release builds nothing: it promotes the digest that `main` published for the
+# tagged commit, after that exact digest passes a native arm64 smoke test.
 env:
   CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/inky-bird
   COMPATIBILITY_IMAGE: ghcr.io/${{ github.repository_owner }}/inky-bird-frame
@@ -43,16 +45,50 @@ jobs:
        github.actor == github.repository_owner && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       packages: write
     outputs:
       version: ${{ steps.image.outputs.version }}
+      digest: ${{ steps.digest.outputs.digest }}
+      source_sha: ${{ steps.image.outputs.source_sha }}
     steps:
       - name: Checkout trusted main revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
           persist-credentials: false
+
+      - name: Verify release source
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          project_version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$GITHUB_REF_NAME" != "v${project_version}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match project version ${project_version} in pyproject.toml."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then
+            echo "::error::The checked-out revision is not the release commit ${SOURCE_SHA}."
+            exit 1
+          fi
+          git fetch --no-tags --filter=blob:none origin \
+            +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main; then
+            echo "::error::Release commit ${SOURCE_SHA} is not on main."
+            exit 1
+          fi
+          # shellcheck disable=SC2016  # $ENV is a jq variable, not shell expansion
+          passed=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&event=push&branch=main&status=success&per_page=100" \
+            --jq '[.workflow_runs[] | select(.head_sha == $ENV.SOURCE_SHA and .conclusion == "success" and .event == "push" and .head_branch == "main")] | length')
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::No successful ci run on main for ${SOURCE_SHA}."
+            exit 1
+          fi
 
       - name: Validate image tag
         id: image
@@ -62,45 +98,55 @@ jobs:
           SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          image="${CONTROLLER_IMAGE}"
-          emit_tag() {
-            echo "${image}:$1"
+          emit_tags() {
+            echo "${CONTROLLER_IMAGE}:$1"
             echo "${COMPATIBILITY_IMAGE}:$1"
           }
           version=""
+          verify_tags=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              tags=$(emit_tags "sha-${SOURCE_SHA}")
+              git fetch --no-tags --depth=1 origin \
+                refs/heads/main:refs/remotes/origin/main
+              if [ "$(git rev-parse refs/remotes/origin/main)" = "$SOURCE_SHA" ]; then
+                tags+=$'\n'$(emit_tags latest)
+              else
+                echo "Skipping latest tag because ${SOURCE_SHA} is no longer current main." >&2
+              fi
+              ;;
+            release)
+              if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "Release tag must use vMAJOR.MINOR.PATCH" >&2
+                exit 1
+              fi
+              version="${GITHUB_REF_NAME#v}"
+              tags=$(emit_tags "${version}")
+              # The images main already published for this commit.
+              verify_tags=$(emit_tags "sha-${SOURCE_SHA}")
+              ;;
+            workflow_dispatch)
+              if [[ ! "$REQUESTED_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                echo "Invalid container tag" >&2
+                exit 1
+              fi
+              if [[ "$REQUESTED_TAG" =~ ^[vV]?[0-9] || "$REQUESTED_TAG" =~ ^[sS][hH][aA]- ]]; then
+                echo "Version and sha- tags are published only by releases and main builds" >&2
+                exit 1
+              fi
+              tags=$(emit_tags "${REQUESTED_TAG}")
+              ;;
+            *)
+              echo "Unsupported event: ${EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
           {
             echo 'tags<<EOF'
-            case "$EVENT_NAME" in
-              workflow_run)
-                emit_tag "sha-${SOURCE_SHA}"
-                git fetch --no-tags --depth=1 origin \
-                  refs/heads/main:refs/remotes/origin/main
-                if [ "$(git rev-parse refs/remotes/origin/main)" = "$SOURCE_SHA" ]; then
-                  emit_tag latest
-                else
-                  echo "Skipping latest tag because ${SOURCE_SHA} is no longer current main." >&2
-                fi
-                ;;
-              release)
-                if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                  echo "Release tag must use vMAJOR.MINOR.PATCH" >&2
-                  exit 1
-                fi
-                version="${GITHUB_REF_NAME#v}"
-                emit_tag "${version}"
-                ;;
-              workflow_dispatch)
-                if [[ ! "$REQUESTED_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-                  echo "Invalid container tag" >&2
-                  exit 1
-                fi
-                emit_tag "${REQUESTED_TAG}"
-                ;;
-              *)
-                echo "Unsupported event: ${EVENT_NAME}" >&2
-                exit 1
-                ;;
-            esac
+            echo "$tags"
+            echo 'EOF'
+            echo 'verify_tags<<EOF'
+            echo "${verify_tags:-$tags}"
             echo 'EOF'
             echo "version=${version}"
             echo "source_sha=${SOURCE_SHA}"
@@ -108,6 +154,7 @@ jobs:
           echo "created=$(git show --no-patch --format=%cI "$SOURCE_SHA")" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
+        if: github.event_name != 'release'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
@@ -122,6 +169,7 @@ jobs:
 
       - name: Build and publish
         id: publish
+        if: github.event_name != 'release'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -134,10 +182,30 @@ jobs:
           provenance: mode=max
           sbom: true
 
+      - name: Resolve published digest
+        id: digest
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILT_DIGEST: ${{ steps.publish.outputs.digest }}
+          VERIFY_TAGS: ${{ steps.image.outputs.verify_tags }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = release ]; then
+            source_tag=$(head -n 1 <<< "$VERIFY_TAGS")
+            if ! digest=$(docker buildx imagetools inspect "$source_tag" --format '{{json .Manifest}}' | jq -r '.digest'); then
+              echo "::error::${source_tag} is not published. Wait for, or re-run, this commit's main container publication, then re-run the release."
+              exit 1
+            fi
+          else
+            digest="$BUILT_DIGEST"
+          fi
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
       - name: Verify both published names
         env:
-          IMAGE_TAGS: ${{ steps.image.outputs.tags }}
-          EXPECTED_DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE_TAGS: ${{ steps.image.outputs.verify_tags }}
+          EXPECTED_DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
@@ -162,9 +230,143 @@ jobs:
             test "$verified" = true
           done <<< "$IMAGE_TAGS"
 
+  smoke-arm64:
+    name: Smoke test arm64 image
+    needs: publish
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out the image's AppArmor profile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.publish.outputs.source_sha }}
+          persist-credentials: false
+          sparse-checkout: deploy/apparmor
+          sparse-checkout-cone-mode: false
+
+      - name: Allow the Codex sandbox
+        run: |
+          sudo install -m 0644 deploy/apparmor/inky-bird-frame-codex /etc/apparmor.d/inky-bird-frame-codex
+          sudo apparmor_parser -r /etc/apparmor.d/inky-bird-frame-codex
+          if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = "1"
+          fi
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run the published image natively
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image="${CONTROLLER_IMAGE}@${DIGEST}"
+          docker pull --platform linux/arm64 "$image"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/arm64
+          reported=$(docker run --rm --platform linux/arm64 "$image" --version)
+          echo "$reported"
+          if [ -n "$VERSION" ] && [ "${reported##* }" != "$VERSION" ]; then
+            echo "::error::The image reports ${reported}; this release is ${VERSION}."
+            exit 1
+          fi
+          docker run --rm --platform linux/arm64 "$image" catalog validate --catalog /app/catalog
+          docker run --rm --platform linux/arm64 --entrypoint codex "$image" --version
+          run_sandbox() {
+            docker run --rm --platform linux/arm64 --read-only --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --security-opt seccomp=unconfined \
+              --security-opt apparmor=unconfined \
+              --pids-limit 256 \
+              --tmpfs /tmp:size=256m,mode=1777 \
+              --tmpfs /data:uid=10001,gid=10001 \
+              --tmpfs /home/inky/.codex:uid=10001,gid=10001 \
+              --entrypoint codex "$image" sandbox -- "$@"
+          }
+          run_sandbox /bin/true
+          if run_sandbox python -c \
+            "import socket; socket.create_connection(('1.1.1.1', 443), timeout=1)"; then
+            echo "::error::The Codex sandbox allowed network access on arm64."
+            exit 1
+          fi
+          docker run --rm --platform linux/arm64 --entrypoint gh "$image" --version
+
+  promote-release:
+    name: Promote release tags
+    if: github.event_name == 'release'
+    needs:
+      - publish
+      - smoke-arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the tested digest
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          errors=$(mktemp)
+          for name in "$CONTROLLER_IMAGE" "$COMPATIBILITY_IMAGE"; do
+            tag="${name}:${VERSION}"
+            if manifest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' 2>"$errors"); then
+              existing=$(jq -r '.digest' <<< "$manifest")
+              if [ "$existing" != "$DIGEST" ]; then
+                echo "::error::${tag} already points at ${existing}. A published version is never moved."
+                exit 1
+              fi
+              echo "${tag} already points at ${DIGEST}."
+              continue
+            fi
+            if ! grep -q ': not found' "$errors"; then
+              cat "$errors" >&2
+              echo "::error::Could not confirm that ${tag} is unpublished."
+              exit 1
+            fi
+            # One source index is copied byte for byte, so its digest is kept.
+            docker buildx imagetools create --tag "$tag" "${name}@${DIGEST}"
+            published=""
+            for attempt in 1 2 3 4; do
+              if manifest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}'); then
+                published=$(jq -r '.digest' <<< "$manifest")
+                [ "$published" = "$DIGEST" ] && break
+              fi
+              sleep "$((attempt * 3))"
+            done
+            if [ "$published" != "$DIGEST" ]; then
+              echo "::error::${tag} resolves to ${published:-nothing}, not ${DIGEST}."
+              exit 1
+            fi
+          done
+
   release-bundle:
     if: github.event_name == 'release'
-    needs: publish
+    needs:
+      - publish
+      - promote-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -209,5 +411,4 @@ jobs:
             inky-bird-docker.tar.gz \
             inky-bird-docker.tar.gz.sha256 \
             inky-bird-frame-docker.tar.gz \
-            inky-bird-frame-docker.tar.gz.sha256 \
-            --clobber
+            inky-bird-frame-docker.tar.gz.sha256

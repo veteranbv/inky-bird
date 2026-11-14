@@ -10,6 +10,10 @@ body:
       label: Area
       options:
         - Controller and discovery
+        - Web journal
+        - Owner access and sign-in
+        - History imports
+        - Home Assistant
         - Generation and review
         - Catalog and publishing
         - Display node and Inky hardware

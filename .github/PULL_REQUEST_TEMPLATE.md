@@ -12,14 +12,18 @@ Describe the problem and the smallest complete change that solves it.
 
 ## Validation
 
-List the commands you ran and their results. The standard checks are:
+List the commands you ran and their results. The required checks are:
 
 ```text
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy
 uv run pytest
-uv run inky-bird-frame catalog validate --catalog catalog
+uv run inky-bird catalog validate --catalog catalog
+for source in src/inky_bird_frame/web/*.js; do
+  node --input-type=module --check < "$source"
+done
+node --test tests/web/*.test.mjs
 ```
 
 ## Catalog contribution
@@ -30,7 +34,7 @@ Delete this section when the pull request does not add a bird plate.
 - Scientific name:
 - iNaturalist taxon ID:
 - [ ] The plate was produced and approved through the project pipeline.
-- [ ] I ran `inky-bird-frame catalog prepare` rather than hand-editing catalog JSON.
+- [ ] I ran `inky-bird catalog prepare` rather than hand-editing catalog JSON.
 - [ ] The manifest records factual sources, reference provenance, generation details, and independent review.
 - [ ] I have the right to submit the generated images and included metadata under this repository's license.
 - [ ] The contribution contains no location, observation history, downloaded reference image, local path, or credential.

@@ -253,7 +253,8 @@ access to the workspace directory, not the private configuration, approved
 catalog, or controller state directories.
 
 Secrets can stay in the mode-`0600` TOML file or come from `controller.env`.
-For environment-backed values, name the variable in TOML:
+For environment-backed values, name the variable in TOML. This fragment shows
+only the changed keys; keep the rest of each table:
 
 ```toml
 [discovery]
@@ -280,6 +281,9 @@ host-only loopback address:
 ```toml
 [discovery]
 sources = ["birdnet-go"]
+radius_km = 8
+species_limit = 50
+window = "last-30-days"
 birdnet_go_url = "http://birdnet-go.local:8080"
 ```
 
@@ -287,13 +291,16 @@ No detector credential or audio volume is required. Keep the endpoint on a
 trusted network or VPN. A TLS reverse proxy may provide transport encryption,
 but this provider does not send proxy authentication credentials.
 
-To import BirdNET Analyzer results, copy the CSV to a temporary controller-
-readable path or bind-mount it read-only, then run the import command in the
-controller container. The durable result is stored in `/data/var/controller`;
-the CSV and recordings do not belong in the persistent volume. For example:
+To import BirdNET Analyzer results, stream the CSV into the running controller
+container's temporary filesystem, then run the import command there. The
+container's root filesystem is read-only and `/tmp` is a 256 MB in-memory
+filesystem, which `docker compose cp` cannot write to; standard input can. The
+durable result is stored in `/data/var/controller`; the CSV and recordings do
+not belong in the persistent volume. For example:
 
 ```bash
-docker compose cp /path/to/results.csv controller:/tmp/results.csv
+docker compose exec -T controller sh -c 'umask 077 && cat > /tmp/results.csv' \
+  < /path/to/results.csv
 docker compose exec controller inky-bird birdnet-analyzer import \
   --config /data/config.toml --csv /tmp/results.csv --observed-on 2026-08-09
 docker compose exec controller rm /tmp/results.csv
@@ -302,11 +309,12 @@ docker compose exec controller rm /tmp/results.csv
 Use `--observed-on` only when every row shares that known recording date. Add
 `"birdnet-analyzer"` to `discovery.sources` and run `refresh` after importing.
 
-For an eBird personal-data export, copy the complete ZIP into the controller's
-temporary filesystem, preview it, and then import it:
+For an eBird personal-data export, stream the complete ZIP into the controller's
+temporary filesystem the same way, preview it, and then import it:
 
 ```bash
-docker compose cp /path/to/ebird.zip controller:/tmp/ebird.zip
+docker compose exec -T controller sh -c 'umask 077 && cat > /tmp/ebird.zip' \
+  < /path/to/ebird.zip
 docker compose exec controller inky-bird ebird archive import \
   --config /data/config.toml --archive /tmp/ebird.zip --dry-run
 docker compose exec controller inky-bird ebird archive import \
@@ -440,7 +448,22 @@ refreshes observations before generation is allowed. `bootstrap` should finish
 with exit code zero; it safely checks the catalog again whenever Compose
 recreates the project.
 
-After this check passes, continue with
+With the `config.example.toml` path, generation is on: the scheduler starts paid
+Codex generation right after its first successful refresh, which happens as
+soon as `up` starts it. To keep it off, set `generation_enabled = false` under
+`[controller]` before `config-sync`. The `config init` seed starts with
+generation off.
+
+Open `http://CONTROLLER_ADDRESS:8793/app` from an address listed in
+`owner_allowed_origins`, and create your username and password (or sign in with
+the account from `access setup`). The examples above list only
+`http://localhost:8793`, which works from the Docker host itself. To sign in
+from a phone, add its address as described above, or for an app-managed
+configuration follow the [app-managed edit under Update](#update). The approved
+artwork is under **Birds → Available artwork**; Home stays empty until a bird
+is observed or saved.
+
+To add a display, continue with
 [Prepare the display Pi](installation.md#2-prepare-the-display-pi).
 
 ## Optional catalog publication
@@ -537,10 +560,36 @@ unattended image update, including `:latest`, keeps new browser controls locked
 until local account setup. It does not wait for input or authorize the first
 network visitor. Do not run `access prepare` on an upgrade.
 
-After editing `config.toml`, rerun `config-sync` and recreate the controller and
-scheduler so both processes load the same validated copy. Recreating the
-services is also required after changing `controller.env` or `access.env`; a restart does not
-reload a container's environment.
+After editing `config.toml` on a managed configuration, rerun `config-sync` and
+recreate the controller and scheduler so both processes load the same validated
+copy. Recreating the services is also required after changing `controller.env`
+or `access.env`; a restart does not reload a container's environment.
+
+An app-managed configuration (the `config init` seed, or one adopted in
+Settings) is different: the runtime copy in `controller-data` is authoritative,
+and `config-sync` keeps it and reports `"preserved": true`. Editing the host
+`config.toml` and rerunning `config-sync` does not change the running
+configuration. Settings in the browser cannot change `owner_allowed_origins`
+either. To add a sign-in address, such as a phone's view of the controller's
+LAN address, edit the runtime copy directly while both services are stopped:
+
+```bash
+docker compose stop scheduler controller
+(umask 077; docker compose run --rm --no-deps -T --entrypoint cat controller \
+  /data/config.toml > config.runtime.toml)
+# Edit owner_allowed_origins in config.runtime.toml. An http:// origin also
+# needs owner_access_mode = "local" in the same [controller] table. Then:
+docker compose run --rm --no-deps -T --entrypoint sh controller -c \
+  'umask 077 && cat > /data/config.edit.toml &&
+   inky-bird config validate --config /data/config.edit.toml &&
+   mv /data/config.edit.toml /data/config.toml' < config.runtime.toml
+docker compose up --detach --force-recreate controller scheduler
+```
+
+The `mv` runs only after validation passes, so an invalid edit leaves the
+running configuration unchanged; the leftover `/data/config.edit.toml` is
+replaced on the next attempt. Delete `config.runtime.toml` afterwards or
+keep it as private as `config.toml`.
 
 Changing the image tag rolls back application code only; it does not roll back
 persistent state. Reviewed catalog sync is forward-only. A newer, validated

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-from .errors import MissingDependencyError
+from .errors import GenerationError, MissingDependencyError
 
 PORTRAIT_SIZE: Final = (1200, 1600)
 HARDWARE_SIZE: Final = (1600, 1200)
@@ -65,6 +65,8 @@ def prepare_generated_plate(
     source_path: Path,
     portrait_path: Path,
     display_path: Path,
+    *,
+    paper_color: tuple[int, int, int] = PAPER_COLOR,
 ) -> None:
     try:
         from PIL import Image, ImageOps
@@ -72,16 +74,25 @@ def prepare_generated_plate(
         raise MissingDependencyError("Pillow is required to prepare generated plates") from exc
 
     if not source_path.is_file():
-        raise FileNotFoundError(source_path)
-    with Image.open(source_path) as source:
-        image = ImageOps.fit(
-            source.convert("RGB"),
-            PORTRAIT_SIZE,
-            method=Image.Resampling.LANCZOS,
-        )
+        raise GenerationError("The generated plate image was not written")
+    try:
+        with Image.open(source_path) as source:
+            source.load()
+            rgba = source.convert("RGBA")
+        # A fresh canvas carries no colour profile or text metadata into the
+        # plate, and transparency lands on paper rather than black.
+        canvas = Image.new("RGB", rgba.size, paper_color)
+        canvas.paste(rgba, mask=rgba.getchannel("A"))
+        image = ImageOps.fit(canvas, PORTRAIT_SIZE, method=Image.Resampling.LANCZOS)
         portrait_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(portrait_path, format="PNG")
         display = image.rotate(ROTATION_DEGREES, expand=True)
         if display.size != HARDWARE_SIZE:
-            raise ValueError(f"rotated image size {display.size} does not match {HARDWARE_SIZE}")
+            raise GenerationError(
+                f"Rotated plate size {display.size} does not match {HARDWARE_SIZE}"
+            )
         display.save(display_path, format="PNG")
+    except GenerationError:
+        raise
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+        raise GenerationError("The generated plate image could not be prepared") from exc
