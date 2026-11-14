@@ -394,6 +394,7 @@ def test_adoption_keeps_the_operator_file_unchanged_across_later_saves(tmp_path:
     status = settings_status(initial)
     assert status["original_backup"] == "config.toml.original"
     assert "config.toml.original" in str(status["adoption_notice"])
+    assert "never change" in str(status["adoption_notice"])
     result = save_settings(initial, revision=str(status["revision"]), changes={}, adopt=True)
     assert result["original_backup"] == "config.toml.original"
     kept = tmp_path / "config.toml.original"
@@ -416,5 +417,9 @@ def test_adoption_never_replaces_an_existing_original_copy(tmp_path: Path) -> No
     kept.chmod(0o600)
     initial = load_config(path)
     status = settings_status(initial)
+    notice = str(status["adoption_notice"])
+    assert "already kept in config.toml.original" in notice
+    assert "config.toml.previous" in notice
+    assert "never change" not in notice
     save_settings(initial, revision=str(status["revision"]), changes={}, adopt=True)
     assert kept.read_bytes() == b"# earlier copy\n"

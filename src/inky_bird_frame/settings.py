@@ -133,6 +133,7 @@ def settings_status(initial: AppConfig) -> dict[str, object]:
     _installation_boundary(initial, config)
     discovery = cast(dict[str, object], raw["discovery"])
     original = _original(path)
+    previous = path.with_suffix(path.suffix + ".previous")
     managed = config.controller.configuration_ownership == "managed"
     fields = {
         key: value
@@ -168,13 +169,20 @@ def settings_status(initial: AppConfig) -> dict[str, object]:
                 for item in config.notifications.destinations
             ],
         },
-        "backup_available": path.with_suffix(path.suffix + ".previous").is_file(),
+        "backup_available": previous.is_file(),
         "original_backup": original.name
         if managed or original.is_file() or original.is_symlink()
         else None,
         "adoption_notice": (
-            f"Inky also keeps this file as it is now in {original.name}. "
-            "Later saves never change that copy."
+            (
+                f"An earlier copy is already kept in {original.name}. "
+                f"This version is kept only until the next save, in {previous.name}."
+            )
+            if original.exists() or original.is_symlink()
+            else (
+                f"Inky also keeps this file as it is now in {original.name}. "
+                "Later saves never change that copy."
+            )
         )
         if managed
         else None,
