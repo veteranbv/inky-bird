@@ -36,7 +36,7 @@ from inky_bird_frame.birdbuddy import (
     sync_birdbuddy_detections,
 )
 from inky_bird_frame.birds import ObservationWindow
-from inky_bird_frame.errors import DataSourceError
+from inky_bird_frame.errors import BusyError, DataSourceError
 
 
 def postcard(
@@ -102,6 +102,13 @@ class BirdBuddyTests(unittest.TestCase):
         )
         confirmed.start()
         self.addCleanup(confirmed.stop)
+        # These tests apply a correction on the very next sync; the daily
+        # confirmed-history cadence has its own tests.
+        every_sync = patch(
+            "inky_bird_frame.birdbuddy.BIRDBUDDY_CONFIRMED_HISTORY_INTERVAL", timedelta(0)
+        )
+        every_sync.start()
+        self.addCleanup(every_sync.stop)
 
     def test_feed_operation_is_read_only_and_metadata_only(self) -> None:
         self.assertEqual(len(_FEED_QUERIES), 2)
@@ -1043,16 +1050,18 @@ class BirdBuddyTests(unittest.TestCase):
             with (
                 _sync_lock(state_dir),
                 patch(
-                    "inky_bird_frame.birdbuddy._refreshed_access_token",
-                    return_value=("access", feeder),
+                    "inky_bird_frame.birdbuddy._session_access_token",
+                    return_value=("access", feeder, False),
                 ),
-                self.assertRaisesRegex(DataSourceError, "sync is already running"),
+                self.assertRaisesRegex(DataSourceError, "sync is already running") as raised,
             ):
                 sync_birdbuddy_detections(
                     state_dir,
                     window=ObservationWindow.ALL_TIME,
                     limit=20,
                 )
+        # Busy by type, still a source error for the per-source status.
+        self.assertIsInstance(raised.exception, BusyError)
 
     def test_malformed_confirmed_snapshot_preserves_detection_history(self) -> None:
         feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")

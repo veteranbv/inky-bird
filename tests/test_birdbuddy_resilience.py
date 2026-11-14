@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import stat
 import unittest
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,6 +23,7 @@ from inky_bird_frame.birdbuddy import (
     ArchivedSpecies,
     BirdBuddyFeeder,
     BirdBuddyPostcard,
+    BirdBuddySyncResult,
     ConfirmedSpeciesEvidence,
     FeederHistory,
     PostcardSpecies,
@@ -561,6 +563,10 @@ class PartialConfirmedSyncTests(unittest.TestCase):
                     "inky_bird_frame.birdbuddy._fetch_confirmed_history",
                     side_effect=snapshots,
                 ),
+                # Read confirmed history on each of these syncs, not once a day.
+                patch(
+                    "inky_bird_frame.birdbuddy.BIRDBUDDY_CONFIRMED_HISTORY_INTERVAL", timedelta(0)
+                ),
             ):
                 sync(state_dir)
                 partial = sync_birdbuddy_detections(
@@ -926,7 +932,12 @@ class TokenRefreshTests(BirdBuddyResilienceTestCase):
                 ):
                     sync(state_dir)
 
-                self.assertEqual(str(raised.exception), f"HTTP {status} from Bird Buddy API")
+                expected = (
+                    "Bird Buddy asked Inky to slow down"
+                    if status == 429
+                    else f"HTTP {status} from Bird Buddy API"
+                )
+                self.assertTrue(str(raised.exception).startswith(expected))
                 self.assertEqual(opener.refresh_tokens, ["refresh-0"])
 
     def test_unexpected_refresh_reply_does_not_claim_the_session_is_invalid(self) -> None:
@@ -1087,6 +1098,314 @@ class LocalStateFailureTests(BirdBuddyResilienceTestCase):
 
         self.assertNotIn(temporary, str(raised.exception))
         self.assertFalse(history_path.exists())
+
+
+def signed_token(expires_at: datetime, label: str = "access") -> str:
+    """An unsigned token shaped like Bird Buddy's, carrying only an expiry claim."""
+
+    def part(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    claims = {"exp": int(expires_at.timestamp()), "sub": label}
+    return f"{part({'alg': 'none'})}.{part(claims)}.signature"
+
+
+class _Reply:
+    def __init__(self, payload: object) -> None:
+        self.body = json.dumps(payload).encode()
+        self.headers = Message()
+
+    def __enter__(self) -> _Reply:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+
+class ScriptedTransport:
+    """Stand-in for urllib's opener: records each GraphQL call and answers it."""
+
+    def __init__(self, answer: Callable[[str, dict[str, object], str | None], object]) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, str | None]] = []
+
+    def open(self, request: object, timeout: float) -> object:
+        data = getattr(request, "data", b"")
+        assert isinstance(data, bytes)
+        body = json.loads(data)
+        assert isinstance(body, dict)
+        authorization = getattr(request, "headers", {}).get("Authorization")
+        token = authorization.removeprefix("Bearer ") if authorization else None
+        query = str(body["query"])
+        self.calls.append((query, token))
+        return _Reply(self.answer(query, body["variables"], token))
+
+    def count(self, query: str) -> int:
+        return sum(1 for sent, _ in self.calls if sent == query)
+
+
+def throttled(retry_after: str | None) -> HTTPError:
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return HTTPError("https://example.test/graphql", 429, "slow down", headers, io.BytesIO())
+
+
+def feed_and_history(
+    query: str, variables: dict[str, object], token: str | None
+) -> dict[str, object]:
+    if query == _REFRESH_TOKEN:
+        return {
+            "data": {
+                "authRefreshToken": {
+                    "accessToken": signed_token(NOW + timedelta(days=30), "renewed"),
+                    "refreshToken": "refresh-renewed",
+                }
+            }
+        }
+    if query == _CONFIRMED_HISTORY:
+        return {"data": confirmed_page(confirmed_record("media-1"))}
+    return {"data": EMPTY_FEED}
+
+
+def logged_in_with_token(state_dir: Path, access_token: str) -> None:
+    with patch(
+        "inky_bird_frame.birdbuddy._authenticate",
+        return_value=(access_token, "refresh-0", [FEEDER]),
+    ):
+        login_birdbuddy(
+            state_dir,
+            email="birder@example.test",
+            password="private-password",
+            authorization_confirmed=True,
+            now=NOW,
+        )
+
+
+def sync_at(
+    state_dir: Path,
+    when: datetime,
+    transport: ScriptedTransport,
+    *,
+    persist_history: bool = True,
+    include_manual_sightings: bool = False,
+) -> BirdBuddySyncResult:
+    with patch("inky_bird_frame.http.build_opener", return_value=transport):
+        return sync_birdbuddy_detections(
+            state_dir,
+            window=ObservationWindow.ALL_TIME,
+            limit=20,
+            now=when,
+            persist_history=persist_history,
+            include_manual_sightings=include_manual_sightings,
+        )
+
+
+class AccessTokenReuseTests(unittest.TestCase):
+    def test_access_token_is_reused_until_shortly_before_it_expires(self) -> None:
+        login_token = signed_token(NOW + timedelta(hours=1), "login")
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, login_token)
+            sync_at(state_dir, NOW, transport)
+            sync_at(state_dir, NOW + timedelta(minutes=50), transport)
+            self.assertEqual(transport.count(_REFRESH_TOKEN), 0)
+            sync_at(state_dir, NOW + timedelta(minutes=56), transport)
+            saved = auth_state(state_dir)
+
+        self.assertEqual(transport.count(_REFRESH_TOKEN), 1)
+        feed_tokens = [token for query, token in transport.calls if query in _FEED_QUERIES]
+        self.assertEqual(set(feed_tokens[:4]), {login_token})
+        self.assertNotIn(login_token, feed_tokens[4:])
+        self.assertEqual(saved["refresh_token"], "refresh-renewed")
+        self.assertEqual(saved["previous_refresh_token"], "refresh-0")
+
+    def test_a_rejected_saved_token_is_renewed_once_and_replaced(self) -> None:
+        stale = signed_token(NOW + timedelta(hours=1), "stale")
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if token == stale:
+                raise HTTPError(
+                    "https://example.test/graphql", 401, "expired", Message(), io.BytesIO()
+                )
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, stale)
+            sync_at(state_dir, NOW, transport)
+            saved = auth_state(state_dir)
+            sync_at(state_dir, NOW + timedelta(minutes=1), transport)
+
+        self.assertEqual(transport.count(_REFRESH_TOKEN), 1)
+        self.assertNotEqual(saved.get("access_token"), stale)
+        self.assertEqual(saved["refresh_token"], "refresh-renewed")
+
+    def test_a_token_without_a_readable_expiry_is_not_kept(self) -> None:
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _REFRESH_TOKEN:
+                return {
+                    "data": {"authRefreshToken": {"accessToken": "opaque", "refreshToken": "r"}}
+                }
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, "opaque-login")
+            sync_at(state_dir, NOW, transport)
+            sync_at(state_dir, NOW + timedelta(minutes=1), transport)
+            saved = auth_state(state_dir)
+
+        self.assertEqual(transport.count(_REFRESH_TOKEN), 2)
+        self.assertNotIn("access_token", saved)
+
+    def test_saved_token_is_private_and_readable_by_the_earlier_reader(self) -> None:
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(hours=1)))
+            mode = stat.S_IMODE((state_dir / "birdbuddy-auth.json").stat().st_mode)
+            saved = auth_state(state_dir)
+            status = birdbuddy_status(state_dir)
+
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(saved["refresh_token"], "refresh-0")
+        self.assertIn("access_token_expires_at", saved)
+        self.assertNotIn("access_token", json.dumps(status))
+
+
+class ConfirmedHistoryCadenceTests(unittest.TestCase):
+    def test_full_confirmed_history_is_read_at_most_once_a_day(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            first = sync_at(state_dir, NOW, transport)
+            later = sync_at(state_dir, NOW + timedelta(hours=23), transport)
+            next_day = sync_at(state_dir, NOW + timedelta(hours=24, minutes=1), transport)
+
+        self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
+        for result, checked in ((first, True), (later, False), (next_day, True)):
+            stats = result.stats.as_dict()
+            self.assertIs(stats["confirmed_history_checked"], checked)
+        # Evidence from the earlier full read is kept on the days in between.
+        species = [item.scientific_name for item in later.species]
+        self.assertIn(HUMMINGBIRD.scientific_name, species)
+
+    def test_turning_on_manual_sightings_reads_history_again(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            sync_at(state_dir, NOW, transport)
+            sync_at(
+                state_dir,
+                NOW + timedelta(hours=1),
+                transport,
+                include_manual_sightings=True,
+            )
+
+        self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
+
+    def test_a_preview_reads_history_but_does_not_postpone_the_daily_read(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            sync_at(state_dir, NOW, transport, persist_history=False)
+            sync_at(state_dir, NOW + timedelta(minutes=5), transport)
+
+        self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
+
+
+class RateLimitTests(unittest.TestCase):
+    def throttled_once(self, retry_after: str | None) -> Callable[..., object]:
+        sent = {"done": False}
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if not sent["done"] and query in _FEED_QUERIES:
+                sent["done"] = True
+                raise throttled(retry_after)
+            return feed_and_history(query, variables, token)
+
+        return answer
+
+    def test_retry_after_is_honoured_by_later_runs_without_contacting_bird_buddy(self) -> None:
+        transport = ScriptedTransport(self.throttled_once("600"))
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            with self.assertRaisesRegex(DataSourceError, "asked Inky to slow down") as first:
+                sync_at(state_dir, NOW, transport)
+            backoff = state_dir / "birdbuddy-backoff.json"
+            mode = stat.S_IMODE(backoff.stat().st_mode)
+            calls = len(transport.calls)
+            with self.assertRaisesRegex(DataSourceError, "slow down"):
+                sync_at(state_dir, NOW + timedelta(minutes=9), transport)
+            with self.assertRaisesRegex(DataSourceError, "slow down"):
+                sync_at(state_dir, NOW + timedelta(minutes=9), transport, persist_history=False)
+            self.assertEqual(len(transport.calls), calls)
+            sync_at(state_dir, NOW + timedelta(minutes=11), transport)
+            cleared = not backoff.exists()
+
+        self.assertEqual(mode, 0o600)
+        self.assertIn("2026-08-03T12:10:00+00:00", str(first.exception))
+        self.assertTrue(cleared)
+
+    def test_throttling_without_a_hint_backs_off_longer_each_time(self) -> None:
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query in _FEED_QUERIES:
+                raise throttled(None)
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            messages = []
+            when = NOW
+            for _ in range(3):
+                with self.assertRaises(DataSourceError) as raised:
+                    sync_at(state_dir, when, transport)
+                messages.append(str(raised.exception))
+                stored = json.loads((state_dir / "birdbuddy-backoff.json").read_text())
+                when = datetime.fromisoformat(str(stored["not_before"]))
+
+        self.assertIn("2026-08-03T12:15:00+00:00", messages[0])
+        self.assertIn("2026-08-03T12:45:00+00:00", messages[1])
+        self.assertIn("2026-08-03T13:45:00+00:00", messages[2])
+
+    def test_an_excessive_or_dated_retry_hint_is_bounded(self) -> None:
+        for hint, expected in (
+            ("999999999", "2026-08-04T12:00:00+00:00"),
+            ("Mon, 03 Aug 2026 13:00:00 GMT", "2026-08-03T13:00:00+00:00"),
+            ("soon", "2026-08-03T12:15:00+00:00"),
+        ):
+            transport = ScriptedTransport(self.throttled_once(hint))
+            with TemporaryDirectory() as temporary, self.subTest(hint=hint):
+                state_dir = Path(temporary)
+                logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+                with self.assertRaises(DataSourceError) as raised:
+                    sync_at(state_dir, NOW, transport)
+                self.assertIn(expected, str(raised.exception))
+
+    def test_an_unreadable_backoff_record_does_not_stop_the_sync(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            backoff = state_dir / "birdbuddy-backoff.json"
+            backoff.write_text("{not json")
+            backoff.chmod(0o600)
+            sync_at(state_dir, NOW, transport)
+            cleared = not backoff.exists()
+
+        self.assertTrue(cleared)
 
 
 if __name__ == "__main__":
