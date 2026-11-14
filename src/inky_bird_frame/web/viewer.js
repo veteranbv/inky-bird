@@ -1,6 +1,8 @@
 // The read-only screen has no owner cookie handling, private history or storage.
-import { frameTools } from '/app/frame-tools.js';
+import { frameTools, compact, glyph, stepIndex, confirmAction } from '/app/frame-tools.js';
 const main = document.querySelector('#main');
+// A hung request must not stop a wall screen: every request ends by this deadline.
+const REQUEST_TIMEOUT = 20000;
 const el = (tag, text = '') => {
   const node = document.createElement(tag);
   node.textContent = text;
@@ -17,33 +19,48 @@ let stopped = false,
   objectURL = null,
   loading = null,
   sequence = 0,
+  presentation = 0,
   stopTools = () => {};
+function notResponding() {
+  return Object.assign(new Error('Inky is not responding. Keep this page open; it will try again.'), {
+    code: 'offline',
+  });
+}
 async function api(path, body) {
-  let response;
+  const request = new AbortController();
+  const deadline = setTimeout(() => request.abort(), REQUEST_TIMEOUT);
   try {
-    response = await fetch(path, {
-      method: body === undefined ? 'GET' : 'POST',
-      credentials: 'same-origin',
-      cache: 'no-store',
-      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch {
-    throw Object.assign(new Error('Offline. Keep this page open and check your connection.'), {
-      code: 'offline',
-    });
+    let response;
+    try {
+      response = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: request.signal,
+      });
+    } catch {
+      if (request.signal.aborted) throw notResponding();
+      throw Object.assign(new Error('Offline. Keep this page open and check your connection.'), {
+        code: 'offline',
+      });
+    }
+    let result;
+    try {
+      result = await response.json();
+    } catch {
+      if (request.signal.aborted) throw notResponding();
+      throw new Error('Inky is not responding. Try again shortly.');
+    }
+    if (!response.ok || !result.ok)
+      throw Object.assign(new Error(result.error?.message || 'Screen access is unavailable.'), {
+        code: result.error?.code,
+      });
+    return result.data;
+  } finally {
+    clearTimeout(deadline);
   }
-  let result;
-  try {
-    result = await response.json();
-  } catch {
-    throw new Error('Inky is not responding. Try again shortly.');
-  }
-  if (!response.ok || !result.ok)
-    throw Object.assign(new Error(result.error?.message || 'Screen access is unavailable.'), {
-      code: result.error?.code,
-    });
-  return result.data;
 }
 function clearArt() {
   stopTools();
@@ -56,11 +73,17 @@ function clearArt() {
   document.body.classList.remove('presenting');
   document.title = 'Inky screen';
 }
-async function forget() {
+// The request comes first: until it succeeds, the screen keeps showing what it showed.
+async function forget(status, failure) {
+  try {
+    await api('/v1/screen/forget', {});
+  } catch (error) {
+    status.textContent = failure + ' ' + error.message;
+    throw error;
+  }
   stopped = true;
   clearTimeout(timer);
   clearArt();
-  await api('/v1/screen/forget', {});
   location.reload();
 }
 function unavailable(message) {
@@ -87,6 +110,14 @@ async function pair() {
     code.className = 'pairing-code';
     const status = el('p', 'Waiting for the owner. This request lasts ten minutes.');
     status.setAttribute('role', 'status');
+    const cancel = button('Cancel pairing', async () => {
+      cancel.disabled = true;
+      try {
+        await forget(status, 'Pairing was not cancelled.');
+      } catch {
+        cancel.disabled = false;
+      }
+    });
     main.replaceChildren(
       el('h1', 'Pair this screen'),
       code,
@@ -99,7 +130,7 @@ async function pair() {
         'Pairing permits approved artwork only. It does not sign this screen in as the owner.',
       ),
       status,
-      button('Cancel pairing', forget),
+      cancel,
     );
     let attempts = 0;
     const check = async () => {
@@ -125,6 +156,8 @@ async function pair() {
 function present(initial) {
   clearTimeout(timer);
   stopped = false;
+  const current = ++presentation;
+  const live = () => !stopped && current === presentation;
   document.body.classList.add('presenting');
   let birds = initial.species,
     position = 0,
@@ -135,6 +168,7 @@ function present(initial) {
     caption = el('p'),
     status = el('p');
   image.className = 'frame-art';
+  image.draggable = false;
   caption.className = 'frame-caption';
   image.hidden = true;
   // The shared status contract: presenting-mode notices float inside the
@@ -143,17 +177,37 @@ function present(initial) {
   status.setAttribute('role', 'status');
   const controls = el('div');
   controls.className = 'frame-controls';
-  const play = button('Pause', () => {
-    paused = !paused;
-    play.textContent = paused ? 'Play' : 'Pause';
-  });
-  const previous = button('Previous', () => show((position - 1 + birds.length) % birds.length));
-  const next = button('Next', () => show((position + 1) % birds.length));
-  const random = button('Shuffle off', () => {
+  const play = compact(
+    button('Play', () => {
+      paused = !paused;
+      play.setAttribute('aria-pressed', String(!paused));
+      glyph(play, paused ? 'play' : 'pause');
+    }),
+    'pause',
+  );
+  play.setAttribute('aria-pressed', 'true');
+  const step = (change) => show(stepIndex(position, change, birds.length));
+  const previous = compact(
+    button('Previous', () => step(-1)),
+    'previous',
+  );
+  const next = compact(
+    button('Next', () => step(1)),
+    'next',
+  );
+  const random = button('Shuffle', () => {
     shuffle = !shuffle;
-    random.textContent = shuffle ? 'Shuffle on' : 'Shuffle off';
+    random.setAttribute('aria-pressed', String(shuffle));
   });
-  controls.append(previous, play, next, random, button('Forget this screen', forget));
+  random.setAttribute('aria-pressed', 'false');
+  const forgetting = confirmAction({
+    button,
+    label: 'Forget this screen',
+    question: 'Forget this screen? It will need pairing again.',
+    confirmLabel: 'Forget',
+    cancelLabel: 'Keep showing birds',
+    action: () => forget(status, 'This screen was not forgotten.'),
+  });
   const viewport = el('div');
   viewport.className = 'frame-viewport';
   viewport.append(image);
@@ -162,11 +216,17 @@ function present(initial) {
     controls,
     status,
     button,
+    primary: [previous, play, next],
+    secondary: [random, forgetting.node],
     previous: () => previous.click(),
     next: () => next.click(),
     togglePlay: () => play.click(),
+    onQuiet: forgetting.reset,
   });
-  main.replaceChildren(viewport, caption, controls, status);
+  const dock = el('div');
+  dock.className = 'frame-dock';
+  dock.append(status, controls);
+  main.replaceChildren(viewport, caption, dock);
   function withdraw() {
     sequence += 1;
     loading?.abort();
@@ -194,6 +254,11 @@ function present(initial) {
     const controller = new AbortController();
     loading = controller;
     const pending = ++sequence;
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT);
     try {
       const response = await fetch(bird.portrait_url, {
         credentials: 'same-origin',
@@ -227,44 +292,49 @@ function present(initial) {
       rendered = key;
       status.textContent = '';
     } catch (error) {
-      if (!controller.signal.aborted && !stopped)
-        status.textContent = error.message + ' Keeping the last approved image.';
+      if ((timedOut || !controller.signal.aborted) && !stopped)
+        status.textContent =
+          (timedOut ? 'The selected plate is temporarily unavailable.' : error.message) +
+          ' Keeping the last approved image.';
+    } finally {
+      clearTimeout(deadline);
     }
   }
   let turn = Date.now();
   async function poll() {
-    if (stopped) return;
-    if (!document.hidden) {
-      try {
-        const view = await api('/v1/screen/view');
-        if (stopped) return;
-        const id = birds[position]?.taxon_id;
-        birds = view.species;
-        if (
-          rendered &&
-          !birds.some((bird) => bird.taxon_id + ':' + bird.portrait_sha256 === rendered)
-        )
-          withdraw();
-        position = Math.max(
-          0,
-          birds.findIndex((bird) => bird.taxon_id === id),
-        );
-        if (!paused && Date.now() - turn >= 60000) {
-          position = shuffle
-            ? Math.floor(Math.random() * birds.length)
-            : (position + 1) % birds.length;
-          turn = Date.now();
-        }
-        await show(position);
-      } catch (error) {
-        if (error.code === 'sign_in_required' || error.code === 'secure_access_required') {
-          unavailable(error.message);
-          return;
-        }
-        status.textContent = error.message + ' Keeping the last approved image.';
+    if (!live()) return;
+    try {
+      if (document.hidden) return;
+      const view = await api('/v1/screen/view');
+      if (!live()) return;
+      const id = birds[position]?.taxon_id;
+      birds = view.species;
+      if (
+        rendered &&
+        !birds.some((bird) => bird.taxon_id + ':' + bird.portrait_sha256 === rendered)
+      )
+        withdraw();
+      position = Math.max(
+        0,
+        birds.findIndex((bird) => bird.taxon_id === id),
+      );
+      if (!paused && Date.now() - turn >= 60000) {
+        position = shuffle
+          ? Math.floor(Math.random() * birds.length)
+          : stepIndex(position, 1, birds.length);
+        turn = Date.now();
       }
+      await show(position);
+    } catch (error) {
+      if (!live()) return;
+      if (error.code === 'sign_in_required' || error.code === 'secure_access_required') {
+        unavailable(error.message);
+        return;
+      }
+      status.textContent = error.message + ' Keeping the last approved image.';
+    } finally {
+      if (live()) timer = setTimeout(poll, 15000);
     }
-    timer = setTimeout(poll, 15000);
   }
   show();
   timer = setTimeout(poll, 15000);

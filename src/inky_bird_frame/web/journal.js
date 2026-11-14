@@ -2,7 +2,7 @@
 import { renderSettings } from '/app/settings.js';
 import { renderImports } from '/app/imports.js';
 import { renderPresentation } from '/app/presentation.js';
-import { frameTools } from '/app/frame-tools.js';
+import { frameTools, compact, glyph, stepIndex } from '/app/frame-tools.js';
 import { icon } from '/app/ui.js';
 import { sourceState, nextCheck, requestState } from '/app/work-status.js';
 let run = 0;
@@ -1176,12 +1176,22 @@ export async function openJournal(ui, message = '') {
       renderedKey = '',
       loading = null;
     image.hidden = true;
+    image.draggable = false;
     const caption = el('p', '', 'frame-caption'),
       status = el('p', '', 'hint');
     status.setAttribute('role', 'status');
     const controls = el('div', '', 'frame-controls');
     const viewport = el('div', '', 'frame-viewport');
     viewport.append(image);
+    function withdraw() {
+      loading?.abort();
+      if (objectURL) URL.revokeObjectURL(objectURL);
+      objectURL = null;
+      renderedKey = '';
+      image.removeAttribute('src');
+      image.hidden = true;
+      caption.textContent = '';
+    }
     function signedOut() {
       if (expired) return;
       ui.sessionExpired();
@@ -1225,6 +1235,7 @@ export async function openJournal(ui, message = '') {
           throw new Error('Plate unavailable');
         nextURL = URL.createObjectURL(await response.blob());
         const nextImage = el('img', '', 'frame-art');
+        nextImage.draggable = false;
         nextImage.src = nextURL;
         nextImage.alt = 'Approved plate: ' + bird.common_name;
         await nextImage.decode();
@@ -1241,24 +1252,28 @@ export async function openJournal(ui, message = '') {
           el('span', bird.scientific_name, 'scientific'),
         );
         details.href = href('bird', { bird: bird.taxon_id });
+        details.hidden = false;
         status.textContent = '';
       } catch (error) {
-        if (!request.signal.aborted && !expired && image.isConnected) {
-          pause();
-          status.textContent =
-            'Plate unavailable. Keeping the last approved plate. Try Next when the connection returns.';
-        }
+        // One failed plate never stops playback: the next turn tries again.
+        if (!request.signal.aborted && !expired && image.isConnected)
+          status.textContent = paused
+            ? 'Plate unavailable. Keeping the last approved plate. Try Next when the connection returns.'
+            : 'Plate unavailable. Keeping the last approved plate. Playback continues.';
       } finally {
         if (nextURL) URL.revokeObjectURL(nextURL);
       }
     }
+    // An emptied or removed view leaves no list to step through.
     function step(change) {
-      if (!document.hidden) show((position + change + birds.length) % birds.length);
+      const index = stepIndex(position, change, birds.length);
+      if (!document.hidden && index >= 0) show(index);
     }
     function pause() {
       paused = true;
       clearInterval(timer);
-      play.textContent = 'Play';
+      play.setAttribute('aria-pressed', 'false');
+      glyph(play, 'play');
     }
     const play = button('Play', () => {
       if (!paused) {
@@ -1266,7 +1281,8 @@ export async function openJournal(ui, message = '') {
         return;
       }
       paused = false;
-      play.textContent = 'Pause';
+      play.setAttribute('aria-pressed', 'true');
+      glyph(play, 'pause');
       timer = setInterval(() => {
         if (!document.hidden && !expired)
           step(
@@ -1274,32 +1290,37 @@ export async function openJournal(ui, message = '') {
           );
       }, 60000);
     });
+    compact(play, 'play');
+    play.setAttribute('aria-pressed', 'false');
     const details = link('Details', 'bird', { bird: birds[0].taxon_id });
     details.addEventListener('click', pause);
-    controls.append(
-      button('Previous', () => step(-1)),
-      play,
-      button('Next', () => step(1)),
-      details,
-      link('Exit Frame', 'collections'),
-    );
-    const random = button('Shuffle off', () => {
+    const random = button('Shuffle', () => {
       shuffle = !shuffle;
-      random.textContent = shuffle ? 'Shuffle on' : 'Shuffle off';
+      random.setAttribute('aria-pressed', String(shuffle));
     });
-    controls.append(random);
-    const labels = button('Bird name on', () => {
+    random.setAttribute('aria-pressed', 'false');
+    const labels = button('Bird name', () => {
       const hidden = document.body.classList.toggle('frame-labels-off');
-      labels.textContent = hidden ? 'Bird name off' : 'Bird name on';
       labels.setAttribute('aria-pressed', String(!hidden));
     });
     labels.setAttribute('aria-pressed', 'true');
-    controls.append(labels);
     const stopTools = frameTools({
       viewport,
       controls,
       status,
       button,
+      primary: [
+        compact(
+          button('Previous', () => step(-1)),
+          'previous',
+        ),
+        play,
+        compact(
+          button('Next', () => step(1)),
+          'next',
+        ),
+      ],
+      secondary: [details, link('Exit Frame', 'collections'), random, labels],
       previous: () => step(-1),
       next: () => step(1),
       togglePlay: () => play.click(),
@@ -1320,19 +1341,17 @@ export async function openJournal(ui, message = '') {
                 : view === 'saved'
                   ? current.saved_taxon_ids
                   : current.collections.find((group) => group.collection_id === view)?.taxon_ids;
+        // An empty or removed view clears the plate but keeps checking, so
+        // plates that return play again without a reload.
         if (
           !ids ||
           !ids.some((id) => current.birds.some((bird) => bird.taxon_id === id && bird.plate_ready))
         ) {
-          pause();
-          loading?.abort();
-          image.removeAttribute('src');
-          image.hidden = true;
-          caption.textContent = '';
-          controls.replaceChildren(link('Choose a collection', 'collections'));
+          birds = [];
+          withdraw();
+          details.hidden = true;
           status.textContent =
             'This view has no approved plates or was removed. Inky will not switch views.';
-          clearInterval(check);
           return;
         }
         const previous = birds[position]?.taxon_id;
@@ -1340,15 +1359,8 @@ export async function openJournal(ui, message = '') {
         if (
           renderedKey &&
           !birds.some((bird) => bird.taxon_id + ':' + bird.portrait_sha256 === renderedKey)
-        ) {
-          loading?.abort();
-          if (objectURL) URL.revokeObjectURL(objectURL);
-          objectURL = null;
-          renderedKey = '';
-          image.removeAttribute('src');
-          image.hidden = true;
-          caption.textContent = '';
-        }
+        )
+          withdraw();
         await show(
           Math.max(
             0,
@@ -1359,9 +1371,8 @@ export async function openJournal(ui, message = '') {
         if (['sign_in_required', 'secure_access_required'].includes(error.code)) {
           signedOut();
         } else {
-          pause();
           loading?.abort();
-          status.textContent = 'Offline. Keeping the last approved plate.';
+          status.textContent = 'Offline. Keeping the last approved plate. Inky will keep checking.';
         }
       }
     }, 60000);
@@ -1373,11 +1384,12 @@ export async function openJournal(ui, message = '') {
       stopTools();
     };
     frameSignOut = signedOut;
+    const dock = el('div', '', 'frame-dock');
+    dock.append(status, controls);
     main.append(
       viewport,
       caption,
-      controls,
-      status,
+      dock,
       note('Plates change once a minute while playing. This does not refresh the wall panel.'),
     );
     show();

@@ -464,6 +464,16 @@ let browser,
   await heading('Collections');
   assert.equal(await page.getByRole('link', { name: 'Filter journey', exact: true }).count(), 0);
   phase = 'pair-readonly-screen';
+  // Frame controls fade after five idle seconds and take no taps while faded,
+  // so every Frame step reveals them first. Narrow screens keep secondary
+  // controls behind More; wide screens have no More button.
+  const openMore = async (target) => {
+    await target.keyboard.press('Shift');
+    await target.locator('.frame-controls:not(.quiet)').waitFor();
+    const more = target.getByRole('button', { name: 'More', exact: true });
+    if ((await more.isVisible()) && (await more.getAttribute('aria-expanded')) !== 'true')
+      await more.click();
+  };
   await page.goto(origin + '/app?page=displays');
   await heading('Displays');
   const screenContext = await browser.newContext({
@@ -522,6 +532,7 @@ let browser,
   // runs the following state changes as an ambient display, and each notice
   // must land inside the live window rather than below the full-height plate.
   let screenAmbient = false;
+  await openMore(screen);
   const screenFullscreen = screen.getByRole('button', { name: 'Fullscreen', exact: true });
   if ((await screenFullscreen.count()) === 1) {
     await screenFullscreen.click();
@@ -573,6 +584,20 @@ let browser,
   await emptyNotice.waitFor();
   if (screenAmbient) assert(await screenInside(emptyNotice));
   assert.equal(await screen.locator('img[src]').count(), 0);
+  // An emptied view leaves nothing to step through.
+  await screen.keyboard.press('ArrowRight');
+  assert.equal(await screen.locator('img[src]').count(), 0);
+  phase = 'screen-forget-failure';
+  // Forget asks first, and a failed request keeps the screen paired and
+  // presenting instead of clearing it before the answer.
+  await screenContext.route('**/v1/screen/forget', (route) => route.abort());
+  await openMore(screen);
+  await screen.getByRole('button', { name: 'Forget this screen', exact: true }).click();
+  await screen.getByRole('button', { name: 'Forget', exact: true }).click();
+  await screen.getByText(/This screen was not forgotten\./).waitFor();
+  assert(await screen.evaluate(() => document.body.classList.contains('presenting')));
+  await screen.getByRole('button', { name: 'Forget this screen', exact: true }).waitFor();
+  await screenContext.unroute('**/v1/screen/forget');
   await page.getByRole('button', { name: 'Revoke screen', exact: true }).click();
   await screen.clock.runFor(15100);
   await screen.getByRole('heading', { name: 'Screen access ended', exact: true }).waitFor();
@@ -724,30 +749,48 @@ let browser,
   await page.goto(origin + '/app?page=frame&view=' + imported.collection_id);
   await page.locator('.frame-art').waitFor();
   await page.locator('.frame-art').evaluate((image) => image.decode());
+  await openMore(page);
   await page.getByRole('button', { name: 'Zoom', exact: true }).click();
   await page.getByRole('button', { name: 'Fit whole plate', exact: true }).click();
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   phase = 'frame-ambient-labels';
-  // The Bird name toggle reports its pressed state and hides the placard.
-  const labelsOn = page.getByRole('button', { name: 'Bird name on', exact: true });
-  assert.equal(await labelsOn.getAttribute('aria-pressed'), 'true');
+  // Toggles keep their names and report state through aria-pressed.
+  const labels = page.getByRole('button', { name: 'Bird name', exact: true });
+  assert.equal(await labels.getAttribute('aria-pressed'), 'true');
   await page.locator('.frame-caption').waitFor();
-  await labelsOn.click();
-  const labelsOff = page.getByRole('button', { name: 'Bird name off', exact: true });
-  await labelsOff.waitFor();
-  assert.equal(await labelsOff.getAttribute('aria-pressed'), 'false');
+  await labels.click();
+  assert.equal(await labels.getAttribute('aria-pressed'), 'false');
   assert(!(await page.locator('.frame-caption').isVisible()));
-  await labelsOff.click();
-  await page.getByRole('button', { name: 'Bird name on', exact: true }).waitFor();
+  await labels.click();
+  assert.equal(await labels.getAttribute('aria-pressed'), 'true');
   await page.locator('.frame-caption').waitFor();
+  for (const name of ['Play', 'Shuffle'])
+    assert.equal(
+      await page.getByRole('button', { name, exact: true }).getAttribute('aria-pressed'),
+      'false',
+    );
   phase = 'frame-ambient-fade';
-  // Idle fades the floating controls once focus leaves them; keyboard
-  // activity brings them back. Focus inside the bar deliberately keeps them.
-  await page.evaluate(() => {
-    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-  });
+  // Idle fades the controls even though the clicked toggle may still hold
+  // focus; keyboard activity brings them back.
   await page.clock.runFor(5100);
   await page.locator('.frame-controls.quiet').waitFor();
+  assert.equal(
+    await page.getByRole('button', { name: 'More', exact: true }).getAttribute('aria-expanded'),
+    'false',
+  );
+  assert(await page.locator('.frame-controls').evaluate((bar) => getComputedStyle(bar).pointerEvents === 'none'));
+  if (engine !== 'firefox') {
+    // A tap on faded controls only wakes them: it must not also press Play.
+    const playBox = await page.getByRole('button', { name: 'Play', exact: true }).boundingBox();
+    await page.touchscreen.tap(playBox.x + playBox.width / 2, playBox.y + playBox.height / 2);
+    await page.locator('.frame-controls:not(.quiet)').waitFor();
+    assert.equal(
+      await page.getByRole('button', { name: 'Play', exact: true }).getAttribute('aria-pressed'),
+      'false',
+    );
+    await page.clock.runFor(5100);
+    await page.locator('.frame-controls.quiet').waitFor();
+  }
   await page.keyboard.press('Shift');
   await page.locator('.frame-controls:not(.quiet)').waitFor();
   // Ambient fullscreen, where the engine honors a trusted request: the plate
@@ -762,6 +805,7 @@ let browser,
   await page.goto(origin + '/app?page=frame&view=all');
   await page.locator('.frame-art').waitFor();
   await page.locator('.frame-art').evaluate((image) => image.decode());
+  await openMore(page);
   const fullscreenButton = page.getByRole('button', { name: 'Fullscreen', exact: true });
   if ((await fullscreenButton.count()) === 1) await fullscreenButton.click();
   if ((await page.evaluate(() => document.fullscreenElement?.tagName)) === 'HTML') {
@@ -782,6 +826,7 @@ let browser,
       }),
     );
     await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
+    await page.keyboard.press('Shift');
     await page.getByRole('button', { name: 'Next', exact: true }).click();
     const notice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
     await notice.waitFor();
@@ -796,23 +841,31 @@ let browser,
   await page.keyboard.press('Shift');
   await page.locator('.frame-controls:not(.quiet)').waitFor();
   await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
-  // The scrolling bar must keep every control genuinely reachable: the
-  // first control (Previous) and the last (Keep screen awake) are clicked
-  // and focused through ordinary scrolling, not a keyboard shortcut around
-  // an inaccessible button. Previous steps to the other plate, whose
+  // At phone width the bar never scrolls sideways: previous, play, next and
+  // More are always on screen, and every control behind More fits the
+  // window when it opens. Previous then steps to the other plate, whose
   // aborted fetch surfaces the notice for the clearance geometry.
   const windowWidth = await page.evaluate(() => innerWidth);
-  const reachable = async (locator) => {
-    await locator.evaluate((node) => node.scrollIntoView({ inline: 'nearest', block: 'nearest' }));
-    await locator.focus();
-    assert(await locator.evaluate((node) => document.activeElement === node));
+  const fits = async (locator) => {
     const box = await locator.boundingBox();
-    // One-pixel tolerance: engines land scroll-into-view on subpixel edges.
+    // One-pixel tolerance for subpixel layout.
     assert(box && box.x >= -1 && box.x + box.width <= windowWidth + 1);
   };
-  await reachable(page.locator('.frame-controls > *:last-child'));
+  const barFits = () =>
+    page.locator('.frame-controls').evaluate((bar) => bar.scrollWidth <= bar.clientWidth + 1);
+  assert(await barFits());
+  for (const name of ['Previous', 'Play', 'Next', 'More'])
+    await fits(page.getByRole('button', { name, exact: true }));
+  await openMore(page);
+  assert(await barFits());
+  for (const control of await page.locator('#frame-more').locator('button:visible, a:visible').all())
+    await fits(control);
+  await page.keyboard.press('Escape');
+  assert.equal(
+    await page.getByRole('button', { name: 'More', exact: true }).getAttribute('aria-expanded'),
+    'false',
+  );
   const previousControl = page.getByRole('button', { name: 'Previous', exact: true });
-  await reachable(previousControl);
   await previousControl.click();
   const clearanceNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
   await clearanceNotice.waitFor();
@@ -820,6 +873,65 @@ let browser,
   const barBox = await page.locator('.frame-controls').boundingBox();
   assert(noticeBox && barBox && noticeBox.y >= 0 && noticeBox.y + noticeBox.height <= barBox.y);
   await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  phase = 'frame-swipe';
+  // A horizontal mouse drag on the plate steps to the next plate instead of
+  // starting a native image drag.
+  const swipeCaption = await page.locator('.frame-caption').innerText();
+  const plateBox = await page.locator('.frame-viewport').boundingBox();
+  await page.mouse.move(plateBox.x + plateBox.width * 0.75, plateBox.y + plateBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(plateBox.x + plateBox.width * 0.25, plateBox.y + plateBox.height / 2, {
+    steps: 5,
+  });
+  await page.mouse.up();
+  await page.waitForFunction(
+    (before) => document.querySelector('.frame-caption')?.innerText !== before,
+    swipeCaption,
+  );
+  phase = 'frame-resilience';
+  // A network outage fails both the periodic check and the next plate, yet
+  // playback continues; an emptied view recovers without a reload once its
+  // plates return.
+  await page.keyboard.press('Shift');
+  const playControl = page.getByRole('button', { name: 'Play', exact: true });
+  await playControl.click();
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
+  await page.route('**/v1/owner/journal', (route) => route.abort());
+  await page.route('**/v1/owner/journal/birds/*/portrait', (route) => route.abort());
+  await page.clock.runFor(60100);
+  await page.getByText(/Keeping the last approved plate\./).waitFor();
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
+  await page.unroute('**/v1/owner/journal');
+  await page.route('**/v1/owner/journal', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    for (const bird of body.data.birds) bird.plate_ready = false;
+    await route.fulfill({ response, json: body });
+  });
+  await page.clock.runFor(60100);
+  await page.getByText(/This view has no approved plates or was removed\./).waitFor();
+  assert.equal(await page.locator('.frame-art[src]').count(), 0);
+  await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('.frame-art[src]').count(), 0);
+  await page.unroute('**/v1/owner/journal');
+  await page.unroute('**/v1/owner/journal/birds/*/portrait');
+  await page.clock.runFor(60100);
+  await page.locator('.frame-art[src]').waitFor();
+  await page.keyboard.press('Shift');
+  await playControl.click();
+  assert.equal(await playControl.getAttribute('aria-pressed'), 'false');
+  phase = 'frame-wide';
+  // Wide screens show every control in one bar and no More button.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.keyboard.press('Shift');
+  await page.locator('.frame-controls:not(.quiet)').waitFor();
+  assert.equal(await page.getByRole('button', { name: 'More', exact: true }).count(), 0);
+  for (const name of ['Previous', 'Play', 'Next', 'Shuffle', 'Bird name', 'Zoom'])
+    assert(await page.getByRole('button', { name, exact: true }).isVisible());
+  assert(await page.locator('.frame-controls').evaluate((bar) => bar.scrollWidth <= bar.clientWidth + 1));
+  const wideBar = await page.locator('.frame-controls').boundingBox();
+  assert(wideBar.y + wideBar.height <= 800);
+  await page.setViewportSize({ width: 390, height: 844 });
   phase = 'sso-error-visibility';
   // Frontend contract only: the provider state and start failure are stubbed,
   // like the community query. Real OIDC exchange stays backend-tested.
@@ -970,12 +1082,15 @@ let browser,
           'explicit missing-plate requests',
           'strict candidate approval/rejection',
           'paired-screen scope withdrawal and revocation',
+          'paired-screen two-step Forget with failure kept paired',
           'scoped dashboard art',
           'separate status credential and revocation',
           'community evidence not personal',
           'Health and operator guidance',
           'explicit Saved birds preview',
           'Frame viewing tools',
+          'Frame wake tap, fade after tap, swipe, outage and emptied-view recovery',
+          'Frame phone More bar and wide single bar',
           'no browser storage credentials',
           'no model process or physical panel write',
           'no script errors',
