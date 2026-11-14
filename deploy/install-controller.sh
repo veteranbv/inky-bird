@@ -28,6 +28,7 @@ if [ -z "${uv_bin}" ]; then
   uv_bin=$(command -v uv || true)
 fi
 python_version=${INKY_BIRD_PYTHON_VERSION:-3.11}
+quiesce_timeout_seconds=1800
 log_dir="${support_dir}/logs"
 agents_dir="${HOME}/Library/LaunchAgents"
 serve_plist="${agents_dir}/com.${service_prefix}.serve.plist"
@@ -37,6 +38,45 @@ catalog_publish_plist="${agents_dir}/com.${service_prefix}.catalog-publish.plist
 notifications_plist="${agents_dir}/com.${service_prefix}.notifications.plist"
 scheduler_plist="${agents_dir}/com.${service_prefix}.scheduler.plist"
 legacy_cycle_plist="${agents_dir}/com.${service_prefix}.controller-cycle.plist"
+runtimes_dir="${app_dir}/.runtimes"
+
+# Run by the old runtime's Python: hold its controller cycle lock so no plate
+# is being made while agents stop. Exit 3 if a cycle is still running at the
+# deadline; exit 0 holding nothing if the old code cannot read the config
+# (then it cannot be running a cycle either).
+cycle_lock_program='
+import fcntl, os, sys, time
+from pathlib import Path
+from inky_bird_frame.config import load_config
+config_path, ready, timeout = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+try:
+    try:
+        config = load_config(config_path, load_secrets=False)
+    except TypeError:
+        config = load_config(config_path)
+    state_dir = config.controller.state_dir
+except Exception:
+    sys.exit(0)
+state_dir.mkdir(parents=True, exist_ok=True)
+handle = (state_dir / "controller.lock").open("a+")
+deadline = time.monotonic() + timeout
+announced = False
+while True:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(3)
+        if not announced:
+            print("Waiting for the plate being made to finish.", file=sys.stderr)
+            announced = True
+        time.sleep(2)
+ready.touch()
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(1)
+'
 
 restore_catalog_publisher_schedule() {
   local uid=$1
@@ -62,21 +102,16 @@ restore_catalog_publisher_schedule() {
   rmdir "${recovery_dir}"
 }
 
-restore_previous_agent() {
-  local label=$1
-  local plist="${agents_dir}/com.${service_prefix}.${label}.plist"
-  local backup="${plist_backup_dir}/com.${service_prefix}.${label}.plist"
-  if [ ! -f "${backup}" ]; then
-    return 0
-  fi
-  # A loaded label here is the failed replacement; put the saved agent back.
-  launchctl bootout "gui/${uid}/com.${service_prefix}.${label}" 2>/dev/null || true
-  cp "${backup}" "${plist}" || return 0
-  if [ "${label}" = "catalog-publish" ]; then
-    restore_catalog_publisher_schedule "${uid}" || true
-  else
-    launchctl bootstrap "gui/${uid}" "${plist}" || true
-  fi
+contains() {
+  local target=$1
+  local item
+  shift
+  for item in "$@"; do
+    if [ "${item}" = "${target}" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 if [ ! -f "${config_path}" ]; then
@@ -89,60 +124,211 @@ if [ -z "${uv_bin}" ] || [ ! -x "${uv_bin}" ]; then
   exit 1
 fi
 
-mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${support_dir}" "${log_dir}" "${agents_dir}"
+mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}" "${support_dir}" \
+  "${log_dir}" "${agents_dir}"
 chmod 700 "${support_dir}" "${log_dir}"
 find "${log_dir}" -maxdepth 1 -type f -name '*.log*' -exec chmod 600 {} +
-if [ "${root}" != "${app_dir}" ]; then
-  mkdir -p "${app_dir}/docs"
-  rsync -a --delete "${root}/src/" "${app_dir}/src/"
-  install -m 0755 "${root}/deploy/install-controller.sh" "${app_dir}/deploy/"
-  for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
-    install -m 0644 "${root}/${file}" "${app_dir}/${file}"
-  done
-fi
-
-"${uv_bin}" sync --project "${app_dir}" --python "${python_version}" --extra controller --locked
+runtimes_dir=$(cd -P "${runtimes_dir}" && pwd)
 
 uid=$(id -u)
-plist_backup_dir=$(mktemp -d "${support_dir}/launchd-restore.XXXXXX")
-previously_loaded_labels=()
+work_dir=$(mktemp -d "${support_dir}/install.XXXXXX")
+plist_backup_dir="${work_dir}/launchd"
+mkdir "${plist_backup_dir}"
+new_runtime=""
+previous_runtime=""
+runtime_activated=false
 installation_complete=false
-was_previously_loaded() {
+cycle_lock_pid=""
+agents_recorded=false
+previously_loaded_labels=()
+stopped_labels=()
+unrestored=()
+
+# Each runtime directory holds one source copy and the venv built from it.
+# ${app_dir}/.venv and ${app_dir}/src link to the active one, so the agents'
+# fixed paths switch versions with a rename.
+current_runtime() {
+  if [ -L "${app_dir}/.venv" ]; then
+    (cd -P "${app_dir}/.venv" 2>/dev/null && dirname "$(pwd -P)") || true
+  fi
+}
+
+point_runtime() {
   local target=$1
-  local loaded
-  if [ "${#previously_loaded_labels[@]}" -gt 0 ]; then
-    for loaded in "${previously_loaded_labels[@]}"; do
-      if [ "${loaded}" = "${target}" ]; then
+  local name
+  for name in src .venv; do
+    # A directory that was never moved aside is still the live one; keep it.
+    if [ -e "${app_dir}/${name}" ] && [ ! -L "${app_dir}/${name}" ]; then
+      continue
+    fi
+    rm -f "${app_dir}/.runtime-link.next"
+    ln -s "${target}/${name}" "${app_dir}/.runtime-link.next"
+    python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
+      "${app_dir}/.runtime-link.next" "${app_dir}/${name}"
+  done
+}
+
+activate_runtime() {
+  local legacy=""
+  local name
+  previous_runtime=$(current_runtime)
+  runtime_activated=true
+  # The single-directory layout becomes the previous runtime on first upgrade.
+  for name in .venv src; do
+    if [ -e "${app_dir}/${name}" ] && [ ! -L "${app_dir}/${name}" ]; then
+      if [ -z "${legacy}" ]; then
+        legacy=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
+        previous_runtime=${previous_runtime:-${legacy}}
+      fi
+      mv "${app_dir}/${name}" "${legacy}/${name}"
+    fi
+  done
+  point_runtime "${new_runtime}"
+}
+
+deactivate_runtime() {
+  if [ -n "${previous_runtime}" ]; then
+    point_runtime "${previous_runtime}"
+  else
+    rm -f "${app_dir}/.venv" "${app_dir}/src"
+  fi
+}
+
+prune_runtimes() {
+  local runtime
+  for runtime in "${runtimes_dir}"/*; do
+    if [ ! -d "${runtime}" ] || [ "${runtime}" = "${new_runtime}" ] || \
+        [ "${runtime}" = "${previous_runtime}" ]; then
+      continue
+    fi
+    rm -rf "${runtime}"
+  done
+}
+
+hold_cycle_lock() {
+  local python="${app_dir}/.venv/bin/python"
+  local ready="${work_dir}/cycle-lock-held"
+  local status=0
+  if [ ! -x "${python}" ]; then
+    return 0
+  fi
+  "${python}" -c "${cycle_lock_program}" "${config_path}" "${ready}" \
+    "${quiesce_timeout_seconds}" &
+  cycle_lock_pid=$!
+  until [ -e "${ready}" ]; do
+    if ! kill -0 "${cycle_lock_pid}" 2>/dev/null; then
+      wait "${cycle_lock_pid}" || status=$?
+      cycle_lock_pid=""
+      if [ "${status}" -eq 0 ]; then
         return 0
       fi
-    done
+      if [ "${status}" -eq 3 ]; then
+        echo "A plate is still being made. Run the upgrade again after it finishes. No changes made." >&2
+        exit 3
+      fi
+      echo "Could not check whether a plate is being made. No changes made." >&2
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+release_cycle_lock() {
+  if [ -n "${cycle_lock_pid}" ]; then
+    kill "${cycle_lock_pid}" 2>/dev/null || true
+    wait "${cycle_lock_pid}" 2>/dev/null || true
+    cycle_lock_pid=""
   fi
-  return 1
+}
+
+restore_agent() {
+  local label=$1
+  local agent="com.${service_prefix}.${label}"
+  local plist="${agents_dir}/com.${service_prefix}.${label}.plist"
+  local backup="${plist_backup_dir}/com.${service_prefix}.${label}.plist"
+  local stopped=false
+  local loaded_before=false
+  if contains "${label}" ${stopped_labels[@]+"${stopped_labels[@]}"}; then
+    stopped=true
+  fi
+  if contains "${label}" ${previously_loaded_labels[@]+"${previously_loaded_labels[@]}"}; then
+    loaded_before=true
+  fi
+  # Unload only what this run loaded: a new agent or a replacement.
+  if { [ "${stopped}" = true ] || [ "${loaded_before}" = false ]; } && \
+      launchctl print "gui/${uid}/${agent}" >/dev/null 2>&1; then
+    if ! launchctl bootout "gui/${uid}/${agent}"; then
+      unrestored+=("${agent}")
+      return 0
+    fi
+  fi
+  if [ -f "${backup}" ]; then
+    if ! cp "${backup}" "${plist}"; then
+      unrestored+=("${agent}")
+      return 0
+    fi
+  else
+    rm -f "${plist}"
+  fi
+  # An agent this run did not stop is still running its old definition.
+  if [ "${stopped}" != true ]; then
+    return 0
+  fi
+  if [ ! -f "${backup}" ]; then
+    unrestored+=("${agent}")
+  elif [ "${label}" = "catalog-publish" ]; then
+    restore_catalog_publisher_schedule "${uid}" || unrestored+=("${agent}")
+  else
+    launchctl bootstrap "gui/${uid}" "${plist}" || unrestored+=("${agent}")
+  fi
 }
 
 cleanup() {
   status=$?
   trap - EXIT
+  release_cycle_lock
   if [ "${installation_complete}" != true ]; then
-    for label in serve refresh generate catalog-publish notifications scheduler; do
-      if was_previously_loaded "${label}"; then
-        restore_previous_agent "${label}"
-      else
-        # Not running before this install: undo any half-installed agent.
-        launchctl bootout "gui/${uid}/com.${service_prefix}.${label}" 2>/dev/null || true
-        if [ -f "${plist_backup_dir}/com.${service_prefix}.${label}.plist" ]; then
-          cp "${plist_backup_dir}/com.${service_prefix}.${label}.plist" \
-            "${agents_dir}/com.${service_prefix}.${label}.plist" || true
-        else
-          rm -f "${agents_dir}/com.${service_prefix}.${label}.plist"
-        fi
-      fi
-    done
+    runtime_restored=true
+    if [ "${runtime_activated}" = true ] && ! deactivate_runtime; then
+      runtime_restored=false
+      echo "Could not switch back to the previous runtime; it is kept in ${runtimes_dir}." >&2
+    fi
+    if [ "${agents_recorded}" = true ]; then
+      for label in serve refresh generate catalog-publish notifications scheduler; do
+        restore_agent "${label}"
+      done
+    fi
+    if [ -n "${new_runtime}" ] && [ "${runtime_restored}" = true ]; then
+      rm -rf "${new_runtime}"
+    fi
+    if [ "${#unrestored[@]}" -gt 0 ]; then
+      echo "The upgrade failed and these agents are not running: ${unrestored[*]}." >&2
+      echo "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist" >&2
+    elif [ "${#stopped_labels[@]}" -gt 0 ]; then
+      echo "The upgrade failed; the previous version is running again." >&2
+    fi
   fi
-  rm -rf "${plist_backup_dir}"
+  rm -rf "${work_dir}"
   exit "${status}"
 }
 trap cleanup EXIT
+
+# Build and check the new runtime beside the live one; nothing running changes.
+new_runtime=$(mktemp -d "${runtimes_dir}/runtime.XXXXXX")
+rsync -a --delete "${root}/src/" "${new_runtime}/src/"
+mkdir -p "${new_runtime}/deploy" "${new_runtime}/docs"
+install -m 0755 "${root}/deploy/install-controller.sh" "${new_runtime}/deploy/"
+for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
+  install -m 0644 "${root}/${file}" "${new_runtime}/${file}"
+done
+env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${new_runtime}" \
+  --python "${python_version}" --extra controller --locked
+if ! "${new_runtime}/.venv/bin/inky-bird" config validate --config "${config_path}" >/dev/null; then
+  echo "The new version cannot use this configuration. The running controller was not changed." >&2
+  exit 1
+fi
+
+hold_cycle_lock
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
@@ -153,8 +339,9 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
     cp "${plist}" "${plist_backup_dir}/"
   fi
 done
+agents_recorded=true
 
-"${app_dir}/.venv/bin/python" - \
+"${new_runtime}/.venv/bin/python" - \
   "${serve_plist}" "${refresh_plist}" "${generation_plist}" "${catalog_publish_plist}" \
   "${notifications_plist}" "${scheduler_plist}" \
   "${root}" "${app_dir}" "${config_path}" "${log_dir}" <<'PY'
@@ -351,26 +538,22 @@ else:
 PY
 
 if [ -f "${catalog_publish_plist}" ]; then
-  publisher_was_loaded=false
   if launchctl print "gui/${uid}/com.${service_prefix}.catalog-publish" >/dev/null 2>&1; then
     launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"
-    publisher_was_loaded=true
+    stopped_labels+=("catalog-publish")
   fi
-  if ! "${app_dir}/.venv/bin/inky-bird" catalog-publish \
-    --config "${config_path}" --dry-run; then
-    if [ "${publisher_was_loaded}" = true ]; then
-      restore_catalog_publisher_schedule "${uid}"
-    fi
-    exit 1
-  fi
+  "${new_runtime}/.venv/bin/inky-bird" catalog-publish --config "${config_path}" --dry-run
 fi
 
-launchctl bootout "gui/${uid}/com.${service_prefix}.serve" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.refresh" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.generate" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.notifications" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.scheduler" 2>/dev/null || true
+for label in serve refresh generate catalog-publish notifications scheduler; do
+  if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/${uid}/com.${service_prefix}.${label}"
+    stopped_labels+=("${label}")
+  fi
+done
+release_cycle_lock
+activate_runtime
+
 launchctl bootstrap "gui/${uid}" "${serve_plist}"
 if [ -f "${refresh_plist}" ]; then
   launchctl bootstrap "gui/${uid}" "${refresh_plist}"
@@ -405,13 +588,27 @@ if [ -f "${notifications_plist}" ]; then
 fi
 
 installation_complete=true
+# Keep the previous runtime for rollback; remove anything older.
+prune_runtimes
+if [ "${root}" != "${app_dir}" ]; then
+  mkdir -p "${app_dir}/docs"
+  install -m 0755 "${root}/deploy/install-controller.sh" "${app_dir}/deploy/"
+  for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
+    install -m 0644 "${root}/${file}" "${app_dir}/${file}"
+  done
+fi
 # Remove the legacy single-agent layout only after the new agents verified,
 # so a failed upgrade leaves the previous controller runnable.
-launchctl bootout "gui/${uid}/com.${service_prefix}.controller-cycle" 2>/dev/null || true
+if launchctl print "gui/${uid}/com.${service_prefix}.controller-cycle" >/dev/null 2>&1; then
+  launchctl bootout "gui/${uid}/com.${service_prefix}.controller-cycle"
+fi
 rm -f "${legacy_cycle_plist}"
 echo "Controller installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
 echo "Logs: ${log_dir}"
+if [ -n "${previous_runtime}" ]; then
+  echo "Previous runtime kept for rollback: ${previous_runtime}"
+fi
 if ! "${app_dir}/.venv/bin/inky-bird" access setup --if-needed --config "${config_path}"; then
   echo "Controller installation completed; owner setup is incomplete. Run access setup in a private terminal. Display and scheduled work continue." >&2
 fi
