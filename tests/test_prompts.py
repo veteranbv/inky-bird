@@ -296,6 +296,9 @@ class PromptTests(unittest.TestCase):
 _FIXTURE_DOMAINS = ("birds.example", "field.example")
 
 
+_FIXTURE_WORKSPACE = Path("/srv/example-user/workspace")
+
+
 def _fixture_species() -> BirdSpecies:
     return BirdSpecies(1, "Test Bird", "Avis test", 1, "test")
 
@@ -390,6 +393,30 @@ def _rendered_prompts() -> list[str]:
             prior_corrections=("Repair the visible leg",),
             prior_profile_conflicts=(_fixture_conflict(),),
         ),
+        plate_prompt(_skimmer(), profile, references, Path("candidate.png")),
+        plate_prompt(
+            _skimmer(),
+            profile,
+            references,
+            Path("candidate.png"),
+            ("Lengthen the lower mandible",),
+            invariant_findings=("Keep the slit pupil",),
+            has_correction_source=True,
+        ),
+        *(
+            plate_prompt(
+                species,
+                profile,
+                references,
+                _FIXTURE_WORKSPACE / ".inky-bird-frame-generation/1-attempt-01-x/generated.png",
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern", "Keep the pale eye"),
+                has_correction_source=has_source,
+                owner_findings=("Keep the pale eye",),
+                workspace=_FIXTURE_WORKSPACE,
+            )
+            for has_source in (True, False)
+        ),
     ]
 
 
@@ -398,7 +425,7 @@ def _rendered_prompts() -> list[str]:
 RENDERED_PROMPT_SHA256 = {
     "field-journal-v7": "84079b7217e69381494122bdee62257b08f9b216b2c9094e566e90239cf90816",
     "field-journal-v8": "9164b21301e4386d75ef442cb6a1db00f93443fbfbdd7f0bae9a45551975e877",
-    "field-journal-v9": "7048d8f423c2bdddedbb0ea3a98c09a0bf73cf5d026766334c12b9ed220e19e3",
+    "field-journal-v9": "a968aa16fad7980af65de822ac3ba09660a29dd393fedda7283eeeac0297d1a5",
 }
 
 
@@ -514,6 +541,24 @@ class PlateWordingTests(unittest.TestCase):
             tail.splitlines()[0], ".inky-bird-frame-generation/1-attempt-01-x/generated.png"
         )
 
+    def test_edit_constraints_keep_their_accepted_review_header(self) -> None:
+        prompt = _normalized(
+            plate_prompt(
+                _fixture_species(),
+                _fixture_profile(),
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Owner note",),
+                has_correction_source=True,
+                owner_findings=("Owner note",),
+            )
+        )
+
+        self.assertIn(
+            "Non-regression constraints from earlier accepted reviews: - From the owner:", prompt
+        )
+
     def test_output_outside_the_workspace_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             plate_prompt(
@@ -541,6 +586,22 @@ class PromptReferenceNumberingTests(unittest.TestCase):
 
 
 class PromptVersionTests(unittest.TestCase):
+    def test_version_fixtures_cover_every_gated_branch(self) -> None:
+        rendered = _normalized("\n".join(_rendered_prompts()))
+
+        for text in (
+            "For an open skimmer bill",
+            "In a side-profile skimmer with an open bill",
+            "thin black vertical slit",
+            "From the owner:",
+            "From earlier automated review:",
+            "From earlier review:",
+            ".inky-bird-frame-generation/1-attempt-01-x/generated.png",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, rendered)
+        self.assertNotIn(_FIXTURE_WORKSPACE.as_posix(), rendered)
+
     def test_rendered_prompt_text_matches_its_version(self) -> None:
         digest = hashlib.sha256("\n\0\n".join(_rendered_prompts()).encode("utf-8")).hexdigest()
 

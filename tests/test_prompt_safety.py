@@ -175,8 +175,21 @@ class UntrustedTextTests(unittest.TestCase):
                 values = _strings(data)
                 self.assertTrue(any(HOSTILE_MARKER in value for value in values), values)
                 block = prompt.split(OPEN, 1)[1].split(CLOSE, 1)[0]
-                for raw in (" ", "‮", "\x7f", "\U000e0041", "<", ">"):
+                for raw in (" ", "‮", "\x7f", "\U000e0041", "<s", "</"):
                     self.assertNotIn(raw, block)
+
+    def test_comparison_signs_stay_literal_for_verbatim_copying(self) -> None:
+        text = "< 5 g -> about 4 g, >3 in"
+        for name, prompt in _all_prompts(text).items():
+            with self.subTest(prompt=name):
+                block = prompt.split(OPEN, 1)[1].split(CLOSE, 1)[0]
+                self.assertIn(text, block)
+
+    def test_profile_family_from_inaturalist_stays_in_the_block(self) -> None:
+        context = TaxonContext(1, "Test Bird", "Avis test", HOSTILE, "A bird.", "https://b.example")
+        outside, data = _split(profile_prompt(_species(), context, [], DOMAINS))
+        self.assertNotIn(HOSTILE_MARKER, outside)
+        self.assertEqual(data, {"family": HOSTILE, "summary": "A bird."})
 
     def test_block_is_introduced_as_reference_material(self) -> None:
         for name, prompt in _all_prompts("Woods").items():
@@ -208,7 +221,7 @@ class UntrustedTextTests(unittest.TestCase):
         )
         self.assertEqual(strip_html(summary), "A small bird. Second line here.")
         _, data = _split(profile_prompt(_species(), _context(summary), [], DOMAINS))
-        self.assertEqual(data, {"summary": "A small bird. Second line here."})
+        self.assertEqual(data, {"family": "Testidae", "summary": "A small bird. Second line here."})
 
     def test_invisible_format_characters_do_not_split_words(self) -> None:
         self.assertEqual(strip_html("<p>sand­piper​</p>"), "sandpiper")

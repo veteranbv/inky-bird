@@ -83,10 +83,13 @@ def _capped(value: str, limit: int) -> str:
     return value if len(value) <= limit else f"{value[:limit]}…"
 
 
-def _escaped(character: str) -> str:
-    if character in "<>" or (
-        character != "\n" and unicodedata.category(character) in _ESCAPED_CATEGORIES
-    ):
+def _escaped(character: str, following: str) -> str:
+    # Only a "<" that could open or close a tag is escaped, so comparison signs stay
+    # literal for text the model must copy verbatim.
+    opens_tag = character == "<" and (
+        following in "/!?" or following.isascii() and following.isalpha()
+    )
+    if opens_tag or (character != "\n" and unicodedata.category(character) in _ESCAPED_CATEGORIES):
         code = ord(character)
         if code < 0x10000:
             return f"\\u{code:04x}"
@@ -98,7 +101,9 @@ def _escaped(character: str) -> str:
 def data_block(data: dict[str, object]) -> str:
     """Render untrusted values as one JSON block that no value can close or break out of."""
     text = json.dumps(data, indent=2, ensure_ascii=False)
-    escaped = "".join(_escaped(character) for character in text)
+    escaped = "".join(
+        _escaped(character, text[index + 1 : index + 2]) for index, character in enumerate(text)
+    )
     return f"{DATA_INTRODUCTION}\n<reference-data>\n{escaped}\n</reference-data>"
 
 
@@ -171,7 +176,10 @@ def profile_prompt(
     profile_conflicts: tuple[ProfileConflict, ...] = (),
 ) -> str:
     summary = _capped(strip_html(context.summary), MAX_PROSE_CHARACTERS)
-    data: dict[str, object] = {"summary": summary}
+    data: dict[str, object] = {
+        "family": _capped(context.family, MAX_NAME_CHARACTERS),
+        "summary": summary,
+    }
     conflict_review = ""
     if prior_profile is not None and profile_conflicts:
         data["profile_conflicts"] = _conflicts_data(profile_conflicts)
@@ -193,7 +201,7 @@ Identity supplied by iNaturalist:
 - Taxon ID: {species.taxon_id}
 - Common name: {species.common_name}
 - Scientific name: {species.scientific_name}
-- Family: {context.family}
+- Family: the "family" value in the reference data
 - Summary: the "summary" value in the reference data
 - Source: {context.source_url}
 
@@ -293,7 +301,7 @@ empty space to make room for corrections.
 Current actionable corrections required after an independent review:
 {issues}
 
-Non-regression constraints:
+Non-regression constraints from earlier accepted reviews:
 {invariants}
 
 Use the supplied current profile as the authority for visible facts, including any text that the
