@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from inky_bird_frame import codex_runner
 from inky_bird_frame.birds import BirdSpecies, TaxonContext
 from inky_bird_frame.codex_runner import (
     CodexRunner,
@@ -233,6 +241,605 @@ class CodexRunnerSubprocessTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 GenerationError, "Codex profile identity does not match the discovered taxon"
             ):
+                runner.create_profile(
+                    _species(),
+                    _context(),
+                    [],
+                    [],
+                    root / "profile.json",
+                    root / "profile.log",
+                    allowed_domains=("birds.example", "field.example"),
+                )
+
+
+def _process_running(pid: int) -> bool:
+    # A killed process stays a zombie until its parent reaps it, and a container
+    # init may never reap adopted children, so only a non-zombie counts.
+    if Path("/proc/self/stat").is_file():
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+        except OSError:
+            return False
+        state = stat[stat.rfind(b")") + 2 :].split(maxsplit=1)[0]
+    else:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, check=False
+        )
+        state = result.stdout.strip()
+        if result.returncode != 0 or not state:
+            return False
+    return not state.startswith((b"Z", b"X"))
+
+
+def _wait_for_exit(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _process_running(pid):
+            return True
+        time.sleep(0.05)
+    return not _process_running(pid)
+
+
+def _kill_if_running(pid: int) -> None:
+    if _process_running(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+
+class CodexRunnerProcessSafetyTests(unittest.TestCase):
+    def test_child_environment_excludes_job_secrets(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "environment.txt"
+            stub = _stub_executable(root, f'env > "{capture}"')
+            runner = CodexRunner(stub, root)
+            job_environment = {
+                "INKY_TEST_PROVIDER_SECRET": "sentinel-provider-secret",
+                "EBIRD_API_KEY": "sentinel-ebird-key",
+                "INKY_BIRD_OIDC_CLIENT_SECRET": "sentinel-oidc-secret",
+                "HTTPS_PROXY": "http://proxy.example.test:3128",
+                "SSL_CERT_FILE": "/etc/ssl/example-bundle.pem",
+                "CODEX_HOME": "/srv/example/codex-home",
+                "LC_CTYPE": "C.UTF-8",
+            }
+
+            with patch.dict(os.environ, job_environment):
+                runner._run([str(stub)], "prompt", root / "run.log")
+
+            child_text = capture.read_text()
+            child = dict(line.split("=", 1) for line in child_text.splitlines() if "=" in line)
+        # Report only names: a failure message must never print environment values.
+        self.assertFalse("sentinel-" in child_text, "a job secret value reached the child")
+        self.assertEqual(
+            sorted(name for name in child if name in job_environment and "SECRET" in name),
+            [],
+        )
+        self.assertNotIn("EBIRD_API_KEY", list(child))
+        self.assertEqual(child.get("HTTPS_PROXY"), "http://proxy.example.test:3128")
+        self.assertEqual(child.get("SSL_CERT_FILE"), "/etc/ssl/example-bundle.pem")
+        self.assertEqual(child.get("CODEX_HOME"), "/srv/example/codex-home")
+        self.assertEqual(child.get("LC_CTYPE"), "C.UTF-8")
+        self.assertEqual(child.get("PATH"), os.environ["PATH"])
+        self.assertIn("HOME", list(child))
+
+    def test_timeout_kills_the_whole_process_group(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "grandchild.pid"
+            stub = _stub_executable(
+                root,
+                f"(trap '' TERM; exec sleep 600) &\necho $! > \"{pid_file}\"\nwait",
+            )
+            runner = CodexRunner(stub, root, timeout_seconds=1)
+            errors: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    runner._run([str(stub)], "prompt", root / "run.log")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            # A worker thread keeps a missed group kill from blocking the suite
+            # until the grandchild's sleep ends.
+            worker = threading.Thread(target=run, daemon=True)
+            started = time.monotonic()
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5):
+                worker.start()
+                try:
+                    worker.join(15.0)
+                    elapsed = time.monotonic() - started
+                    returned = not worker.is_alive()
+                    grandchild = int(pid_file.read_text())
+                    survived = not _wait_for_exit(grandchild, 5.0)
+                finally:
+                    if pid_file.is_file() and pid_file.read_text().strip():
+                        _kill_if_running(int(pid_file.read_text()))
+                    worker.join(15.0)
+        self.assertTrue(returned, "the Codex run did not return after its timeout")
+        self.assertLess(elapsed, 15.0)
+        self.assertFalse(survived, "a grandchild of the Codex process survived its timeout")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], GenerationError)
+        self.assertIn("Codex timed out after 1 seconds", str(errors[0]))
+
+    def test_clean_exit_stops_background_tools_with_redirected_streams(self) -> None:
+        # Redirected streams mean the output pipes close as soon as the agent
+        # exits, so pipe EOF says nothing about tools still running.
+        # A tool writes the ready marker once it is set up, and the agent exits
+        # only after that, so the group stop cannot arrive before the TERM trap.
+        tools = {
+            "stops on TERM": "sh -c ': > \"$1\"; exec sleep 600' tool",
+            "ignores TERM": 'sh -c \'trap "" TERM; : > "$1"; exec sleep 600\' tool',
+        }
+        for label, tool in tools.items():
+            with self.subTest(tool=label):
+                self._assert_tool_stopped_after_clean_exit(tool)
+
+    def _assert_tool_stopped_after_clean_exit(self, tool: str) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "tool.pid"
+            ready = root / "tool.ready"
+            stub = _stub_executable(
+                root,
+                f'{tool} "{ready}" </dev/null >/dev/null 2>&1 &\n'
+                f'echo $! > "{pid_file}"\n'
+                "waited=0\n"
+                f'while [ ! -e "{ready}" ] && [ "$waited" -lt 200 ]; do\n'
+                "  sleep 0.05\n"
+                "  waited=$((waited + 1))\n"
+                "done\n"
+                "exit 0",
+            )
+            runner = CodexRunner(stub, root)
+            results: list[subprocess.CompletedProcess[str]] = []
+            errors: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    results.append(runner._run([str(stub)], "prompt", root / "run.log"))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            # A worker thread keeps a run that never returns from blocking the suite.
+            worker = threading.Thread(target=run, daemon=True)
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5):
+                worker.start()
+                try:
+                    worker.join(15.0)
+                    returned = not worker.is_alive()
+                    running = _process_running(int(pid_file.read_text()))
+                    was_ready = ready.is_file()
+                finally:
+                    if pid_file.is_file() and pid_file.read_text().strip():
+                        _kill_if_running(int(pid_file.read_text()))
+                    worker.join(15.0)
+        self.assertTrue(was_ready, "the background tool never finished setting up")
+        self.assertTrue(returned, "the Codex run did not return after the agent exited")
+        self.assertEqual(errors, [])
+        self.assertEqual([result.returncode for result in results], [0])
+        self.assertFalse(running, "a background tool survived the agent's clean exit")
+
+    def test_failure_to_list_group_members_still_kills_tools_and_reaps_the_agent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            agent_file = root / "agent.pid"
+            tool_file = root / "tool.pid"
+            stub = _stub_executable(
+                root,
+                f'echo $$ > "{agent_file}"\n'
+                f'sleep 600 </dev/null >/dev/null 2>&1 &\necho $! > "{tool_file}"\nexit 0',
+            )
+            runner = CodexRunner(stub, root)
+            errors: list[BaseException] = []
+            try:
+                with (
+                    patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 0.5),
+                    patch.object(
+                        codex_runner, "_group_members", side_effect=ValueError("synthetic")
+                    ),
+                ):
+                    try:
+                        runner._run([str(stub)], "prompt", root / "run.log")
+                    except BaseException as exc:
+                        errors.append(exc)
+                agent = int(agent_file.read_text())
+                tool_stopped = _wait_for_exit(int(tool_file.read_text()), 5.0)
+                try:
+                    unreaped = os.waitpid(agent, os.WNOHANG)[0] == agent
+                except ChildProcessError:
+                    unreaped = False
+            finally:
+                if tool_file.is_file() and tool_file.read_text().strip():
+                    _kill_if_running(int(tool_file.read_text()))
+                if agent_file.is_file() and agent_file.read_text().strip():
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(int(agent_file.read_text()), 0)
+        self.assertTrue(tool_stopped, "a background tool survived a failed group listing")
+        self.assertFalse(unreaped, "the agent was left unreaped")
+        self.assertEqual([type(error) for error in errors], [GenerationError])
+        self.assertIsInstance(errors[0].__cause__, ValueError)
+
+    def test_clean_exit_without_leftover_tools_does_not_wait_for_grace(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(root, "exit 0")
+            runner = CodexRunner(stub, root)
+            started = time.monotonic()
+            with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 30.0):
+                runner._run([str(stub)], "prompt", root / "run.log")
+            self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_tools_that_stop_on_term_end_the_run_before_the_grace_expires(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "tool.pid"
+            stub = _stub_executable(
+                root, f'sleep 600 </dev/null >/dev/null 2>&1 &\necho $! > "{pid_file}"\nexit 0'
+            )
+            runner = CodexRunner(stub, root)
+            started = time.monotonic()
+            try:
+                with patch.object(codex_runner, "TERMINATE_GRACE_SECONDS", 30.0):
+                    runner._run([str(stub)], "prompt", root / "run.log")
+                elapsed = time.monotonic() - started
+                running = _process_running(int(pid_file.read_text()))
+            finally:
+                if pid_file.is_file() and pid_file.read_text().strip():
+                    _kill_if_running(int(pid_file.read_text()))
+        self.assertFalse(running, "a background tool survived the agent's clean exit")
+        self.assertLess(elapsed, 10.0)
+
+    def test_job_stop_signal_stops_the_agent(self) -> None:
+        # The scheduler stops a job by signalling the job's own process group;
+        # the agent runs in a separate session, so the job must pass the stop on.
+        for stop_signal in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=stop_signal.name), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pid_file = root / "agent.pid"
+                _stub_executable(root, f'echo $$ > "{pid_file}"\nexec sleep 600')
+                job_script = root / "job.py"
+                job_script.write_text(
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "from inky_bird_frame.codex_runner import CodexRunner\n"
+                    "root = Path(sys.argv[1])\n"
+                    "runner = CodexRunner(root / 'codex', root, timeout_seconds=600)\n"
+                    "runner._run([str(root / 'codex')], 'prompt', root / 'run.log')\n"
+                )
+                job = subprocess.Popen(
+                    [sys.executable, str(job_script), str(root)], start_new_session=True
+                )
+                agent: int | None = None
+                try:
+                    deadline = time.monotonic() + 15.0
+                    while time.monotonic() < deadline and agent is None:
+                        if pid_file.is_file() and pid_file.read_text().strip():
+                            agent = int(pid_file.read_text())
+                        else:
+                            time.sleep(0.05)
+                    self.assertIsNotNone(agent, "the agent did not start")
+                    assert agent is not None
+                    os.killpg(job.pid, stop_signal)
+                    returncode = job.wait(timeout=15.0)
+                    survived = not _wait_for_exit(agent, 5.0)
+                finally:
+                    if job.poll() is None:
+                        job.kill()
+                        job.wait()
+                    if agent is not None:
+                        _kill_if_running(agent)
+                self.assertFalse(survived, "the agent kept running after the job was stopped")
+                self.assertEqual(returncode, -stop_signal)
+
+    def test_stop_signal_chains_to_the_previous_handler(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "agent.pid"
+            stub = _stub_executable(root, f'echo $$ > "{pid_file}"\nexec sleep 600')
+            runner = CodexRunner(stub, root, timeout_seconds=600)
+            received: list[int] = []
+            finished = threading.Event()
+
+            def previous(signum: int, _frame: object) -> None:
+                received.append(signum)
+
+            def send_stop() -> None:
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline and not pid_file.is_file():
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                os.kill(os.getpid(), signal.SIGTERM)
+                # Without forwarding the run would wait for the agent's sleep;
+                # end the agent so the failure shows up promptly.
+                if not finished.wait(15.0) and pid_file.is_file():
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+            original = signal.signal(signal.SIGTERM, previous)
+            sender = threading.Thread(target=send_stop, daemon=True)
+            try:
+                sender.start()
+                try:
+                    with self.assertRaisesRegex(GenerationError, "Codex was stopped"):
+                        runner._run([str(stub)], "prompt", root / "run.log")
+                finally:
+                    finished.set()
+                restored = signal.getsignal(signal.SIGTERM)
+            finally:
+                signal.signal(signal.SIGTERM, original)
+                sender.join(15.0)
+            agent = int(pid_file.read_text())
+            survived = not _wait_for_exit(agent, 5.0)
+            _kill_if_running(agent)
+        self.assertEqual(received, [signal.SIGTERM])
+        self.assertIs(restored, previous)
+        self.assertFalse(survived, "the agent kept running after the stop signal")
+
+    def test_timeout_logs_captured_output_and_names_the_log(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(
+                root, 'echo "early stdout marker"\necho "early stderr marker" >&2\nexec sleep 60'
+            )
+            runner = CodexRunner(stub, root, timeout_seconds=1)
+            log_path = root / "logs" / "run.log"
+
+            with self.assertRaises(GenerationError) as raised:
+                runner._run([str(stub)], "prompt", log_path)
+
+            message = str(raised.exception)
+            self.assertIn("timed out", message)
+            self.assertIn("see run.log", message)
+            self.assertNotIn(temporary, message)
+            log = log_path.read_text()
+        self.assertIn("early stdout marker", log)
+        self.assertIn("early stderr marker", log)
+
+    def test_failure_messages_name_files_without_absolute_paths(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = CodexRunner(_stub_executable(root, "exit 3"), root)
+
+            with self.assertRaises(GenerationError) as exited:
+                runner._run([str(root / "codex")], "prompt", root / "logs" / "plate.log")
+            with self.assertRaises(GenerationError) as missing:
+                runner.generate_plate(
+                    _species(), _profile(), [], [], root / "plate.png", root / "plate.log"
+                )
+
+        self.assertEqual(str(exited.exception), "Codex exited with status 3; see plate.log")
+        self.assertIn("plate", str(missing.exception))
+        for raised in (exited, missing):
+            self.assertNotIn(temporary, str(raised.exception))
+
+    def test_unwritable_log_keeps_the_failure_cause(self) -> None:
+        cases = {"exit 3": "Codex finished with exit status 3", "exec sleep 60": "Codex timed out"}
+        for body, cause in cases.items():
+            with self.subTest(body), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "blocked").write_text("a file where the log directory belongs")
+                runner = CodexRunner(_stub_executable(root, body), root, timeout_seconds=1)
+
+                with self.assertRaises(GenerationError) as raised:
+                    runner._run([str(root / "codex")], "prompt", root / "blocked" / "run.log")
+
+                message = str(raised.exception)
+                self.assertTrue(message.startswith(cause), message)
+                self.assertIn("run.log could not be written", message)
+                self.assertNotIn(temporary, message)
+
+    def test_captured_output_is_bounded(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(
+                root, "head -c 2000000 /dev/zero | tr '\\0' a\necho tail-marker"
+            )
+            runner = CodexRunner(stub, root)
+            log_path = root / "run.log"
+
+            with patch.object(codex_runner, "MAX_CAPTURED_OUTPUT_BYTES", 4096):
+                runner._run([str(stub)], "prompt", log_path)
+
+            size = log_path.stat().st_size
+            log = log_path.read_text()
+        self.assertLess(size, 16384)
+        self.assertIn("output truncated", log)
+
+    def test_unstartable_executable_raises_generation_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "codex"
+            executable.write_text("not a program\n")
+            executable.chmod(0o644)
+            runner = CodexRunner(executable, root)
+
+            with self.assertRaisesRegex(GenerationError, "Codex could not be started"):
+                runner._run([str(executable)], "prompt", root / "run.log")
+
+    def test_undecodable_output_is_logged_without_failing(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(root, "printf 'bad \\377\\376 bytes\\n'")
+            runner = CodexRunner(stub, root)
+            log_path = root / "run.log"
+
+            runner._run([str(stub)], "prompt", log_path)
+
+            log = log_path.read_text()
+        self.assertIn("bad", log)
+        self.assertIn("\ufffd", log)
+
+    def test_stale_structured_output_is_not_reused(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(root, "exit 0")
+            runner = CodexRunner(stub, root)
+            output_path = root / "profile.json"
+            output_path.write_text(json.dumps(dict(_profile())))
+
+            with self.assertRaisesRegex(
+                GenerationError, "Codex did not write valid structured output"
+            ):
+                runner.create_profile(
+                    _species(),
+                    _context(),
+                    [],
+                    [],
+                    output_path,
+                    root / "profile.log",
+                    allowed_domains=("birds.example", "field.example"),
+                )
+
+    def test_undecodable_structured_output_raises_generation_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(
+                root, f"{_CAPTURE_OUTPUT_ARGUMENT}printf '\\377\\376' > \"$out\""
+            )
+            runner = CodexRunner(stub, root)
+
+            with self.assertRaisesRegex(
+                GenerationError, "Codex did not write valid structured output"
+            ):
+                runner.create_profile(
+                    _species(),
+                    _context(),
+                    [],
+                    [],
+                    root / "profile.json",
+                    root / "profile.log",
+                    allowed_domains=("birds.example", "field.example"),
+                )
+
+
+def _profile_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = dict(_profile())
+    payload.update(changes)
+    return payload
+
+
+def _passing_review_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "passed": True,
+        "species_accuracy": 5,
+        "anatomy_accuracy": 5,
+        "text_accuracy": 5,
+        "composition_quality": 5,
+        "location_free": True,
+        "findings": ["Accurate plumage"],
+        "correction_findings": [],
+        "verification_sources": [
+            {"title": "One", "url": "https://birds.example/one"},
+            {"title": "Two", "url": "https://field.example/two"},
+        ],
+    }
+    payload.update(changes)
+    return payload
+
+
+class CodexOutputSizeTests(unittest.TestCase):
+    def test_profile_accepts_generous_real_world_sizes(self) -> None:
+        profile = parse_species_profile(
+            _profile_payload(
+                habitat="h" * 3000,
+                behavior="b" * 3000,
+                field_marks=[f"mark {index} " + "m" * 400 for index in range(20)],
+                palette=[f"colour {index}" for index in range(20)],
+            )
+        )
+
+        self.assertEqual(len(profile["field_marks"]), 20)
+
+    def test_profile_rejects_runaway_strings(self) -> None:
+        cases: dict[str, object] = {
+            "common_name": "n" * 201,
+            "family": "f" * 201,
+            "habitat": "h" * 4001,
+            "behavior": "b" * 4001,
+            "measurements": {"length": "l" * 501, "wingspan": "2 in", "weight": "3 oz"},
+            "field_marks": ["one", "two", "three", "f" * 1001],
+            "palette": ["red", "green", "p" * 301],
+            "sources": [
+                {"title": "t" * 501, "url": "https://birds.example/one"},
+                {"title": "Two", "url": "https://field.example/two"},
+            ],
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field), self.assertRaisesRegex(GenerationError, "at most"):
+                parse_species_profile(_profile_payload(**{field: value}))
+
+    def test_profile_rejects_runaway_lists(self) -> None:
+        sources = [
+            {"title": f"Source {index}", "url": f"https://birds.example/{index}"}
+            for index in range(33)
+        ]
+        cases: dict[str, object] = {
+            "field_marks": [f"mark {index}" for index in range(33)],
+            "palette": [f"colour {index}" for index in range(33)],
+            "sources": sources,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field), self.assertRaisesRegex(GenerationError, "at most"):
+                parse_species_profile(_profile_payload(**{field: value}))
+
+    def test_review_rejects_runaway_findings(self) -> None:
+        cases: dict[str, object] = {
+            "findings": ["x" * 4001],
+            "verification_sources": [
+                {"title": f"Source {index}", "url": f"https://birds.example/{index}"}
+                for index in range(33)
+            ],
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field), self.assertRaisesRegex(GenerationError, "at most"):
+                _parse_review(_passing_review_payload(**{field: value}))
+        with self.assertRaisesRegex(GenerationError, "at most"):
+            _parse_review(_passing_review_payload(findings=["finding"] * 101))
+        with self.assertRaisesRegex(GenerationError, "at most"):
+            _parse_review(
+                _passing_review_payload(
+                    passed=False,
+                    species_accuracy=3,
+                    correction_findings=["Fix the bill " + "c" * 4000],
+                )
+            )
+        with self.assertRaisesRegex(GenerationError, "at most"):
+            _parse_review(
+                _passing_review_payload(
+                    passed=False,
+                    species_accuracy=3,
+                    correction_findings=[f"Fix part {index}" for index in range(51)],
+                )
+            )
+
+    def test_review_rejects_runaway_profile_conflict(self) -> None:
+        conflict = {
+            "field": "habitat",
+            "profile_value": "Woods",
+            "observed_value": "o" * 4001,
+            "sources": [
+                {"title": "One", "url": "https://birds.example/habitat"},
+                {"title": "Two", "url": "https://field.example/habitat"},
+            ],
+        }
+        with self.assertRaisesRegex(GenerationError, "at most"):
+            _parse_review(
+                _passing_review_payload(
+                    passed=False, species_accuracy=3, profile_conflicts=[conflict]
+                )
+            )
+
+    def test_structured_output_file_is_bounded(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stub = _stub_executable(
+                root,
+                f"{_CAPTURE_OUTPUT_ARGUMENT}head -c 2000000 /dev/zero | tr '\\0' ' ' > \"$out\"",
+            )
+            runner = CodexRunner(stub, root)
+
+            with self.assertRaisesRegex(GenerationError, "structured output is too large"):
                 runner.create_profile(
                     _species(),
                     _context(),
