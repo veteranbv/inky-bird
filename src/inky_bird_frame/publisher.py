@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -13,6 +12,7 @@ import stat
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Literal, cast
@@ -151,22 +151,28 @@ def _word_pattern(term: str) -> re.Pattern[str]:
 
 def _coordinate_terms(value: float) -> set[str]:
     magnitude = abs(value)
+    exact = abs(Decimal(str(value)))
     terms: set[str] = set()
     # Two decimals would also match common DOI prefixes such as "10.12" in source links.
     for digits in range(3, 7):
-        scale = 10**digits
         terms.add(f"{magnitude:.{digits}f}")
-        terms.add(f"{math.floor(magnitude * scale) / scale:.{digits}f}")
+        terms.add(f"{exact.quantize(Decimal(1).scaleb(-digits), rounding=ROUND_DOWN)}")
     return terms
 
 
-def _discovered_place_name(state_dir: Path) -> str | None:
+def _discovered_place(state_dir: Path) -> tuple[str, str] | None:
     try:
         discovery = json.loads((state_dir / "discovery.json").read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    place_name = discovery.get("place_name") if isinstance(discovery, dict) else None
-    return place_name.strip() if isinstance(place_name, str) else None
+    if not isinstance(discovery, dict):
+        return None
+    place_name = discovery.get("place_name")
+    state = discovery.get("state")
+    if not isinstance(place_name, str) or not isinstance(state, str):
+        return None
+    place_name, state = place_name.strip(), state.strip()
+    return (place_name, state) if place_name and state else None
 
 
 def publication_privacy_patterns(config: AppConfig) -> tuple[re.Pattern[str], ...]:
@@ -177,12 +183,15 @@ def publication_privacy_patterns(config: AppConfig) -> tuple[re.Pattern[str], ..
         if code is not None:
             words.add(code.strip())
             words.add(re.sub(r"[\s-]", "", code))
-    place_name = _discovered_place_name(config.controller.state_dir)
-    if place_name is not None:
-        words.add(place_name)
     patterns = [
         _word_pattern(word) for word in sorted(words) if len(word) >= _MINIMUM_PRIVATE_TERM_LENGTH
     ]
+    place = _discovered_place(config.controller.state_dir)
+    if place is not None:
+        # A bare place name also names birds such as "Baltimore Oriole" or "Lincoln's Sparrow",
+        # so only the place together with its state counts as the controller's location.
+        place_name, state = (re.escape(part.casefold()) for part in place)
+        patterns.append(re.compile(rf"(?<!\w){place_name}[\s,]+{state}(?!\w)"))
     coordinates: set[str] = set()
     for coordinate in (discovery.latitude, discovery.longitude):
         if coordinate is not None:
@@ -204,7 +213,7 @@ def publication_privacy_patterns(config: AppConfig) -> tuple[re.Pattern[str], ..
             # A root-level path such as "/" or "/root" would match ordinary URLs.
             if candidate.is_absolute() and len(candidate.parts) >= 3:
                 path_terms.add(str(candidate).casefold())
-    patterns.extend(re.compile(re.escape(term)) for term in sorted(path_terms))
+    patterns.extend(re.compile(rf"{re.escape(term)}(?![\w-])") for term in sorted(path_terms))
     return tuple(patterns)
 
 
@@ -1500,7 +1509,10 @@ def _pull_request(
     publication: PublicCatalogConfig,
     repository: str,
     branch: str,
+    *,
+    branch_existed: bool,
 ) -> dict[str, object] | None:
+    """Return the PR to reuse for this branch, or None when a new one is needed."""
     raw = _gh(
         publication,
         "pr",
@@ -1512,7 +1524,7 @@ def _pull_request(
         "--state",
         "all",
         "--limit",
-        "1",
+        "20",
         "--json",
         "number,url,state,headRefOid",
     ).stdout
@@ -1524,7 +1536,13 @@ def _pull_request(
         not isinstance(item, dict) for item in pull_requests
     ):
         raise CatalogPublishError("GitHub CLI returned invalid pull request data")
-    return cast(dict[str, object], pull_requests[0]) if pull_requests else None
+    typed = cast(list[dict[str, object]], pull_requests)
+    open_pull = next((item for item in typed if item.get("state") == "OPEN"), None)
+    if open_pull is not None:
+        return open_pull
+    # The branch name repeats when the catalog returns to an earlier state on the same base.
+    # Earlier PRs whose branch was deleted, for example by stale cleanup, belong to the past.
+    return typed[0] if typed and branch_existed else None
 
 
 def _create_pull_request(
@@ -1778,7 +1796,9 @@ def _publish_from_worktree(
     result["commit"] = commit
     result["branch"] = branch
 
-    pull_request = _pull_request(publication, repository, branch)
+    pull_request = _pull_request(
+        publication, repository, branch, branch_existed=bool(remote_branch)
+    )
     if pull_request is None:
         pull_request_url = _create_pull_request(
             publication,
@@ -1793,7 +1813,10 @@ def _publish_from_worktree(
             raise CatalogPublishError("Existing publication PR has no URL")
         pull_request_url = existing_url
         if pull_request.get("state") == "CLOSED":
-            raise CatalogPublishError("Existing publication PR was closed without merge")
+            raise CatalogPublishError(
+                "Existing publication PR was closed without merge; "
+                f"delete branch {branch} to publish it again"
+            )
         head_sha = pull_request.get("headRefOid")
         if head_sha != commit:
             raise CatalogPublishError("Existing publication PR has an unexpected head")

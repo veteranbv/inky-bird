@@ -29,6 +29,7 @@ from inky_bird_frame.publisher import (
     _catalog_transaction_prefix,
     _check_json_privacy,
     _cleanup_abandoned_publish_work_locked,
+    _coordinate_terms,
     _gh,
     _git,
     _remote_repository,
@@ -2055,7 +2056,9 @@ class PublicationRunTests(unittest.TestCase):
             )
             _create_species(catalog, 1, "Good Bird")
             leaky = _create_species(catalog, 2, "Leaky Bird")
-            _set_profile_field(leaky, "habitat", "Common in the parks of exampleville.")
+            _set_profile_field(
+                leaky, "habitat", "Common in the parks of exampleville, example state."
+            )
             rebuild_catalog_index(catalog)
 
             with _github(fake):
@@ -2222,6 +2225,89 @@ class PublicationRunTests(unittest.TestCase):
             self.assertEqual(len(fake.pull_requests), 1)
             self.assertEqual(fake.pull_requests[0]["state"], "MERGED")
 
+    def test_publishes_a_species_named_after_the_configured_place(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            config.controller.state_dir.mkdir(parents=True)
+            write_json_atomic(
+                config.controller.state_dir / "discovery.json",
+                {"place_name": "Baltimore", "state": "MD"},
+            )
+            _create_species(config.controller.catalog_dir, 1, "Baltimore Oriole")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["skipped"], [])
+            self.assertIn("catalog/species/1-baltimore-oriole/manifest.json", _remote_files(remote))
+
+    def test_dry_run_without_changes_does_not_clean_stale_publications(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            with _github(fake):
+                run_catalog_publish(config)
+            stale = "catalog/publish-aaaaaaaa-bbbbbbbb"
+            _run_git(remote, "update-ref", f"refs/heads/{stale}", "refs/heads/main")
+            owner_pull = fake.add_pull_request(stale)
+
+            with _github(fake):
+                result = run_catalog_publish(config, dry_run=True)
+
+            self.assertEqual(result["already_present"], [1])
+            self.assertEqual(result["cleaned_publication_branches"], [])
+            self.assertIn(stale, _remote_branches(remote))
+            self.assertEqual(owner_pull["state"], "OPEN")
+
+    def test_publishes_again_on_a_branch_that_cleanup_closed_earlier(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Example Bird")
+            fake.fail_next_merge = True
+            with _github(fake), self.assertRaisesRegex(CatalogPublishError, "simulated outage"):
+                run_catalog_publish(config)
+            first_branch = str(fake.pull_requests[0]["headRefName"])
+
+            second = _create_species(catalog, 2, "Second Bird")
+            fake.fail_next_merge = True
+            with _github(fake), self.assertRaisesRegex(CatalogPublishError, "simulated outage"):
+                run_catalog_publish(config)
+            self.assertEqual(fake.pull_requests[0]["state"], "CLOSED")
+            self.assertNotIn(first_branch, _remote_branches(remote))
+
+            shutil.rmtree(second)
+            rebuild_catalog_index(catalog)
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["branch"], first_branch)
+            self.assertEqual(
+                [item["state"] for item in fake.pull_requests], ["CLOSED", "CLOSED", "MERGED"]
+            )
+            self.assertIn("catalog/species/1-example-bird/manifest.json", _remote_files(remote))
+
+    def test_refuses_a_closed_pull_request_whose_branch_was_kept(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            fake.fail_next_merge = True
+            with _github(fake), self.assertRaisesRegex(CatalogPublishError, "simulated outage"):
+                run_catalog_publish(config)
+            fake.pull_requests[0]["state"] = "CLOSED"
+            branch = str(fake.pull_requests[0]["headRefName"])
+
+            with (
+                _github(fake),
+                self.assertRaisesRegex(CatalogPublishError, "closed without merge"),
+            ):
+                run_catalog_publish(config)
+
+            self.assertIn(branch, _remote_branches(remote))
+            self.assertEqual(len(fake.pull_requests), 1)
+
     def test_cleanup_failure_does_not_replace_the_original_error(self) -> None:
         with TemporaryDirectory() as temporary:
             _, _, config, fake = self._environment(Path(temporary))
@@ -2337,10 +2423,12 @@ class PublicationPrivacyTests(unittest.TestCase):
             )
             state_dir = postal_config.controller.state_dir
             rejected = {
-                "place": (postal, "Often seen near exampleville in winter."),
+                "place": (postal, "Often seen near Exampleville, Example State in winter."),
+                "place without comma": (postal, "exampleville example state parks"),
                 "postal code": (postal, "Area 12345 survey"),
                 "state path": (postal, f"Saved under {state_dir}/pending"),
                 "home path": (postal, f"Copied from {Path.home()}/Pictures"),
+                "home path at sentence end": (postal, f"Copied from {Path.home()}."),
                 "rounded latitude": (coordinates, "lat 1.2346, lon 0"),
                 "truncated longitude": (coordinates, "lon -2.345 here"),
                 "longitude digits": (coordinates, "at 2.345678 degrees"),
@@ -2361,6 +2449,7 @@ class PublicationPrivacyTests(unittest.TestCase):
                 "Wingspan 12.345 cm",
                 "https://doi.org/10.1234/example",
                 "Example State woodland",
+                "The Exampleville Warbler sings",
                 "https://example.test/one",
             ):
                 with self.subTest(allowed=text):
@@ -2377,6 +2466,50 @@ class PublicationPrivacyTests(unittest.TestCase):
             with self.assertRaisesRegex(CatalogPublishError, "Private location or path"):
                 _check_json_privacy("zip 12345", Path("profile.json"), patterns)
             _check_json_privacy("exampleville", Path("profile.json"), patterns)
+
+    def test_place_names_inside_species_names_are_not_private(self) -> None:
+        cases = {
+            ("Baltimore", "MD"): (
+                ["The Baltimore Oriole sings", "Baltimore Oriole (Icterus galbula)"],
+                ["Nests in Baltimore, MD parks", "baltimore md"],
+            ),
+            ("Lincoln", "NE"): (["Lincoln's Sparrow skulks in brush"], ["Lincoln, NE"]),
+            ("United States", ""): (["Breeds across the United States and Canada"], []),
+        }
+        for (place, state), (allowed, rejected) in cases.items():
+            with self.subTest(place=place), TemporaryDirectory() as temporary:
+                config = self._config(Path(temporary), 'zip_code = "12345"')
+                write_json_atomic(
+                    config.controller.state_dir / "discovery.json",
+                    {"place_name": place, "state": state},
+                )
+                patterns = publication_privacy_patterns(config)
+                for text in allowed:
+                    _check_json_privacy({"common_name": text}, Path("profile.json"), patterns)
+                for text in rejected:
+                    with self.assertRaisesRegex(CatalogPublishError, "Private location or path"):
+                        _check_json_privacy({"habitat": text}, Path("profile.json"), patterns)
+
+    def test_paths_do_not_match_a_longer_sibling(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary), 'zip_code = "12345"')
+            patterns = publication_privacy_patterns(config)
+            home = Path.home()
+            for text in (f"Notes on {home}stein", f"Copied from {home}-old/file"):
+                with self.subTest(text=text):
+                    _check_json_privacy({"title": text}, Path("profile.json"), patterns)
+            with self.assertRaisesRegex(CatalogPublishError, "Private location or path"):
+                _check_json_privacy(
+                    {"title": f"Copied from {home}/x"}, Path("profile.json"), patterns
+                )
+
+    def test_truncated_coordinates_do_not_gain_float_error_terms(self) -> None:
+        terms = _coordinate_terms(40.123)
+        self.assertIn("40.123", terms)
+        self.assertIn("40.12300", terms)
+        self.assertNotIn("40.12299", terms)
+        self.assertNotIn("0.28999", _coordinate_terms(0.29))
+        self.assertIn("2.345", _coordinate_terms(-2.3459))
 
 
 if __name__ == "__main__":
