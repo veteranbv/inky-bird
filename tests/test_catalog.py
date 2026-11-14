@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time_ns
+from typing import BinaryIO
 from unittest.mock import patch
 
 import pytest
 from png_fixtures import write_plate_pair, write_png, write_truncated_png
 
+from inky_bird_frame import catalog as catalog_module
 from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.catalog import (
     CandidateApprovalError,
@@ -369,6 +373,46 @@ class CatalogTests(unittest.TestCase):
                 index_after = (catalog / "index.json").read_bytes()
 
                 self.assertEqual(index_after, index_before)
+
+    def test_unchanged_assets_are_hashed_once_and_changed_ones_again(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            portrait = catalog / "species/7513-carolina-wren/portrait.png"
+            hashed: list[object] = []
+            original = catalog_module._sha256_handle
+
+            def counting(handle: BinaryIO) -> str:
+                hashed.append(handle)
+                return original(handle)
+
+            with patch("inky_bird_frame.catalog._sha256_handle", side_effect=counting):
+                read_catalog_entries(catalog)
+                read_catalog_entries(catalog)
+                fresh = len(hashed)
+                hashed.clear()
+                # Distinct explicit times keep this independent of timestamp granularity.
+                os.utime(portrait, ns=(10**18, 10**18))
+                with patch("inky_bird_frame.catalog.time_ns", return_value=time_ns() + 10**10):
+                    read_catalog_entries(catalog)
+                    first = len(hashed)
+                    read_catalog_entries(catalog)
+                    repeated = len(hashed) - first
+                    body = bytearray(portrait.read_bytes())
+                    body[-20] ^= 0xFF
+                    portrait.write_bytes(bytes(body))
+                    os.utime(portrait, ns=(10**18 + 1, 10**18 + 1))
+                    with self.assertRaisesRegex(CatalogError, "checksum mismatch"):
+                        read_catalog_entries(catalog)
+
+        self.assertEqual(fresh, 4)
+        self.assertEqual(first, 2)
+        self.assertEqual(repeated, 0)
 
     def test_approval_refuses_text_with_private_terms_and_keeps_the_candidate(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")

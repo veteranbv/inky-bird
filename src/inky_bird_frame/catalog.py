@@ -8,14 +8,15 @@ import json
 import os
 import re
 import shutil
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from time import monotonic, sleep
-from typing import cast
+from time import monotonic, sleep, time_ns
+from typing import BinaryIO, cast
 
 from .birds import BirdSpecies
 from .errors import BusyError, CatalogError, MissingDependencyError
@@ -255,12 +256,48 @@ def remove_collection_taxa(
     return remaining, removed
 
 
-def sha256_file(path: Path) -> str:
+def _sha256_handle(handle: BinaryIO) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return _sha256_handle(handle)
+
+
+# Readers validate every plate on each call; remember a plate's checksum while its file
+# is unchanged. Files changed within the window are hashed again, because coarse
+# filesystem timestamps cannot tell two writes in the same tick apart.
+_CHECKSUM_CACHE_LIMIT = 4096
+_CHECKSUM_SETTLED_NS = 2_000_000_000
+_checksum_cache: dict[tuple[int, int, int, int, int], str] = {}
+_checksum_cache_lock = threading.Lock()
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _asset_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        identity = _file_identity(before)
+        with _checksum_cache_lock:
+            cached = _checksum_cache.get(identity)
+        if cached is not None:
+            return cached
+        checksum = _sha256_handle(handle)
+        unchanged = _file_identity(os.fstat(handle.fileno())) == identity
+    settled = time_ns() - max(before.st_mtime_ns, before.st_ctime_ns) > _CHECKSUM_SETTLED_NS
+    if unchanged and settled:
+        with _checksum_cache_lock:
+            if len(_checksum_cache) >= _CHECKSUM_CACHE_LIMIT:
+                _checksum_cache.clear()
+            _checksum_cache[identity] = checksum
+    return checksum
 
 
 def read_json(path: Path) -> object:
@@ -407,7 +444,7 @@ def _verify_asset_checksums(
 ) -> None:
     for filename, checksum in checksums.items():
         try:
-            matches = sha256_file(directory / filename) == checksum
+            matches = _asset_sha256(directory / filename) == checksum
         except OSError as exc:
             raise CatalogError(f"Catalog asset is missing or unreadable: {manifest_path}") from exc
         if not matches:
