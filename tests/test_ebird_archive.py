@@ -13,6 +13,8 @@ from unittest.mock import patch
 from inky_bird_frame.birds import DateRange, EbirdArchiveSpecies, ObservationWindow
 from inky_bird_frame.ebird_archive import (
     CSV_FILENAME,
+    EXPORT_COLUMNS,
+    MAX_NAME_LENGTH,
     MAX_ZIP_METADATA_BYTES,
     REQUIRED_COLUMNS,
     import_ebird_archive,
@@ -29,7 +31,7 @@ def _row(
     *,
     location: str = "Private Place",
 ) -> dict[str, str]:
-    row = dict.fromkeys(REQUIRED_COLUMNS, "")
+    row = dict.fromkeys(EXPORT_COLUMNS, "")
     row.update(
         {
             "Submission ID": submission_id,
@@ -51,7 +53,7 @@ def _row(
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -380,6 +382,120 @@ class EbirdArchiveImportTests(unittest.TestCase):
             csv_path.write_text("\n".join((lines[0], f"{lines[1]},unexpected")))
             with self.assertRaisesRegex(DataSourceError, "Malformed.*row 2"):
                 import_ebird_archive(csv_path, root / "state")
+
+    def test_damaged_or_non_utf8_exports_are_reported_without_cell_content(self) -> None:
+        rows = [
+            _row(f"S{index}", "Eastern Bluebird", "Sialia sialis", "2026-08-08")
+            for index in range(2000)
+        ]
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            truncated = root / "truncated.zip"
+            _write_zip(truncated, rows)
+            truncated.write_bytes(truncated.read_bytes()[: truncated.stat().st_size // 2])
+            corrupted = root / "corrupted.zip"
+            _write_zip(corrupted, rows)
+            contents = bytearray(corrupted.read_bytes())
+            with zipfile.ZipFile(corrupted) as archive:
+                info = archive.getinfo(CSV_FILENAME)
+            start = info.header_offset + 30 + len(info.filename) + len(info.extra)
+            # A first deflate block of type 3 does not exist: zlib rejects the stream.
+            contents[start : start + info.compress_size] = b"\xff" * info.compress_size
+            corrupted.write_bytes(contents)
+            checksum = root / "checksum.zip"
+            _write_zip(checksum, rows)
+            contents = bytearray(checksum.read_bytes())
+            directory = contents.index(b"PK\x01\x02") + 16
+            contents[directory : directory + 4] = bytes(4)
+            checksum.write_bytes(contents)
+            short = root / "short.csv"
+            _write_csv(short, rows[:1])
+            short.write_bytes(short.read_bytes().replace(b"Bluebird", b"Blue\xffbird"))
+            late = root / "late.csv"
+            _write_csv(late, rows)
+            body = late.read_bytes()
+            cut = body.rindex(b"Bluebird")
+            late.write_bytes(body[:cut] + b"\xff" + body[cut:])
+            cases = {
+                truncated: "not an eBird export",
+                corrupted: "^This eBird export is damaged; download it again$",
+                checksum: "damaged near row [0-9]+; download it again",
+                short: "not an eBird export: it is not UTF-8 text",
+                late: "not UTF-8 text near row [0-9]+",
+            }
+            for path, message in cases.items():
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(DataSourceError, message) as raised:
+                        import_ebird_archive(path, state)
+                    for private in ("Bluebird", "Sialia", "S1", str(root)):
+                        self.assertNotIn(private, str(raised.exception))
+            self.assertFalse((state / "ebird-archive-observations.json").exists())
+
+    def test_unused_export_columns_may_be_renamed_or_removed(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            columns = [
+                "Renamed Count" if name == "Count" else name
+                for name in EXPORT_COLUMNS
+                if name not in {"Latitude", "Longitude", "ML Catalog Numbers"}
+            ]
+            row = _row("S1", "Eastern Bluebird", "Sialia sialis", "2026-08-08")
+            row["Renamed Count"] = row.pop("Count")
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow(row)
+            self.assertEqual(import_ebird_archive(csv_path, root / "state").species, 1)
+            minimal = root / "minimal.csv"
+            with minimal.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow(row)
+            self.assertEqual(import_ebird_archive(minimal, root / "state").checklists, 1)
+            for missing in REQUIRED_COLUMNS:
+                with self.subTest(missing=missing):
+                    with minimal.open("w", encoding="utf-8", newline="") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=[name for name in REQUIRED_COLUMNS if name != missing],
+                            extrasaction="ignore",
+                        )
+                        writer.writeheader()
+                        writer.writerow(row)
+                    with self.assertRaisesRegex(
+                        DataSourceError, f"missing required columns: {missing}$"
+                    ):
+                        import_ebird_archive(minimal, root / "state")
+
+    def test_species_names_are_bounded_visible_text(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            for column, value in (
+                ("Common Name", "B" * (MAX_NAME_LENGTH + 1)),
+                ("Scientific Name", "Sialia\u0007sialis"),
+                ("Common Name", "Eastern\u200bBluebird"),
+            ):
+                with self.subTest(column=column, value=value[:12]):
+                    row = _row("S2", "Eastern Bluebird", "Sialia sialis", "2026-08-08")
+                    row[column] = value
+                    _write_csv(
+                        csv_path,
+                        [
+                            _row("S1", "Northern Cardinal", "Cardinalis cardinalis", "2026-08-08"),
+                            row,
+                        ],
+                    )
+                    with self.assertRaisesRegex(
+                        DataSourceError, f"^Invalid {column} on eBird archive row 3$"
+                    ):
+                        import_ebird_archive(csv_path, root / "state")
+            self.assertFalse((root / "state/ebird-archive-observations.json").exists())
+            row = _row("S1", "B" * MAX_NAME_LENGTH, "Sialia sialis", "2026-08-08")
+            _write_csv(csv_path, [row])
+            self.assertEqual(import_ebird_archive(csv_path, root / "state").species, 1)
 
 
 if __name__ == "__main__":

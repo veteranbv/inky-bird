@@ -8,7 +8,9 @@ import hashlib
 import json
 import re
 import stat
+import unicodedata
 import zipfile
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -24,7 +26,12 @@ from .http import write_bytes_atomic, write_json_atomic
 
 STATE_FILENAME = "ebird-archive-observations.json"
 CSV_FILENAME = "MyEBirdData.csv"
-REQUIRED_COLUMNS = (
+# Only the columns import reads; Location labels trips while choosing them.
+REQUIRED_COLUMNS = ("Submission ID", "Common Name", "Scientific Name", "Date", "Location")
+# Species names longer than this are not real eBird taxa.
+MAX_NAME_LENGTH = 200
+# The columns of an official "Download My Data" export, for reference.
+EXPORT_COLUMNS = (
     "Submission ID",
     "Common Name",
     "Scientific Name",
@@ -378,6 +385,15 @@ def _required_text(row: dict[str, str | None], name: str, line: int) -> str:
     return value.strip()
 
 
+def _species_name(row: dict[str, str | None], name: str, line: int) -> str:
+    value = _required_text(row, name, line)
+    if len(value) > MAX_NAME_LENGTH or any(
+        unicodedata.category(char).startswith("C") for char in value
+    ):
+        raise DataSourceError(f"Invalid {name} on eBird archive row {line}")
+    return value
+
+
 def _parse_archive(
     archive_path: Path,
     *,
@@ -385,10 +401,13 @@ def _parse_archive(
 ) -> tuple[dict[str, _StoredChecklist], int, int, date, date]:
     builders: dict[str, tuple[date, dict[str, _StoredSpecies]]] = {}
     rows = duplicate_rows = 0
+    # Text is decoded in blocks, so a decoding failure is reported near, not at, a row.
+    line: int | None = None
     with _open_archive_csv(archive_path) as handle:
         try:
             reader = csv.DictReader(handle, strict=True)
             fieldnames = reader.fieldnames or []
+            line = 1
             if len(fieldnames) != len(set(fieldnames)):
                 raise DataSourceError("eBird archive contains duplicate columns")
             missing = [name for name in REQUIRED_COLUMNS if name not in fieldnames]
@@ -401,8 +420,8 @@ def _parse_archive(
                     raise DataSourceError(f"Malformed eBird archive row {line}")
                 rows += 1
                 submission_id = _required_text(row, "Submission ID", line)
-                common_name = _required_text(row, "Common Name", line)
-                scientific_name = _required_text(row, "Scientific Name", line)
+                common_name = _species_name(row, "Common Name", line)
+                scientific_name = _species_name(row, "Scientific Name", line)
                 observed_on_text = _required_text(row, "Date", line)
                 observed_on = _parse_date(observed_on_text, f"date on row {line}")
                 fingerprint = hashlib.sha256(submission_id.encode()).hexdigest()
@@ -435,6 +454,18 @@ def _parse_archive(
                 species_by_name[scientific_name] = species
         except csv.Error as exc:
             raise DataSourceError("Invalid eBird archive CSV") from exc
+        except UnicodeDecodeError as exc:
+            raise DataSourceError(
+                "This file is not an eBird export: it is not UTF-8 text"
+                if line is None
+                else f"eBird archive is not UTF-8 text near row {line + 1}"
+            ) from exc
+        except (zlib.error, zipfile.BadZipFile, EOFError) as exc:
+            raise DataSourceError(
+                "This eBird export is damaged; download it again"
+                if line is None
+                else f"This eBird export is damaged near row {line + 1}; download it again"
+            ) from exc
     if rows == 0 or not builders:
         raise DataSourceError("eBird archive contains no observation rows")
     checklists = {
