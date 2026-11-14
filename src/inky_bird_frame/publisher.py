@@ -1246,7 +1246,8 @@ def _remote_repository(remote_url: str) -> str | None:
     return match.group("repository") if match is not None else None
 
 
-def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> str:
+def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> tuple[str, str]:
+    """Return the repository and the signed-in account that publishes to it."""
     if checkout.is_symlink() or not checkout.is_dir():
         raise CatalogPublishError(f"Repository checkout does not exist: {checkout}")
     repository = publication.repository
@@ -1282,8 +1283,16 @@ def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> str:
             ) from exc
         raise
     if authenticated.casefold() != owner.casefold():
-        raise CatalogPublishError(f"GitHub CLI must be authenticated as repository owner {owner!r}")
-    return repository
+        # An organisation is never the signed-in account; its administrators can still merge.
+        administrator = _gh(
+            publication, "api", f"repos/{repository}", "--jq", ".permissions.admin"
+        ).stdout.strip()
+        if administrator != "true":
+            raise CatalogPublishError(
+                f"GitHub CLI must be authenticated as repository owner {owner!r} "
+                f"or an administrator of {repository}"
+            )
+    return repository, authenticated
 
 
 def _commit_message(published: list[dict[str, object]]) -> str:
@@ -1429,10 +1438,11 @@ def _cleanup_stale_publications(
     checkout: Path,
     publication: PublicCatalogConfig,
     repository: str,
+    publisher: str,
     *,
     keep: str | None,
 ) -> list[str]:
-    """Close the owner's abandoned publication PRs and delete their branches."""
+    """Close the publishing account's abandoned publication PRs and delete their branches."""
     heads = _git(
         checkout,
         "ls-remote",
@@ -1447,7 +1457,7 @@ def _cleanup_stale_publications(
         if _PUBLICATION_BRANCH.fullmatch(name) is not None and name != keep:
             branches[name] = head
 
-    owner = repository.split("/", maxsplit=1)[0].casefold()
+    owner = publisher.casefold()
     cleaned: list[str] = []
     for name in sorted(branches):
         raw = _gh(
@@ -1614,7 +1624,7 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
         cleaned_work_directories = (
             0 if dry_run else _cleanup_abandoned_publish_work_locked(work_parent)
         )
-        repository = _validate_checkout(checkout, publication)
+        repository, publisher = _validate_checkout(checkout, publication)
         remote_ref = f"refs/remotes/{publication.remote}/{publication.base_branch}"
         _git(
             checkout,
@@ -1676,6 +1686,7 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                     source_snapshot,
                     publication,
                     repository,
+                    publisher,
                     result,
                     dry_run=dry_run,
                 )
@@ -1701,6 +1712,7 @@ def _publish_from_worktree(
     source_snapshot: Path,
     publication: PublicCatalogConfig,
     repository: str,
+    publisher: str,
     result: dict[str, object],
     *,
     dry_run: bool,
@@ -1732,7 +1744,7 @@ def _publish_from_worktree(
     if not changed:
         if not dry_run:
             result["cleaned_publication_branches"] = _cleanup_stale_publications(
-                checkout, publication, repository, keep=None
+                checkout, publication, repository, publisher, keep=None
             )
         return result
     if not typed_published:
@@ -1749,7 +1761,7 @@ def _publish_from_worktree(
     staged_tree = _git(worktree, "write-tree").stdout.strip()
     branch = f"catalog/publish-{_catalog_digest(source_snapshot)[:8]}-{base_commit[:8]}"
     result["cleaned_publication_branches"] = _cleanup_stale_publications(
-        checkout, publication, repository, keep=branch
+        checkout, publication, repository, publisher, keep=branch
     )
     remote_branch = _git(
         checkout,

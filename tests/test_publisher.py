@@ -298,6 +298,8 @@ class _FakeGitHub:
         self.merged_commits: list[str] = []
         self.fail_next_merge = False
         self.fail_next_create = False
+        self.login = "example"
+        self.admin = "false"
 
     def add_pull_request(self, branch: str, *, author: str = "example") -> dict[str, object]:
         number = len(self.pull_requests) + 1
@@ -329,7 +331,10 @@ class _FakeGitHub:
         self.calls.append(arguments)
         stdout = ""
         if arguments[:2] == ("api", "user"):
-            stdout = "example\n"
+            stdout = f"{self.login}\n"
+        elif arguments[:2] == ("api", f"repos/{_REPOSITORY}"):
+            self.test.assertEqual(arguments[2:], ("--jq", ".permissions.admin"))
+            stdout = f"{self.admin}\n"
         elif arguments[:2] == ("pr", "list"):
             self.test.assertEqual(arguments[arguments.index("--repo") + 1], _REPOSITORY)
             state = arguments[arguments.index("--state") + 1]
@@ -2412,6 +2417,37 @@ class PublicationRunTests(unittest.TestCase):
             self.assertEqual(
                 sorted(_remote_branches(remote)), sorted([foreign_pull, "feature/keep", "main"])
             )
+
+    def test_publishes_to_an_organisation_repository_as_one_of_its_administrators(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            fake.login = "maintainer"
+            fake.admin = "true"
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            stale = "catalog/publish-cccccccc-dddddddd"
+            _run_git(remote, "update-ref", f"refs/heads/{stale}", "refs/heads/main")
+            stale_pull = fake.add_pull_request(stale, author="maintainer")
+
+            with _github(fake):
+                result = run_catalog_publish(config)
+
+            self.assertTrue(result["merged"])
+            self.assertEqual(result["cleaned_publication_branches"], [stale])
+            self.assertEqual(stale_pull["state"], "CLOSED")
+
+    def test_refuses_an_account_that_does_not_administer_the_repository(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            fake.login = "contributor"
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+
+            with (
+                _github(fake),
+                self.assertRaisesRegex(CatalogPublishError, "administrator of"),
+            ):
+                run_catalog_publish(config)
+
+            self.assertEqual(_remote_branches(remote), ["main"])
 
     def test_keeps_a_publication_named_branch_committed_by_another_identity(self) -> None:
         with TemporaryDirectory() as temporary:
