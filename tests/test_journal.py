@@ -28,7 +28,7 @@ from inky_bird_frame.config import (
     DisplayNodeConfig,
 )
 from inky_bird_frame.controller import GenerationWork, TerminalQueueEntry
-from inky_bird_frame.ebird_archive import REQUIRED_COLUMNS as EBIRD_COLUMNS
+from inky_bird_frame.ebird_archive import EXPORT_COLUMNS as EBIRD_COLUMNS
 from inky_bird_frame.ebird_archive import import_ebird_archive
 from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.http import write_json_atomic
@@ -145,7 +145,7 @@ def test_manual_selection_retains_names_and_rejects_unknown_ids(tmp_path: Path) 
 def _import_archive(state_dir: Path, root: Path, rows: list[tuple[str, str, str, str]]) -> None:
     path = root / "MyEBirdData.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=EBIRD_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=EBIRD_COLUMNS, restval="")
         writer.writeheader()
         for submission, common, scientific, observed in rows:
             writer.writerow(
@@ -193,11 +193,9 @@ def test_retained_library_does_not_truncate_or_publish_partial_source_coverage(
     payload = json.loads(summary.read_text())
     payload["species"][1]["common_name"] = "Bad\nname"
     write_json_atomic(summary, payload, mode=0o600)
-    snapshot = service.snapshot()
-    assert len(cast(list[object], snapshot["history_coverage"])) == 1
-    assert cast(list[dict[str, object]], snapshot["history_coverage"])[0]["status"] == "unavailable"
-    assert cast(list[dict[str, object]], snapshot["birds"])[0]["retained_evidence"] == []
-    assert snapshot["unresolved_history"] == []
+    # The history itself is sound, so an unshowable summary is rebuilt from it.
+    assert service.snapshot() == snapshot
+    assert "Bad" not in summary.read_text()
 
 
 def test_browsing_art_never_claims_private_evidence_or_writes_state(tmp_path: Path) -> None:
@@ -933,6 +931,45 @@ def test_one_unreadable_operator_file_degrades_only_its_part(tmp_path: Path, par
     assert "private path" not in json.dumps(snapshot)
     assert cast(list[dict[str, object]], snapshot["collections"])[0]["label"] == "Kept"
     assert [bird["taxon_id"] for bird in cast(list[dict[str, object]], snapshot["birds"])] == [1]
+
+
+def test_unreadable_queue_refuses_changes_that_need_every_known_bird(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    app = _app_config(controller, tmp_path)
+    save_collection(controller.state_dir, revision=0, label="Kept", taxon_ids=[1])
+    (controller.state_dir / "generation-queue.json").write_bytes(b"\xff\xfe")
+    before = (controller.state_dir / "journal.json").read_bytes()
+    service = JournalService(controller, app_config=app)
+    unreadable = "^The list of birds waiting for plates could not be read.$"
+    with patch("inky_bird_frame.journal.current_config", side_effect=lambda value: value):
+        with pytest.raises(JournalError, match=unreadable):
+            service.collection_import_preview(portable_document())
+        with pytest.raises(JournalError, match=unreadable):
+            service.import_collection(
+                document=portable_document(),
+                revision=1,
+                preview_hash="0" * 64,
+                collection_id="a" * 32,
+            )
+        with pytest.raises(JournalError, match=unreadable):
+            service.favorite(revision=1, taxon_id=900, favorite=True)
+        with pytest.raises(JournalError, match=unreadable):
+            service.save_selection(revision=1, label="Later", taxon_ids=[900])
+    assert (controller.state_dir / "journal.json").read_bytes() == before
+
+
+def test_unreadable_crosswalk_refuses_changes_that_need_every_known_bird(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    _import_archive(
+        controller.state_dir, tmp_path, [("S1", "Robin", "Turdus migratorius", "2020-01-01")]
+    )
+    (controller.state_dir / "ebird-archive-taxonomy-crosswalk.json").write_bytes(b"\xff")
+    with pytest.raises(JournalError, match="^Saved species matches for this history"):
+        JournalService(controller).collection_import_preview(portable_document())
 
 
 def test_unreadable_crosswalk_marks_only_its_source_unavailable(tmp_path: Path) -> None:

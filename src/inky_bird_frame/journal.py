@@ -224,7 +224,7 @@ class JournalState:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": JOURNAL_SCHEMA,
             "revision": self.revision,
             "collections": [asdict(group) for group in self.collections],
         }
@@ -821,7 +821,7 @@ class JournalService:
         bird = next(
             (
                 bird
-                for bird in cast(list[dict[str, object]], self.snapshot()["birds"])
+                for bird in cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
                 if bird["taxon_id"] == taxon_id
             ),
             None,
@@ -853,7 +853,7 @@ class JournalService:
                 cast(str, bird["common_name"]),
                 cast(str, bird["scientific_name"]),
             )
-            for bird in cast(list[dict[str, object]], self.snapshot()["birds"])
+            for bird in cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
         }
         if any(taxon not in identities for taxon in taxa):
             raise JournalError("Choose birds from your journal or available artwork")
@@ -985,7 +985,7 @@ class JournalService:
             )
         return {
             "format": "inky-collection",
-            "schema_version": 1,
+            "schema_version": PORTABLE_SCHEMA,
             "label": group.label,
             "start_date": group.start_date,
             "end_date": group.end_date,
@@ -1005,7 +1005,7 @@ class JournalService:
             != {"format", "schema_version", "label", "start_date", "end_date", "members"}
             or document["format"] != "inky-collection"
             or type(document["schema_version"]) is not int
-            or document["schema_version"] != 1
+            or document["schema_version"] != PORTABLE_SCHEMA
         ):
             raise JournalError("Choose a supported Inky collection export")
         label = _label(document["label"])
@@ -1013,7 +1013,7 @@ class JournalService:
         raw_members = document["members"]
         if not isinstance(raw_members, list):
             raise JournalError("The collection export has no valid member list")
-        birds = cast(list[dict[str, object]], self.snapshot()["birds"])
+        birds = cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
         by_id = {bird["taxon_id"]: bird for bird in birds}
         by_scientific: dict[str, list[dict[str, object]]] = {}
         for bird in birds:
@@ -1093,12 +1093,22 @@ class JournalService:
         )
         return save_imported_collection(self.config.state_dir, revision=expected, collection=group)
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self, *, strict: bool = False) -> dict[str, object]:
+        """Owner journal projection.
+
+        The page degrades an unreadable part to a notice. ``strict`` callers use
+        the bird list as the record of which birds exist, so they refuse instead.
+        """
         if self.app_config is not None:
             self.app_config = current_config(self.app_config)
-        retained, evidence, coverage, unresolved, recent = self._retained_history()
-        # Parts the page can show without; one unreadable file must not hide the journal.
+        retained, evidence, coverage, unresolved, recent = self._retained_history(strict=strict)
         notices: list[dict[str, str]] = []
+
+        def degrade(part: str, message: str, error: Exception) -> None:
+            if strict:
+                raise JournalError(message) from error
+            notices.append({"part": part, "message": message})
+
         with catalog_state_lock(self.config.state_dir):
             state = read_journal(self.config.state_dir)
             saved = [entry.taxon_id for entry in read_collection(self.config.state_dir)]
@@ -1111,26 +1121,21 @@ class JournalService:
                 )
                 active_species = cast(list[dict[str, object]], active["species"])
                 featured = featured_plate_entry(active)
-            except (CatalogError, OSError, ValueError):
+            except (CatalogError, OSError, ValueError) as error:
                 active_species, featured = [], None
-                notices.append(
-                    {
-                        "part": "current-birds",
-                        "message": "The current wall birds could not be read. "
-                        "The next refresh writes them again.",
-                    }
+                degrade(
+                    "current-birds",
+                    "The current wall birds could not be read. The next refresh writes them again.",
+                    error,
                 )
             active_ids = [cast(int, entry["taxon_id"]) for entry in active_species]
             observed = current_discovery_species(self.app_config) if self.app_config else []
             try:
                 queued = read_generation_queue(self.app_config) if self.app_config else []
-            except (CatalogError, OSError, ValueError):
+            except (CatalogError, OSError, ValueError) as error:
                 queued = []
-                notices.append(
-                    {
-                        "part": "plate-queue",
-                        "message": "The list of birds waiting for plates could not be read.",
-                    }
+                degrade(
+                    "plate-queue", "The list of birds waiting for plates could not be read.", error
                 )
             identities = {bird.taxon_id: bird for bird in [*retained, *queued, *observed]}
             from .recovery import pending_inventory
@@ -1140,14 +1145,9 @@ class JournalService:
                 pending: dict[str, object] = (
                     pending_inventory(self.app_config) if self.app_config else unavailable
                 )
-            except (CatalogError, JournalError, OSError, ValueError):
+            except (CatalogError, JournalError, OSError, ValueError) as error:
                 pending = unavailable
-                notices.append(
-                    {
-                        "part": "plates-in-review",
-                        "message": "Plates waiting for review could not be read.",
-                    }
-                )
+                degrade("plates-in-review", "Plates waiting for review could not be read.", error)
             for candidate in cast(list[dict[str, object]], pending["candidates"]):
                 id = cast(int, candidate["taxon_id"])
                 if candidate["inspect_available"] and id not in identities:
@@ -1222,14 +1222,13 @@ class JournalService:
                 bird["retained_evidence"] = evidence.get(cast(int, bird["taxon_id"]), [])
             try:
                 management = self.management(approved=approved_ids, pending=pending)
-            except (CatalogError, JournalError, OSError, ValueError):
+            except (CatalogError, JournalError, OSError, ValueError) as error:
                 management = {"available": False}
-                notices.append(
-                    {
-                        "part": "plate-work",
-                        "message": "Plate work could not be read. Manage shows it again "
-                        "once its files are readable.",
-                    }
+                degrade(
+                    "plate-work",
+                    "Plate work could not be read. Manage shows it again "
+                    "once its files are readable.",
+                    error,
                 )
             result = {
                 "revision": state.revision,
@@ -1270,6 +1269,7 @@ class JournalService:
         cached = self._evidence_cache
         if cached is not None and cached[0] == key:
             return [[dict(row) for row in rows] for rows in cached[1]]
+        cacheable = True
         try:
             _, records = read_ebird_checklists(self.config.state_dir)
             available = path.is_file()
@@ -1280,6 +1280,8 @@ class JournalService:
             }
         except DataSourceError:
             available, links = False, {}
+            # A passing failure must not outlive an unchanged file.
+            cacheable = False
         evidence: list[list[dict[str, object]]] = [
             [
                 {
@@ -1296,11 +1298,12 @@ class JournalService:
             ]
             for group in state.collections
         ]
-        self._evidence_cache = (key, evidence)
+        if cacheable:
+            self._evidence_cache = (key, evidence)
         return [[dict(row) for row in rows] for rows in evidence]
 
     def _retained_history(
-        self,
+        self, *, strict: bool = False
     ) -> tuple[
         list[BirdSpecies],
         dict[int, list[dict[str, object]]],
@@ -1428,6 +1431,10 @@ class JournalService:
                         "Inspect this source before importing or restoring.",
                     }
                 )
+        if strict:
+            for row in coverage:
+                if row["status"] == "unavailable":
+                    raise JournalError(cast(str, row["coverage"]))
         recent = [
             {"taxon_id": id, "last_noted": noted, "source": source}
             for id, (noted, source) in sorted(
