@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import plistlib
@@ -517,6 +518,81 @@ def test_native_oidc_secret_is_serving_only_in_systemd_and_private_launchd(tmp_p
     assert scheduler["EnvironmentVariables"]["SSL_CERT_FILE"] == str(bundle)
 
 
+def _exec_start(unit: str) -> str:
+    return next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+
+
+def test_dollar_signs_in_service_commands_stay_literal(tmp_path: Path) -> None:
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = load_config(write_config(tmp_path, codex))
+    executable = Path("/opt/a$HOME/${USER}/inky-bird")
+    app_dir = Path("/opt/app$dir")
+    config_path = Path("/etc/inky/$config.toml")
+    units = controller_systemd_units(
+        config,
+        executable=executable,
+        app_dir=app_dir,
+        config_path=config_path,
+        home=tmp_path,
+        user="frame",
+    )
+    units.update(
+        display_systemd_units(
+            config, executable=executable, app_dir=app_dir, config_path=config_path, user="frame"
+        )
+    )
+    commands = [_exec_start(unit) for name, unit in units.items() if name.endswith(".service")]
+    assert len(commands) == 4
+    for command in commands:
+        # systemd expands $NAME and ${NAME} in ExecStart; $$ is one literal dollar.
+        assert '"/opt/a$$HOME/$${USER}/inky-bird"' in command
+        assert '"/etc/inky/$$config.toml"' in command
+        assert command.replace("$$", "").count("$") == 0
+    # Other directives do not expand variables, so they keep the path unchanged.
+    assert "WorkingDirectory=/opt/app$dir\n" in units["inky-bird-frame-controller.service"]
+
+
+@pytest.mark.parametrize(
+    ("controller", "expected_seconds"),
+    [
+        # Five species x (three attempts x generate+review, plus profile and refresh).
+        ("", 5 * (3 * 2 + 2) * 1200 + 900),
+        ("max_species_attempts_per_cycle = 1\nmax_generation_attempts = 1\n", 4 * 1200 + 900),
+        ("max_species_attempts_per_cycle = 2\nmax_generation_attempts = 5\n", 2 * 12 * 1200 + 900),
+    ],
+)
+def test_generate_unit_timeout_covers_the_configured_cycle(
+    tmp_path: Path, controller: str, expected_seconds: int
+) -> None:
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    path = write_config(tmp_path, codex)
+    text = path.read_text().replace("max_generation_attempts = 3\n", "")
+    if "max_generation_attempts" not in controller:
+        controller += "max_generation_attempts = 3\n"
+    path.write_text(text.replace("[controller]\n", f"[controller]\n{controller}"))
+    units = controller_systemd_units(
+        load_config(path),
+        executable=Path("/opt/inky-bird"),
+        app_dir=tmp_path,
+        config_path=path,
+        home=tmp_path,
+        user="frame",
+    )
+    assert f"TimeoutStartSec={expected_seconds}s\n" in units["inky-bird-frame-generate.service"]
+    assert "TimeoutStartSec=30min\n" in units["inky-bird-frame-refresh.service"]
+    assert expected_seconds > 30 * 60
+
+
+def test_generate_unit_budget_matches_the_agent_call_limit() -> None:
+    from inky_bird_frame.codex_runner import CodexRunner
+    from inky_bird_frame.installation import CODEX_CALL_TIMEOUT_SECONDS
+
+    default = inspect.signature(CodexRunner).parameters["timeout_seconds"].default
+    assert default == CODEX_CALL_TIMEOUT_SECONDS
+
+
 class InstallationTests(unittest.TestCase):
     def test_controller_executable_path_prepends_and_deduplicates_codex_directory(
         self,
@@ -660,7 +736,7 @@ class InstallationTests(unittest.TestCase):
             units["inky-bird-frame-controller.service"],
         )
         self.assertIn(
-            '"/opt/inky bird/$bin/inky-bird-frame"',
+            '"/opt/inky bird/$$bin/inky-bird-frame"',
             units["inky-bird-frame-controller.service"],
         )
         self.assertIn(
@@ -731,8 +807,8 @@ display_startup_delay_seconds = 30
         timer = units["inky-bird-frame-display.timer"]
         self.assertEqual(len(units), 2)
         self.assertIn("WorkingDirectory=/home/frame/Inky Bird Frame", service)
-        self.assertIn('"/home/frame/Pimoroni $Env/bin/inky-bird-frame"', service)
-        self.assertIn('"/home/frame/$config.toml"', service)
+        self.assertIn('"/home/frame/Pimoroni $$Env/bin/inky-bird-frame"', service)
+        self.assertIn('"/home/frame/$$config.toml"', service)
         self.assertIn("OnActiveSec=30s", timer)
         self.assertIn("OnUnitActiveSec=180s", timer)
         self.assertIn("RandomizedDelaySec=7s", timer)

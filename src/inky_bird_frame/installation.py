@@ -27,6 +27,10 @@ from .native_names import LEGACY_NAME, resolve_native_layout, service_family
 from .notifications import notification_state_path, notification_status
 
 SUDO_AUTHORIZATION_TIMEOUT_SECONDS = 300
+# CodexRunner's default per-call limit; a test keeps the two equal.
+CODEX_CALL_TIMEOUT_SECONDS = 1200
+# Discovery refresh, reference downloads and stopping the agent cleanly.
+GENERATION_UNIT_MARGIN_SECONDS = 900
 INSTALLER_TIMEOUT_SECONDS = 3600
 # One native sign-in credential, bounded below normal OS environment limits.
 MAX_NATIVE_ACCESS_BYTES = 64 * 1024
@@ -141,6 +145,11 @@ def _systemd_literal(value: str) -> str:
 def _systemd_quote(value: str) -> str:
     escaped = _systemd_literal(value).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _systemd_argument(value: str) -> str:
+    # ExecStart expands $NAME and ${NAME}; other directives used here do not.
+    return _systemd_quote(value).replace("$", "$$")
 
 
 def controller_executable_path(codex_path: Path, *, generation_enabled: bool = True) -> str:
@@ -265,6 +274,15 @@ def native_tls_environment(config_path: Path) -> dict[str, str]:
     return {"SSL_CERT_FILE": str(bundle)}
 
 
+def generation_cycle_timeout_seconds(config: AppConfig) -> int:
+    """Bound one generation cycle by the agent calls its configuration allows."""
+    # Each species may need a profile, one profile refresh, and per attempt one
+    # generation and one review. Deferred species still count toward the cap.
+    calls_per_species = 2 + 2 * config.controller.max_generation_attempts
+    calls = config.controller.max_species_attempts_per_cycle * calls_per_species
+    return calls * CODEX_CALL_TIMEOUT_SECONDS + GENERATION_UNIT_MARGIN_SECONDS
+
+
 def controller_systemd_units(
     config: AppConfig,
     *,
@@ -299,7 +317,7 @@ def controller_systemd_units(
     )
 
     def command(*arguments: str) -> str:
-        return " ".join(_systemd_quote(argument) for argument in (str(executable), *arguments))
+        return " ".join(_systemd_argument(argument) for argument in (str(executable), *arguments))
 
     serving = common + owner_environment + SYSTEMD_SERVICE_HARDENING
     units = {
@@ -344,6 +362,7 @@ WantedBy=multi-user.target
             config.notifications.enabled,
         ),
     )
+    timeouts = {"generate": f"{generation_cycle_timeout_seconds(config)}s"}
     for name, minutes, enabled in jobs:
         if not enabled:
             continue
@@ -366,7 +385,7 @@ Description=Run the Inky Bird {name} cycle
 [Service]
 Type=oneshot
 {common}ExecStart={command(*arguments)}
-TimeoutStartSec=30min
+TimeoutStartSec={timeouts.get(name, "30min")}
 """
         units[f"{service_prefix}-{name}.timer"] = f"""[Unit]
 Description=Schedule the Inky Bird {name} cycle
@@ -394,8 +413,8 @@ def display_systemd_units(
     """Render the display service and timer from validated configuration."""
     service_prefix = service_family(service_prefix)
     exec_start = (
-        f"{_systemd_quote(str(executable))} display-cycle "
-        f"--config {_systemd_quote(str(config_path))}"
+        f"{_systemd_argument(str(executable))} display-cycle "
+        f"--config {_systemd_argument(str(config_path))}"
     )
     tls_environment = "".join(
         f"Environment={_systemd_quote(f'{name}={value}')}\n"
