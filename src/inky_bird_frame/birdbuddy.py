@@ -1456,6 +1456,15 @@ def _postcard_payload(postcard: BirdBuddyPostcard) -> dict[str, object]:
     }
 
 
+def _history_content(histories: dict[str, FeederHistory]) -> dict[str, object]:
+    return _history_payload(
+        {
+            feeder_id: replace(history, last_successful_sync_at=None)
+            for feeder_id, history in histories.items()
+        }
+    )
+
+
 def _history_payload(histories: dict[str, FeederHistory]) -> dict[str, object]:
     return {
         "schema_version": HISTORY_SCHEMA_VERSION,
@@ -1771,6 +1780,7 @@ def _update_history(
     lock = _history_lock(state_dir) if persist else nullcontext()
     with lock:
         histories = _read_history(state_dir)
+        content_before = _history_content(histories) if persist else None
         history = histories.get(
             feeder_id,
             FeederHistory(current_iso, None, None, {}, {}, {}),
@@ -1860,9 +1870,13 @@ def _update_history(
         if persist:
             path = _history_path(state_dir)
             # The feed is short-lived, so archived counts cannot be rebuilt;
-            # keep the last readable version beside the new one.
-            if path.exists():
-                write_bytes_atomic(_previous_history_path(state_dir), path.read_bytes(), mode=0o600)
+            # keep the last readable version beside the new one. A sync that
+            # changes only its own time leaves the earlier copy in place.
+            previous_path = _previous_history_path(state_dir)
+            if path.exists() and (
+                not previous_path.exists() or _history_content(histories) != content_before
+            ):
+                write_bytes_atomic(previous_path, path.read_bytes(), mode=0o600)
             write_json_atomic(path, _history_payload(histories), mode=0o600)
     return _HistoryUpdate(
         history,

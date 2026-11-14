@@ -601,6 +601,56 @@ class HistoryFileTests(BirdBuddyResilienceTestCase):
         self.assertEqual(mode, 0o600)
         self.assertEqual(after_preview, first)
 
+    def test_previous_history_is_rewritten_only_when_the_history_changes(self) -> None:
+        def sync_at(state_dir: Path, minute: int, api: FakeBirdBuddyApi) -> None:
+            with patch("inky_bird_frame.birdbuddy._graphql_request", side_effect=api):
+                sync_birdbuddy_detections(
+                    state_dir,
+                    window=ObservationWindow.ALL_TIME,
+                    limit=20,
+                    now=datetime(2026, 8, 3, 12, minute, tzinfo=UTC),
+                )
+
+        one_postcard = FakeBirdBuddyApi(
+            page(node("postcard-1", species=BLUEBIRD)),
+            page(node("postcard-1", variant="SightingRecognizedBirdUnlocked")),
+        )
+        two_postcards = FakeBirdBuddyApi(
+            page(
+                node("postcard-1", species=BLUEBIRD),
+                node("postcard-2", created_at="2026-08-03T11:00:00+00:00", species=BLUEBIRD),
+            ),
+            page(
+                node("postcard-1", variant="SightingRecognizedBirdUnlocked"),
+                node(
+                    "postcard-2",
+                    created_at="2026-08-03T11:00:00+00:00",
+                    variant="SightingRecognizedBirdUnlocked",
+                ),
+            ),
+        )
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in(state_dir)
+            history = state_dir / "birdbuddy-detections.json"
+            previous = state_dir / "birdbuddy-detections.json.previous"
+            sync_at(state_dir, 0, one_postcard)
+            first = history.read_bytes()
+            sync_at(state_dir, 15, one_postcard)
+            kept_after_second = previous.read_bytes()
+            second = history.read_bytes()
+            sync_at(state_dir, 30, one_postcard)
+            kept_after_unchanged = previous.read_bytes()
+            third = history.read_bytes()
+            sync_at(state_dir, 45, two_postcards)
+            kept_after_change = previous.read_bytes()
+
+        self.assertEqual(kept_after_second, first)
+        # Only the sync time changed, so the earlier copy is still a full backup.
+        self.assertNotEqual(third, second)
+        self.assertEqual(kept_after_unchanged, first)
+        self.assertEqual(kept_after_change, third)
+
     def test_invalid_history_names_the_failing_section(self) -> None:
         valid_feeder: dict[str, object] = {
             "history_started_at": "2026-08-01T00:00:00+00:00",
