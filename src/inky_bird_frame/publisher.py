@@ -26,6 +26,7 @@ from .catalog import (
     clear_catalog_staging,
     has_passing_sourced_review,
     is_bounded_generation,
+    mentions_private_text,
     read_catalog_entries,
     read_json,
     rebuild_catalog_index,
@@ -234,10 +235,8 @@ def _check_json_privacy(
         for child in value:
             _check_json_privacy(child, source, private_patterns)
         return
-    if isinstance(value, str) and private_patterns:
-        folded = value.casefold()
-        if any(pattern.search(folded) is not None for pattern in private_patterns):
-            raise CatalogPublishError(f"Private location or path text found in {source}")
+    if isinstance(value, str) and mentions_private_text(value, private_patterns):
+        raise CatalogPublishError(f"Private location or path text found in {source}")
     if isinstance(value, str) and (
         value.startswith("file://")
         or Path(value).is_absolute()
@@ -415,9 +414,13 @@ def _validate_species_directory(
     return taxon_id, slug
 
 
-def validate_pending_candidate(directory: Path) -> None:
+def validate_pending_candidate(
+    directory: Path, *, private_patterns: tuple[re.Pattern[str], ...] = ()
+) -> None:
     """Use the publication gates before ordinary owner approval, without legacy bypasses."""
-    _validate_species_directory(directory, expected_status="pending")
+    _validate_species_directory(
+        directory, expected_status="pending", private_patterns=private_patterns
+    )
     manifest = read_json(directory / "manifest.json")
     if not isinstance(manifest, dict):
         raise CatalogPublishError("Pending profile is invalid")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -368,6 +369,38 @@ class CatalogTests(unittest.TestCase):
                 index_after = (catalog / "index.json").read_bytes()
 
                 self.assertEqual(index_after, index_before)
+
+    def test_approval_refuses_text_with_private_terms_and_keeps_the_candidate(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        private = (re.compile("exampleville"),)
+        for filename in ("manifest.json", "profile.json", "quality-review.json"):
+            with self.subTest(filename=filename), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = root / "state"
+                catalog = root / "catalog"
+                candidate = make_candidate(state, species, review)
+                manifest = read_json(candidate / "manifest.json")
+                assert isinstance(manifest, dict)
+                if filename == "manifest.json":
+                    manifest["profile"]["habitat"] = "Gardens of Exampleville"
+                    write_json_atomic(candidate / "manifest.json", manifest)
+                else:
+                    payload = manifest[
+                        "profile" if filename == "profile.json" else "quality_review"
+                    ]
+                    payload = {**payload, "note": "Seen near EXAMPLEVILLE station"}
+                    write_json_atomic(candidate / filename, payload)
+
+                with self.assertRaisesRegex(CandidateApprovalError, "location or a local path"):
+                    approve_candidate(state, catalog, species.taxon_id, private_patterns=private)
+                pending_kept = (candidate / "manifest.json").is_file()
+                catalog_entry = (catalog / "species/7513-carolina-wren").exists()
+
+                self.assertTrue(pending_kept)
+                self.assertFalse(catalog_entry)
+                approve_candidate(state, catalog, species.taxon_id)
+                self.assertTrue(has_valid_approved_candidate(catalog, species.taxon_id))
 
     def test_truncated_pending_image_is_refused_before_anything_is_staged(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")

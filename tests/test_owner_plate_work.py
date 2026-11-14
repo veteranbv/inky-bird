@@ -150,7 +150,14 @@ def test_pending_review_uses_publication_gates_and_exact_candidate_binding(tmp_p
 
 @pytest.mark.parametrize(
     "problem",
-    ["missing-sources", "incomplete-profile", "malformed-source", "extra-file", "private-metadata"],
+    [
+        "missing-sources",
+        "incomplete-profile",
+        "malformed-source",
+        "extra-file",
+        "private-metadata",
+        "private-path-text",
+    ],
 )
 def test_invalid_candidates_cannot_bypass_ordinary_approval(tmp_path: Path, problem: str) -> None:
     application = config(tmp_path)
@@ -164,6 +171,9 @@ def test_invalid_candidates_cannot_bypass_ordinary_approval(tmp_path: Path, prob
         manifest["profile"]["sources"][0]["url"] = "https://["
     elif problem == "extra-file":
         (root / "private.env").write_text("MUST_NOT_PROJECT")
+    elif problem == "private-path-text":
+        # Publication would leave this plate out, so approval refuses it first.
+        manifest["profile"]["habitat"] = f"Seen from {application.controller.state_dir}"
     else:
         manifest["password"] = "MUST_NOT_PROJECT"
     write_json_atomic(root / "manifest.json", manifest)

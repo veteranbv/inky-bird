@@ -36,7 +36,7 @@ from .errors import CatalogError, CatalogPublishError, GenerationError, SpeciesS
 from .http import MAX_ASSET_BYTES
 from .journal import MAX_JOURNAL_BYTES, JournalConflictError, JournalError
 from .models import ProfileConflict, SpeciesProfileData
-from .publisher import validate_pending_candidate
+from .publisher import publication_privacy_patterns, validate_pending_candidate
 from .retry import RetryStore, parse_retry_profile_conflicts
 
 
@@ -158,7 +158,7 @@ def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
         path, manifest, _, revision = _pending_candidate(config, taxon_id)
         ready = True
         try:
-            validate_pending_candidate(path)
+            validate_pending_candidate(path, private_patterns=publication_privacy_patterns(config))
         except (CatalogPublishError, CatalogError, OSError, ValueError):
             ready = False
         profile: SpeciesProfileData | None
@@ -241,14 +241,20 @@ def decide_pending_candidate(
                 "operator migration workflow."
             )
         if approve:
+            private_patterns = publication_privacy_patterns(config)
             try:
-                validate_pending_candidate(path)
+                validate_pending_candidate(path, private_patterns=private_patterns)
             except (CatalogPublishError, CatalogError, OSError, ValueError) as exc:
                 raise JournalError(
                     "This candidate cannot pass ordinary approval. "
                     "Use operator recovery without bypassing review."
                 ) from exc
-            approve_candidate(config.controller.state_dir, config.controller.catalog_dir, taxon_id)
+            approve_candidate(
+                config.controller.state_dir,
+                config.controller.catalog_dir,
+                taxon_id,
+                private_patterns=private_patterns,
+            )
         else:
             if not reason.strip() or len(reason) > 2000:
                 raise JournalError("Give a rejection reason of 1–2000 characters")

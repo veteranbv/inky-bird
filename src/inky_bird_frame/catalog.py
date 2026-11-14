@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -719,6 +720,35 @@ def _validate_pending_candidate_files(
     _verify_candidate_images(source)
 
 
+def mentions_private_text(value: object, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    """Whether any string inside a JSON value matches a casefolded privacy pattern."""
+    if isinstance(value, dict):
+        return any(mentions_private_text(child, patterns) for child in value.values())
+    if isinstance(value, list):
+        return any(mentions_private_text(child, patterns) for child in value)
+    if isinstance(value, str):
+        folded = value.casefold()
+        return any(pattern.search(folded) is not None for pattern in patterns)
+    return False
+
+
+def _refuse_private_text(source: Path, patterns: tuple[re.Pattern[str], ...]) -> None:
+    if not patterns:
+        return
+    for filename in sorted(SPECIES_FILENAMES - set(ASSET_FILENAMES.values())):
+        path = source / filename
+        if not path.is_file():
+            continue
+        try:
+            payload = read_json(path)
+        except CatalogError as exc:
+            raise CandidateApprovalError(f"Candidate {source.name} has unreadable JSON") from exc
+        if mentions_private_text(payload, patterns):
+            raise CandidateApprovalError(
+                f"Candidate {source.name} mentions this controller's location or a local path"
+            )
+
+
 def _discard_pending(source: Path) -> None:
     # Drop the manifest first: an interrupted removal then leaves an incomplete
     # directory that no reader treats as a candidate to approve.
@@ -727,7 +757,14 @@ def _discard_pending(source: Path) -> None:
     fsync_directory(source.parent)
 
 
-def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> CatalogEntry:
+def approve_candidate(
+    state_dir: Path,
+    catalog_dir: Path,
+    taxon_id: int,
+    *,
+    private_patterns: tuple[re.Pattern[str], ...] = (),
+) -> CatalogEntry:
+    """Approve one pending plate; ``private_patterns`` are publication's privacy terms."""
     source = find_taxon_directory(state_dir / "pending", taxon_id)
     if source is None:
         raise CatalogError(f"No pending candidate exists for taxon {taxon_id}")
@@ -770,6 +807,7 @@ def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> Cata
     # Verify the candidate before anything is staged: an unverified copy would
     # replace the only retained plate with an entry that blocks every reader.
     _validate_pending_candidate_files(source, manifest, taxon_id)
+    _refuse_private_text(source, private_patterns)
     if destination.exists():
         # Debris from an interrupted legacy copy, or the same candidate copied
         # incompletely: never a valid approval, so approve again.
