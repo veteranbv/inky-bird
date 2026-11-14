@@ -673,3 +673,50 @@ def test_display_rejected_configuration_changes_nothing(tmp_path: Path) -> None:
     assert not any(call[:2] == ["pip", "install"] for call in host.calls())
     assert host.state_of("pip") == {"inky-bird": {"source": str(host.app)}}
     assert host.runtime_dirs() == []
+
+
+# Uninstallers ----------------------------------------------------------------
+
+
+def test_linux_uninstaller_reports_a_unit_it_could_not_remove(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_units(
+        controller_service="active", refresh_service="inactive", refresh_timer="active"
+    )
+    host.fail(f"systemctl:disable:{host.family}-refresh.timer")
+    result = host.run("uninstall-controller-systemd.sh")
+    assert result.returncode == 1
+    assert f"{host.family}-refresh.timer" in result.stderr
+    assert "Controller services uninstalled." not in result.stdout
+    assert host.unit_state("controller.service")["active"] is False
+
+
+def test_linux_uninstaller_succeeds_when_units_are_absent(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_units(controller_service="active")
+    result = host.run("uninstall-controller-systemd.sh")
+    assert result.returncode == 0, result.stderr
+    assert "Controller services uninstalled." in result.stdout
+    assert not (host.units / f"{host.family}-controller.service").exists()
+    assert host.config.exists()
+
+
+def test_macos_uninstaller_reports_an_agent_it_could_not_stop(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    host.load_agents("serve", "refresh")
+    host.fail("bootout:com.inky-bird.serve")
+    result = host.run("uninstall-controller.sh", shell=MACOS_BASH)
+    assert result.returncode == 1
+    assert "com.inky-bird.serve" in result.stderr
+    assert "Controller LaunchAgents uninstalled." not in result.stdout
+    assert "refresh" not in host.loaded_agents()
+
+
+def test_display_uninstaller_reports_a_unit_it_could_not_remove(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_units(display_service="inactive", display_timer="active")
+    host.fail("sudo:rm")
+    result = host.run("uninstall-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    assert result.returncode == 1
+    assert f"{host.family}-display" in result.stderr
+    assert "Display node services uninstalled." not in result.stdout

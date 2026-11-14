@@ -262,9 +262,8 @@ def test_systemd_controller_uninstaller_removes_units_and_preserves_data() -> No
 
     assert "set -euo pipefail" in script
     assert "for name in refresh generate catalog-publish notifications; do" in script
-    assert 'sudo systemctl disable --now "${timer}"' in script
-    assert 'sudo systemctl disable --now "${service_prefix}-controller.service"' in script
-    assert 'sudo systemctl disable --now "${service_prefix}-scheduler.service"' in script
+    assert 'disable_unit "${service_prefix}-controller.service"' in script
+    assert 'disable_unit "${service_prefix}-scheduler.service"' in script
     assert (
         "for name in controller scheduler refresh generate catalog-publish notifications; do"
         in script
