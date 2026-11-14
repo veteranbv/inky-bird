@@ -1633,12 +1633,6 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                 publication_privacy_patterns(config),
             )
             validate_public_catalog(source_snapshot)
-            if not _species_directories(source_snapshot / "species"):
-                if not dry_run:
-                    result["cleaned_publication_branches"] = _cleanup_stale_publications(
-                        checkout, publication, repository, keep=None
-                    )
-                return result
 
             worktree = Path(temporary) / "checkout"
             _git(
@@ -1707,7 +1701,7 @@ def _publish_from_worktree(
             "--",
             "catalog",
         ).stdout.strip()
-    )
+    ) and bool(_species_directories(source_snapshot / "species"))
     result.update(sync)
     result["changed"] = changed
     if not changed:

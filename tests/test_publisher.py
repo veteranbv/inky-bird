@@ -2206,15 +2206,32 @@ class PublicationRunTests(unittest.TestCase):
             lambda catalog: damage(catalog / "species/1-example-bird"), "1-example-bird"
         )
 
+    def test_rejects_a_damaged_remote_catalog_when_nothing_is_approved_locally(self) -> None:
+        def add_stray_file(catalog: Path) -> None:
+            (catalog / "notes.txt").write_text("unexpected")
+
+        self._assert_damaged_remote_catalog_is_not_reported_published(
+            add_stray_file,
+            "Unexpected catalog root entries.*notes.txt",
+            empty_local_catalog=True,
+        )
+
     def _assert_damaged_remote_catalog_is_not_reported_published(
-        self, damage: Callable[[Path], None], reason: str
+        self,
+        damage: Callable[[Path], None],
+        reason: str,
+        *,
+        empty_local_catalog: bool = False,
     ) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             remote, _, config, fake = self._environment(root)
-            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+            species = _create_species(config.controller.catalog_dir, 1, "Example Bird")
             with _github(fake):
                 run_catalog_publish(config)
+            if empty_local_catalog:
+                shutil.rmtree(species)
+                rebuild_catalog_index(config.controller.catalog_dir)
             editor = root / "editor"
             subprocess.run(
                 ["git", "clone", "--branch", "main", str(remote), str(editor)],
