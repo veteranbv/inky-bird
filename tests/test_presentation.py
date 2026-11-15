@@ -236,9 +236,9 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
         TestClient(create_app(config), base_url=ORIGIN) as owner,
         TestClient(create_app(config), base_url=ORIGIN) as screen,
     ):
-        assert (
-            screen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN}).status_code == 401
-        )
+        # Pairing is off until the owner exists: not a sign-in problem.
+        early = screen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+        assert (early.status_code, early.json()["error"]["code"]) == (403, "feature_unavailable")
         AccessStore(config.state_dir).setup_owner("fixture-owner", "long synthetic password")
         login = owner.post(
             "/v1/owner/login",
@@ -277,7 +277,11 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
         assert plate.headers["cache-control"] == "private, max-age=31536000, immutable"
         assert screen.get("/v1/owner/journal").status_code == 401
         assert screen.get("/v1/screen/plates/999?revision=" + "a" * 64).status_code == 404
-        assert screen.get("/v1/dashboard/art").status_code == 401
+        art_off = screen.get("/v1/dashboard/art")
+        assert (art_off.status_code, art_off.json()["error"]["code"]) == (
+            403,
+            "feature_unavailable",
+        )
         assert (
             owner.post(
                 "/v1/owner/presentation",
@@ -400,10 +404,14 @@ def test_local_owner_access_does_not_permit_plain_lan_screen_credentials(tmp_pat
     with TestClient(create_app(config), base_url=origin, client=("192.168.1.20", 41000)) as client:
         assert client.get("/v1/access").status_code == 200
         result = client.post("/v1/screen/pair", json={}, headers={"Origin": origin})
-        assert result.status_code == 401
+        assert (result.status_code, result.json()["error"]["code"]) == (
+            403,
+            "secure_access_required",
+        )
         assert "HTTPS or" in result.json()["error"]["message"]
         assert "inky-local-screen" not in client.cookies
-        assert client.get("/v1/screen/view").status_code == 401
+        view = client.get("/v1/screen/view")
+        assert (view.status_code, view.json()["error"]["code"]) == (403, "secure_access_required")
         assert access.status()["grants"] == []
 
 
