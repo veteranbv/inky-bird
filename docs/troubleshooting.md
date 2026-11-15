@@ -43,7 +43,7 @@ installations exist", it lists what it found for each name. Keep the
 installation you use. For the other one, remove its services (see
 [Uninstall](installation.md#uninstall)) and move its folders aside, for example
 by renaming them, once you no longer need their data. Then run the command
-again. Leftover data alone no longer blocks the name whose services are
+again. Leftover data alone does not block the name whose services are
 installed, or the name whose support folder holds the configuration you passed
 to setup.
 
@@ -134,8 +134,10 @@ could not be loaded" notice through the last good destinations. Run
 `"$IBF" config validate --config "$CONFIG"`, fix the file, and the jobs resume.
 
 A scheduler that starts with a broken file, for example after a reboot or a
-restart that followed a hand edit, exits `1` and is restarted by systemd,
-launchd or Docker every few seconds, with no notice. Check the service status
+restart that followed a hand edit, exits `1` and is restarted with no notice:
+about every 10 seconds by systemd or launchd, and by Docker after a delay that
+starts short and doubles with each failure. Only a break while the scheduler is
+already running sends the notice above. Check the service status
 and its log, then fix the file.
 
 ### `codex_executable` fails
@@ -208,9 +210,21 @@ An eBird response can take longer than other providers, so its recent-observatio
 request has a separate 90-second limit. The eBird provider's private `details`
 reports `http_duration_ms` for both successes and request failures. If eBird
 still times out, check that duration before changing the configured radius or
-window. The notification comparison does not hold failed-provider observations
-in the active catalog; their return after recovery no longer produces a
-duplicate discovery notice.
+window. A failed provider's last birds stay in the active catalog for three
+refresh intervals (see [Multiple providers](discovery.md#multiple-providers)),
+and their return after recovery does not produce a duplicate discovery notice.
+
+Unless a caller sets its own deadline, an outbound request, redirects
+included, also ends after four times its per-read timeout: for example 40
+seconds for a default 10-second request, and 240 seconds for the display's
+60-second plate download. The trip preview's name lookups share one 60-second
+deadline. A response shorter than
+the length it declared is an error, not a truncated result.
+
+If Bird Buddy reports "Bird Buddy asked Inky to slow down; Inky will try again
+after …", Inky is waiting as Bird Buddy asked and sends no request until then.
+Wait, or see [Bird Buddy setup](discovery.md#bird-buddy-setup) for how long the
+wait lasts.
 
 ### A source shows a bird, but the frame does not change
 

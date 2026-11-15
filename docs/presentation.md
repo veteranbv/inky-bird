@@ -47,9 +47,13 @@ presentation. For a tablet that should keep running, pair it instead.
 
 The code identifies a request. It cannot approve one or sign anyone in as the
 owner. Requests expire after ten minutes. Inky keeps at most eight pending
-requests and 32 current screen/status credentials in total. New unrelated
-pairing requests are rate-limited to one per 15 seconds. Existing requests can
-resume without consuming another slot.
+requests and 32 current screen/status credentials in total; once eight are
+waiting, new requests are refused until one is approved, removed or expires.
+Each network address may start a new request once every 15 seconds. That pause
+is kept in memory and resets when the controller restarts. Behind a reverse
+proxy every screen arrives from the proxy's address, so they share one pause,
+unless `trusted_proxy_addresses` names the proxy.
+Existing requests can resume without consuming another slot.
 
 The screen receives a random 256-bit secret in an HttpOnly, same-site cookie.
 HTTPS uses a Secure host-only cookie. No credential goes in a link, QR code,

@@ -60,7 +60,10 @@ In Manage → Settings and backups, adoption has a separate preview and confirm
 step. It preserves existing source choices and generation policy. The first
 save that adopts an operator-written file also keeps that file, unchanged, as
 `config.toml.original` (mode `0600`). It is written only if absent and never
-overwritten. If an earlier copy already exists, the preview says so, and the
+overwritten, so any credentials written in the file at adoption stay in it
+after you change or remove them in the browser. After rotating such a key,
+delete that copy or keep it as protected as the key. If an earlier copy already
+exists, the preview says so, and the
 current file is kept only in `config.toml.previous` until the next save. In the
 settings status, `original_backup` names the copy that is or will be kept and
 `original_backup_available` says whether it exists yet. Then re-run

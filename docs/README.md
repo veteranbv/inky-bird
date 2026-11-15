@@ -34,6 +34,7 @@ These guides describe `main`. If you run a tagged version, start with the
 - [Update names without losing existing state](repository-name.md).
 - [Diagnose a problem](troubleshooting.md).
 - [Understand how the controller, display, and trust boundaries fit together](architecture.md).
+- [Look up HTTP errors, caching headers, and recipes for other browser applications and Homepage](reference.md).
 
 For code, documentation, or new plates, start with [Contributing](../CONTRIBUTING.md).
 Report security issues through the [private reporting process](../SECURITY.md).
