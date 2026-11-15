@@ -439,6 +439,27 @@ def test_macos_failure_after_switch_restarts_old_agents_on_old_runtime(
     assert "previous version is running again" in result.stderr
 
 
+def test_macos_rollback_leaves_an_agent_that_was_not_loaded_unloaded(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    host.install_old_runtime("legacy")
+    host.load_agents("serve", "refresh")
+    loaded = host.state_of("launchd")
+    del loaded[f"com.{host.family}.refresh"]
+    host.save_state("launchd", loaded)
+    host.fail("bootstrap-new:notifications")
+
+    result = host.run(
+        "install-controller.sh", shell=MACOS_BASH, FAKE_AGENTS="serve refresh notifications"
+    )
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    assert set(host.loaded_agents()) == {"serve"}
+    assert host.loaded_agents()["serve"]["runtime"] == "old"
+    assert host.plist_generation("refresh") == "old"
+    assert "previous version is running again" in result.stderr
+
+
 def test_macos_failed_upgrade_reports_agents_it_could_not_restart(tmp_path: Path) -> None:
     host = Host(tmp_path, "Darwin")
     host.install_old_runtime("legacy")
@@ -751,6 +772,42 @@ def test_linux_other_refresh_failures_abort_and_keep_the_old_runtime(
     assert host.runtime_dirs() == []
 
 
+@pytest.mark.parametrize("extra_failures", [(), ("systemctl:disable:inky-bird-refresh.timer",)])
+def test_linux_rollback_leaves_previously_disabled_units_disabled_and_stopped(
+    tmp_path: Path, extra_failures: tuple[str, ...]
+) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_old_runtime("legacy")
+    host.install_units(
+        controller_service="active",
+        scheduler_service="inactive",
+        refresh_service="inactive",
+        refresh_timer="inactive",
+        generate_service="inactive",
+        generate_timer="active",
+    )
+    state = host.state_of("systemd")
+    for name in ("scheduler.service", "refresh.timer"):
+        state[f"{host.family}-{name}"] = {"active": False, "enabled": False}
+    host.save_state("systemd", state)
+    host.fail(f"systemctl:restart:{host.family}-generate.timer", *extra_failures)
+
+    result = run_linux(host, f"{TIMER_UNITS} scheduler.service")
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    if extra_failures:
+        assert host.unit_state("refresh.timer")["enabled"] is True
+        assert "Could not put back" in result.stderr
+        assert "previous version is running again" not in result.stderr
+        return
+    for name in ("scheduler.service", "refresh.timer"):
+        assert host.unit_state(name) == {"active": False, "enabled": False}
+    assert host.unit_state("controller.service") == {"active": True, "enabled": True}
+    assert host.unit_state("generate.timer")["active"] is True
+    assert "previous version is running again" in result.stderr
+
+
 def unit_install_calls(host: Host) -> list[int]:
     return [
         index
@@ -1023,6 +1080,47 @@ def test_display_name_migration_renders_units_with_the_new_package(tmp_path: Pat
     # The old package shadowed the new one until it was removed; units come from the new one.
     assert "# rendered by new" in host.unit_text("display.service")
     assert not (host.venv / "lib/python3/site-packages/inky_bird_frame").exists()
+
+
+def disable_display_timer(host: Host) -> None:
+    state = host.state_of("systemd")
+    state[f"{host.family}-display.timer"] = {"active": False, "enabled": False}
+    host.save_state("systemd", state)
+
+
+def test_display_rollback_leaves_a_previously_disabled_timer_disabled(tmp_path: Path) -> None:
+    host = display_host(tmp_path, "inky-bird")
+    disable_display_timer(host)
+    host.fail(f"systemctl:start:{host.family}-display.service")
+
+    result = host.run(
+        "install-display-local.sh",
+        INKY_BIRD_NONINTERACTIVE_SUDO="true",
+        INKY_BIRD_RUN_INITIAL_DISPLAY="true",
+    )
+
+    assert result.returncode == 1
+    assert host.unit_state("display.timer") == {"active": False, "enabled": False}
+    assert "# old" in host.unit_text("display.timer")
+    assert "previous version is unchanged" in result.stderr
+
+
+def test_display_rollback_reports_a_timer_it_could_not_put_back(tmp_path: Path) -> None:
+    host = display_host(tmp_path, "inky-bird")
+    disable_display_timer(host)
+    timer = f"{host.family}-display.timer"
+    host.fail(f"systemctl:start:{host.family}-display.service", f"systemctl:disable:{timer}")
+
+    result = host.run(
+        "install-display-local.sh",
+        INKY_BIRD_NONINTERACTIVE_SUDO="true",
+        INKY_BIRD_RUN_INITIAL_DISPLAY="true",
+    )
+
+    assert result.returncode == 1
+    assert host.unit_state("display.timer")["enabled"] is True
+    assert timer in result.stderr and "could not be put back" in result.stderr
+    assert "previous version is unchanged" not in result.stderr
 
 
 def test_display_failure_after_timer_restart_rearms_the_previous_timer(tmp_path: Path) -> None:

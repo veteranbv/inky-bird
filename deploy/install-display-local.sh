@@ -121,6 +121,9 @@ installed_source=""
 source_link=""
 moved_runtime=""
 timer_was_enabled=false
+timer_was_active=false
+timer_want_running=false
+timer_state_recorded=false
 package_installed=false
 old_package_removed=false
 runtime_linked=false
@@ -198,12 +201,38 @@ reinstall_previous() {
   "${venv}/bin/python" -m pip install --disable-pip-version-check -e "${source}[inky]"
 }
 
+# Put the timer back as it was. The upgrade requires a stopped timer, so an
+# enabled one is started again; a disabled one stays disabled and stopped.
+restore_timer_state() {
+  local restored=true
+  if [ "${timer_was_enabled}" = true ]; then
+    if ! systemctl is-enabled --quiet "${timer}"; then
+      "${sudo_command[@]}" systemctl enable "${timer}" || restored=false
+    fi
+  elif systemctl is-enabled --quiet "${timer}"; then
+    "${sudo_command[@]}" systemctl disable "${timer}" || restored=false
+  fi
+  if [ "${timer_want_running}" = true ]; then
+    # A timer this run restarted keeps its new schedule until it is restarted.
+    if [ "${units_replaced}" = true ]; then
+      "${sudo_command[@]}" systemctl restart "${timer}" || restored=false
+    else
+      "${sudo_command[@]}" systemctl start "${timer}" || restored=false
+    fi
+  elif systemctl is-active --quiet "${timer}"; then
+    "${sudo_command[@]}" systemctl stop "${timer}" || restored=false
+  fi
+  [ "${restored}" = true ]
+}
+
 cleanup() {
   status=$?
   trap - EXIT
   if [ "${installation_complete}" != true ]; then
     previous_kept=true
+    state_restored=true
     if [ "${units_replaced}" = true ] && ! restore_units; then
+      state_restored=false
       echo "Could not put back the previous display service files in ${unit_root}." >&2
     fi
     if [ "${package_installed}" = true ]; then
@@ -222,18 +251,15 @@ cleanup() {
     if [ "${previous_kept}" = true ] && [ -n "${new_runtime}" ]; then
       rm -rf "${new_runtime}"
     fi
-    # A timer this run restarted keeps its new schedule until it is restarted.
-    timer_action=start
-    if [ "${units_replaced}" = true ]; then
-      timer_action=restart
+    if [ "${timer_state_recorded}" = true ] && [ -f "${unit_backup_dir}/${timer}" ] && \
+        ! restore_timer_state; then
+      state_restored=false
+      echo "${timer} could not be put back as it was before the upgrade. Check it with: systemctl status ${timer}" >&2
     fi
-    if [ -n "${installed}" ] && [ "${timer_was_enabled}" = true ]; then
-      if ! "${sudo_command[@]}" systemctl "${timer_action}" "${timer}"; then
-        echo "The display timer is stopped. Start it with: sudo systemctl start ${timer}" >&2
-      fi
-    fi
-    if [ -n "${installed}" ] && [ "${previous_kept}" = true ]; then
+    if [ -n "${installed}" ] && [ "${previous_kept}" = true ] && [ "${state_restored}" = true ]; then
       echo "The upgrade failed; the previous version is unchanged." >&2
+    elif [ -n "${installed}" ] && [ "${previous_kept}" = true ]; then
+      echo "The upgrade failed; the previous version is installed, but see the error above." >&2
     elif [ -n "${installed}" ]; then
       echo "The upgrade failed after the new version was installed; the display uses the new version." >&2
     fi
@@ -266,6 +292,14 @@ fi
 if systemctl is-enabled --quiet "${timer}"; then
   timer_was_enabled=true
 fi
+if systemctl is-active --quiet "${timer}"; then
+  timer_was_active=true
+fi
+timer_want_running=${timer_was_active}
+if [ -n "${installed}" ] && [ "${timer_was_enabled}" = true ]; then
+  timer_want_running=true
+fi
+timer_state_recorded=true
 for name in "${service_prefix}-display.service" "${timer}"; do
   if [ -f "${unit_root}/${name}" ]; then
     cp "${unit_root}/${name}" "${unit_backup_dir}/${name}"

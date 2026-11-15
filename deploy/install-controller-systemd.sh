@@ -324,7 +324,9 @@ cleanup() {
   release_cycle_lock
   if [ "${installation_complete}" != true ]; then
     runtime_restored=true
+    units_restored=true
     if [ "${units_replaced}" = true ] && ! restore_units; then
+      units_restored=false
       echo "Could not put back every previous service file in ${unit_root}." >&2
     fi
     # A stopped service this run started again runs the new runtime; stop it
@@ -364,9 +366,11 @@ cleanup() {
     if [ "${#not_restarted[@]}" -gt 0 ]; then
       echo "The upgrade failed and these services are stopped: ${not_restarted[*]}." >&2
       echo "Start them with: sudo systemctl start ${not_restarted[*]}" >&2
-    elif [ "${runtime_restored}" = true ] && \
+    elif [ "${runtime_restored}" = true ] && [ "${units_restored}" = true ] && \
         { [ "${#stopped_units[@]}" -gt 0 ] || [ "${controller_restarted}" = true ]; }; then
       echo "The upgrade failed; the previous version is running again." >&2
+    elif [ "${runtime_restored}" = true ] && [ "${units_restored}" = false ]; then
+      echo "The upgrade failed; the previous version is back, but its services are not all as they were." >&2
     fi
   elif [ "${status}" -ne 0 ]; then
     echo "The new version is installed and running, but a final step failed; see the error above." >&2
