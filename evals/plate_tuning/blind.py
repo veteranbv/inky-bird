@@ -63,6 +63,10 @@ RULER_NOTE: Final = "SCHEMATIC — NOT TO SCALE"
 KEYS_DIR: Final = "unblinding"
 
 
+# Tests that inspect a judged folder set this; runs leave it off to bound disk use.
+KEEP_JUDGED_FOLDERS = False
+
+
 def expected_text(profile: SpeciesProfileData) -> dict[str, object]:
     """The lettering a correct plate carries, with the labels the prompt asks for."""
     measurements = profile["measurements"]
@@ -344,6 +348,10 @@ def _judge_once(
         )
         error_path.unlink(missing_ok=True)
         ledger.record("judgment-finished", pair=pair_id, judge=judge.name, usage=usage)
+        # The verdict is stored; the folder's plate copies are rebuilt from the
+        # key if this pair is ever judged again.
+        if not KEEP_JUDGED_FOLDERS:
+            shutil.rmtree(request.blind_dir, ignore_errors=True)
         return
     write_json(error_path, {"error": message, "attempts": attempts})
 

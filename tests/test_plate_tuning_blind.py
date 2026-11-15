@@ -257,8 +257,9 @@ def test_expected_text_names_every_printed_label() -> None:
 
 
 def test_a_rubric_or_judge_model_change_rebuilds_the_folder_and_judges_again(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("plate_tuning.blind.KEEP_JUDGED_FOLDERS", True)
     run, panel, _ = make_run(tmp_path)
     specs = _specs(tmp_path, run, panel, 2)
     judge = PixelJudge("fake-1")
