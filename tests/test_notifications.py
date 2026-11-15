@@ -895,6 +895,115 @@ class DisplayHeartbeatTests(unittest.TestCase):
         self.assertTrue(past_floor["stale"])
         self.assertEqual(notify.call_count, 1)
 
+    def test_old_update_right_after_controller_downtime_is_not_stale(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            self._write_success(config, now - timedelta(minutes=10))
+            with patch(
+                "inky_bird_frame.notifications.safe_notify",
+                return_value={"queued": True},
+            ) as notify:
+                before = check_display_heartbeat(config, now=now)
+                # The controller is away for four hours, so the display cannot report.
+                back = now + timedelta(hours=4)
+                checks = [
+                    check_display_heartbeat(config, now=back + timedelta(minutes=minutes))
+                    for minutes in (0, 5, 10, 15, 20, 25)
+                ]
+                stale_alerts = notify.call_count
+                # The display reports again within a rotation.
+                self._write_success(config, back + timedelta(minutes=27))
+                resumed = check_display_heartbeat(config, now=back + timedelta(minutes=30))
+
+        self.assertFalse(before["stale"])
+        self.assertEqual([check["stale"] for check in checks], [False] * 6)
+        self.assertTrue(all(check["resuming"] for check in checks))
+        self.assertEqual(stale_alerts, 0)
+        self.assertFalse(resumed["stale"])
+        self.assertEqual(notify.call_count, 0)
+
+    def test_display_still_silent_after_the_grace_is_stale(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            self._write_success(config, now - timedelta(minutes=10))
+            with patch(
+                "inky_bird_frame.notifications.safe_notify",
+                return_value={"queued": True},
+            ) as notify:
+                check_display_heartbeat(config, now=now)
+                back = now + timedelta(hours=4)
+                check_display_heartbeat(config, now=back)
+                check_display_heartbeat(config, now=back + timedelta(minutes=20))
+                late = check_display_heartbeat(config, now=back + timedelta(minutes=40))
+
+        self.assertTrue(late["stale"])
+        self.assertFalse(late["resuming"])
+        self.assertIs(notify.call_args.args[1], NotificationEvent.DISPLAY_STALE)
+
+    def test_regular_checks_keep_reporting_a_stale_display(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            self._write_success(config, now - timedelta(hours=5))
+            results = [
+                check_display_heartbeat(config, now=now + timedelta(minutes=minutes))
+                for minutes in (0, 5, 10)
+            ]
+
+        self.assertEqual([result["stale"] for result in results], [True, True, True])
+
+
+class NotificationFailureLogTests(unittest.TestCase):
+    def test_failed_queueing_is_logged_without_details(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(CONFIG)
+            config = load_config(path)
+            with (
+                patch(
+                    "inky_bird_frame.notifications.enqueue_notification",
+                    side_effect=OSError("/private/state/notifications.json"),
+                ),
+                self.assertLogs("inky_bird_frame.notifications", "WARNING") as logs,
+            ):
+                result = safe_notify(
+                    config,
+                    NotificationEvent.TERMINAL_ERROR,
+                    dedupe_key="example",
+                    title="Example",
+                    body="Example",
+                )
+
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("terminal_error", logs.output[0])
+        self.assertIn("OSError", logs.output[0])
+        self.assertNotIn("/private", logs.output[0])
+
+    def test_failed_health_records_are_logged(self) -> None:
+        from inky_bird_frame.notifications import safe_record_degradation, safe_record_recovery
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(CONFIG)
+            config = load_config(path)
+            failure = OSError("disk full")
+            with (
+                patch("inky_bird_frame.notifications.record_degradation", side_effect=failure),
+                patch("inky_bird_frame.notifications.record_recovery", side_effect=failure),
+                self.assertLogs("inky_bird_frame.notifications", "WARNING") as logs,
+            ):
+                safe_record_degradation(config, key="refresh", title="Down", body="Down")
+                safe_record_recovery(config, key="refresh", title="Up", body="Up")
+
+        self.assertEqual(len(logs.output), 2)
+        self.assertTrue(all("refresh" in line and "OSError" in line for line in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from .timeutil import parse_utc_timestamp
 
 if TYPE_CHECKING:
     import apprise
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -93,9 +96,57 @@ def retry_policy(settings: NotificationsConfig) -> dict[str, int]:
     }
 
 
+def display_check_path(config: AppConfig) -> Path:
+    return config.controller.state_dir / "display-check.json"
+
+
 def display_stale_threshold(config: AppConfig) -> timedelta:
     # Three missed rotations, floored so short rotations survive controller downtime.
     return timedelta(minutes=max(3 * config.schedule.rotation_minutes, 60))
+
+
+def _check_gap(config: AppConfig) -> timedelta:
+    # Display checks run with notification delivery; a longer silence means the
+    # controller was down or busy and could not have heard from the display.
+    return timedelta(minutes=max(3 * config.notifications.delivery_retry_minutes, 30))
+
+
+def _resume_grace(config: AppConfig) -> timedelta:
+    # After such a silence the display needs up to one rotation to report again.
+    schedule = config.schedule
+    return timedelta(
+        minutes=schedule.rotation_minutes + 5,
+        seconds=schedule.rotation_jitter_seconds + schedule.display_startup_delay_seconds,
+    )
+
+
+def _watching_since(config: AppConfig, current: datetime) -> datetime | None:
+    """Return when display checks resumed after a silence, and record this check."""
+    path = display_check_path(config)
+    previous: datetime | None = None
+    since: datetime | None = None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict) and raw.get("schema_version") == 1:
+        previous = _health_datetime(raw.get("checked_at"))
+        since = _health_datetime(raw.get("watching_since"))
+    if previous is not None and current - previous > _check_gap(config):
+        since = current
+    try:
+        write_json_atomic(
+            path,
+            {
+                "schema_version": 1,
+                "checked_at": current.isoformat(),
+                "watching_since": since.isoformat() if since is not None else None,
+            },
+        )
+    except OSError:
+        # Without the record the next check simply applies no grace.
+        _LOG.warning("Display check time could not be saved")
+    return since
 
 
 def _new_notifier() -> apprise.Apprise:
@@ -377,6 +428,8 @@ def safe_notify(
             "failed": 0,
         }
     except Exception as exc:
+        # Callers carry on without the notice; leave a trace in the service log.
+        _LOG.warning("Notification %s could not be queued (%s)", event.value, type(exc).__name__)
         return {
             "queued": False,
             "attempted": 0,
@@ -405,6 +458,7 @@ def safe_record_degradation(
             now=now,
         )
     except Exception as exc:
+        _LOG.warning("Problem %s could not be recorded (%s)", key, type(exc).__name__)
         return {"queued": False, "error_type": type(exc).__name__}
 
 
@@ -425,11 +479,13 @@ def safe_record_recovery(
             event=event,
         )
     except Exception as exc:
+        _LOG.warning("Recovery %s could not be recorded (%s)", key, type(exc).__name__)
         return {"queued": False, "error_type": type(exc).__name__}
 
 
 def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -> dict[str, object]:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    watching_since = _watching_since(config, current)
     success_at, success_warning, _ = _read_display_heartbeat(
         display_success_path(config), "succeeded_at"
     )
@@ -470,12 +526,24 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         and current - fetched_at <= threshold
         and _wall_view_is_empty(config)
     )
+    # Right after the controller was away, an old update only shows that the
+    # display could not reach it; wait one rotation before calling it stale.
+    resuming = (
+        stale
+        and not paused
+        and watching_since is not None
+        and current - watching_since <= _resume_grace(config)
+    )
     if paused:
         assert fetched_at is not None
         stale = False
         signal = "catalog-fetch"
         seen_at = fetched_at
         notice: dict[str, object] = {"queued": False}
+    elif resuming:
+        # Neither a new incident nor the end of an open one.
+        stale = False
+        notice = {"queued": False}
     elif stale:
         notice = safe_record_degradation(
             config,
@@ -500,6 +568,7 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         "checked": True,
         "stale": stale,
         "paused": paused,
+        "resuming": resuming,
         "signal": signal,
         "seen_at": seen_at.isoformat(),
         "threshold_minutes": int(threshold.total_seconds() // 60),
