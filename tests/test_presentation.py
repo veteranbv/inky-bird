@@ -21,7 +21,12 @@ from inky_bird_frame.journal import (
     remove_collection,
     save_collection,
 )
-from inky_bird_frame.presentation import MAX_GRANTS, MAX_PENDING, PresentationAccess
+from inky_bird_frame.presentation import (
+    MAX_GRANTS,
+    MAX_PENDING,
+    MAX_PENDING_PER_CLIENT,
+    PresentationAccess,
+)
 from inky_bird_frame.server import project_catalog
 from inky_bird_frame.web import create_app
 
@@ -517,3 +522,25 @@ def test_a_full_screen_list_still_refuses_new_pairing(tmp_path: Path) -> None:
         )
     with pytest.raises(AccessRateLimitError):
         access.request_pair("", client="198.51.100.7")
+
+
+def test_one_client_cannot_hold_more_than_two_waiting_requests(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        for _ in range(MAX_PENDING_PER_CLIENT):
+            access.request_pair("", client="198.51.100.7")
+            clock.at += timedelta(seconds=16)
+        saved = access.path.read_bytes()
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("", client="198.51.100.7")
+        assert access.path.read_bytes() == saved
+        # Another screen still pairs.
+        other, _ = access.request_pair("", client="192.0.2.1")
+        clock.at += timedelta(seconds=16)
+        # Removing one of the client's requests frees its place again.
+        status = cast(dict[str, Any], access.status())
+        first = status["grants"][0]["id"]
+        access.update(revision=status["revision"], action="revoke", id=first, confirm=True)
+        access.request_pair("", client="198.51.100.7")
+        assert other
