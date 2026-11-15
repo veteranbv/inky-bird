@@ -13,7 +13,7 @@ const helpers = await import(
     Buffer.from(
       "let csrf = 'csrf-token';\n" +
         app.slice(start, end) +
-        '\nexport { upload, RequestError };\n',
+        '\nexport { upload, request, RequestError };\n',
     ).toString('base64')
 );
 
@@ -117,8 +117,9 @@ test(
   }),
 );
 
+// A stop the owner asked for is its own outcome, not a network fault.
 test(
-  'stopping an upload aborts the request and fails like a lost connection',
+  'stopping an upload aborts the request and reports it as stopped',
   withXHR(async () => {
     const controller = new AbortController();
     const result = helpers.upload('/v1/upload', { size: 1 }, controller.signal);
@@ -126,8 +127,8 @@ test(
     assert.equal(FakeXHR.last.aborted, true);
     const error = await rejection(result);
     assert.ok(error instanceof helpers.RequestError);
-    assert.equal(error.code, 'offline');
-    assert.equal(error.message, OFFLINE);
+    assert.equal(error.code, 'stopped');
+    assert.notEqual(error.message, OFFLINE);
   }),
 );
 
@@ -137,10 +138,47 @@ test(
     const controller = new AbortController();
     controller.abort();
     const error = await rejection(helpers.upload('/v1/upload', { size: 1 }, controller.signal));
-    assert.equal(error.code, 'offline');
+    assert.equal(error.code, 'stopped');
     assert.equal(FakeXHR.last?.body, undefined);
   }),
 );
+
+test('a request that never answers ends at its deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const original = globalThis.fetch;
+  let signal;
+  globalThis.fetch = (_path, options) =>
+    new Promise((_resolve, reject) => {
+      signal = options.signal;
+      signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    });
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const result = helpers.request('/v1/owner/journal', { method: 'GET' });
+  t.mock.timers.tick(59999);
+  assert.equal(signal.aborted, false, 'a slow answer gets its full time');
+  t.mock.timers.tick(1);
+  const error = await rejection(result);
+  assert.ok(error instanceof helpers.RequestError);
+  assert.equal(error.code, 'timeout');
+});
+
+test('an answered request clears its deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const original = globalThis.fetch;
+  let signal;
+  globalThis.fetch = async (_path, options) => {
+    signal = options.signal;
+    return new Response(JSON.stringify({ ok: true, data: 'done' }), { status: 200 });
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  assert.equal(await helpers.request('/v1/owner/journal', { method: 'GET' }), 'done');
+  t.mock.timers.tick(60000);
+  assert.equal(signal.aborted, false);
+});
 
 test(
   'network failures and timeouts are reported as offline',
