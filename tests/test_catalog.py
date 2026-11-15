@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import unittest
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -235,6 +236,23 @@ class CatalogTests(unittest.TestCase):
             self.assertFalse(candidate.exists())
             with self.assertRaises(CatalogError):
                 approve_candidate(state, catalog, species.taxon_id)
+
+    def test_finder_metadata_inside_a_candidate_is_left_out_of_the_catalog(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            candidate = make_candidate(state, species, review)
+            (candidate / ".DS_Store").write_bytes(b"\0\0\0\1Bud1")
+
+            entry = approve_candidate(state, catalog, species.taxon_id)
+
+            self.assertEqual(entry.taxon_id, species.taxon_id)
+            self.assertFalse(candidate.exists())
+            self.assertFalse((catalog / "species/7513-carolina-wren/.DS_Store").exists())
+            self.assertTrue(has_valid_approved_candidate(catalog, species.taxon_id))
 
     def test_valid_approved_candidate_requires_complete_checked_assets(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
@@ -542,8 +560,13 @@ class CatalogTests(unittest.TestCase):
             candidate = make_candidate(state, species, review)
             original_copytree = shutil.copytree
 
-            def short_copy(source: Path, destination: Path) -> object:
-                result = original_copytree(source, destination)
+            def short_copy(
+                source: Path,
+                destination: Path,
+                *,
+                ignore: Callable[[str, list[str]], Iterable[str]],
+            ) -> object:
+                result = original_copytree(source, destination, ignore=ignore)
                 with (Path(destination) / "portrait.png").open("r+b") as handle:
                     handle.truncate(10)
                 return result

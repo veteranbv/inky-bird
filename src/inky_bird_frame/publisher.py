@@ -383,7 +383,10 @@ def _validate_species_directory(
 ) -> tuple[int, str]:
     if directory.is_symlink() or not directory.is_dir():
         raise CatalogPublishError(f"Species path must be a directory, not a symlink: {directory}")
-    files = {path.name for path in directory.iterdir()}
+    # A pending candidate's Finder metadata is left behind at approval; nothing publishes it.
+    ignored = {_FINDER_METADATA} if expected_status == "pending" else set()
+    paths = [path for path in directory.iterdir() if path.name not in ignored]
+    files = {path.name for path in paths}
     unexpected = files - _ALLOWED_SPECIES_FILES
     missing = {"manifest.json", "portrait.png", "display.png"} - files
     if unexpected:
@@ -394,7 +397,7 @@ def _validate_species_directory(
         raise CatalogPublishError(
             f"Required catalog files missing from {directory}: {', '.join(sorted(missing))}"
         )
-    for path in directory.iterdir():
+    for path in paths:
         if path.is_symlink() or not path.is_file():
             raise CatalogPublishError(f"Catalog entries must be regular files: {path}")
 

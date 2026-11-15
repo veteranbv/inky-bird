@@ -271,6 +271,17 @@ def decide_pending_candidate(
             try:
                 validate_pending_candidate(path, private_patterns=private_patterns)
             except (CatalogPublishError, CatalogError, OSError, ValueError) as exc:
+                private_only = bool(private_patterns)
+                if private_only:
+                    try:
+                        validate_pending_candidate(path)
+                    except (CatalogPublishError, CatalogError, OSError, ValueError):
+                        private_only = False
+                if private_only:
+                    raise JournalError(
+                        "This plate's text names this controller's location or a local path, "
+                        "so it cannot be published. Reject it, then retry the bird."
+                    ) from exc
                 raise JournalError(
                     "This candidate cannot pass ordinary approval. "
                     "Use operator recovery without bypassing review."

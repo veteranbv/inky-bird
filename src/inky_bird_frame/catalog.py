@@ -37,6 +37,8 @@ SPECIES_FILENAMES = frozenset(
         "quality-review.json",
     }
 )
+# Finder writes this when the owner browses a folder; it is never copied into the catalog.
+FINDER_METADATA = ".DS_Store"
 
 
 class CandidateApprovalError(CatalogError):
@@ -669,7 +671,7 @@ def _refresh_index_after_removal(catalog_dir: Path, taxon_id: int) -> None:
 def _copy_tree_durably(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copytree(source, destination)
+        shutil.copytree(source, destination, ignore=shutil.ignore_patterns(FINDER_METADATA))
         fsync_tree(destination)
     except Exception:
         if destination.exists():
@@ -758,6 +760,8 @@ def _validate_pending_candidate_files(
     # Publication accepts only these regular files, and copying follows
     # symlinks, so anything else would leak into or block the catalog.
     for path in source.iterdir():
+        if path.name == FINDER_METADATA:
+            continue
         if path.name not in SPECIES_FILENAMES or path.is_symlink() or not path.is_file():
             raise CandidateApprovalError(f"Candidate {source.name} has an unexpected file")
     if (

@@ -182,7 +182,12 @@ def test_invalid_candidates_cannot_bypass_ordinary_approval(tmp_path: Path, prob
     view = pending_candidate(application, 10)
     assert not view["can_approve"]
     assert "MUST_NOT_PROJECT" not in json.dumps(view)
-    with pytest.raises(JournalError):
+    refusal = (
+        "names this controller's location or a local path"
+        if problem == "private-path-text"
+        else "cannot pass ordinary approval"
+    )
+    with pytest.raises(JournalError, match=refusal):
         decide_pending_candidate(
             application, 10, revision=str(view["candidate_revision"]), approve=True
         )
@@ -460,6 +465,14 @@ def test_finder_metadata_does_not_mark_plate_work_incomplete(tmp_path: Path) -> 
     ]
 
 
+def test_finder_metadata_inside_a_candidate_does_not_block_approval(tmp_path: Path) -> None:
+    application = config(tmp_path)
+    directory = candidate(application)
+    (directory / ".DS_Store").write_bytes(b"\0\0\0\1Bud1")
+
+    assert pending_candidate(application, 10)["can_approve"]
+
+
 def test_plate_review_reads_give_up_while_the_catalog_is_being_changed(tmp_path: Path) -> None:
     application = config(tmp_path)
     candidate(application)
@@ -485,3 +498,27 @@ def test_plate_review_reads_give_up_while_the_catalog_is_being_changed(tmp_path:
         release.set()
         worker.join()
     assert pending_candidate(application, 10)["candidate_revision"] == revision
+
+
+def test_plate_review_reads_share_the_catalog_with_other_readers(tmp_path: Path) -> None:
+    application = config(tmp_path)
+    candidate(application)
+    revision = str(pending_candidate(application, 10)["candidate_revision"])
+    held = threading.Event()
+    release = threading.Event()
+
+    def read() -> None:
+        with catalog_state_lock(application.controller.state_dir, shared=True):
+            held.set()
+            release.wait(10)
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    try:
+        assert held.wait(5)
+        with patch("inky_bird_frame.recovery.PLATE_REVIEW_LOCK_SECONDS", 0.1):
+            assert pending_candidate(application, 10)["candidate_revision"] == revision
+            pending_portrait(application, 10, revision=revision)
+    finally:
+        release.set()
+        worker.join()
