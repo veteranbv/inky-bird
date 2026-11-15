@@ -806,3 +806,30 @@ def test_cli_exit_codes_and_error_types_match_the_code() -> None:
             assert int(stated.group(1)) == expected, code
         else:
             assert expected == 1, f"{code} exits {expected}; the table must say so"
+
+
+def test_http_error_codes_and_statuses_match_the_code() -> None:
+    from inky_bird_frame.web import HTTP_ERROR_CODES
+
+    source = (ROOT / "src/inky_bird_frame/web.py").read_text(encoding="utf-8")
+    returned: defaultdict[str, set[int]] = defaultdict(set)
+    for status, code in re.findall(r'_error\(\s*(\d{3}),\s*"([a-z_]+)"', source):
+        returned[code].add(int(status))
+    assert set(returned) == set(HTTP_ERROR_CODES)
+
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("### Owner, screen and integration routes", 1)[1].split("\n### ", 1)[0]
+    documented = {
+        row[0].strip("`"): {int(row[1])}
+        for row in _markdown_table(section, "| `code` | Status | Meaning |")
+    }
+    assert documented == dict(returned)
+
+
+def test_docs_say_head_answers_like_get() -> None:
+    for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "returns 404 to `HEAD`" not in text, path.name
+        assert "`HEAD /health` returns 404" not in text, path.name
+    reference = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    assert "Every `GET` route answers `HEAD`" in reference

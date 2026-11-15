@@ -178,11 +178,24 @@ See [RFC 6265's cookie security limits](https://www.rfc-editor.org/rfc/rfc6265#s
 Plate images in the journal (portraits, grid thumbnails and paired-screen
 plates) are kept in that browser's private cache when their address names the
 current plate revision (`Cache-Control: private, max-age=31536000,
-immutable`). They can stay in the browser's cache after sign-out; clear the
-browser's cache to remove them. Every other owner and private response is
-`no-store`. Grid thumbnails are small copies cached on the controller under
+immutable`). Signing out, and **Forget this screen** on a paired screen, tell
+the browser to drop them. Browsers follow that only over HTTPS or the
+controller's own loopback address; over plain LAN HTTP, clear the browser's
+cache to remove them. Every other owner and private response is `no-store`.
+Grid thumbnails are small copies cached on the controller under
 `state_dir/plate-thumbnails/`; that folder is safe to delete and rebuilds
-itself.
+itself. A thumbnail already made keeps showing if its catalog plate is later
+damaged; the full plate then reports the damage.
+
+### Restarts and the controller clock
+
+Sign-ins are saved with the access state, so restarting the controller keeps
+you signed in. Up to 60 seconds of clock difference is tolerated for sessions,
+recent confirmations and single sign-on. If the controller's clock is further
+behind than that, for example a Raspberry Pi without a real-time clock before
+it has synchronized the time, sign-ins are refused until the clock is right.
+They are kept, not deleted, and work again once the clock is correct. A clock
+that jumps forward past a sign-in's expiry ends that sign-in for good.
 
 ## Recover a forgotten password
 
@@ -642,7 +655,14 @@ behind "Sign in with your Inky password instead" and remains the recovery
 path. Without a ready linked provider, the password form leads unchanged.
 
 A provider outage disables the SSO button with an explanation. Local login
-works unless you deliberately chose SSO-only mode. Signing out of Inky revokes
+works unless you deliberately chose SSO-only mode. Inky contacts the provider
+before it reserves a sign-in, so an outage reports the provider error and does
+not push out a sign-in already in progress. Inky keeps the provider's discovery
+document for 15 minutes. After that it keeps using it for up to 24 hours while
+one background request refreshes it, and it waits 30 seconds after a failed
+fetch before trying again. A change to the provider's endpoints can therefore
+take up to 15 minutes to be picked up; restart Inky to apply it at once. During
+a short outage the access page can still show the provider as ready. Signing out of Inky revokes
 only that Inky login. It does not sign out other identity-service applications.
 Disabling an identity-service account does not instantly revoke an existing
 Inky login; use Inky's device revocation or local recovery when needed.
