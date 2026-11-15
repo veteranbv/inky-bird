@@ -199,7 +199,7 @@ test('field notes that fail to load leave the rest of the bird page working', as
   });
   assert.deepEqual(problems, []);
   assert(findButton(main, 'Add to Favorites'), 'Favorites still works');
-  assert(findButton(main, 'Review adding to Saved birds'), 'Saved birds still works');
+  assert(findButton(main, 'Add to Saved birds'), 'Saved birds still works');
   assert(nodes(main).some((node) => node.textContent === 'Field notes are unavailable.'));
 });
 
@@ -211,7 +211,7 @@ test('field notes arrive below the bird actions, so nothing moves under a finger
   const holding = (target) => notes.children.findIndex((child) => child === target || nodes(child).includes(target));
   const fieldNotes = notes.children.findIndex((node) => node.classList.contains('field-notes'));
   const favorites = holding(findButton(main, 'Add to Favorites'));
-  const saved = holding(findButton(main, 'Review adding to Saved birds'));
+  const saved = holding(findButton(main, 'Add to Saved birds'));
   assert(favorites >= 0 && saved >= 0 && fieldNotes >= 0);
   assert(fieldNotes > favorites && fieldNotes > saved, 'field notes come after the actions');
 });
@@ -255,4 +255,34 @@ for (const [name, change] of [
     const { main } = await open(t, { page: 'home' }, { state: withState({ ...empty, ...change }) });
     assert(!main.textContent.includes(welcome));
     assert(main.textContent.includes('Make room for a bird'));
+  });
+
+for (const [plateReady, oneTap] of [
+  [true, true],
+  [false, false],
+])
+  test(`removing a saved bird ${plateReady ? 'with' : 'without'} approved art ${oneTap ? 'is one tap' : 'asks first'}`, async (t) => {
+    const changes = [];
+    const { main, assigned } = await open(t, { page: 'bird', bird: '4' }, {
+      state: withState({
+        birds: [{ ...bird(4, 'Demo Plover', 'd'), saved: true, plate_ready: plateReady }],
+        saved_taxon_ids: [4],
+      }),
+      respond(path, body) {
+        if (path === '/v1/owner/settings') return { revision: 'r'.repeat(64) };
+        if (path === '/v1/owner/saved/preview')
+          return { added_count: 0, removed_count: 1, migrated_legacy_queue_count: 0, collection_revision: sha('c') };
+        if (path === '/v1/owner/saved/change') {
+          changes.push(body);
+          return { operation_id: 'op1', kind: 'saved-collection', status: 'succeeded', result: {} };
+        }
+        throw new Error('unexpected ' + path);
+      },
+    });
+    findButton(main, 'Remove from Saved birds').click();
+    await flush();
+    assert.equal(changes.length, oneTap ? 1 : 0);
+    assert.equal(Boolean(findButton(main, 'Confirm Saved birds change')), !oneTap);
+    assert.equal(Boolean(findButton(main, 'Undo')), oneTap);
+    assert.deepEqual(assigned, []);
   });

@@ -167,6 +167,9 @@ async function historyAndCollections(t) {
   await page.getByRole('button', { name: 'Confirm these plate requests', exact: true }).click();
   await heading('Operation outcome');
   await shown(page, 'Finished');
+  // Every count the request returns stays on the outcome.
+  await shown(page, '1 plate request saved');
+  await shown(page, '0 birds still held');
   const queue = JSON.parse(
     fs.readFileSync(path.join(fixture, 'var/controller/generation-queue.json')),
   ).species;

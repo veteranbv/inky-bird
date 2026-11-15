@@ -279,18 +279,40 @@ test('an outcome shows plain words, never identifiers or hashes', async () => {
     }),
     ['1 bird added', '2 birds removed', '0 legacy seed members migrated', 'Generation off'],
   );
-  // Fields this page has no words for are left out, never shown by their key.
+  // Every other field is shown: in words where this page has them, otherwise
+  // under a readable label, never as a raw key.
   assert.deepEqual(
     manage.resultLines({
       window: 'last-30-days',
-      start_date: '2001-03-01',
       radius_km: 25,
-      species_limit: 10,
       earliest_observed_on: '2001-03-01',
+      latest_observed_on: '2001-03-09',
       rows: 3,
       added_checklists: 1,
+      dry_run: true,
     }),
-    ['Source rows: 3', 'New checklists: 1'],
+    [
+      'Window: last-30-days',
+      'Radius km: 25',
+      'Earliest checklist: 2001-03-01',
+      'Latest checklist: 2001-03-09',
+      'Source rows: 3',
+      'New checklists: 1',
+      'Trial run only: nothing was changed',
+    ],
+  );
+});
+
+test('queued plate requests show every count the controller returns', () => {
+  // The queue-plates result from controller.queue_owner_selection_locked.
+  assert.deepEqual(
+    manage.resultLines({ message: 'x', queued: 3, already_queued: 1, held: 2, ready: 0 }),
+    [
+      '3 plate requests saved',
+      '1 bird already waiting for a plate',
+      '2 birds still held',
+      '0 birds already with a plate',
+    ],
   );
 });
 
@@ -523,4 +545,122 @@ test('the editor keeps unresolved names unless one is unticked', async (t) => {
     collection_id: group.collection_id,
     remove_unresolved: [{ common_name: 'Robin', scientific_name: 'Turdus migratorius' }],
   });
+});
+
+// Saved birds as the controller keeps them: adding needs approved art.
+function membershipServer(members, approved) {
+  const changes = [];
+  const receipts = new Map();
+  const preview = (body) => {
+    if (body.action === 'add' && !approved.has(body.taxon_id))
+      throw new Error('Choose approved artwork before adding it to Saved birds');
+    const has = members.has(body.taxon_id);
+    return {
+      added_count: body.action === 'add' && !has ? 1 : 0,
+      removed_count: body.action === 'remove' && has ? 1 : 0,
+      migrated_legacy_queue_count: 0,
+      collection_revision: 'c'.repeat(64),
+    };
+  };
+  return {
+    changes,
+    respond(path, body) {
+      if (path === '/v1/owner/settings') return { revision: 'r'.repeat(64) };
+      if (path === '/v1/owner/saved/preview') return preview(body);
+      if (path === '/v1/owner/saved/change') {
+        changes.push(body);
+        let result;
+        try {
+          result = preview(body);
+          if (body.action === 'add') members.add(body.taxon_id);
+          else members.delete(body.taxon_id);
+        } catch (error) {
+          result = { message: error.message };
+        }
+        const id = 'op' + changes.length;
+        receipts.set(id, { result, status: result.message ? 'failed' : 'succeeded' });
+        return { operation_id: id, kind: 'saved-collection', status: 'pending' };
+      }
+      if (path.startsWith('/v1/owner/operations/')) {
+        const id = path.split('/').pop();
+        return { operation_id: id, kind: 'saved-collection', ...receipts.get(id) };
+      }
+      throw new Error('unexpected ' + path);
+    },
+  };
+}
+
+for (const [start, first] of [
+  [new Set(), 'Add to Saved birds'],
+  [new Set([7, 8]), 'Remove from Saved birds'],
+])
+  test(`Undo after one tap to ${first.split(' ')[0].toLowerCase()} restores the Saved birds`, async (t) => {
+    const members = new Set(start);
+    const server = membershipServer(members, new Set([7]));
+    const { context, main, assigned } = page(t, server.respond);
+    const section = collections.savedChange(
+      context,
+      '',
+      start.has(7) ? 'remove' : 'add',
+      7,
+      true,
+    );
+    main.append(section);
+    findButton(section, first).click();
+    await settle(t);
+    assert.notDeepEqual([...members].sort(), [...start].sort());
+    findButton(section, 'Undo').click();
+    await settle(t);
+    assert.deepEqual([...members].sort(), [...start].sort());
+    assert.equal(server.changes.length, 2);
+    assert.equal(findButton(section, first) !== null, true);
+    assert.deepEqual(assigned, []);
+  });
+
+test('removing a bird without approved art asks first and offers no Undo', async (t) => {
+  const members = new Set([7]);
+  const server = membershipServer(members, new Set());
+  const { context, main, assigned } = page(t, server.respond);
+  const section = collections.savedChange(context, '', 'remove', 7, false);
+  main.append(section);
+  findButton(section, 'Remove from Saved birds').click();
+  await settle(t);
+  // Nothing changed yet: the owner is asked, since adding it back would be refused.
+  assert.equal(server.changes.length, 0);
+  assert.deepEqual([...members], [7]);
+  assert.equal(findButton(section, 'Undo'), null);
+  assert(
+    texts(section).includes(
+      'This bird has no approved art yet, so it cannot be added back until it does.',
+    ),
+  );
+  const confirm = findButton(section, 'Confirm Saved birds change');
+  confirm.fire('click', { currentTarget: confirm });
+  await settle(t);
+  assert.deepEqual([...members], []);
+  assert.deepEqual(assigned, ['/app?page=operation&operation=op1']);
+});
+
+test('a bird page with approved art removes it in one tap', async (t) => {
+  const members = new Set([7]);
+  const server = membershipServer(members, new Set([7]));
+  const { context, main } = page(t, server.respond);
+  const section = collections.savedChange(context, '', 'remove', 7, true);
+  main.append(section);
+  findButton(section, 'Remove from Saved birds').click();
+  await settle(t);
+  assert.deepEqual([...members], []);
+  assert(texts(section).includes('Removed from Saved birds.'));
+  assert(findButton(section, 'Undo'));
+});
+
+test('an interrupted change says to check Saved birds', async (t) => {
+  const message = 'Interrupted. The outcome is not confirmed. Inspect state before an explicit retry.';
+  const server = savedServer({}, 'interrupted', { message });
+  const { context, main } = page(t, server.respond);
+  const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+  main.append(section);
+  findButton(section, 'Add to Saved birds').click();
+  await settle(t);
+  assert(texts(section).includes(message + ' Check Saved birds if the connection was lost.'));
 });

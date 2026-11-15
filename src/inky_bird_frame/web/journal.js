@@ -12,6 +12,7 @@ import {
   renderEditCollection,
   renderImportCollection,
   renderCollection,
+  savedChange,
 } from '/app/collections.js';
 import { renderFrame } from '/app/frame.js';
 import { renderCandidate } from '/app/candidate.js';
@@ -312,57 +313,8 @@ export async function openJournal(ui, message = '') {
     section.append(start);
     return section;
   }
-  function savedAction(label, action, taxonId) {
-    const section = el('section', '', 'journal-card'),
-      problem = el('p', '', 'error');
-    problem.setAttribute('role', 'alert');
-    const start = button(label, async () => {
-      start.disabled = true;
-      try {
-        const settings = await api('/v1/owner/settings'),
-          body = { action, configuration_revision: settings.revision };
-        if (taxonId) body.taxon_id = taxonId;
-        const preview = await api('/v1/owner/saved/preview', body),
-          key = randomHex(24);
-        section.append(
-          el('h2', 'Change Saved birds?'),
-          note(
-            preview.added_count +
-              ' additions · ' +
-              preview.removed_count +
-              ' removals · ' +
-              preview.migrated_legacy_queue_count +
-              ' legacy seed members migrated',
-          ),
-          note(
-            'Saved birds join the compatible current selection and can affect the existing wall immediately at its next refresh. This is curation, not a sighting. Other named collections and source history stay unchanged. No model starts.',
-          ),
-          button('Confirm Saved birds change', async (event) => {
-            const control = event.currentTarget;
-            control.disabled = true;
-            try {
-              const receipt = await api('/v1/owner/saved/change', {
-                ...body,
-                key,
-                confirm: true,
-                collection_revision: preview.collection_revision,
-              });
-              location.assign(href('operation', { operation: receipt.operation_id }));
-            } catch (error) {
-              problem.textContent =
-                error.message + ' Check Saved birds if the connection was lost.';
-              control.disabled = false;
-            }
-          }),
-          button('Cancel', () => location.reload()),
-        );
-      } catch (error) {
-        problem.textContent = error.message;
-        start.disabled = false;
-      }
-    });
-    section.append(start, problem);
-    return section;
+  function savedAction(label, action, taxonId, plateReady) {
+    return savedChange(context, label, action, taxonId, plateReady);
   }
   // Each area module receives the page's shared state through this one object.
   const context = {

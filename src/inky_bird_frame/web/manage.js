@@ -31,6 +31,10 @@ const countWords = {
   failed: ['message failed', 'messages failed'],
   pending: ['message waiting', 'messages waiting'],
   dead_letters: ['dead letter', 'dead letters'],
+  queued: ['plate request saved', 'plate requests saved'],
+  already_queued: ['bird already waiting for a plate', 'birds already waiting for a plate'],
+  held: ['bird still held', 'birds still held'],
+  ready: ['bird already with a plate', 'birds already with a plate'],
 };
 // History import totals, named as the import review names them.
 const totalWords = {
@@ -48,18 +52,27 @@ const totalWords = {
   duplicates: 'Unchanged detections',
   dated: 'Dated detections',
   undated: 'Undated detections',
+  earliest_observed_on: 'Earliest checklist',
+  latest_observed_on: 'Latest checklist',
 };
 const flagWords = {
   generation_enabled: ['Generation enabled', 'Generation off'],
   dispatcher_busy: ['Another delivery run was already busy', ''],
   unchanged: ['No history changes', ''],
+  dry_run: ['Trial run only: nothing was changed', ''],
 };
 // Shown elsewhere on the page, or internal: identifiers, hashes and revisions.
-const shownElsewhere = new Set(['message', 'taxon_ids', 'providers', 'dry_run', 'error_type']);
-const internal = /(^|_)(id|ids|hash|sha256|revision|key)$/;
+const shownElsewhere = new Set(['message', 'taxon_ids', 'providers', 'error_type']);
+const internal = /(^|_)(id|ids|hash|sha256|digest|revision|key)$/;
 
-// One plain line per result field the owner can act on. Fields this page has
-// no words for are left out rather than shown by their key.
+// A field from a newer controller, named readably rather than by its raw key.
+function fieldLabel(key) {
+  const words = key.replaceAll('_', ' ');
+  return words[0].toUpperCase() + words.slice(1);
+}
+
+// One plain line per result field. A field this page has no words for still
+// shows, under a readable label.
 export function resultLines(result) {
   const lines = [];
   for (const [key, value] of Object.entries(result || {})) {
@@ -69,8 +82,11 @@ export function resultLines(result) {
     else if (typeof value === 'boolean' && flagWords[key]) {
       const text = flagWords[key][value ? 0 : 1];
       if (text) lines.push(text);
-    } else if (typeof value === 'number' && totalWords[key])
+    } else if (['number', 'string'].includes(typeof value) && totalWords[key])
       lines.push(totalWords[key] + ': ' + value);
+    else if (typeof value === 'number' || (typeof value === 'string' && value))
+      lines.push(fieldLabel(key) + ': ' + value);
+    else if (typeof value === 'boolean') lines.push(fieldLabel(key) + ': ' + (value ? 'yes' : 'no'));
   }
   return lines;
 }

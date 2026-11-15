@@ -358,6 +358,7 @@ export async function renderBird(context) {
         bird.saved ? 'Review removal from Saved birds' : 'Review adding to Saved birds',
         bird.saved ? 'remove' : 'add',
         bird.taxon_id,
+        bird.plate_ready,
       ),
     );
   if (!bird.plate_ready) return;

@@ -642,14 +642,14 @@ function savedSummary(preview) {
 function savedProblem(error, sent = true) {
   return (
     error.message +
-    (sent && ['offline', 'invalid_response'].includes(error.code)
+    (sent && ['offline', 'invalid_response', 'interrupted'].includes(error.code)
       ? ' Check Saved birds if the connection was lost.'
       : '')
   );
 }
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
-function confirmSaved(context, section, problem, body, preview) {
+function confirmSaved(context, section, problem, body, preview, reason = '') {
   const { el, button, api, note, href } = context;
   const key = randomHex(24);
   const confirm = button('Confirm Saved birds change', async (event) => {
@@ -671,6 +671,7 @@ function confirmSaved(context, section, problem, body, preview) {
   section.append(
     el('h2', 'Change Saved birds?'),
     note(savedSummary(preview)),
+    ...(reason ? [note(reason)] : []),
     note(
       'Saved birds join the compatible current selection and can affect the existing wall immediately at its next refresh. This is curation, not a sighting. Other named collections and source history stay unchanged. No model starts.',
     ),
@@ -708,7 +709,9 @@ export function savedReview(context, label, action, taxonId) {
 }
 
 // One bird: a toggle with an inline result and Undo. A change that would touch
-// other birds (an old queue migration) still asks first.
+// other birds (an old queue migration) still asks first, and so does removing a
+// bird without approved art: adding it back would be refused, so Undo could not
+// restore it.
 export function savedToggle(context, bird) {
   const { ui, el, button, api } = context;
   const section = el('section', '', 'journal-card'),
@@ -716,7 +719,9 @@ export function savedToggle(context, bird) {
     problem = el('p', '', 'error');
   status.setAttribute('role', 'status');
   problem.setAttribute('role', 'alert');
+  // The controller adds, and previews adding, only birds with approved art.
   let saved = Boolean(bird.saved),
+    plateReady = Boolean(bird.plate_ready),
     undo = null,
     sent = false;
   const control = button('', () => change(saved ? 'remove' : 'add', true));
@@ -738,14 +743,29 @@ export function savedToggle(context, bird) {
       if (!own && !other && !preview.migrated_legacy_queue_count) {
         // Another tab or device already made this change: show it, send nothing.
         saved = action === 'add';
+        if (saved) plateReady = true;
         label();
         status.textContent = saved ? 'Already in Saved birds.' : 'Not in Saved birds.';
         return;
       }
-      if (own > 1 || other || preview.migrated_legacy_queue_count) {
+      if (
+        own > 1 ||
+        other ||
+        preview.migrated_legacy_queue_count ||
+        (action === 'remove' && !plateReady)
+      ) {
         status.textContent = '';
         control.remove();
-        confirmSaved(context, section, problem, body, preview);
+        confirmSaved(
+          context,
+          section,
+          problem,
+          body,
+          preview,
+          action === 'remove' && !plateReady
+            ? 'This bird has no approved art yet, so it cannot be added back until it does.'
+            : '',
+        );
         return;
       }
       sent = true;
@@ -761,8 +781,12 @@ export function savedToggle(context, bird) {
       );
       if (!receipt) return;
       if (receipt.status !== 'succeeded')
-        throw new Error(receipt.result?.message || 'The operation did not finish.');
+        throw Object.assign(
+          new Error(receipt.result?.message || 'The operation did not finish.'),
+          { code: receipt.status },
+        );
       saved = action === 'add';
+      if (saved) plateReady = true;
       label();
       status.textContent = saved ? 'Added to Saved birds.' : 'Removed from Saved birds.';
       if (offerUndo) {
@@ -786,8 +810,12 @@ export function savedToggle(context, bird) {
 }
 
 // The journal's Saved birds action: one bird toggles, everything else is reviewed.
-export function savedChange(context, label, action, taxonId) {
+export function savedChange(context, label, action, taxonId, plateReady = false) {
   return taxonId
-    ? savedToggle(context, { taxon_id: taxonId, saved: action === 'remove' })
+    ? savedToggle(context, {
+        taxon_id: taxonId,
+        saved: action === 'remove',
+        plate_ready: Boolean(plateReady),
+      })
     : savedReview(context, label, action, taxonId);
 }
