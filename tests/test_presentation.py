@@ -21,7 +21,7 @@ from inky_bird_frame.journal import (
     remove_collection,
     save_collection,
 )
-from inky_bird_frame.presentation import PresentationAccess
+from inky_bird_frame.presentation import MAX_GRANTS, MAX_PENDING, PresentationAccess
 from inky_bird_frame.server import project_catalog
 from inky_bird_frame.web import create_app
 
@@ -448,3 +448,64 @@ def test_screen_plate_replaced_after_authorization_is_not_cached_as_the_old_revi
         )
         assert current.content == replacement
         assert current.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.at = datetime(2026, 10, 15, 12, tzinfo=UTC)
+
+    def now(self, tz: object = None) -> datetime:
+        return self.at
+
+
+def test_a_waiting_screen_keeps_its_code_while_another_client_keeps_asking(
+    tmp_path: Path,
+) -> None:
+    # Called exactly as the web route calls it: no client is named.
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        screen, first = access.request_pair("")
+        for _ in range(MAX_PENDING - 1):
+            clock.at += timedelta(seconds=16)
+            access.request_pair("")
+        saved = access.path.read_bytes()
+        clock.at += timedelta(seconds=16)
+        # The pending allowance is full: refuse the newcomer, never evict the
+        # screen whose code the owner may be about to approve.
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("")
+        assert access.path.read_bytes() == saved
+        resumed = access.request_pair(screen)[1]
+        assert resumed == {"status": "pending", "pairing_code": first["pairing_code"]}
+
+
+def test_pairing_pause_is_per_client_and_forgets_finished_pauses(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        access.request_pair("", client="198.51.100.7")
+        access.request_pair("", client="192.0.2.1")
+        saved = access.path.read_bytes()
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("", client="198.51.100.7")
+        assert access.path.read_bytes() == saved
+        clock.at += timedelta(seconds=16)
+        access.request_pair("", client="198.51.100.7")
+        # Only pauses still running are remembered, so the table stays as
+        # small as the pending allowance and no entry is dropped early.
+        assert set(access._pair_requests) == {"198.51.100.7"}
+
+
+def test_a_full_screen_list_still_refuses_new_pairing(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    for index in range(MAX_GRANTS):
+        access.update(
+            revision=access.status()["revision"],
+            action="status",
+            name=f"Credential {index}",
+            view="all",
+            confirm=True,
+        )
+    with pytest.raises(AccessRateLimitError):
+        access.request_pair("", client="198.51.100.7")

@@ -7,7 +7,8 @@ import json
 import os
 import shutil
 import stat
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -32,12 +33,35 @@ from .controller import (
     read_generation_queue,
     retry_approved_candidate,
 )
-from .errors import CatalogError, CatalogPublishError, GenerationError, SpeciesStateError
+from .errors import (
+    BusyError,
+    CatalogError,
+    CatalogPublishError,
+    GenerationError,
+    SpeciesStateError,
+)
 from .http import MAX_ASSET_BYTES
 from .journal import MAX_JOURNAL_BYTES, JournalConflictError, JournalError
 from .models import ProfileConflict, SpeciesProfileData
-from .publisher import validate_pending_candidate
+from .publisher import publication_privacy_patterns, validate_pending_candidate
 from .retry import RetryStore, parse_retry_profile_conflicts
+
+# Plate review reads run in the web worker pool; a long catalog change must not pin a worker.
+PLATE_REVIEW_LOCK_SECONDS = 10.0
+
+
+@contextmanager
+def _plate_review_read_lock(config: AppConfig) -> Iterator[None]:
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                catalog_state_lock(
+                    config.controller.state_dir, shared=True, timeout=PLATE_REVIEW_LOCK_SECONDS
+                )
+            )
+        except BusyError as exc:
+            raise JournalError("Plate work is busy. Try again in a moment.") from exc
+        yield
 
 
 def _candidate_bytes(path: Path, maximum: int) -> bytes:
@@ -116,6 +140,8 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
     ids = set()
     unknown = False
     for directory in sorted(root.iterdir()) if root.exists() else []:
+        if directory.name == ".DS_Store":
+            continue
         prefix, separator, _ = directory.name.partition("-")
         if not separator or not prefix.isascii() or not prefix.isdigit() or int(prefix) <= 0:
             unknown = True
@@ -154,11 +180,11 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
 
 def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
     """Owner-only allowlist; generated candidates are never approved/public art."""
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         path, manifest, _, revision = _pending_candidate(config, taxon_id)
         ready = True
         try:
-            validate_pending_candidate(path)
+            validate_pending_candidate(path, private_patterns=publication_privacy_patterns(config))
         except (CatalogPublishError, CatalogError, OSError, ValueError):
             ready = False
         profile: SpeciesProfileData | None
@@ -219,7 +245,7 @@ def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
 
 
 def pending_portrait(config: AppConfig, taxon_id: int, *, revision: str) -> bytes:
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         _, _, body, current = _pending_candidate(config, taxon_id)
         if current != revision:
             raise JournalConflictError("This candidate changed. Reload its review before viewing.")
@@ -241,14 +267,31 @@ def decide_pending_candidate(
                 "operator migration workflow."
             )
         if approve:
+            private_patterns = publication_privacy_patterns(config)
             try:
-                validate_pending_candidate(path)
+                validate_pending_candidate(path, private_patterns=private_patterns)
             except (CatalogPublishError, CatalogError, OSError, ValueError) as exc:
+                private_only = bool(private_patterns)
+                if private_only:
+                    try:
+                        validate_pending_candidate(path)
+                    except (CatalogPublishError, CatalogError, OSError, ValueError):
+                        private_only = False
+                if private_only:
+                    raise JournalError(
+                        "This plate's text names this controller's location or a local path, "
+                        "so it cannot be published. Reject it, then retry the bird."
+                    ) from exc
                 raise JournalError(
                     "This candidate cannot pass ordinary approval. "
                     "Use operator recovery without bypassing review."
                 ) from exc
-            approve_candidate(config.controller.state_dir, config.controller.catalog_dir, taxon_id)
+            approve_candidate(
+                config.controller.state_dir,
+                config.controller.catalog_dir,
+                taxon_id,
+                private_patterns=private_patterns,
+            )
         else:
             if not reason.strip() or len(reason) > 2000:
                 raise JournalError("Give a rejection reason of 1–2000 characters")

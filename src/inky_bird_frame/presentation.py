@@ -25,6 +25,9 @@ from .journal import JournalConflictError, JournalError, JournalService, Journal
 MAX_GRANTS = 32
 MAX_PENDING = 8
 PAIR_SECONDS = 10 * 60
+# One client may start a new pairing request this often. The pause is kept per
+# client, so it applies to the whole household only while callers name none.
+PAIR_REQUEST_INTERVAL_SECONDS = 15
 GRANT_DAYS = 90
 MAX_STATE_BYTES = 256 * 1024
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -80,6 +83,9 @@ class PresentationAccess:
     def __init__(self, state_dir: Path, journal: JournalService) -> None:
         self.state_dir, self.journal = state_dir, journal
         self.path = state_dir / "presentation-access.json"
+        # When each recent client last started a request; kept in memory so
+        # that refusing a client never needs a disk write.
+        self._pair_requests: dict[str, float] = {}
 
     def _load(self) -> PresentationState:
         if not self.path.exists() and not self.path.is_symlink():
@@ -185,7 +191,8 @@ class PresentationAccess:
                 ],
             }
 
-    def request_pair(self, existing: str) -> tuple[str, dict[str, object]]:
+    def request_pair(self, existing: str, *, client: str = "") -> tuple[str, dict[str, object]]:
+        """Start or resume pairing for one screen; ``client`` identifies its network peer."""
         with catalog_state_lock(self.state_dir):
             state = self._load()
             now = datetime.now(UTC).timestamp()
@@ -200,10 +207,17 @@ class PresentationAccess:
             )
             if current is not None and current.kind in {"pending", "viewer"}:
                 return existing, {"status": current.kind, "pairing_code": current.pairing_code}
+            # Keep only running pauses. Each one took a pending slot, so the table
+            # is bounded without dropping a pause before it ends.
+            self._pair_requests = {
+                key: at
+                for key, at in self._pair_requests.items()
+                if 0 <= now - at < PAIR_REQUEST_INTERVAL_SECONDS
+            }
             if (
-                len(grants) >= MAX_GRANTS
+                client in self._pair_requests
+                or len(grants) >= MAX_GRANTS
                 or sum(g.kind == "pending" for g in grants) >= MAX_PENDING
-                or now - state.last_pair_request_at < 15
             ):
                 raise AccessRateLimitError(
                     "Pairing is busy. Wait a moment or remove an unused request in Displays."
@@ -227,6 +241,7 @@ class PresentationAccess:
                     last_pair_request_at=now,
                 )
             )
+            self._pair_requests[client] = now
             return secret, {
                 "status": "pending",
                 "pairing_code": grant.pairing_code,
