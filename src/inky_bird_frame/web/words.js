@@ -49,3 +49,49 @@ export function recentDate(value, today = new Date()) {
 }
 
 // Workstream additions go below, each in its own marked section, appended at the end.
+
+// ---- design-copy workstream ----
+
+const WINDOWS = {
+  'last-day': 'Last day',
+  'last-week': 'Last week',
+  'last-30-days': 'Last 30 days',
+  'last-year': 'Last year',
+  'all-time': 'All time',
+};
+// "Last 30 days"; a window this page does not know is still readable.
+export function windowName(value) {
+  const words = String(value ?? '').replaceAll('-', ' ').trim();
+  return WINDOWS[value] || (words ? words[0].toUpperCase() + words.slice(1) : '');
+}
+
+const EVENTS = {
+  discovery: 'New birds',
+  generation_approved: 'New plates',
+  terminal_error: 'A plate needs a hand',
+  degraded: 'Something stopped working',
+  recovered: 'It works again',
+  publication_error: 'Plates could not be published',
+  publication_recovered: 'Publishing works again',
+  display_stale: 'The wall frame stopped updating',
+  display_recovered: 'The wall frame updates again',
+};
+export function eventName(value) {
+  const words = String(value ?? '').replaceAll('_', ' ').trim();
+  return EVENTS[value] || (words ? words[0].toUpperCase() + words.slice(1) : '');
+}
+
+// A moment in the owner's terms: "today at 14:05", "yesterday at 09:10",
+// "on Tuesday", "12 Mar 2019". An unreadable value gives an empty string.
+export function when(value, today = new Date()) {
+  const moment = new Date(value);
+  if (value === null || value === undefined || value === '' || Number.isNaN(moment.getTime()))
+    return '';
+  const pad = (number) => String(number).padStart(2, '0');
+  const local =
+    moment.getFullYear() + '-' + pad(moment.getMonth() + 1) + '-' + pad(moment.getDate());
+  const day = recentDate(local, today);
+  return ['today', 'yesterday'].includes(day)
+    ? day + ' at ' + pad(moment.getHours()) + ':' + pad(moment.getMinutes())
+    : day;
+}
