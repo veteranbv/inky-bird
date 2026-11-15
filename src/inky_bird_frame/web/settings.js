@@ -1,5 +1,6 @@
 // Settings edit the controller's authoritative file. Secrets are write-only.
 import { inlineProblem } from '/app/ui.js';
+import { windowName, eventName } from '/app/words.js';
 
 const secretNames = {
   ebird_api_key: 'eBird API key',
@@ -144,7 +145,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   if (source) {
     const group = section(
       'Use this source',
-      'Enabling a source can put newly observed birds into the live selection. It does not download media. Automatic plate work follows your generation setting.',
+      'Birds this source notes can go on your frame. Plates for them are made only if plate making is on.',
     );
     checkbox(
       group,
@@ -201,7 +202,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (['ebird-archive', 'birdnet-analyzer'].includes(source))
       form.append(
         note(
-          'An import is retained history, not a live connection. Enabling it selects records within the shared window; it does not request a new file automatically.',
+          'This is history you imported, not a live connection. Turning it on uses its records within your window; it never fetches a new file.',
         ),
       );
   } else {
@@ -262,12 +263,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     });
     const selection = section(
       'Shared live selection',
-      'Collections keep their own fixed membership. These choices control scheduled observation refreshes. eBird nearby supports up to 30 days and 50 km.',
+      'These choices set what your regular checks look for. Collections keep their own birds. eBird nearby looks back at most 30 days and 50 km.',
     );
     const window = el('select');
     window.setAttribute('aria-label', 'Observation window');
     for (const key of ['last-day', 'last-week', 'last-30-days', 'last-year', 'all-time']) {
-      const option = el('option', key.replaceAll('-', ' '));
+      const option = el('option', windowName(key));
       option.value = key;
       window.append(option);
     }
@@ -282,12 +283,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       hint: 'This limits live discovery, not the membership of a saved trip. BirdWeather supports at most 100.',
     });
     const generation = section(
-      'Plate generation',
-      'Approved art is free to browse. First install and sign in to Codex through the operator setup, then run the controller doctor. Creating missing plates uses that AI account and its allowance or costs. Inky keeps sourced review and retry limits. Disabling generation leaves history and queued work intact. An attempt already running can finish.',
+      'Plate making',
+      'Browsing your plates is free. New plates are drawn with your own image-generation account, and that provider’s charges apply. Set the account up on the controller first, then run the controller doctor. Every new plate is checked before you keep it. Turning this off keeps your history and waiting requests; a plate already being drawn can finish.',
     );
     checkbox(
       generation,
-      'Enable scheduled plate generation',
+      'Make new plates on a schedule',
       settings.generation_enabled,
       (checked) => {
         changes.controller.generation_enabled = checked;
@@ -295,13 +296,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     );
     const consent = checkbox(
       generation,
-      'I understand that enabling generation can start AI work at the next scheduled cycle.',
+      'I understand this can start using my image-generation account at the next check.',
       false,
       () => {},
     );
     read.push(() => {
       if (!settings.generation_enabled && changes.controller.generation_enabled && !consent.checked)
-        throw new Error('Confirm AI use before enabling generation.');
+        throw new Error('Tick the box to confirm before turning plate making on.');
     });
     const notifications = section(
       'Notifications',
@@ -353,7 +354,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
           field = el('input');
         field.type = 'checkbox';
         field.checked = !saved.events || saved.events.includes(event);
-        label.append(field, document.createTextNode(event.replaceAll('_', ' ')));
+        label.append(field, document.createTextNode(eventName(event)));
         row.append(label);
         checked.push([event, field]);
       }
@@ -430,8 +431,8 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         );
       else
         summary.push(
-          'Live window: ' + changes.discovery.window.replaceAll('-', ' ') + '.',
-          'Generation: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
+          'Window: ' + windowName(changes.discovery.window) + '.',
+          'Plate making: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
           'Notifications: ' + (changes.notifications.enabled ? 'on' : 'off') + '.',
         );
       summary.push(...differences(settings, changes));
@@ -439,7 +440,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         el('h2', 'Save these choices?'),
         ...summary.map(note),
         note(
-          'Inky validates the whole file before saving. A private previous-file backup is kept. The scheduler reads changes on its next check. Saving a new source does not run a connection test.',
+          'Inky checks the whole file before saving and keeps a private copy of the previous one. Changes apply from the next check. Saving a source does not test its connection.',
         ),
         button('Save settings', async (event) => {
           const control = event.currentTarget;

@@ -7,8 +7,13 @@ import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 const uiURL = moduleURL(await readFile(new URL('ui.js', web), 'utf8'));
+const wordsURL = moduleURL(await readFile(new URL('words.js', web), 'utf8'));
 const { renderSettings } = await import(
-  moduleURL((await readFile(new URL('settings.js', web), 'utf8')).replace("'/app/ui.js'", JSON.stringify(uiURL)))
+  moduleURL(
+    (await readFile(new URL('settings.js', web), 'utf8'))
+      .replace("'/app/ui.js'", JSON.stringify(uiURL))
+      .replace("'/app/words.js'", JSON.stringify(wordsURL)),
+  )
 );
 
 const sourceNames = {

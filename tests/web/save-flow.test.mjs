@@ -141,9 +141,10 @@ async function settle(t) {
 test('one bird is saved with one tap, an inline result and Undo', async (t) => {
   const server = savedServer();
   const { context, main, assigned } = page(t, server.respond);
+  context.byId.set(7, { taxon_id: 7, common_name: 'Brown Creeper' });
   const section = collections.savedChange(context, 'Review adding to Saved birds', 'add', 7);
   main.append(section);
-  findButton(section, 'Add to Saved birds').click();
+  findButton(section, 'Add to my frame').click();
   await settle(t);
   assert.deepEqual(assigned, []);
   assert.equal(server.changes.length, 1);
@@ -151,15 +152,15 @@ test('one bird is saved with one tap, an inline result and Undo', async (t) => {
   assert.equal(server.changes[0].taxon_id, 7);
   assert.equal(server.changes[0].confirm, true);
   assert.equal(server.changes[0].collection_revision, 'c'.repeat(64));
-  assert(texts(section).includes('Added to Saved birds.'));
-  assert(findButton(section, 'Remove from Saved birds'));
+  assert(texts(section).includes('Brown Creeper will show on your frame from the next refresh.'));
+  assert(findButton(section, 'Remove from my frame'));
   findButton(section, 'Undo').click();
   await settle(t);
   assert.equal(server.changes.length, 2);
   assert.equal(server.changes[1].action, 'remove');
   assert.notEqual(server.changes[1].key, server.changes[0].key);
-  assert(texts(section).includes('Removed from Saved birds.'));
-  assert(findButton(section, 'Add to Saved birds'));
+  assert(texts(section).includes('Brown Creeper will leave your frame at the next refresh.'));
+  assert(findButton(section, 'Add to my frame'));
   assert.equal(findButton(section, 'Undo'), null);
   assert.equal(texts(section).some((text) => /[0-9a-f]{32}/.test(text)), false);
 });
@@ -169,11 +170,12 @@ test('a single-bird change that would touch other birds still asks first', async
   const { context, main } = page(t, server.respond);
   const section = collections.savedChange(context, 'Review adding to Saved birds', 'add', 7);
   main.append(section);
-  findButton(section, 'Add to Saved birds').click();
+  findButton(section, 'Add to my frame').click();
   await settle(t);
   assert.equal(server.changes.length, 0);
-  assert(findButton(section, 'Confirm Saved birds change'));
-  assert(texts(section).includes('1 addition · 0 removals · 1 legacy seed member migrated'));
+  assert(findButton(section, 'Change my frame'));
+  assert(texts(section).includes('Adding 1 bird. Keeping 1 bird from your earlier setup.'));
+  assert(!texts(section).some((text) => /legacy|seed|sighting|model/i.test(text)));
 });
 
 test('a failed toggle stays on the page with its message', async (t) => {
@@ -183,16 +185,16 @@ test('a failed toggle stays on the page with its message', async (t) => {
   });
   const section = collections.savedToggle(context, { taxon_id: 7, saved: true });
   main.append(section);
-  findButton(section, 'Remove from Saved birds').click();
+  findButton(section, 'Remove from my frame').click();
   await settle(t);
   assert.equal(requests.at(-1).path, '/v1/owner/saved/preview');
   assert(texts(section).includes('Saved birds or approved artwork changed. Review this action again.'));
-  assert.equal(findButton(section, 'Remove from Saved birds').disabled, false);
+  assert.equal(findButton(section, 'Remove from my frame').disabled, false);
 });
 
 for (const [saved, shown, label] of [
-  [false, 'Already in Saved birds.', 'Remove from Saved birds'],
-  [true, 'Not in Saved birds.', 'Add to Saved birds'],
+  [false, 'Already on your frame.', 'Remove from my frame'],
+  [true, 'Not on your frame.', 'Add to my frame'],
 ])
   test(`a stale ${saved ? 'remove' : 'add'} sends nothing and offers no Undo`, async (t) => {
     // Another tab already made this change, so the server reports nothing to do.
@@ -200,7 +202,7 @@ for (const [saved, shown, label] of [
     const { context, main } = page(t, server.respond);
     const section = collections.savedToggle(context, { taxon_id: 7, saved });
     main.append(section);
-    findButton(section, saved ? 'Remove from Saved birds' : 'Add to Saved birds').click();
+    findButton(section, saved ? 'Remove from my frame' : 'Add to my frame').click();
     await settle(t);
     assert.equal(server.changes.length, 0);
     assert(texts(section).includes(shown));
@@ -214,13 +216,13 @@ test('a change the controller refused does not flip the toggle', async (t) => {
   const { context, main } = page(t, server.respond);
   const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
   main.append(section);
-  findButton(section, 'Add to Saved birds').click();
+  findButton(section, 'Add to my frame').click();
   await settle(t);
   assert.equal(server.changes.length, 1);
   const shown = texts(section);
   assert(shown.includes(message));
-  assert(!shown.includes('Added to Saved birds.'));
-  assert(findButton(section, 'Add to Saved birds'));
+  assert(!shown.some((text) => text.includes('will show on your frame')));
+  assert(findButton(section, 'Add to my frame'));
   assert.equal(findButton(section, 'Undo'), null);
 });
 
@@ -228,7 +230,7 @@ for (const [failing, hint] of [
   ['/v1/owner/saved/preview', false],
   ['/v1/owner/saved/change', true],
 ])
-  test(`a lost connection at ${failing.split('/').pop()} ${hint ? 'says' : 'does not say'} to check Saved birds`, async (t) => {
+  test(`a lost connection at ${failing.split('/').pop()} ${hint ? 'says' : 'does not say'} to check On my frame`, async (t) => {
     // Only a change that was sent can have been applied without an answer.
     const server = savedServer();
     const { context, main } = page(t, (path, body) => {
@@ -238,31 +240,31 @@ for (const [failing, hint] of [
     });
     const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
     main.append(section);
-    findButton(section, 'Add to Saved birds').click();
+    findButton(section, 'Add to my frame').click();
     await settle(t);
-    const hinted = 'Inky cannot be reached. Check Saved birds if the connection was lost.';
+    const hinted = 'Inky cannot be reached. Check On my frame to see whether it changed.';
     assert(texts(section).includes(hint ? hinted : 'Inky cannot be reached.'));
     assert.equal(texts(section).includes(hinted), hint);
   });
 
-test('bulk Saved birds changes keep their review step', async (t) => {
+test('changes to many birds keep their review step', async (t) => {
   const server = savedServer({ added_count: 3 });
   const { context, main } = page(t, server.respond);
   const section = collections.savedChange(
     context,
-    'Review adding all available approved art',
+    'Add every bird with a plate',
     'import-approved',
   );
   main.append(section);
-  findButton(section, 'Review adding all available approved art').click();
+  findButton(section, 'Add every bird with a plate').click();
   await settle(t);
   assert.equal(server.changes.length, 0);
-  assert(texts(section).includes('3 additions · 0 removals · 0 legacy seed members migrated'));
+  assert(texts(section).includes('Adding 3 birds.'));
 });
 
 test('an outcome shows plain words, never identifiers or hashes', async () => {
-  assert.equal(manage.statusText('succeeded'), 'Finished');
-  assert.equal(manage.statusText('something-new'), 'Status unknown');
+  assert.equal(manage.statusText('succeeded'), 'Done.');
+  assert.equal(manage.statusText('something-new'), 'Inky could not tell how this went.');
   assert.deepEqual(
     manage.resultLines({
       added_count: 1,
@@ -277,7 +279,7 @@ test('an outcome shows plain words, never identifiers or hashes', async () => {
       error_type: 'JournalError',
       generation_enabled: false,
     }),
-    ['1 bird added', '2 birds removed', '0 legacy seed members migrated', 'Generation off'],
+    ['1 bird added', '2 birds removed', '0 birds kept from your earlier setup', 'Plate making is off'],
   );
   // Every other field is shown: in words where this page has them, otherwise
   // under a readable label, never as a raw key.
@@ -292,13 +294,13 @@ test('an outcome shows plain words, never identifiers or hashes', async () => {
       dry_run: true,
     }),
     [
-      'Window: last-30-days',
+      'Window: Last 30 days',
       'Radius km: 25',
-      'Earliest checklist: 2001-03-01',
-      'Latest checklist: 2001-03-09',
-      'Source rows: 3',
+      'Earliest checklist: 1 Mar 2001',
+      'Latest checklist: 9 Mar 2001',
+      'Rows in the file: 3',
       'New checklists: 1',
-      'Trial run only: nothing was changed',
+      'Nothing was changed: this was a trial run',
     ],
   );
 });
@@ -308,15 +310,15 @@ test('queued plate requests show every count the controller returns', () => {
   assert.deepEqual(
     manage.resultLines({ message: 'x', queued: 3, already_queued: 1, held: 2, ready: 0 }),
     [
-      '3 plate requests saved',
+      '3 plates asked for',
       '1 bird already waiting for a plate',
-      '2 birds still held',
+      '2 birds left as they are',
       '0 birds already with a plate',
     ],
   );
 });
 
-test('the outcome page renders a Saved birds receipt without raw keys', async (t) => {
+test('the outcome page says what happened to the frame, without raw keys', async (t) => {
   const { context, main } = page(t, () => ({
     operation_id: 'op1',
     kind: 'saved-collection',
@@ -331,8 +333,9 @@ test('the outcome page renders a Saved birds receipt without raw keys', async (t
   context.query = new URLSearchParams({ operation: 'op1' });
   await manage.renderOperation(context);
   const shown = texts(main);
-  assert(shown.includes('Change Saved birds'));
-  assert(shown.includes('Finished'));
+  assert.equal(main.querySelector('h1').textContent, 'Change to your frame');
+  assert(shown.includes('Your frame was changed. It updates at its next refresh.'));
+  assert(!shown.some((text) => /Operation|Owner operation|Finished/.test(text)));
   assert(shown.includes('1 bird added'));
   assert(!shown.some((text) => text.includes('succeeded') || text.includes('71bc32')));
   assert(!shown.some((text) => text.includes('_') || text.includes('count:')));
@@ -365,8 +368,16 @@ test('a source this page does not know still shows the Sources page', async (t) 
   await manage.renderStatus(context);
   const shown = texts(main);
   assert(shown.includes('newer-source'));
-  assert(shown.includes('Set up iNaturalist'));
-  assert(!shown.includes('Set up newer-source'));
+  const setup = [];
+  (function walk(node) {
+    for (const child of node.children) {
+      if (child.tagName === 'A' && child.textContent === 'Set up') setup.push(child);
+      walk(child);
+    }
+  })(main);
+  assert.deepEqual(setup.map((node) => node.getAttribute('aria-label')), ['Set up iNaturalist']);
+  assert(shown.includes('Birds noted in the last 30 days. Inky checks each source on a schedule; it does not listen all the time.'));
+  assert(!shown.some((text) => text.includes('last-30-days')));
 });
 
 test('a source that first appears in a status update does not stop the updates', async (t) => {
@@ -440,7 +451,7 @@ test('no retry hint shows while there are no birds to choose', async (t) => {
   });
   await manage.renderStatus(context);
   const shown = texts(main);
-  assert(shown.includes('No birds currently need retry selection.'));
+  assert(shown.includes('No birds need trying again.'));
   assert(!shown.includes('Select between 1 and 32 birds.'));
 });
 
@@ -485,7 +496,7 @@ test('a retry selection outside 1 to 32 is a note beside the choices', async (t)
   });
   context.byId.set(5, { taxon_id: 5, common_name: 'Example Wren', plate_ready: false });
   await manage.renderStatus(context);
-  const queue = findButton(main, 'Queue selected for the next scheduled check');
+  const queue = findButton(main, 'Try at the next check');
   assert.equal(queue.disabled, true);
   assert(texts(main).includes('Select between 1 and 32 birds.'));
   const box = main.querySelector('input');
@@ -493,7 +504,7 @@ test('a retry selection outside 1 to 32 is a note beside the choices', async (t)
   box.fire('change');
   assert.equal(queue.disabled, false);
   assert(!texts(main).includes('Select between 1 and 32 birds.'));
-  assert.equal(main.querySelector('h1').textContent, 'Plate work');
+  assert.equal(main.querySelector('h1').textContent, 'In the works');
 });
 
 test('the editor keeps unresolved names unless one is unticked', async (t) => {
@@ -591,10 +602,10 @@ function membershipServer(members, approved) {
 }
 
 for (const [start, first] of [
-  [new Set(), 'Add to Saved birds'],
-  [new Set([7, 8]), 'Remove from Saved birds'],
+  [new Set(), 'Add to my frame'],
+  [new Set([7, 8]), 'Remove from my frame'],
 ])
-  test(`Undo after one tap to ${first.split(' ')[0].toLowerCase()} restores the Saved birds`, async (t) => {
+  test(`Undo after one tap to ${first.split(' ')[0].toLowerCase()} restores On my frame`, async (t) => {
     const members = new Set(start);
     const server = membershipServer(members, new Set([7]));
     const { context, main, assigned } = page(t, server.respond);
@@ -623,7 +634,7 @@ test('removing a bird without approved art asks first and offers no Undo', async
   const { context, main, assigned } = page(t, server.respond);
   const section = collections.savedChange(context, '', 'remove', 7, false);
   main.append(section);
-  findButton(section, 'Remove from Saved birds').click();
+  findButton(section, 'Remove from my frame').click();
   await settle(t);
   // Nothing changed yet: the owner is asked, since adding it back would be refused.
   assert.equal(server.changes.length, 0);
@@ -631,10 +642,10 @@ test('removing a bird without approved art asks first and offers no Undo', async
   assert.equal(findButton(section, 'Undo'), null);
   assert(
     texts(section).includes(
-      'This bird has no approved art yet, so it cannot be added back until it does.',
+      'This bird has no plate yet, so you can add it back only once it has one.',
     ),
   );
-  const confirm = findButton(section, 'Confirm Saved birds change');
+  const confirm = findButton(section, 'Change my frame');
   confirm.fire('click', { currentTarget: confirm });
   await settle(t);
   assert.deepEqual([...members], []);
@@ -647,22 +658,22 @@ test('a bird page with approved art removes it in one tap', async (t) => {
   const { context, main } = page(t, server.respond);
   const section = collections.savedChange(context, '', 'remove', 7, true);
   main.append(section);
-  findButton(section, 'Remove from Saved birds').click();
+  findButton(section, 'Remove from my frame').click();
   await settle(t);
   assert.deepEqual([...members], []);
-  assert(texts(section).includes('Removed from Saved birds.'));
+  assert(texts(section).includes('This bird will leave your frame at the next refresh.'));
   assert(findButton(section, 'Undo'));
 });
 
-test('an interrupted change says to check Saved birds', async (t) => {
+test('an interrupted change says to check On my frame', async (t) => {
   const message = 'Interrupted. The outcome is not confirmed. Inspect state before an explicit retry.';
   const server = savedServer({}, 'interrupted', { message });
   const { context, main } = page(t, server.respond);
   const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
   main.append(section);
-  findButton(section, 'Add to Saved birds').click();
+  findButton(section, 'Add to my frame').click();
   await settle(t);
-  assert(texts(section).includes(message + ' Check Saved birds if the connection was lost.'));
+  assert(texts(section).includes(message + ' Check On my frame to see whether it changed.'));
 });
 
 const candidatePage = await import(moduleURL(await inline("export * from '/app/candidate.js';")));
@@ -741,7 +752,7 @@ test('a community collection that cannot be saved keeps its preview on the page'
     throw new Error('unexpected ' + path);
   });
   await collections.renderCommunity(context);
-  findButton(main, 'Save community collection').click();
+  findButton(main, 'Save as a collection').click();
   await flush();
   assert.deepEqual(problems, []);
   const shown = texts(main);

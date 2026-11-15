@@ -6,12 +6,20 @@ import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 
 // Recovery paths of the history import page. Helpers match imports.test.mjs.
 
-const source = await readFile(
-  new URL('../../src/inky_bird_frame/web/imports.js', import.meta.url),
-  'utf8',
-);
+const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
+const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+// A data: module cannot resolve '/app/' paths, so its imports are inlined too.
+const inlined = new Map();
+async function inline(source) {
+  for (const [, path] of source.matchAll(/from '(\/app\/[\w-]+\.js)'/g)) {
+    if (!inlined.has(path))
+      inlined.set(path, moduleURL(await inline(await readFile(new URL(path.slice(5), web), 'utf8'))));
+    source = source.replace(`'${path}'`, JSON.stringify(inlined.get(path)));
+  }
+  return source;
+}
 const { renderImports } = await import(
-  'data:text/javascript;base64,' + Buffer.from(source).toString('base64')
+  moduleURL(await inline(await readFile(new URL('imports.js', web), 'utf8')))
 );
 
 const HOUR = 3600 * 1000;
