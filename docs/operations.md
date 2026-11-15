@@ -41,6 +41,17 @@ generation, and review; otherwise the controller inherits the machine-wide
 Codex default. Each private run record states the requested value explicitly,
 including `null` when the default was inherited.
 
+Codex runs with a short allowlist of environment variables: executable lookup,
+home and user, locale and time zone, temporary directories, TLS trust
+(`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`,
+`CODEX_CA_CERTIFICATE`), proxy settings, and Codex's own configuration
+locations (`CODEX_HOME`, `XDG_*` and, on Linux, `DBUS_SESSION_BUS_ADDRESS`).
+Provider keys, notification URLs, sign-in secrets and API-key variables are not
+passed to it. If Codex was authenticated only through an environment variable,
+sign in with `codex login` as the account that runs the services. When a Codex
+call times out, Inky stops its whole process group and the error names the run
+log that holds its captured output.
+
 Scheduler events and sanitized catalog-service request and failure logs include
 an ISO-8601 UTC `timestamp`. Use the event time when correlating rotated logs;
 the time a collector ingests a line can be later. Earlier logs may not contain
@@ -192,8 +203,13 @@ configured rotation resumes. The priority display counts as shown when that
 bird is already next in sequence or present in a shuffle pool, which prevents
 an immediate duplicate without reordering the other birds. A failed panel
 update does not consume the detection, and a first run shows only the current
-newest detection rather than replaying the historical window. Set the option to
-`false` to use `rotation_mode` for every update.
+newest detection rather than replaying the historical window. A detected bird
+jumps the queue only when it is not among the last six birds shown (fewer when
+the catalog is smaller), and never more than twice in a row; otherwise the
+configured rotation takes its turn. A bird that a station hears every cycle
+therefore cannot hold the frame. The display reuses a cached plate whose
+checksum still matches and removes cached plates for birds that left the
+catalog. Set the option to `false` to use `rotation_mode` for every update.
 
 Approved plates use the project's canonical 1200x1600 portrait and 1600x1200
 display assets. This geometry remains the catalog contract. PIM774 consumes the
@@ -306,6 +322,10 @@ taxon in `manual_retry_required` can be restored to the durable queue with
 problem that caused its earlier attempts to fail. Each list has a matching
 count.
 
+`status` also has a `notifications` object with `available`, `enabled`,
+`pending`, `dead_letters` and `next_attempt_at`. `available` is false when the
+notification delivery state cannot be read.
+
 `generation.complete` is true only when the discovery snapshot exists and is no
 older than twice `schedule.refresh_minutes`. Missing or stale discovery remains
 visible as `generation.discovery.status`, preserves the candidates known from
@@ -314,6 +334,13 @@ state fails the command instead of being repaired or presented as healthy.
 Passing pending candidates remain visible in the separate top-level `pending`
 view and are recovered at the start of a generation cycle. `retry TAXON_ID`
 archives an incomplete or terminal candidate before making it eligible again.
+
+Before approving a pending plate, Inky checks its taxon, both image files, their
+checksums and a full image decode. A plate that fails is **held**: it stays in
+`pending/`, the catalog is not changed, and the rest of the cycle continues. The
+generation result lists it as a terminal failure with the message "The pending
+plate failed its approval checks, so it was kept for review. Reject it to make a
+new one." Inspect the plate, then reject it to queue a new one.
 
 ## Run a combined cycle
 
@@ -436,6 +463,16 @@ compatible within their minor line. Before version 1.0, a minor release may
 include a documented configuration or operational migration. Release notes are
 the source of truth for each upgrade.
 
+A release builds no new image. The release workflow checks that the tag is `v`
+followed by the version in `pyproject.toml`, that the tagged commit is on `main`
+and has a passing `ci` run, and that `main` already published a container image
+for that commit. It runs that exact image natively on arm64 (version, catalog
+validation and the Codex sandbox check) and only then adds the release's version
+tags to it. A published version tag is never moved to a different image, and an
+uploaded release file is never replaced. If the commit's image is missing, wait
+for or re-run that commit's `main` container publication, then re-run the
+release.
+
 ### Version 1 compatibility contract
 
 `1.0.0rc1` identifies the first release candidate, not a stable 1.0 release.
@@ -479,6 +516,11 @@ security or privacy flaw makes a compatibility promise unsafe, a release may
 close that boundary earlier; the release notes must identify the exception,
 impact, and safest upgrade or rollback path.
 
+After a downgrade, a journal or collection written by a newer version is
+reported as "This journal needs a newer Inky version" or "This collection needs
+a newer Inky version", not as damaged. Upgrade again instead of restoring an
+older backup over the newer file.
+
 Before changing versions:
 
 1. read every release note between the installed and target versions;
@@ -495,6 +537,55 @@ check the display. Do not restore older state over newer state while services
 are running. For recovery, stop writers and start the prior release with a
 backup created by that release; restore data only when the release notes or the
 failure require it.
+
+### Command results and exit codes
+
+Every one-shot command prints one JSON object. Success is `{"ok": true, "data": ...,
+"schema_version": 1}`. A failure is `{"ok": false, "error": {"type": ...,
+"message": ...}, "schema_version": 1}`. Scripts should branch on the exit code
+and `error.type`, not on the message wording.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The command succeeded. |
+| `1` | The command failed. `doctor` also exits `1` when a check fails; that report is still `"ok": true` with `"ready": false`. |
+| `2` | The arguments are wrong. Fix the command; retrying it unchanged will not help. |
+| `3` | Busy: another process holds the lock this command needs. |
+
+Exit code `2` covers only argument errors. Command-line parsing errors print a
+usage message to standard error instead of the JSON object. Checks the CLI makes
+itself print the JSON object with `error.type` `usage`. A runtime fault the code
+reports as a plain value error, such as an unsafe CA bundle or an unsupported
+display size, is `internal` with exit code `1` and keeps its message.
+
+`error.type` is always one of these values:
+
+| `error.type` | Meaning |
+| --- | --- |
+| `configuration` | The configuration file or a browser setting is not valid. |
+| `usage` | The arguments are wrong (exit code `2`). |
+| `busy` | Another process holds the lock (exit code `3`). |
+| `data_source` | An observation provider or an import file failed. |
+| `catalog` | Catalog or journal state is not valid. |
+| `generation` | Plate generation failed. |
+| `publication` | Public catalog publication failed. |
+| `installation` | Setup, a required program or a dependency failed. |
+| `access` | Owner access or sign-in state refused the request. |
+| `storage` | A file could not be read or written, or owner-operation storage is full. |
+| `internal` | An error with no more specific type. A readable project error or value error keeps its message. Any other unexpected error gets fixed text, and one diagnostic line goes to standard error, which is the service log. |
+
+`busy` means, for example, that a cycle, refresh, publication, display cycle,
+owner operation or a second scheduler is already running. `generate` and
+`catalog-publish` send no failure notification for a busy result. Before 1.0, `error.type` held a Python class
+name. The fixed list above replaced it as an approved pre-1.0 contract change.
+
+### Deprecations
+
+Unknown configuration keys are deprecated. A key or table that this version does
+not use is still accepted in 1.x. `config validate` lists it under
+`unknown_keys`, and the controller doctor warns with check `config_unknown_keys`
+(names only, never values). Version 2.0 will reject unknown keys. Fix typos and
+remove settings you no longer need now, so the upgrade does not stop on them.
 
 ## Inspect or override a candidate
 
@@ -550,10 +641,13 @@ only; they never enter the approved catalog or rotation.
   observation later expires. By default, validated research and references are
   reused. Omit `--source-attempt` when no retained image should be reused.
   Transient source failures retain the guidance and edit source until
-  generation reaches a successful or terminal quality result. If retry finds an
-  interrupted, fully invalid approval directory, it archives that debris and
-  removes the stale local catalog entry before regeneration; a valid approved
-  plate still requires the explicit replacement command below. When a
+  generation reaches a successful or terminal quality result. If a bird's only
+  state is an invalid approved entry (for example a damaged image), `retry
+  TAXON_ID`, `retry TAXON_ID --refresh-research` and `retry TAXON_ID
+  --replace-approved --reason "..."` move it to `state_dir/archive/invalid-approved-*`, remove
+  it from the local catalog index and queue the bird again. Removing one entry
+  works even when another entry is also invalid. A valid approved plate still
+  requires the explicit replacement command below. When a
   stronger portrait belongs to an older archived generation run, use
   `retry TAXON_ID --source-run RUN_NAME --source-attempt N`. `RUN_NAME` is the
   archive directory name, not a path. The command validates archive containment,
@@ -591,6 +685,18 @@ only; they never enter the approved catalog or rotation.
   replacements as history. CI rejects a replacement whose newest record does
   not match the pull request base, while controller sync may use the recorded
   ancestry when an installation skips an intermediate release.
+- Configuration stops loading while the scheduler runs (Docker and
+  app-managed native installations, which use one scheduler process): it
+  keeps its last good job list and logs `jobs_reload_failed` once. Scheduled jobs fail until the file is fixed. After
+  the usual degradation threshold, it sends one "Inky settings could not be
+  loaded" notice through the destinations of the last configuration that
+  loaded, at most every five minutes and subject to `cooldown_minutes`. A
+  "Inky settings load again" notice follows only if that notice was sent. Run
+  `config validate` to see the problem. This holds only while the process stays
+  up: a scheduler that starts with a broken file (after a reboot or restart)
+  exits `1`, and systemd, launchd or Docker restarts it without a notice.
+  Check the service status and log. A second scheduler for the same
+  installation exits `3` (busy).
 - Controller unavailable: the current e-paper image remains visible. Display
   state is not advanced.
 - Checksum mismatch: the controller refuses an active on-disk asset that no
