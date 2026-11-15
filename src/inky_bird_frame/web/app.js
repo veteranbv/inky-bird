@@ -45,8 +45,14 @@ function stoppedUpload() {
 // Uploads are bounded by their own progress instead.
 const REQUEST_TIMEOUT = 60000;
 
-function notAnswered() {
-  return new RequestError('Inky did not answer in time. Check your connection and try again.', 'timeout');
+// A write that timed out may still have been applied by Inky.
+function notAnswered(write) {
+  return new RequestError(
+    write
+      ? 'Inky did not answer in time. The change may still have been saved, so reload before trying again.'
+      : 'Inky did not answer in time. Check your connection and try again.',
+    'timeout',
+  );
 }
 
 // fetch cannot report how much of a request body has been sent.
@@ -108,12 +114,12 @@ async function request(path, options) {
         signal: control.signal,
       });
     } catch {
-      throw timedOut ? notAnswered() : unreachable();
+      throw timedOut ? notAnswered(options.method === 'POST') : unreachable();
     }
     try {
       return await reply(response);
     } catch (error) {
-      throw timedOut ? notAnswered() : error;
+      throw timedOut ? notAnswered(options.method === 'POST') : error;
     }
   } finally {
     clearTimeout(deadline);

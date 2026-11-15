@@ -212,3 +212,21 @@ test('a failed status credential can be tried again', async (t) => {
   assert.deepEqual(alerts(main), ['Could not create it.']);
   assert.equal(changes(calls).length, 1);
 });
+
+test('a change pressed while another is saving says so', async (t) => {
+  const busyState = state();
+  busyState.grants.push({ id: 'g3', kind: 'screen', name: 'Den tablet', view: 'current', expires_at: 2e9 });
+  const { main, calls } = await open(t, 'displays', (path, body) =>
+    body ? new Promise(() => {}) : busyState,
+  );
+  const sections = walk(main).filter((node) => findButton(node, 'Revoke screen') && node.tagName === 'SECTION');
+  const [first, second] = sections;
+  findButton(first, 'Revoke screen').fire('click');
+  findButton(first, 'Revoke').fire('click');
+  await flush();
+  findButton(second, 'Revoke screen').fire('click');
+  findButton(second, 'Revoke').fire('click');
+  await flush();
+  assert.equal(changes(calls).length, 1, 'only one change is sent at a time');
+  assert.deepEqual(alerts(second), ['Another change is still being saved. Try again when it finishes.']);
+});

@@ -399,7 +399,6 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     review.replaceChildren();
   }
   form.addEventListener('input', withdrawReview);
-  form.addEventListener('change', withdrawReview);
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     problem.textContent = '';

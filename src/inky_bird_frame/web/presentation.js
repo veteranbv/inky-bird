@@ -73,7 +73,12 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   }
   // Resolves true once the change was made, false when it was not.
   async function update(body, section, done = () => location.reload()) {
-    if (busy) return false;
+    if (busy) {
+      inlineProblem(ui, section, {
+        message: 'Another change is still being saved. Try again when it finishes.',
+      });
+      return false;
+    }
     busy = true;
     try {
       const result = await api('/v1/owner/presentation', {

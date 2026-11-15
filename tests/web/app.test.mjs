@@ -66,6 +66,10 @@ async function open(t, journal, { offline = false } = {}) {
   define('fetch', async (path, options = {}) => {
     requests.push({ path, method: options.method || 'GET' });
     if (offline) throw new TypeError('network');
+    if (path === '/v1/owner/slow')
+      return new Promise((_resolve, reject) =>
+        options.signal.addEventListener('abort', () => reject(new DOMException('', 'AbortError'))),
+      );
     if (path === '/v1/access') return json(access);
     if (path === '/v1/owner/session') return json({ csrf: 'token', single_sign_on: false });
     if (path === '/v1/owner/logout') return json({});
@@ -116,4 +120,26 @@ test('a failure before sign-in offers only Try again', async (t) => {
   assert.ok(findButton(main, 'Try again'));
   assert.equal(findButton(main, 'Go to Home'), null);
   assert.equal(findButton(main, 'Sign out'), null);
+});
+
+test('a change that timed out says it may have been saved', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let pending;
+  await open(t, async (ui) => {
+    pending = [ui.api('/v1/owner/slow'), ui.api('/v1/owner/slow', {})].map((call) =>
+      call.then(
+        () => null,
+        (error) => error,
+      ),
+    );
+  });
+  t.mock.timers.tick(60000);
+  const [read, write] = await Promise.all(pending);
+  assert.equal(read.code, 'timeout');
+  assert.equal(write.code, 'timeout');
+  assert.equal(read.message, 'Inky did not answer in time. Check your connection and try again.');
+  assert.equal(
+    write.message,
+    'Inky did not answer in time. The change may still have been saved, so reload before trying again.',
+  );
 });
