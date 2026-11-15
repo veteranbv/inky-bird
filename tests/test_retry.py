@@ -43,6 +43,31 @@ class RetryStoreTests(unittest.TestCase):
             self.assertEqual(reloaded.common_name, "Example Bird")
             self.assertEqual(reloaded.scientific_name, "Avis exemplum")
 
+    def test_backoff_doubles_each_failure_until_the_cap(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        waits: list[timedelta] = []
+        attempts: list[int] = []
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            current = now
+            for _ in range(6):
+                record = RetryStore(path).record_failure(
+                    42,
+                    RuntimeError("temporary"),
+                    now=current,
+                    initial_minutes=10,
+                    maximum_minutes=100,
+                )
+                waits.append(record.next_attempt_at - current)
+                attempts.append(record.attempts)
+                current = record.next_attempt_at
+
+        self.assertEqual(
+            waits,
+            [timedelta(minutes=minutes) for minutes in (10, 20, 40, 80, 100, 100)],
+        )
+        self.assertEqual(attempts, [1, 2, 3, 4, 5, 6])
+
     def test_failure_without_message_is_recorded_in_a_readable_form(self) -> None:
         now = datetime(2026, 7, 10, tzinfo=UTC)
         with TemporaryDirectory() as temporary:
