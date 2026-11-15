@@ -66,14 +66,24 @@ async function ownerSetup(t) {
   await page.getByRole('button', { name: 'Create account', exact: true }).click();
   await heading('Your field journal');
   await page
-    .getByText('No sources selected for refresh. Artwork and saved collections still work.', {
+    .getByText('No sources are checked for new birds. Plates and collections still work.', {
       exact: true,
     })
     .waitFor();
-  assert.equal(await page.getByText(/The last saved selection may be out of date/).count(), 0);
-  await page.getByRole('link', { name: '2 plates ready for your review', exact: true }).waitFor();
-  await page.getByRole('link', { name: '1 plate held for recovery', exact: true }).waitFor();
-  assert.equal(await page.getByText(/3 plates ready for your review/).count(), 0);
+  assert.equal(await page.getByText(/may be out of date/).count(), 0);
+  // New plates are good news on Home; plates that need a hand stay in Manage.
+  await page.getByRole('link', { name: '2 new plates are ready to look at.', exact: true }).waitFor();
+  assert.equal(await page.getByText(/held for recovery|needs a hand/i).count(), 0);
+  assert.equal(await page.locator('.attention-banner').count(), 0);
+  // Nothing is on the frame yet: Home still opens on a plate and invites a start.
+  await page.locator('.featured-art img').waitFor();
+  await page.getByText('Pick a few birds you love to start your frame.', { exact: true }).waitFor();
+  await page.getByRole('link', { name: 'Choose birds', exact: true }).waitFor();
+  for (const [width, height] of [[375, 812], [1280, 800]]) {
+    await page.setViewportSize({ width, height });
+    await noSideways(page, 'First Home at ' + width + ' px');
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
 }
 
 async function providerSignIn(t) {

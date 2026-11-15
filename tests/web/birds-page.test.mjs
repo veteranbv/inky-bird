@@ -239,11 +239,13 @@ test('the bird page shows its notes beside the plate', async (t) => {
   assert(layout.children[1].contains(findButton(main, 'Add to Favorites')));
 });
 
-const welcome = 'Welcome. Start wherever you like.';
+const welcome = 'Connect a source (optional)';
+const start = 'Pick a few birds you love to start your frame.';
 const empty = { birds: [], active_taxon_ids: [], featured_taxon_id: null };
-test('a new journal shows the welcome', async (t) => {
+test('a new journal offers a first start', async (t) => {
   const { main } = await open(t, { page: 'home' }, { state: withState(empty) });
   assert(main.textContent.includes(welcome));
+  assert(main.textContent.includes(start));
 });
 
 for (const [name, change] of [
@@ -254,7 +256,7 @@ for (const [name, change] of [
   test('a journal with ' + name + ' and no birds is not shown as new', async (t) => {
     const { main } = await open(t, { page: 'home' }, { state: withState({ ...empty, ...change }) });
     assert(!main.textContent.includes(welcome));
-    assert(main.textContent.includes('Make room for a bird'));
+    assert(main.textContent.includes(start));
   });
 
 for (const [plateReady, oneTap] of [

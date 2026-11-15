@@ -17,6 +17,7 @@ import {
 import { renderFrame } from '/app/frame.js';
 import { renderCandidate } from '/app/candidate.js';
 import { renderOperation, renderGuides, renderManage, renderStatus } from '/app/manage.js';
+import { WORDS, plateCounts, plural } from '/app/words.js';
 let run = 0;
 let stopScreen = () => {};
 let frameSignOut = null;
@@ -45,6 +46,17 @@ export function plateURL(bird, size = 'full') {
     encodeURIComponent(bird.portrait_sha256)
   );
 }
+
+// How each source's birds read on a card, in the owner's terms.
+const notedOn = {
+  inaturalist: 'Seen nearby',
+  ebird: 'Seen nearby',
+  'ebird-archive': 'In your checklists',
+  birdweather: 'On your microphone',
+  'birdnet-go': 'On your microphone',
+  'birdnet-analyzer': 'On your microphone',
+  birdbuddy: 'At your feeder',
+};
 
 const sourceNames = {
   inaturalist: ['iNaturalist', 'Community reports'],
@@ -80,7 +92,7 @@ export async function openJournal(ui, message = '') {
   }
   function art(bird, className = '', size = 'full') {
     const image = el('img', '', className);
-    image.alt = 'Approved field-journal plate: ' + bird.common_name;
+    image.alt = 'Plate: ' + bird.common_name;
     // Set before src so the browser can defer the request and reserve the space.
     image.loading = 'lazy';
     image.decoding = 'async';
@@ -95,23 +107,23 @@ export async function openJournal(ui, message = '') {
       [
         ...new Set(
           [...bird.sources, ...(bird.retained_evidence || []).map((item) => item.source)]
-            .map((name) => sourceNames[name]?.[1])
+            .map((name) => notedOn[name])
             .filter(Boolean),
         ),
       ].join(' · ') ||
-      (bird.sources.includes('owner-selection')
-        ? 'Plate request or review · not a sighting'
-        : bird.saved
-          ? 'Saved selection'
+      (bird.saved
+        ? WORDS.onMyFrame
+        : bird.sources.includes('owner-selection')
+          ? 'Plate requested'
           : bird.known
-            ? 'Collection selection'
-            : 'Available artwork · not a sighting')
+            ? 'In a collection'
+            : 'Plate available')
     );
   }
   function card(bird) {
     const node = link('', 'bird', { bird: bird.taxon_id }, 'bird-card');
     if (bird.plate_ready) node.append(art(bird, '', 'thumbnail'));
-    else node.append(el('div', 'Plate not ready', 'missing-art'));
+    else node.append(el('div', 'No plate yet', 'missing-art'));
     node.append(
       el('h2', bird.common_name),
       el('p', bird.scientific_name, 'scientific'),
@@ -137,14 +149,12 @@ export async function openJournal(ui, message = '') {
   }
   function viewLabel(key) {
     return key === 'favorites'
-      ? 'Favorites'
+      ? WORDS.favorites
       : key === 'all'
-        ? 'All available artwork'
-        : key === 'saved'
-          ? 'Saved birds'
-          : key === 'current'
-            ? 'Current and saved'
-            : data.collections.find((group) => group.collection_id === key)?.label || 'Collection';
+        ? 'All birds'
+        : key === 'saved' || key === 'current'
+          ? WORDS.onMyFrame
+          : data.collections.find((group) => group.collection_id === key)?.label || 'Collection';
   }
   function base(title, description = '') {
     screen(title, description);
@@ -152,63 +162,27 @@ export async function openJournal(ui, message = '') {
     const nav = el('nav', '', 'journal-navigation');
     nav.id = 'journal-navigation';
     nav.setAttribute('aria-label', 'Journal');
+    const { newPlates } = plateCounts(management);
     for (const [key, name, glyph, extra] of [
       ['home', 'Home', 'home'],
       ['birds', 'Birds', 'birds'],
       ['collections', 'Collections', 'collections'],
-      ['frame', 'Frame', 'frame', { view: 'current' }],
+      ['frame', WORDS.play, 'frame', { view: 'current' }],
       ['manage', 'Manage', 'manage'],
     ]) {
       const item = link('', key, extra || {}, '');
       item.append(icon(glyph), el('span', name));
+      if (key === 'manage' && newPlates) {
+        const badge = el('span', String(newPlates), 'tab-count');
+        badge.setAttribute('aria-hidden', 'true');
+        item.append(badge);
+        item.setAttribute('aria-label', name + ', ' + plural(newPlates, 'new plate', 'new plates'));
+      }
       if (key === area) item.setAttribute('aria-current', 'page');
       nav.append(item);
     }
     document.querySelector('header').after(nav);
     if (message) main.append(el('p', message, 'connection'));
-    if (
-      management.available &&
-      !['manage', 'sources', 'work', 'notifications', 'frame', 'operation', 'candidate'].includes(
-        area,
-      )
-    ) {
-      // Each issue links to the screen that names the affected birds or
-      // destinations and offers the action, not to a general directory.
-      const issues = [];
-      const stopped = management.work.needs_attention.length;
-      if (stopped)
-        issues.push([stopped === 1 ? '1 plate stopped' : stopped + ' plates stopped', 'work']);
-      const candidates = management.work.in_review.candidates;
-      const review = candidates.filter((candidate) => candidate.inspect_available).length;
-      if (review)
-        issues.push([
-          review === 1 ? '1 plate ready for your review' : review + ' plates ready for your review',
-          'work',
-        ]);
-      const held = candidates.length - review;
-      if (held)
-        issues.push([
-          held === 1 ? '1 plate held for recovery' : held + ' plates held for recovery',
-          'work',
-        ]);
-      if (management.notifications.dead_letters)
-        issues.push(['notification delivery failing', 'notifications']);
-      const failing = management.sources.filter(
-        (source) => source.enabled && source.status === 'error',
-      ).length;
-      if (failing)
-        issues.push([
-          failing === 1 ? 'a source check failed' : failing + ' source checks failed',
-          'sources',
-        ]);
-      if (issues.length) {
-        const banner = el('div', '', 'attention-banner');
-        banner.setAttribute('role', 'status');
-        banner.append(icon('alert'));
-        for (const [text, page] of issues) banner.append(link(text, page, {}, 'attention-item'));
-        main.append(banner);
-      }
-    }
   }
   // Parts the controller could not read; the rest of the journal still works.
   function unreadable(messages) {

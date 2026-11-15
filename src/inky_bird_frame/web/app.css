@@ -816,3 +816,67 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   .bird-card:hover, a.journal-card:hover { box-shadow: var(--shadow); }
   .frame-controls { transition: opacity 0.3s; }
 }
+
+/* ---- design-heart: Home, bird page and new plates ---- */
+
+.featured-caption .why-this-bird { margin-top: 2px; font-style: italic; }
+.home-start { margin-block: 14px 0; font-family: var(--serif); font-size: 1.0588rem; }
+.home-rail .home-alert { margin-right: 0; font-weight: 600; }
+.journal-card.new-plates {
+  display: flex;
+  align-items: center;
+  min-height: 56px;
+  font-weight: 600;
+  border-left: 4px solid var(--accent);
+}
+.lately { margin-block: 28px 8px; }
+.lately h2 { margin-bottom: 8px; }
+.lately-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: 8px 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.lately-bird {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 56px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--paper-raised);
+  color: inherit;
+  text-decoration: none;
+}
+.lately-bird:hover { border-color: var(--line-strong); }
+.lately-name { font-weight: 600; overflow-wrap: anywhere; }
+.lately-date { font-size: 0.8529rem; color: var(--ink-soft); }
+.lately .journal-size, .journal-size { margin-top: 12px; }
+.bird-notes .journal-line { margin-block: 6px 12px; }
+.plate-checks { margin-block: 4px 12px; padding-left: 1.2em; }
+.journal-navigation a { position: relative; }
+.journal-navigation .tab-count {
+  position: absolute;
+  top: 5px;
+  left: calc(50% + 8px);
+  min-width: 1.25rem;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 0.6765rem;
+  font-weight: 700;
+  line-height: 1.25rem;
+  text-align: center;
+}
+/* The top bar on wide screens has room for the count beside the name. */
+@media (min-width: 820px) {
+  .journal-navigation .tab-count { position: static; margin-left: -2px; }
+}
+@media (forced-colors: active) {
+  .journal-navigation .tab-count { border: 1px solid CanvasText; }
+}
+.candidate-references { margin-block: 4px 12px; padding-left: 1.2em; }

@@ -1,4 +1,5 @@
 import { inlineProblem } from '/app/ui.js';
+import { WORDS, journalLine } from '/app/words.js';
 // The list's search, sort and filter live in the address, so Back, the bird
 // page and its previous and next links all see the same list.
 function lastNoted(bird) {
@@ -23,9 +24,9 @@ const sorts = {
 };
 const shows = {
   all: ['All', () => true],
-  favorites: ['Favorites', (bird, sets) => sets.favorites.has(bird.taxon_id)],
-  current: ['Current and saved', (bird, sets) => sets.current.has(bird.taxon_id)],
-  record: ['In your history', (bird) => (bird.retained_evidence || []).length > 0],
+  favorites: [WORDS.favorites, (bird, sets) => sets.favorites.has(bird.taxon_id)],
+  current: [WORDS.onMyFrame, (bird, sets) => sets.current.has(bird.taxon_id)],
+  record: ['Noted by you', (bird) => (bird.retained_evidence || []).length > 0],
   missing: ['No plate yet', (bird) => !bird.plate_ready],
 };
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
@@ -92,10 +93,10 @@ export function renderBirds(context) {
   const state = listState(query);
   const artScope = state.scope === 'art';
   base(
-    artScope ? 'Available artwork' : 'Your birds',
+    artScope ? WORDS.morePlates : 'Your birds',
     artScope
-      ? 'Approved local plates. Browsing does not add a sighting or change your wall.'
-      : 'Birds in retained history, current observations or saved collections. A missing plate does not erase a bird.',
+      ? 'Plates you could add to your frame.'
+      : 'Every bird in your journal, with a plate or still waiting for one.',
   );
   const scopes = el('div', '', 'segment');
   scopes.setAttribute('role', 'navigation');
@@ -103,7 +104,7 @@ export function renderBirds(context) {
   const scopeLinks = [];
   for (const [label, active, scope] of [
     ['Your birds', !artScope, ''],
-    ['Available artwork', artScope, 'art'],
+    [WORDS.morePlates, artScope, 'art'],
   ]) {
     const option = link(label, 'birds', {}, '');
     if (active) option.setAttribute('aria-current', 'page');
@@ -185,7 +186,7 @@ export function renderBirds(context) {
             ? 'Try another name.'
             : state.show !== 'all'
               ? 'Try another filter.'
-              : 'Connect a source or choose artwork for a collection.',
+              : 'Connect a source, or pick plates for a collection.',
         );
     if (none) grid.append(none);
   }
@@ -223,7 +224,7 @@ export function renderBirds(context) {
   setStopScreen(() => document.removeEventListener('keydown', onKey));
   if (!artScope) {
     const coverage = el('details');
-    coverage.append(el('summary', 'History coverage and unmatched species'));
+    coverage.append(el('summary', 'What your history covers'));
     for (const source of data.history_coverage || [])
       coverage.append(
         note((sourceNames[source.source]?.[0] || source.source) + ': ' + source.coverage),
@@ -231,7 +232,7 @@ export function renderBirds(context) {
     for (const member of data.unresolved_history || [])
       coverage.append(
         note(
-          'Unmatched: ' +
+          'Not matched yet: ' +
             (member.scientific_name || member.common_name) +
             ' · ' +
             (sourceNames[member.source]?.[0] || member.source) +
@@ -243,7 +244,7 @@ export function renderBirds(context) {
       );
     coverage.append(
       note(
-        'Unmatched names stay private. They cannot request artwork until an exact taxon match exists. Viewing history does not contact a source or change generation eligibility. Live sources without retained local history describe only their last discovery window.',
+        'Names that are not matched stay private and cannot get a plate until they match a known species. Live sources without saved history show only their latest check.',
       ),
     );
     main.append(coverage);
@@ -252,7 +253,7 @@ export function renderBirds(context) {
 
 export async function renderBird(context) {
   const {
-    ui, el, button, api, main, query, data, byId, sourceNames, plateURL, link, note, art,
+    ui, el, button, api, main, query, data, byId, plateURL, link, note, art,
     evidence, base, empty, savedAction, setStopScreen,
   } = context;
   const state = listState(query);
@@ -302,17 +303,8 @@ export async function renderBird(context) {
   layout.append(plate, notes);
   main.append(layout);
   notes.append(note(evidence(bird)));
-  for (const item of bird.retained_evidence || [])
-    notes.append(
-      note(
-        (sourceNames[item.source]?.[0] || item.source) +
-          ': ' +
-          item.count +
-          ' ' +
-          item.unit +
-          ' in retained history. Counts from different sources are not added together.',
-      ),
-    );
+  const kept = journalLine(bird.retained_evidence);
+  if (kept) notes.append(el('p', kept, 'journal-line'));
   const fieldNotes = el('div', '', 'field-notes');
   if (bird.plate_ready) {
     // The full plate opens on its own, where the browser can zoom it.
@@ -322,13 +314,10 @@ export async function renderBird(context) {
     plate.append(zoom);
   } else
     plate.append(
-      empty(
-        'Plate not ready',
-        'This bird stays in your journal. Open Plate work to inspect its current state.',
-      ),
+      empty('No plate yet', 'This bird stays in your journal. In the works shows how its plate is coming along.'),
     );
   const groups = data.collections.filter((group) => group.taxon_ids.includes(bird.taxon_id));
-  notes.append(el('h2', 'In your collections'));
+  if (groups.length) notes.append(el('h2', 'In your collections'));
   for (const group of groups)
     notes.append(link(group.label, 'collection', { view: group.collection_id }));
   const favorite = groups.some((group) => group.kind === 'favorites');
@@ -348,9 +337,6 @@ export async function renderBird(context) {
         inlineProblem(ui, notes, error);
       }
     }),
-    note(
-      'Favorites are bookmarks. They do not record sightings, request art or change your wall.',
-    ),
     link(
       'Make a collection with this bird',
       'edit-collection',
@@ -361,7 +347,7 @@ export async function renderBird(context) {
   if (bird.saved || bird.plate_ready)
     notes.append(
       savedAction(
-        bird.saved ? 'Review removal from Saved birds' : 'Review adding to Saved birds',
+        bird.saved ? 'Take this bird off my frame' : 'Put this bird on my frame',
         bird.saved ? 'remove' : 'add',
         bird.taxon_id,
         bird.plate_ready,

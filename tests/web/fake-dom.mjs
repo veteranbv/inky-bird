@@ -228,6 +228,11 @@ export function fakeDocument() {
   doc.documentElement = {};
   doc.createElement = (tag) => (tag === 'img' ? new ImageElement() : new Element(tag));
   doc.createElementNS = (_namespace, tag) => new Element(tag);
+  doc.createTextNode = (text) => {
+    const node = new Element('#text');
+    node.text = String(text);
+    return node;
+  };
   return doc;
 }
 
