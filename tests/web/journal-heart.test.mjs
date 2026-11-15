@@ -97,6 +97,43 @@ test('the featured plate says why it is shown when the data supports it', async 
   assert.equal(line?.textContent, 'Noted at your feeder this week');
 });
 
+test('a featured bird known only from an old postcard is not shown as noted lately', async (t) => {
+  // The journal lists a retained record's source among the bird's sources.
+  const state = withState({
+    birds: [
+      {
+        ...bird(1, 'Example Wren', 'a'),
+        sources: ['birdbuddy'],
+        retained_evidence: [{ source: 'birdbuddy', count: 2, unit: 'postcards', first_noted: '2019-03-12', last_noted: '2019-04-01' }],
+      },
+    ],
+    management: { ...work([]), window: 'last-week', discovery_refreshed_at: '2026-01-01T00:00:00+00:00', recent_detections: [] },
+  });
+  const { main } = await open(t, { page: 'home' }, { state });
+  assert.equal(main.querySelector('.why-this-bird')?.textContent, 'From your journal, 2019');
+});
+
+const recent = (offset) => day(offset) + 'T12:00:00+00:00';
+const detection = (taxon_id, latest_detection_at) => ({
+  taxon_id,
+  sources: ['inaturalist'],
+  timestamp_source: 'inaturalist',
+  latest_detection_at,
+});
+for (const [name, detections, expected] of [
+  ['seen nearby this week says so', [detection(1, recent(1))], 'Seen nearby this week'],
+  ['last seen weeks ago has no reason line', [detection(1, recent(20))], null],
+  ['without its own detection has no reason line', [detection(2, recent(1))], null],
+])
+  test('a featured bird ' + name, async (t) => {
+    const state = withState({
+      birds: [{ ...bird(1, 'Example Wren', 'a'), sources: ['inaturalist'] }],
+      management: { ...work([]), window: 'last-week', recent_detections: detections },
+    });
+    const { main } = await open(t, { page: 'home' }, { state });
+    assert.equal(main.querySelector('.why-this-bird')?.textContent ?? null, expected);
+  });
+
 test('a featured plate without supporting data has no reason line', async (t) => {
   const { main } = await open(t, { page: 'home' });
   assert.equal(main.querySelector('.why-this-bird'), null);
@@ -187,6 +224,8 @@ test('an empty frame with an unreadable part is not offered a first start', asyn
   const { main } = await open(t, { page: 'home' }, { state });
   assert(has(main, 'The current wall birds could not be read.'));
   assert.equal(linkTo(main, 'Connect a source (optional)'), undefined);
+  // The frame may already hold birds, so Home does not say it is empty.
+  assert(!main.textContent.includes('to start your frame'));
 });
 
 test('bird cards and the list use the shared names', async (t) => {
@@ -244,15 +283,15 @@ test('a new plate arrives as a new page for the journal', async (t) => {
     birds: [{ ...bird(7, 'Sample Finch', 'b'), retained_evidence: [evidence('birdbuddy', 1, '2019-01-01', '2019-03-12')] }],
   });
   const { main } = await open(t, { page: 'candidate', bird: '7' }, { state, respond: candidateResponder(candidate()) });
-  assert.equal(main.querySelector('h1').textContent, 'A new page for your journal');
-  assert(has(main, 'Sample Finch — noted at your feeder on 12 Mar 2019. Keep it, or send it back.'));
+  assert.equal(main.querySelector('h1').textContent, 'Review candidate');
+  assert(has(main, 'Sample Finch — noted at your feeder on 12 Mar 2019.'));
   for (const sentence of ['Checks passed', 'No place details in the image'])
     assert(has(main, sentence), sentence);
-  for (const raw of ['passed', 'location free', 'true', 'species accuracy', 'Review candidate', 'Generated art'])
+  for (const raw of ['passed', 'location free', 'true', 'species accuracy', 'Generated art'])
     assert(!texts(main).includes(raw) && !main.textContent.includes(raw + ' '), raw);
   assert(!main.textContent.includes('Server notice.'), 'a ready plate needs no server caveat');
-  assert(findButton(main, 'Keep this plate'));
-  assert(findButton(main, 'Send this plate back'));
+  assert(findButton(main, 'Confirm local approval'));
+  assert(findButton(main, 'Confirm rejection'));
   assert(has(main, 'This note is sent to the image service to guide the next attempt.'));
   const plate = images(main)[0];
   const heading = main.querySelector('h2');
@@ -261,7 +300,7 @@ test('a new plate arrives as a new page for the journal', async (t) => {
 
 test('a new plate without a record of the bird leaves the noted clause out', async (t) => {
   const { main } = await open(t, { page: 'candidate', bird: '7' }, { respond: candidateResponder(candidate()) });
-  assert(has(main, 'Sample Finch. Keep it, or send it back.'));
+  assert(has(main, 'Sample Finch.'));
 });
 
 test('a plate that did not pass says so and keeps the server reason', async (t) => {
@@ -274,7 +313,7 @@ test('a plate that did not pass says so and keeps the server reason', async (t) 
   assert(has(main, 'Checks did not pass'));
   assert(has(main, 'The image may show place details'));
   assert(has(main, 'This candidate does not meet ordinary publication checks.'));
-  assert.equal(findButton(main, 'Keep this plate'), null);
-  assert(findButton(main, 'Send this plate back'));
+  assert.equal(findButton(main, 'Confirm local approval'), null);
+  assert(findButton(main, 'Confirm rejection'));
   await flush();
 });

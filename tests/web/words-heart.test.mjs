@@ -47,18 +47,35 @@ test('the noted clause names the latest dated record and when', () => {
 
 test('why this bird comes only from data that supports it', () => {
   const bird = (sources, evidence) => ({ sources, retained_evidence: evidence });
+  const seen = (sources, latest_detection_at, timestamp_source = sources.length === 1 ? sources[0] : null) => ({
+    sources,
+    latest_detection_at,
+    timestamp_source,
+  });
   assert.equal(
-    words.whyThisBird(bird([], [row('birdbuddy', 1, '2026-01-01', '2026-11-12')]), { today }),
+    words.whyThisBird(bird(['birdbuddy'], [row('birdbuddy', 1, '2026-01-01', '2026-11-12')]), { today }),
     'Noted at your feeder this week',
   );
-  assert.equal(words.whyThisBird(bird(['inaturalist'], []), { window: 'last-week', today }), 'Seen nearby this week');
-  assert.equal(words.whyThisBird(bird(['ebird'], []), { window: 'last-30-days', today }), 'Seen nearby this month');
-  assert.equal(words.whyThisBird(bird(['ebird'], []), { window: 'all-time', today }), 'Seen nearby');
-  assert.equal(words.whyThisBird(bird(['birdweather'], []), { window: 'last-day', today }), 'Noted on your microphone this week');
+  const nearby = bird(['inaturalist'], []);
+  assert.equal(words.whyThisBird(nearby, { detection: seen(['inaturalist'], '2026-11-12T08:00:00Z'), today }), 'Seen nearby this week');
   assert.equal(
-    words.whyThisBird(bird([], [row('ebird-archive', 3, '2019-03-12', '2020-05-01')]), { today }),
+    words.whyThisBird(bird(['birdweather'], []), { detection: seen(['birdweather'], '2026-11-14T05:00:00Z'), today }),
+    'Noted on your microphone this week',
+  );
+  // Two live sources with different places: the line names none.
+  assert.equal(
+    words.whyThisBird(bird(['birdweather', 'ebird'], []), { detection: seen(['birdweather', 'ebird'], '2026-11-13T05:00:00Z'), today }),
+    'Noted this week',
+  );
+  assert.equal(
+    words.whyThisBird(bird(['ebird-archive'], [row('ebird-archive', 3, '2019-03-12', '2020-05-01')]), { today }),
     'From your journal, 2019',
   );
+  // A live source alone, without a recent dated detection, says nothing.
+  assert.equal(words.whyThisBird(nearby, { today }), '');
+  assert.equal(words.whyThisBird(nearby, { detection: seen(['inaturalist'], '2026-10-01T08:00:00Z'), today }), '');
+  assert.equal(words.whyThisBird(nearby, { detection: seen(['inaturalist'], '2026-11-20T08:00:00Z'), today }), '');
+  assert.equal(words.whyThisBird(nearby, { detection: seen(['inaturalist'], 'nonsense'), today }), '');
   // A record older than a week, or dated in the future, is not "this week".
   assert.equal(
     words.whyThisBird(bird([], [row('birdbuddy', 1, null, '2026-11-01'), row('birdbuddy', 1, null, '2026-12-01')]), { today }),
@@ -66,6 +83,34 @@ test('why this bird comes only from data that supports it', () => {
   );
   assert.equal(words.whyThisBird(bird(['owner-selection'], []), { today }), '');
   assert.equal(words.whyThisBird(null), '');
+});
+
+test('a bird known only from an old postcard is not shown as noted lately', () => {
+  // The journal lists a retained record's source among the bird's sources.
+  const postcard = {
+    sources: ['birdbuddy'],
+    retained_evidence: [{ source: 'birdbuddy', count: 2, unit: 'postcards', first_noted: '2019-03-12', last_noted: '2019-04-01' }],
+  };
+  assert.equal(words.whyThisBird(postcard, { today }), 'From your journal, 2019');
+  assert.equal(words.whyThisBird({ ...postcard, retained_evidence: [{ ...postcard.retained_evidence[0], first_noted: null }] }, { today }), '');
+});
+
+test('counts in different units are not added into one total', () => {
+  assert.equal(
+    words.journalLine([
+      { source: 'ebird-archive', count: 3, unit: 'checklists', first_noted: '2019-03-12', last_noted: '2020-05-01' },
+      { source: 'birdnet-analyzer', count: 500, unit: 'detections', first_noted: '2021-01-01', last_noted: '2026-11-02' },
+    ]),
+    'In your journal: first noted 12 Mar 2019 · last noted 2 Nov 2026',
+  );
+});
+
+test('a record dated in the future is not named as noted', () => {
+  assert.equal(words.notedClause([row('birdbuddy', 2, null, '2026-11-20')], today), '');
+  assert.equal(
+    words.notedClause([row('birdbuddy', 2, null, '2026-11-20'), row('ebird-archive', 1, null, '2026-11-10')], today),
+    'noted in your checklists on Tuesday',
+  );
 });
 
 test('short dates read as a day name or a plain date', () => {

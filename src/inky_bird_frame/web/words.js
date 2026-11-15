@@ -68,14 +68,6 @@ const RECORDS_FROM = Object.freeze({
   'ebird-archive': 'from your checklists',
 });
 const RETAINED_ORDER = ['birdbuddy', 'birdnet-analyzer', 'ebird-archive'];
-const LIVE_ORDER = ['birdbuddy', 'birdweather', 'birdnet-go', 'inaturalist', 'ebird'];
-// How far back the live sources look, as the owner would say it.
-const WINDOW_PERIOD = Object.freeze({
-  'last-day': 'this week',
-  'last-week': 'this week',
-  'last-30-days': 'this month',
-  'last-year': 'this year',
-});
 
 function records(evidence) {
   return (Array.isArray(evidence) ? evidence : []).filter(
@@ -103,10 +95,14 @@ export function journalLine(evidence) {
     if (last) parts.push('last noted ' + plainDate(last));
   }
   const sources = [...new Set(rows.map((row) => row.source))];
-  const total = rows.reduce((sum, row) => sum + row.count, 0);
-  const from = sources.length === 1 ? RECORDS_FROM[sources[0]] : '';
-  parts.push(plural(total, 'record', 'records') + (from ? ' ' + from : ''));
-  return 'In your journal: ' + parts.join(' · ');
+  // Checklists, postcards and recordings are different things: only counts
+  // of one kind add up to a number of records.
+  if (new Set(rows.map((row) => row.unit)).size === 1) {
+    const total = rows.reduce((sum, row) => sum + row.count, 0);
+    const from = sources.length === 1 ? RECORDS_FROM[sources[0]] : '';
+    parts.push(plural(total, 'record', 'records') + (from ? ' ' + from : ''));
+  }
+  return parts.length ? 'In your journal: ' + parts.join(' · ') : '';
 }
 
 function daysAgo(value, today) {
@@ -115,39 +111,41 @@ function daysAgo(value, today) {
   const day = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
   return Math.round((Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) - day) / 86400000);
 }
+const thisWeek = (value, today) => {
+  const age = daysAgo(value, today);
+  return age !== null && age >= 0 && age < 7;
+};
 
 // When and where the bird was most recently noted, from the owner's own
 // records: "noted at your feeder on Tuesday". Empty when no dated record exists.
 export function notedClause(evidence, today = new Date()) {
   let best = null;
-  for (const row of records(evidence))
-    if (NOTED_AT[row.source] && plainDate(row.last_noted) && (!best || row.last_noted > best.last_noted))
+  for (const row of records(evidence)) {
+    const age = daysAgo(row.last_noted, today);
+    if (NOTED_AT[row.source] && age !== null && age >= 0 && (!best || row.last_noted > best.last_noted))
       best = row;
+  }
   if (!best) return '';
   const when = recentDate(best.last_noted, today);
   return 'noted ' + NOTED_AT[best.source] + ' ' + (/^\d/.test(when) ? 'on ' + when : when);
 }
 
 // One line saying why this bird is shown today, only from data that supports
-// it: a record from this week, a live source's current window, or the year it
-// was first noted. Empty otherwise. `window` is the live sources' look-back;
-// without a known period the line names none.
-export function whyThisBird(bird, { window = null, today = new Date() } = {}) {
+// it: one of the owner's records from this week, a live source's detection
+// from this week, or the year it was first noted. Empty otherwise. `detection`
+// is the bird's entry in the owner's recent detections, when it has one.
+export function whyThisBird(bird, { detection = null, today = new Date() } = {}) {
   if (!bird) return '';
   const rows = records(bird.retained_evidence);
-  for (const source of RETAINED_ORDER) {
-    const recent = rows.some((row) => {
-      const age = row.source === source ? daysAgo(row.last_noted, today) : null;
-      return age !== null && age >= 0 && age < 7;
-    });
-    if (recent) return 'Noted ' + NOTED_AT[source] + ' this week';
-  }
-  const live = LIVE_ORDER.find((source) => (bird.sources || []).includes(source));
-  if (live) {
-    const period = WINDOW_PERIOD[window];
-    const place = NOTED_AT[live];
-    const lead = place === 'nearby' ? 'Seen nearby' : 'Noted ' + place;
-    return period ? lead + ' ' + period : lead;
+  for (const source of RETAINED_ORDER)
+    if (rows.some((row) => row.source === source && thisWeek(row.last_noted, today)))
+      return 'Noted ' + NOTED_AT[source] + ' this week';
+  if (detection && thisWeek(detection.latest_detection_at, today)) {
+    const named = detection.timestamp_source ? [detection.timestamp_source] : detection.sources || [];
+    const places = new Set(named.map((source) => NOTED_AT[source]).filter(Boolean));
+    const place = places.size === 1 ? [...places][0] : '';
+    if (place === 'nearby') return 'Seen nearby this week';
+    return place ? 'Noted ' + place + ' this week' : 'Noted this week';
   }
   const first = earliest(rows.map((row) => row.first_noted));
   return first ? 'From your journal, ' + first.slice(0, 4) : '';

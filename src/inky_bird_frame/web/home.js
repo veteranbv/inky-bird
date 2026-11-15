@@ -26,7 +26,10 @@ export function renderHome(context) {
     caption.append(el('h2', featured.common_name), el('p', featured.scientific_name, 'scientific'));
     if (onFrame) {
       caption.append(note(evidence(featured)));
-      const why = whyThisBird(featured, { window: management.available ? management.window : null });
+      const detection = management.available
+        ? (management.recent_detections || []).find((row) => row.taxon_id === featured.taxon_id)
+        : null;
+      const why = whyThisBird(featured, { detection });
       if (why) caption.append(el('p', why, 'hint why-this-bird'));
     }
     const feature = el('div', '', 'home-feature');
@@ -47,7 +50,9 @@ export function renderHome(context) {
       !unreadable &&
       !data.birds.some((bird) => bird.known) &&
       (!management.available || !management.sources.some((source) => source.enabled));
-    rail.append(el('p', 'Pick a few birds you love to start your frame.', 'home-start'));
+    // When the frame's birds could not be read, it may not be empty.
+    if (!(data.notices || []).some((notice) => notice.part === 'current-birds'))
+      rail.append(el('p', 'Pick a few birds you love to start your frame.', 'home-start'));
     actions.append(link('Choose birds', 'birds', { scope: 'art' }, 'primary-link'));
     if (fresh) actions.append(link('Connect a source (optional)', 'sources'));
   }

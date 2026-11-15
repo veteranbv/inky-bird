@@ -206,7 +206,7 @@ async function journalHeart(page, size) {
   assert.match(sizeLine, /^\d+ birds? in your journal( · (1 with a plate|\d+ with plates))?$/, size);
   const why = page.locator('.why-this-bird');
   if (await why.count())
-    assert.match(await why.innerText(), /^(Noted (at your feeder|on your microphone|in your checklists) this week|Seen nearby( this (week|month|year))?|Noted .+|From your journal, \d{4})$/);
+    assert.match(await why.innerText(), /^(Noted( (at your feeder|on your microphone|in your checklists))? this week|Seen nearby this week|From your journal, \d{4})$/);
   await plainWords(page, 'Home ' + size);
   for (const [a, b] of [['.home-feature', '.lately']]) {
     const [first, second] = [await box(page.locator(a)), await box(page.locator(b))];
