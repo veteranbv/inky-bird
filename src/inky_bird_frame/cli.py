@@ -332,10 +332,13 @@ def generate_command(args: argparse.Namespace) -> int:
                 and isinstance(common_name, str)
             ):
                 notified_taxa.add(taxon_id)
+                entry = item.get("published", item)
+                plate = entry.get("portrait_sha256") if isinstance(entry, dict) else None
                 safe_notify(
                     config,
                     NotificationEvent.GENERATION_APPROVED,
-                    dedupe_key=str(taxon_id),
+                    # A replacement plate for the same bird is a new approval.
+                    dedupe_key=f"{taxon_id}:{plate}" if isinstance(plate, str) else str(taxon_id),
                     title=f"{common_name} plate approved",
                     body="The generated plate passed factual and visual review.",
                 )

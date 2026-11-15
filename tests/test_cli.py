@@ -3777,6 +3777,28 @@ def test_generate_failures_notify_terminal_errors_and_defer_transient_ones() -> 
     assert [call.kwargs["key"] for call in recover.call_args_list] == ["generation-cycle"]
 
 
+def test_each_approved_plate_of_a_bird_is_announced() -> None:
+    first = {"taxon_id": 7, "common_name": "Example Bird", "portrait_sha256": "a" * 64}
+    replacement = {**first, "portrait_sha256": "b" * 64}
+    keys: list[str] = []
+    for result in (
+        {"published_pending": [first]},
+        {"generated": [{"taxon_id": 7, "common_name": "Example Bird", "published": replacement}]},
+    ):
+        with (
+            patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+            patch("inky_bird_frame.cli.run_generation_cycle", return_value=result),
+            patch("inky_bird_frame.cli.safe_notify") as notify,
+            patch("inky_bird_frame.cli.safe_record_degradation"),
+            patch("inky_bird_frame.cli.safe_record_recovery"),
+            redirect_stdout(io.StringIO()),
+        ):
+            generate_command(Namespace())
+        keys.extend(call.kwargs["dedupe_key"] for call in notify.call_args_list)
+
+    assert keys == [f"7:{'a' * 64}", f"7:{'b' * 64}"]
+
+
 def test_generate_reports_both_deferred_and_manual_retry_items() -> None:
     result = {
         "failures": [{"taxon_id": 3, "failure": "network"}],
