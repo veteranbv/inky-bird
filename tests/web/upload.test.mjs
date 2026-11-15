@@ -51,6 +51,9 @@ class FakeXHR {
   }
 }
 
+// Page-level listeners the helper adds, by event name.
+const pageListeners = new Map();
+
 function withXHR(action) {
   return async () => {
     const original = globalThis.XMLHttpRequest;
@@ -59,15 +62,25 @@ function withXHR(action) {
     globalThis.fetch = () => {
       throw new Error('upload must not use fetch');
     };
+    globalThis.addEventListener = (name, listener) => {
+      if (!pageListeners.has(name)) pageListeners.set(name, new Set());
+      pageListeners.get(name).add(listener);
+    };
+    globalThis.removeEventListener = (name, listener) => pageListeners.get(name)?.delete(listener);
     FakeXHR.last = null;
     try {
       await action();
     } finally {
       globalThis.XMLHttpRequest = original;
       globalThis.fetch = originalFetch;
+      delete globalThis.addEventListener;
+      delete globalThis.removeEventListener;
+      pageListeners.clear();
     }
   };
 }
+
+const leaveGuards = () => [...(pageListeners.get('beforeunload') || [])];
 
 async function rejection(promise) {
   try {
@@ -226,5 +239,28 @@ test(
       assert.equal(error.message, message);
       assert.equal(error.code, code);
     }
+  }),
+);
+
+test(
+  'leaving the page asks first while an upload is in flight',
+  withXHR(async () => {
+    const controller = new AbortController();
+    const finished = helpers.upload('/v1/upload', { size: 1 });
+    assert.equal(leaveGuards().length, 1);
+    const event = { prevented: false, preventDefault() { this.prevented = true; } };
+    leaveGuards()[0](event);
+    assert.equal(event.prevented, true);
+    FakeXHR.last.reply(200, JSON.stringify({ ok: true, data: 'done' }));
+    await finished;
+    assert.equal(leaveGuards().length, 0, 'a finished upload no longer asks');
+    const stopped = helpers.upload('/v1/upload', { size: 1 }, controller.signal);
+    controller.abort();
+    await rejection(stopped);
+    assert.equal(leaveGuards().length, 0, 'a stopped upload no longer asks');
+    const lost = helpers.upload('/v1/upload', { size: 1 });
+    FakeXHR.last.onerror();
+    await rejection(lost);
+    assert.equal(leaveGuards().length, 0, 'a failed upload no longer asks');
   }),
 );

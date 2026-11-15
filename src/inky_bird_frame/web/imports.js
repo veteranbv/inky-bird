@@ -42,7 +42,11 @@ export async function renderImports(ui, { base, link, note, kind }) {
   }
   function fail(node, error) {
     if (error.code === 'sign_in_required') ui.showProblem(error);
-    else node.textContent = error.message;
+    else {
+      node.textContent = error.message;
+      // The step that owned this message may have been replaced meanwhile.
+      if (!node.isConnected && content.isConnected) content.append(node);
+    }
   }
   // A recovery button shows its own failure beside it instead of rejecting.
   const recoveryAlerts = new WeakMap();
@@ -70,11 +74,12 @@ export async function renderImports(ui, { base, link, note, kind }) {
       else content.append(alert);
     }
   }
+  const unknownOutcome = ['offline', 'timeout', 'invalid_response'];
   function operation(label, action, uploadId, extra, onSuccess = load) {
     const section = el('div'),
       error = problem();
-    const key = randomId();
-    let request = null;
+    let key = randomId(),
+      request = null;
     const start = button(label, async (event) => {
       const control = event.currentTarget;
       control.disabled = true;
@@ -93,6 +98,12 @@ export async function renderImports(ui, { base, link, note, kind }) {
         const receipt = await api('/v1/owner/imports/' + action, request);
         if (!stopped) await watch(receipt.operation_id, onSuccess);
       } catch (failure) {
+        // Only a reply that may have been lost is sent again unchanged, so the
+        // controller can recognise it. A refusal is rebuilt from current choices.
+        if (!unknownOutcome.includes(failure.code)) {
+          request = null;
+          key = randomId();
+        }
         control.disabled = false;
         fail(error, failure);
       }
@@ -407,9 +418,12 @@ export async function renderImports(ui, { base, link, note, kind }) {
         if (!stopped) await load();
       } catch (failure) {
         if (!stopped) {
-          progress.textContent =
-            'No history changed. If the response was lost, check the saved upload before sending again.';
-          fail(error, failure);
+          if (failure.code === 'stopped') progress.textContent = failure.message;
+          else {
+            progress.textContent =
+              'No history changed. If the response was lost, check the saved upload before sending again.';
+            fail(error, failure);
+          }
           recheck.hidden = false;
         }
       } finally {
@@ -574,14 +588,24 @@ export async function renderImports(ui, { base, link, note, kind }) {
       link('Check saved collections', 'collections'),
     );
   }
-  const recent = await api('/v1/owner/operations');
-  const active = recent.operations.find(
-    (receipt) =>
-      ['import-preview', 'import-commit', 'trip-preview', 'trip-save'].includes(receipt.kind) &&
-      ['pending', 'running'].includes(receipt.status),
-  );
-  if (active) await watch(active.operation_id);
-  else await load();
+  async function resume() {
+    const recent = await api('/v1/owner/operations');
+    const active = recent.operations.find(
+      (receipt) =>
+        ['import-preview', 'import-commit', 'trip-preview', 'trip-save'].includes(receipt.kind) &&
+        ['pending', 'running'].includes(receipt.status),
+    );
+    if (active) await watch(active.operation_id);
+    else await load();
+  }
+  try {
+    await resume();
+  } catch (error) {
+    if (error.code === 'sign_in_required') throw error;
+    const retry = recovery('Check saved state', resume);
+    content.replaceChildren(retry);
+    recoveryFailed(retry, error);
+  }
   return () => {
     stopped = true;
     clearTimeout(timer);

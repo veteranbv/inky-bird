@@ -58,8 +58,14 @@ async function upload(path, file, signal, onProgress) {
     }
     const xhr = new XMLHttpRequest();
     const stop = () => xhr.abort();
+    // Leaving the page would end the transfer, so the browser asks first.
+    const stay = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
     const settle = (finish) => {
       signal?.removeEventListener('abort', stop);
+      removeEventListener('beforeunload', stay);
       finish();
     };
     xhr.onload = () =>
@@ -79,6 +85,7 @@ async function upload(path, file, signal, onProgress) {
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Inky-CSRF', csrf);
     signal?.addEventListener('abort', stop);
+    addEventListener('beforeunload', stay);
     xhr.send(file);
   });
   return reply(response);
