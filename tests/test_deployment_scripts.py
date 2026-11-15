@@ -162,7 +162,8 @@ def test_controller_installers_use_provider_lists_for_managed_credentials() -> N
 def test_controller_installers_sync_catalogs_with_reviewed_replacements() -> None:
     # Failure and restore order is exercised in tests/test_installer_behaviour.py.
     for script in _controller_installers():
-        assert 'if [ "${root}" != "${app_dir}" ]; then' in script
+        # The new runtime is built beside the live one, never over it.
+        assert 'stage_runtime_source "${new_runtime}"' in script
         assert 'rsync -a "${root}/catalog/" "${app_dir}/catalog/"' not in script
         assert "retain_independent_approvals=True" in script
         assert "allow_replacements=True" in script
@@ -201,13 +202,14 @@ def test_systemd_controller_installer_restarts_boot_persistent_services() -> Non
     assert 'systemctl restart "${service_prefix}-refresh.timer"' in script
     assert 'systemctl restart "${service_prefix}-generate.timer"' in script
     initial_refresh = script.index(
-        '"${app_dir}/.venv/bin/inky-bird" refresh --config "${config_path}"'
+        '"${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}"'
     )
     quiesce = script.index('sudo systemctl stop "${timer}"')
-    runtime_update = script.index('rsync -a --delete "${root}/src/"')
-    validation = script.index('"${app_dir}/.venv/bin/inky-bird" catalog-publish')
+    runtime_build = script.index('stage_runtime_source "${new_runtime}"')
+    validation = script.index('"${new_runtime}/.venv/bin/inky-bird" catalog-publish')
+    activation = script.index("\nactivate_runtime\n")
     unit_install = script.index('sudo install -m 0644 "${unit}"')
-    assert quiesce < runtime_update < initial_refresh < validation < unit_install
+    assert runtime_build < quiesce < initial_refresh < validation < activation < unit_install
     assert "deadline=$((SECONDS + quiesce_timeout_seconds))" in script
     assert 'systemctl show --property=ActiveState --value "${service}"' in script
     assert "active | activating | deactivating | reloading" in script
@@ -215,7 +217,6 @@ def test_systemd_controller_installer_restarts_boot_persistent_services() -> Non
     # Restart reporting on failure is exercised in tests/test_installer_behaviour.py.
     assert 'systemctl is-enabled --quiet "${service_prefix}-catalog-publish.timer"' in script
     assert 'systemctl is-active --quiet "${service_prefix}-notifications.timer"' in script
-    assert 'if [ "${root}" != "${app_dir}" ]; then' in script
     assert 'rsync -a "${root}/catalog/" "${app_dir}/catalog/"' not in script
     assert "retain_independent_approvals=True" in script
     assert "allow_replacements=True" in script

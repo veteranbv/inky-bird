@@ -6,10 +6,33 @@ if [ "$(uname -s)" != "Linux" ] || ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
+# Until the layout is known, nothing has changed.
+trap 'echo "Uninstall was stopped. No changes made." >&2; exit 129' HUP
+trap 'echo "Uninstall was stopped. No changes made." >&2; exit 130' INT
+trap 'echo "Uninstall was stopped. No changes made." >&2; exit 143' TERM
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
+if ! native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py"); then
+  echo "Could not find where the services are installed. No changes made." >&2
+  exit 1
+fi
 service_prefix="" app_dir="" support_dir="" config_path=""
 eval "${native_names}"
+# A stopped uninstall names what it has not removed yet.
+stopped() {
+  trap '' HUP INT TERM
+  local remaining=() unit
+  for unit in "${service_prefix}-display.service" "${service_prefix}-display.timer"; do
+    if [ -e "/etc/systemd/system/${unit}" ]; then
+      remaining+=("${unit}")
+    fi
+  done
+  echo "Uninstall was stopped before it finished; still installed: ${remaining[*]-none}." >&2
+  echo "Run the uninstaller again to finish." >&2
+  exit "$1"
+}
+trap 'stopped 129' HUP
+trap 'stopped 130' INT
+trap 'stopped 143' TERM
 venv=${INKY_BIRD_DISPLAY_VENV:-"${HOME}/.virtualenvs/pimoroni"}
 noninteractive_sudo=${INKY_BIRD_NONINTERACTIVE_SUDO:-false}
 
@@ -20,7 +43,7 @@ case "${noninteractive_sudo}" in
     ;;
   false)
     if ! sudo -v; then
-      echo "Administrator access is required to remove the display service." >&2
+      echo "Administrator access is required to remove the display service. No changes made." >&2
       exit 1
     fi
     ;;

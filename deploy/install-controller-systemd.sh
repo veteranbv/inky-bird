@@ -11,18 +11,36 @@ if [ "$(id -u)" = 0 ]; then
 fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# The managed directory's copy of this script reinstalls the active runtime.
+if [ -L "${root}/.venv" ]; then
+  root=$(cd -P "${root}/.venv/.." && pwd)
+fi
 native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
 service_prefix="" app_dir="" support_dir="" config_path=""
 eval "${native_names}"
 export INKY_BIRD_SERVICE_PREFIX="${service_prefix}"
 python_version=${INKY_BIRD_PYTHON_VERSION:-3.11}
 quiesce_timeout_seconds=1800
+poll_seconds=1
 uv_bin=${UV_BIN:-}
 if [ -z "${uv_bin}" ]; then
   uv_bin=$(command -v uv || true)
 fi
 unit_root="/etc/systemd/system"
+# Each runtime holds one source copy and the venv built from it;
+# ${app_dir}/.venv links to the active one.
+runtimes_dir="${app_dir}/.runtimes"
+# setup --yes from the installed CLI runs the active runtime's own copy of this
+# script. A runtime holds no catalog; that stays in the managed directory.
+catalog_root=${root}
+if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
+  catalog_root=${app_dir}
+fi
 user=$(id -un)
+managed_units=()
+for name in controller scheduler refresh generate catalog-publish notifications; do
+  managed_units+=("${service_prefix}-${name}.service" "${service_prefix}-${name}.timer")
+done
 
 # Run by the installed version's Python: hold its controller cycle lock so no
 # plate is being made while services stop. Exit 3 if a cycle is still running
@@ -92,13 +110,79 @@ if ! sudo -v; then
   exit 1
 fi
 
-work_dir=$(mktemp -d)
-unit_dir="${work_dir}/units"
-mkdir "${unit_dir}"
+work_dir=""
+unit_dir=""
+unit_backup_dir=""
+created_runtimes_dir=false
+new_runtime=""
+previous_runtime=""
+legacy_runtime=""
+venv_before=""
+units_recorded=false
+runtime_activated=false
+units_replaced=false
 installation_complete=false
 cycle_lock_pid=""
+enabled_before=()
+active_before=()
 stopped_units=()
-not_restarted=()
+started_units=()
+stuck_units=()
+venv_restored=true
+
+# mktemp -d into the variable named $1. A stop signal that arrives after the
+# directory exists but before its name is recorded waits until it is, so
+# cleanup can still remove it.
+make_temp_dir() {
+  local created=""
+  stop_status=""
+  trap 'stop_status=129' HUP
+  trap 'stop_status=130' INT
+  trap 'stop_status=143' TERM
+  created=$(mktemp -d ${2:+"$2"}) || created=""
+  if [ -n "${created}" ]; then
+    printf -v "$1" '%s' "${created}"
+  fi
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -n "${stop_status}" ]; then
+    exit "${stop_status}"
+  fi
+  [ -n "${created}" ]
+}
+
+# Copy what building, and later reinstalling, a runtime needs from ${root}.
+stage_runtime_source() {
+  local target=$1
+  rsync -a --delete "${root}/src/" "${target}/src/"
+  mkdir -p "${target}/deploy" "${target}/docs"
+  install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${target}/deploy/"
+  for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
+    install -m 0644 "${root}/${file}" "${target}/${file}"
+  done
+}
+
+contains() {
+  local target=$1
+  local item
+  shift
+  for item in "$@"; do
+    if [ "${item}" = "${target}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The controller and scheduler run continuously and timers keep their own
+# state; the services the timers start are jobs that come and go.
+long_running() {
+  case "$1" in
+    *.timer | *-controller.service | *-scheduler.service) return 0 ;;
+  esac
+  return 1
+}
 
 hold_cycle_lock() {
   local python="${app_dir}/.venv/bin/python"
@@ -124,7 +208,7 @@ hold_cycle_lock() {
       echo "Could not check whether a plate is being made. No changes made." >&2
       exit 1
     fi
-    sleep 1
+    sleep "${poll_seconds}"
   done
 }
 
@@ -136,39 +220,258 @@ release_cycle_lock() {
   fi
 }
 
-# A unit this run removed on purpose is not one to start again on failure.
-forget_stopped() {
-  local kept=()
+# Remember every managed unit's file and state before anything changes.
+record_units() {
   local unit
-  for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
-    if [ "${unit}" != "$1" ]; then
-      kept+=("${unit}")
+  for unit in "${managed_units[@]}"; do
+    if [ -f "${unit_root}/${unit}" ]; then
+      cp "${unit_root}/${unit}" "${unit_backup_dir}/${unit}"
+    fi
+    if systemctl is-enabled --quiet "${unit}"; then
+      enabled_before+=("${unit}")
+    fi
+    if long_running "${unit}" && systemctl is-active --quiet "${unit}"; then
+      active_before+=("${unit}")
     fi
   done
-  stopped_units=(${kept[@]+"${kept[@]}"})
+  units_recorded=true
+}
+
+replace_venv_link() {
+  rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
+    python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
+      "${app_dir}/.venv.next" "${app_dir}/.venv"
+}
+
+# Point ${app_dir}/.venv, the path every unit runs, at the new runtime. The
+# single-directory layout's venv moves into a runtime of its own; its source
+# stays at ${app_dir}/src, which that venv imports.
+activate_runtime() {
+  runtime_activated=true
+  if [ -L "${app_dir}/.venv" ]; then
+    venv_before="link:$(readlink "${app_dir}/.venv")"
+    previous_runtime=$(cd -P "${app_dir}/.venv/.." 2>/dev/null && pwd || true)
+  elif [ -e "${app_dir}/.venv" ]; then
+    venv_before=directory
+    make_temp_dir legacy_runtime "${runtimes_dir}/runtime.XXXXXX"
+    previous_runtime=${legacy_runtime}
+    mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
+  else
+    venv_before=absent
+  fi
+  replace_venv_link "${new_runtime}/.venv"
+}
+
+# Put ${app_dir}/.venv back exactly as it was before this run.
+restore_venv() {
+  case "${venv_before}" in
+    link:*) replace_venv_link "${venv_before#link:}" ;;
+    directory)
+      if [ -n "${legacy_runtime}" ] && [ -d "${legacy_runtime}/.venv" ]; then
+        if [ -L "${app_dir}/.venv" ]; then
+          rm -f "${app_dir}/.venv" || return 1
+        fi
+        mv "${legacy_runtime}/.venv" "${app_dir}/.venv" || return 1
+      fi
+      if [ -n "${legacy_runtime}" ]; then
+        rmdir "${legacy_runtime}" || return 1
+      fi
+      ;;
+    *) rm -f "${app_dir}/.venv" || return 1 ;;
+  esac
+  rm -f "${app_dir}/.venv.next"
+}
+
+# Return every managed unit to the file and state recorded before the run.
+restore_units() {
+  local unit
+  local changed=false
+  if [ "${units_replaced}" = true ]; then
+    for unit in "${managed_units[@]}"; do
+      if [ -f "${unit_backup_dir}/${unit}" ]; then
+        if ! cmp -s "${unit_backup_dir}/${unit}" "${unit_root}/${unit}"; then
+          changed=true
+          sudo install -m 0644 "${unit_backup_dir}/${unit}" "${unit_root}/${unit}" || true
+        fi
+      elif [ -e "${unit_root}/${unit}" ]; then
+        changed=true
+        if { systemctl is-active --quiet "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
+            ! sudo systemctl disable --now "${unit}"; then
+          # Keep its file so a rerun or the uninstaller can still find and stop it.
+          continue
+        fi
+        sudo rm -f "${unit_root}/${unit}" || true
+      fi
+    done
+    if [ "${changed}" = true ]; then
+      sudo systemctl daemon-reload || true
+    fi
+  fi
+  # A service started after the switch runs the new version; stop it before
+  # switching back so it starts again below on the previous one.
+  if [ "${runtime_activated}" = true ]; then
+    for unit in "${managed_units[@]}"; do
+      case "${unit}" in
+        *.service)
+          if [ -e "${unit_root}/${unit}" ] && systemctl is-active --quiet "${unit}" && \
+              { ! long_running "${unit}" || contains "${unit}" ${started_units[@]+"${started_units[@]}"}; }; then
+            sudo systemctl stop "${unit}" || stuck_units+=("${unit}")
+          fi
+          ;;
+      esac
+    done
+    if ! restore_venv; then
+      venv_restored=false
+      echo "Could not switch back to the previous version; the new one stays active, kept in ${new_runtime}." >&2
+    fi
+  fi
+  if [ "${units_recorded}" != true ]; then
+    return 0
+  fi
+  for unit in "${managed_units[@]}"; do
+    if [ ! -e "${unit_root}/${unit}" ]; then
+      continue
+    fi
+    if contains "${unit}" ${enabled_before[@]+"${enabled_before[@]}"}; then
+      systemctl is-enabled --quiet "${unit}" || sudo systemctl enable "${unit}" || true
+    elif systemctl is-enabled --quiet "${unit}"; then
+      sudo systemctl disable "${unit}" || true
+    fi
+    if long_running "${unit}"; then
+      if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
+        systemctl is-active --quiet "${unit}" || sudo systemctl start "${unit}" || true
+      elif systemctl is-active --quiet "${unit}"; then
+        sudo systemctl stop "${unit}" || true
+      fi
+    fi
+  done
+}
+
+# Name every unit that is not back as it was, from what systemd reports now.
+report_restore() {
+  local unit
+  local stopped=()
+  local running=()
+  local changed=()
+  if [ "${units_recorded}" != true ]; then
+    return 0
+  fi
+  for unit in "${managed_units[@]}"; do
+    if [ -e "${unit_root}/${unit}" ]; then
+      if [ "${units_replaced}" = true ] && { [ ! -f "${unit_backup_dir}/${unit}" ] || \
+          ! cmp -s "${unit_backup_dir}/${unit}" "${unit_root}/${unit}"; }; then
+        changed+=("${unit}")
+      elif contains "${unit}" ${enabled_before[@]+"${enabled_before[@]}"}; then
+        systemctl is-enabled --quiet "${unit}" || changed+=("${unit}")
+      elif systemctl is-enabled --quiet "${unit}"; then
+        changed+=("${unit}")
+      fi
+    elif [ -f "${unit_backup_dir}/${unit}" ]; then
+      changed+=("${unit}")
+    fi
+    if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
+      systemctl is-active --quiet "${unit}" || stopped+=("${unit}")
+    elif { long_running "${unit}" || [ "${runtime_activated}" = true ]; } && \
+        systemctl is-active --quiet "${unit}"; then
+      running+=("${unit}")
+    fi
+  done
+  if [ "${#running[@]}" -gt 0 ]; then
+    echo "The upgrade failed and these services could not be stopped: ${running[*]}." >&2
+    echo "Stop them with: sudo systemctl stop ${running[*]}" >&2
+  fi
+  if [ "${#stuck_units[@]}" -gt 0 ]; then
+    echo "These services could not be stopped and may still run the new version, kept in ${new_runtime}: ${stuck_units[*]}." >&2
+  fi
+  if [ "${#stopped[@]}" -gt 0 ]; then
+    echo "The upgrade failed and these services are stopped: ${stopped[*]}." >&2
+    echo "Start them with: sudo systemctl start ${stopped[*]}" >&2
+  fi
+  if [ "${#changed[@]}" -gt 0 ]; then
+    echo "These services are not set up as they were before the upgrade: ${changed[*]}." >&2
+    echo "Check them with: systemctl status ${changed[*]}" >&2
+  fi
+  if [ "${#running[@]}" -eq 0 ] && [ "${#stopped[@]}" -eq 0 ] && [ "${#changed[@]}" -eq 0 ] && \
+      [ "${#stuck_units[@]}" -eq 0 ] && [ "${venv_restored}" = true ]; then
+    if [ "${#stopped_units[@]}" -gt 0 ]; then
+      echo "The upgrade failed; the services it stopped were started again on the previous version." >&2
+    elif [ "${runtime_activated}" = true ] && [ "${venv_before}" != absent ]; then
+      echo "The upgrade failed; the previous version is running again." >&2
+    fi
+  fi
 }
 
 cleanup() {
   status=$?
   trap - EXIT
+  # Finish cleaning up even if a stop signal arrives, then report it.
+  cleanup_stop=""
+  trap 'cleanup_stop=129' HUP
+  trap 'cleanup_stop=130' INT
+  trap 'cleanup_stop=143' TERM
   release_cycle_lock
   if [ "${installation_complete}" != true ]; then
-    for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
-      if ! sudo systemctl start "${unit}" && ! systemctl is-active --quiet "${unit}"; then
-        not_restarted+=("${unit}")
-      fi
-    done
-    if [ "${#not_restarted[@]}" -gt 0 ]; then
-      echo "The upgrade failed and these services are stopped: ${not_restarted[*]}." >&2
-      echo "Start them with: sudo systemctl start ${not_restarted[*]}" >&2
-    elif [ "${#stopped_units[@]}" -gt 0 ]; then
-      echo "The upgrade failed; the services it stopped were started again." >&2
+    restore_units
+    report_restore
+    if [ -n "${new_runtime}" ] && [ "${#stuck_units[@]}" -eq 0 ] && [ "${venv_restored}" = true ]; then
+      rm -rf "${new_runtime}"
+    fi
+    if [ "${created_runtimes_dir}" = true ]; then
+      rmdir "${runtimes_dir}" 2>/dev/null || true
+    fi
+    if [ "${status}" -eq 0 ]; then
+      status=1
+    fi
+  elif [ "${status}" -ne 0 ]; then
+    echo "The new version is installed and running, but a final step failed; see the error above." >&2
+    if [ -n "${previous_runtime}" ]; then
+      echo "Previous version kept for rollback: ${previous_runtime}" >&2
     fi
   fi
-  rm -rf "${work_dir}"
+  if [ -n "${work_dir}" ] && ! rm -rf "${work_dir}"; then
+    echo "Could not remove temporary files; remove them by hand: ${work_dir}" >&2
+  fi
+  if [ -n "${cleanup_stop}" ] && [ "${status}" -eq 0 ]; then
+    echo "Stopped while finishing; the new version is installed and running." >&2
+    status=${cleanup_stop}
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
+# A stopped installer still restores what it changed, then reports the signal.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+make_temp_dir work_dir
+unit_dir="${work_dir}/units"
+unit_backup_dir="${work_dir}/previous-units"
+mkdir "${unit_dir}" "${unit_backup_dir}"
+
+chmod 600 "${config_path}"
+if [ ! -d "${runtimes_dir}" ]; then
+  created_runtimes_dir=true
+fi
+mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}" "${support_dir}"
+runtimes_dir=$(cd -P "${runtimes_dir}" && pwd)
+
+# Build and check the new runtime beside the live one; nothing running changes.
+make_temp_dir new_runtime "${runtimes_dir}/runtime.XXXXXX"
+stage_runtime_source "${new_runtime}"
+# A stray UV_PROJECT_ENVIRONMENT would build the venv somewhere the units do not run.
+env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${new_runtime}" \
+  --python "${python_version}" --extra controller --locked
+# The CLI reports a rejection as a JSON envelope on stdout; show its message.
+if ! validation=$("${new_runtime}/.venv/bin/inky-bird" config validate --config "${config_path}"); then
+  echo "The new version cannot use this configuration. No changes made." >&2
+  python3 -I -c '
+import json, sys
+try:
+    print(json.loads(sys.argv[1])["error"]["message"])
+except (ValueError, KeyError, TypeError):
+    print("The configuration check failed without a readable reason.")
+' "${validation}" >&2
+  exit 1
+fi
 
 hold_cycle_lock
 # Waiting for a plate can outlast cached sudo credentials; ask again before stopping anything.
@@ -176,17 +479,18 @@ if ! sudo -v; then
   echo "Administrator access is required to install system services. No changes made." >&2
   exit 1
 fi
+record_units
 # App-owned installations use the same dynamic scheduler as Docker. Stop it
 # before replacing its runtime; a managed installation removes it below.
 if systemctl is-active --quiet "${service_prefix}-scheduler.service"; then
-  sudo systemctl stop "${service_prefix}-scheduler.service"
   stopped_units+=("${service_prefix}-scheduler.service")
+  sudo systemctl stop "${service_prefix}-scheduler.service"
 fi
 for name in refresh generate catalog-publish notifications; do
   timer="${service_prefix}-${name}.timer"
   if systemctl is-active --quiet "${timer}"; then
-    sudo systemctl stop "${timer}"
     stopped_units+=("${timer}")
+    sudo systemctl stop "${timer}"
   fi
 done
 deadline=$((SECONDS + quiesce_timeout_seconds))
@@ -212,23 +516,8 @@ if ! sudo -v; then
   exit 1
 fi
 
-chmod 600 "${config_path}"
-mkdir -p "${app_dir}/src" "${app_dir}/catalog" "${app_dir}/deploy" "${support_dir}"
-if [ "${root}" != "${app_dir}" ]; then
-  mkdir -p "${app_dir}/docs"
-  rsync -a --delete "${root}/src/" "${app_dir}/src/"
-  install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${app_dir}/deploy/"
-  for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
-    install -m 0644 "${root}/${file}" "${app_dir}/${file}"
-  done
-fi
-
-# A stray UV_PROJECT_ENVIRONMENT would build the venv somewhere the units do not run.
-env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${app_dir}" \
-  --python "${python_version}" --extra controller --locked
-
-"${app_dir}/.venv/bin/python" - \
-  "${unit_dir}" "${root}" "${app_dir}" "${config_path}" "${HOME}" "${user}" <<'PY'
+"${new_runtime}/.venv/bin/python" - \
+  "${unit_dir}" "${catalog_root}" "${app_dir}" "${config_path}" "${HOME}" "${user}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -308,7 +597,7 @@ PY
 # Only an unreachable bird source may wait for the scheduled refresh; any other
 # failure means the new version does not work here.
 refresh_status=0
-refresh_output=$("${app_dir}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
+refresh_output=$("${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
   refresh_status=$?
 printf '%s\n' "${refresh_output}"
 if [ "${refresh_status}" -ne 0 ]; then
@@ -327,30 +616,30 @@ except (ValueError, KeyError, TypeError):
 fi
 
 if [ -f "${unit_dir}/${service_prefix}-catalog-publish.timer" ]; then
-  "${app_dir}/.venv/bin/inky-bird" catalog-publish \
+  "${new_runtime}/.venv/bin/inky-bird" catalog-publish \
     --config "${config_path}" --dry-run
 fi
 
+activate_runtime
+units_replaced=true
 for unit in "${unit_dir}"/*; do
-  sudo install -m 0644 "${unit}" "/etc/systemd/system/$(basename "${unit}")"
+  sudo install -m 0644 "${unit}" "${unit_root}/$(basename "${unit}")"
 done
 for optional in refresh generate catalog-publish notifications; do
   if [ ! -f "${unit_dir}/${service_prefix}-${optional}.timer" ]; then
-    if [ -e "/etc/systemd/system/${service_prefix}-${optional}.timer" ]; then
+    if [ -e "${unit_root}/${service_prefix}-${optional}.timer" ]; then
       sudo systemctl disable --now "${service_prefix}-${optional}.timer"
     fi
-    forget_stopped "${service_prefix}-${optional}.timer"
     sudo rm -f \
-      "/etc/systemd/system/${service_prefix}-${optional}.service" \
-      "/etc/systemd/system/${service_prefix}-${optional}.timer"
+      "${unit_root}/${service_prefix}-${optional}.service" \
+      "${unit_root}/${service_prefix}-${optional}.timer"
   fi
 done
 if [ ! -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
-  if [ -e "/etc/systemd/system/${service_prefix}-scheduler.service" ]; then
+  if [ -e "${unit_root}/${service_prefix}-scheduler.service" ]; then
     sudo systemctl disable --now "${service_prefix}-scheduler.service"
   fi
-  forget_stopped "${service_prefix}-scheduler.service"
-  sudo rm -f "/etc/systemd/system/${service_prefix}-scheduler.service"
+  sudo rm -f "${unit_root}/${service_prefix}-scheduler.service"
 fi
 
 sudo systemctl daemon-reload
@@ -370,11 +659,13 @@ fi
 if [ -f "${unit_dir}/${service_prefix}-notifications.timer" ]; then
   sudo systemctl enable "${service_prefix}-notifications.timer"
 fi
+started_units+=("${service_prefix}-controller.service")
 sudo systemctl restart "${service_prefix}-controller.service"
 if [ -f "${unit_dir}/${service_prefix}-refresh.timer" ]; then
   sudo systemctl restart "${service_prefix}-refresh.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
+  started_units+=("${service_prefix}-scheduler.service")
   sudo systemctl restart "${service_prefix}-scheduler.service"
 fi
 if [ -f "${unit_dir}/${service_prefix}-generate.timer" ]; then
@@ -411,8 +702,20 @@ if [ -f "${unit_dir}/${service_prefix}-notifications.timer" ]; then
 fi
 
 installation_complete=true
+# Keep the previous runtime for rollback; nothing runs from anything older.
+for runtime in "${runtimes_dir}"/*; do
+  if [ -d "${runtime}" ] && [ "${runtime}" != "${new_runtime}" ] && \
+      [ "${runtime}" != "${previous_runtime}" ] && ! rm -rf "${runtime}"; then
+    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+  fi
+done
+# The managed directory's copy of this script reinstalls the active runtime.
+install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${app_dir}/deploy/"
 echo "Controller installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
+if [ -n "${previous_runtime}" ]; then
+  echo "Previous version kept for rollback: ${previous_runtime}"
+fi
 if ! "${app_dir}/.venv/bin/inky-bird" access setup --if-needed --config "${config_path}"; then
   echo "Controller installation completed; owner setup is incomplete. Run access setup in a private terminal. Display and scheduled work continue." >&2
 fi

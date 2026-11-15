@@ -28,6 +28,28 @@ case "${run_initial_display}" in
   *) echo "INKY_BIRD_RUN_INITIAL_DISPLAY must be true or false." >&2; exit 1 ;;
 esac
 
+# mktemp -d into the variable named $1. A stop signal that arrives after the
+# directory exists but before its name is recorded waits until it is, so
+# cleanup can still remove it.
+make_temp_dir() {
+  local created=""
+  stop_status=""
+  trap 'stop_status=129' HUP
+  trap 'stop_status=130' INT
+  trap 'stop_status=143' TERM
+  created=$(mktemp -d ${2:+"$2"}) || created=""
+  if [ -n "${created}" ]; then
+    printf -v "$1" '%s' "${created}"
+  fi
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -n "${stop_status}" ]; then
+    exit "${stop_status}"
+  fi
+  [ -n "${created}" ]
+}
+
 remote_command() {
   local command
   printf -v command '%q ' "$@"
@@ -52,21 +74,37 @@ if [[ ! "${stage_suffix}" =~ ^[0-9a-f]{12}$ ]]; then
   exit 1
 fi
 remote_stage="${stage_prefix}${stage_suffix}"
-reply_dir=$(mktemp -d)
+reply_dir=""
 stage_requested=false
 stage_foreign=false
 cleanup() {
   status=$?
   trap - EXIT
-  rm -rf "${reply_dir}"
+  # Finish cleaning up even if a stop signal arrives, then report it.
+  cleanup_stop=""
+  trap 'cleanup_stop=129' HUP
+  trap 'cleanup_stop=130' INT
+  trap 'cleanup_stop=143' TERM
+  if [ -n "${reply_dir}" ] && ! rm -rf "${reply_dir}"; then
+    echo "Could not remove temporary files; remove them by hand: ${reply_dir}" >&2
+  fi
   # Only the exact path this invocation asked to create, never one that existed.
   if [ "${stage_requested}" = true ] && [ "${stage_foreign}" != true ] && \
       ! remote_command rm -rf -- "${remote_stage}"; then
     echo "Could not remove isolated public-source staging; remove it after reconnecting: ${remote_stage}" >&2
   fi
+  if [ -n "${cleanup_stop}" ] && [ "${status}" -eq 0 ]; then
+    echo "Stopped while finishing; the new version is installed and running." >&2
+    status=${cleanup_stop}
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
+# A stopped installer still restores what it changed, then reports the signal.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+make_temp_dir reply_dir
 stage_requested=true
 stage_status=0
 remote_command bash -s -- "${remote_parent}" "${remote_stage}" \
