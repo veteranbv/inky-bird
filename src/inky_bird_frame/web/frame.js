@@ -292,10 +292,12 @@ export function renderFrame(context) {
   main.append(
     viewport,
     caption,
-    dock,
     note('Plates change once a minute while playing. This does not refresh the wall panel.'),
   );
   if (!window.isSecureContext)
     main.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
+  // Last in the column, so a notice of any length takes its own room above
+  // the bar instead of covering the bird name or the notes.
+  main.append(dock);
   show();
 }

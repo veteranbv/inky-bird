@@ -168,6 +168,10 @@ class JournalViewRemovedError(JournalError):
     """A selected view was authoritatively removed, not temporarily unavailable."""
 
 
+class JournalUnavailableError(JournalError):
+    """The saved journal is damaged, unreadable or too new; not a request mistake."""
+
+
 @dataclass(frozen=True)
 class ChecklistEvidence:
     checklist_hash: str
@@ -399,6 +403,16 @@ def _newer_schema(value: object, supported: int) -> bool:
 
 
 def read_journal(state_dir: Path) -> JournalState:
+    try:
+        return _read_journal(state_dir)
+    except JournalUnavailableError:
+        raise
+    except JournalError as exc:
+        # Every refusal here is about the saved file, whatever helper raised it.
+        raise JournalUnavailableError(str(exc)) from exc
+
+
+def _read_journal(state_dir: Path) -> JournalState:
     path = state_dir / "journal.json"
     try:
         info = path.lstat()
@@ -497,14 +511,24 @@ def save_collection(
     taxon_ids: object,
     collection_id: object = None,
     member_names: Mapping[int, tuple[str, str]] | None = None,
+    remove_unresolved: object = None,
 ) -> JournalState:
+    """Save a named selection.
+
+    ``remove_unresolved`` names unresolved members to take out, in the owner
+    projection's shape. A removed member whose scientific name matches a newly
+    chosen bird resolves to it and keeps its origin and checklist links.
+    """
     expected = _revision(revision)
     name = _label(label)
     taxa = _taxa(taxon_ids)
+    drop = _unresolved_choice(remove_unresolved)
     if collection_id is not None and (
         not isinstance(collection_id, str) or not COLLECTION_ID.fullmatch(collection_id)
     ):
         raise JournalError("Choose an existing collection")
+    if collection_id is None and drop:
+        raise JournalError("A new collection has no unresolved species to remove")
     with catalog_state_lock(state_dir):
         state = read_journal(state_dir)
         if state.revision != expected:
@@ -540,6 +564,30 @@ def save_collection(
             retained = {
                 member.taxon_id: member for member in current.members if member.taxon_id is not None
             }
+            pending = [member for member in current.members if member.taxon_id is None]
+            if drop:
+                names = {(member.common_name, member.scientific_name) for member in pending}
+                if not drop <= names:
+                    raise JournalError("Choose unresolved species from this collection")
+                dropped = {
+                    member.scientific_name.casefold(): member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) in drop
+                    and member.scientific_name
+                }
+                pending = [
+                    member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) not in drop
+                ]
+                for taxon_id, member in zip(taxa, members, strict=True):
+                    if taxon_id in retained:
+                        continue
+                    match = dropped.pop(member.scientific_name.casefold(), None)
+                    if match is not None:
+                        retained[taxon_id] = replace(
+                            member, origin=match.origin, evidence=match.evidence
+                        )
             groups[found] = replace(
                 current,
                 label=name,
@@ -547,11 +595,27 @@ def save_collection(
                 members=tuple(
                     retained.get(cast(int, member.taxon_id), member) for member in members
                 )
-                + tuple(member for member in current.members if member.taxon_id is None),
+                + tuple(pending),
             )
         result = JournalState(state.revision + 1, tuple(groups))
         _write_journal(state_dir, result)
         return result
+
+
+def _unresolved_choice(value: object) -> set[tuple[str, str]]:
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise JournalError("Choose which unresolved species to remove")
+    chosen: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"common_name", "scientific_name"}:
+            raise JournalError("Choose which unresolved species to remove")
+        pair = (_visible_text(item["common_name"]), _visible_text(item["scientific_name"]))
+        if pair in chosen:
+            raise JournalError("A collection cannot contain a species twice")
+        chosen.add(pair)
+    return chosen
 
 
 def remove_collection(state_dir: Path, *, revision: object, collection_id: object) -> JournalState:
@@ -860,6 +924,7 @@ class JournalService:
         label: object,
         taxon_ids: object,
         collection_id: object = None,
+        remove_unresolved: object = None,
     ) -> JournalState:
         taxa = _taxa(taxon_ids)
         identities = {
@@ -878,6 +943,7 @@ class JournalService:
             taxon_ids=list(taxa),
             collection_id=collection_id,
             member_names=identities,
+            remove_unresolved=remove_unresolved,
         )
 
     def _listed_birds(self, taxa: list[int]) -> dict[int, dict[str, object]]:
@@ -1227,6 +1293,7 @@ class JournalService:
                         else [],
                         "portrait_url": f"/v1/owner/journal/birds/{taxon_id}/portrait",
                         "portrait_sha256": entry["portrait_sha256"],
+                        "approved_at": entry["approved_at"],
                     }
                 )
             approved_ids = {cast(int, bird["taxon_id"]) for bird in birds}

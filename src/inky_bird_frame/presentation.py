@@ -28,6 +28,9 @@ PAIR_SECONDS = 10 * 60
 # One client may start a new pairing request this often. The pause is kept per
 # client, so it applies to the whole household only while callers name none.
 PAIR_REQUEST_INTERVAL_SECONDS = 15
+# Waiting requests one named client may hold, so one device cannot use up the
+# household's pending allowance.
+MAX_PENDING_PER_CLIENT = 2
 GRANT_DAYS = 90
 MAX_STATE_BYTES = 256 * 1024
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -86,6 +89,9 @@ class PresentationAccess:
         # When each recent client last started a request; kept in memory so
         # that refusing a client never needs a disk write.
         self._pair_requests: dict[str, float] = {}
+        # Which named client started each waiting request, by grant id. Kept in
+        # memory only: after a restart each client starts with a clean count.
+        self._pending_clients: dict[str, str] = {}
 
     def _load(self) -> PresentationState:
         if not self.path.exists() and not self.path.is_symlink():
@@ -214,10 +220,16 @@ class PresentationAccess:
                 for key, at in self._pair_requests.items()
                 if 0 <= now - at < PAIR_REQUEST_INTERVAL_SECONDS
             }
+            waiting = {g.id for g in grants if g.kind == "pending"}
+            self._pending_clients = {
+                id: owner for id, owner in self._pending_clients.items() if id in waiting
+            }
             if (
                 client in self._pair_requests
                 or len(grants) >= MAX_GRANTS
-                or sum(g.kind == "pending" for g in grants) >= MAX_PENDING
+                or len(waiting) >= MAX_PENDING
+                or client
+                and list(self._pending_clients.values()).count(client) >= MAX_PENDING_PER_CLIENT
             ):
                 raise AccessRateLimitError(
                     "Pairing is busy. Wait a moment or remove an unused request in Displays."
@@ -242,6 +254,8 @@ class PresentationAccess:
                 )
             )
             self._pair_requests[client] = now
+            if client:
+                self._pending_clients[grant.id] = client
             return secret, {
                 "status": "pending",
                 "pairing_code": grant.pairing_code,

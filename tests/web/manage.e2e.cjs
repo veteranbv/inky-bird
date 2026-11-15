@@ -4,6 +4,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { noSideways } = require('./e2e-layout.cjs');
+const { execFileSync } = require('node:child_process');
 
 async function birdBuddySettings(t) {
   const { page, origin, heading } = t;
@@ -32,6 +34,46 @@ async function birdBuddySettings(t) {
   );
 }
 
+// Saving a key from a session signed in long ago asks for the password first;
+// typing it must not withdraw the review that holds the confirmation.
+async function recentSignIn(t) {
+  const { page, origin, root, fixture, heading, password } = t;
+  t.phase = 'settings-recent-sign-in';
+  // Age this installation's own sessions past the recent sign-in window,
+  // under the store's lock, as real time would.
+  execFileSync(
+    process.env.INKY_QA_PYTHON || path.join(root, '.venv/bin/python'),
+    [
+      '-c',
+      `from dataclasses import replace
+from pathlib import Path
+from inky_bird_frame.access import RECENT_AUTH_SECONDS, AccessStore
+from inky_bird_frame.config import load_config
+store=AccessStore(load_config(Path(${JSON.stringify(path.join(fixture, 'config.toml'))}),load_secrets=False).controller.state_dir)
+with store._locked() as state:
+ assert state.sessions
+ state.sessions=[replace(s,authenticated_at=s.authenticated_at-2*RECENT_AUTH_SECONDS) for s in state.sessions]
+ store._save(state)
+`,
+    ],
+    { cwd: root, env: { PATH: process.env.PATH, PYTHONPATH: root + '/src' } },
+  );
+  await page.goto(origin + '/app?page=settings&source=ebird');
+  await heading('eBird nearby');
+  await page.getByLabel('eBird API key', { exact: true }).fill('SYNTHETIC_EBIRD_KEY');
+  await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+  await page.getByRole('button', { name: 'Save settings', exact: true }).click();
+  const confirmation = page.getByLabel('Your Inky password', { exact: true });
+  await confirmation.waitFor();
+  // Typed key by key, as an owner would.
+  await confirmation.pressSequentially(password);
+  await confirmation.press('Enter');
+  await page.getByRole('button', { name: 'Confirm and save', exact: true }).click();
+  await heading('eBird nearby');
+  await page.getByText('Saved. Leave this empty to keep it.', { exact: true }).waitFor();
+  assert.equal(await page.getByLabel('eBird API key', { exact: true }).inputValue(), '');
+}
+
 // Plate work: candidate review and recovery holds.
 async function candidates(t) {
   const { page, origin, fixture, heading } = t;
@@ -52,11 +94,11 @@ async function candidates(t) {
   await page.getByRole('button', { name: 'Confirm local approval', exact: true }).click();
   await heading('Operation outcome');
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('Finished', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('Finished', { exact: true }).waitFor();
   assert(
     fs.existsSync(
       path.join(fixture, 'catalog/species/9999991-synthetic-qa-candidate-9999991/manifest.json'),
@@ -71,11 +113,11 @@ async function candidates(t) {
   await page.getByRole('button', { name: 'Confirm rejection', exact: true }).click();
   await heading('Operation outcome');
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('Finished', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('Finished', { exact: true }).waitFor();
   assert(
     fs.existsSync(
       path.join(
@@ -129,16 +171,17 @@ async function integrations(t) {
   });
   assert.equal(aggregate.status(), 200);
   assert(!JSON.stringify(await aggregate.json()).includes(trip.label));
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Integrations');
   await Promise.all([
     page.waitForEvent('load'),
     page.getByRole('button', { name: 'I saved it · clear this copy', exact: true }).click(),
   ]);
   await heading('Integrations');
   assert.equal(await page.getByText(serviceSecret, { exact: true }).count(), 0);
+  await page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click();
   await Promise.all([
     page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click(),
+    page.getByRole('button', { name: 'Revoke', exact: true }).click(),
   ]);
   await heading('Integrations');
   assert.equal(
@@ -166,11 +209,11 @@ async function health(t) {
   ]) {
     await page.goto(origin + '/app?page=' + area);
     await heading(title);
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, title);
   }
 }
 
-module.exports = { birdBuddySettings, candidates, integrations, health };
+module.exports = { birdBuddySettings, recentSignIn, candidates, integrations, health };
 
 if (require.main === module) {
   console.error('Run tests/web/journal.e2e.cjs');

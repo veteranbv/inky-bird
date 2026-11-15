@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { run } = require('./e2e-harness.cjs');
+const { noSideways } = require('./e2e-layout.cjs');
 const birds = require('./birds.e2e.cjs');
 const save = require('./save.e2e.cjs');
 const frame = require('./frame.e2e.cjs');
@@ -29,7 +30,7 @@ async function ownerSetup(t) {
   assert.equal(guide.status(), 200);
   assert((await guide.text()).includes('An unattended upgrade does not wait for a prompt.'));
   await page.setViewportSize({width: 320, height: 844});
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Setup at 320 px');
   await page.setViewportSize({width: 390, height: 844});
   await context.unroute(origin + '/v1/access', reservedStatus);
   t.phase = 'registration';
@@ -54,7 +55,7 @@ async function ownerSetup(t) {
   await heading('Make Inky yours');
   for (const width of [320, 390]) {
     await page.setViewportSize({ width, height: 844 });
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, 'Registration at ' + width + ' px');
   }
   fs.writeFileSync(fixture + '/sign-in-phone.png', await page.screenshot({ fullPage: true }), {
     mode: 0o600,
@@ -203,6 +204,7 @@ async function finish(t) {
         accessibility: !!process.env.INKY_QA_AXE,
         checks: [
           'owner setup',
+          'password confirmation for a key saved from an older sign-in',
           'HTTP and HTTPS cookie-host trust guidance (HTTPS rendering synthetic)',
           'Favorites separate from sightings',
           'complete archive upload',
@@ -239,6 +241,7 @@ async function finish(t) {
 run(async (t) => {
   await ownerSetup(t);
   await manage.birdBuddySettings(t);
+  await manage.recentSignIn(t);
   await save.historyAndCollections(t);
   await manage.candidates(t);
   await birds.unreadableNotice(t);

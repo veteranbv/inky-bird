@@ -353,15 +353,31 @@ jobs:
             = "$PLAYWRIGHT_VERSION"
           "$qa_tools/node_modules/.bin/playwright" install --with-deps chromium
 
-      # Evidence screenshots and cookies hold synthetic credentials, so the
-      # evidence directory is not uploaded; the log names the failing phase.
+      # The log names the failing phase and, for a layout check, the window
+      # and every measured box.
       - name: Run the browser journeys
         run: |
           set -euo pipefail
           qa_tools="${RUNNER_TEMP}/qa-tools"
+          mkdir -p "${RUNNER_TEMP}/browser-evidence"
+          INKY_QA_EVIDENCE_DIR="${RUNNER_TEMP}/browser-evidence" \
           INKY_QA_PLAYWRIGHT="$qa_tools/node_modules/playwright" \
           INKY_QA_AXE="$qa_tools/node_modules/@axe-core/playwright" \
             node tests/web/journal.e2e.cjs
+
+      # The evidence is synthetic by construction (tests/web/e2e-harness.cjs):
+      # a fresh configuration, a random per-run password whose sessions end
+      # with the run, synthetic history and screenshots of them. The copied
+      # public plates are left out.
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-journey-evidence
+          path: |
+            ${{ runner.temp }}/browser-evidence/
+            !${{ runner.temp }}/browser-evidence/*/catalog/**
+          retention-days: 7
 
   quality:
     name: quality

@@ -579,18 +579,16 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 .presenting, body.presenting { background: #16120c; }
 .presenting {
   --frame-control: 44px;
-  /* The bar's offset from the bottom edge, its height (one control row plus
-     its padding and border) and a gap above it. */
-  --frame-bar-room: calc(max(14px, env(safe-area-inset-bottom)) + var(--frame-control) + 20px);
 }
-/* One screen tall: the plate takes whatever height the title, bird name and
-   note leave above the room kept for the control bar. */
+/* One screen tall: the plate takes whatever height the title, bird name,
+   notes and bottom dock leave. Everything is in the column's flow, so taller
+   text shrinks the plate, or scrolls the page, and never overlaps. */
 .presenting main {
   display: flex;
   flex-direction: column;
   height: 100vh; height: 100svh;
   max-width: none;
-  padding: 0 max(10px, env(safe-area-inset-right)) var(--frame-bar-room) max(10px, env(safe-area-inset-left));
+  padding: 0 max(10px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   text-align: center;
 }
 /* The focus ring sits on the dark presenting background in both themes. */
@@ -610,25 +608,27 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 .presenting h1::after { display: none; }
 .presenting .intro { font-size: 0.7647rem; margin: 3px 0 10px; color: #9b8f7a; }
 /* Only the viewport is sized: the plate fills it, so Zoom can still enlarge
-   the plate. */
-.presenting .frame-viewport { flex: 1 1 0; height: auto; min-height: 40vh; min-height: 40svh; max-height: 80vh; max-height: 80svh; }
+   the plate. It gives up height first, so the text and controls stay on
+   screen while a notice shows. */
+.presenting .frame-viewport { flex: 1 1 0; height: auto; min-height: 0; max-height: 80vh; max-height: 80svh; }
 .presenting .frame-art { background: transparent; border: 0; border-radius: 0; }
-/* The notice and the control bar share one bottom dock, so the notice
-   always sits above the bar however many rows the bar needs. The dock
-   itself takes no taps; only its visible contents do. */
+/* The notice and the control bar share one bottom dock, last in the
+   column, so the notice always sits above the bar and below the notes
+   however many lines either takes. The dock itself takes no taps; only its
+   visible contents do. */
 .frame-dock { display: contents; }
 .presenting .frame-dock {
-  position: fixed;
-  bottom: max(14px, env(safe-area-inset-bottom));
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 6;
+  position: relative;
+  flex: none;
+  align-self: center;
+  margin-top: auto;
+  padding-top: 10px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
   width: max-content;
-  max-width: 96vw;
+  max-width: 100%;
   pointer-events: none;
 }
 .presenting .frame-dock > :not(.quiet) { pointer-events: auto; }
@@ -642,7 +642,22 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   border-radius: 20px;
   gap: 4px;
 }
-.presenting .frame-controls.expanded .frame-more { padding-bottom: 6px; border-bottom: 1px solid #4e4638; }
+/* Narrower screens open More over the page, above the dock, so the plate
+   keeps its size. */
+@media (max-width: 1023.98px) {
+  .presenting .frame-controls.expanded .frame-more {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100vw - 20px);
+    padding: 4px 6px;
+    background: rgb(27 22 17 / 0.92);
+    border: 1px solid #4e4638;
+    border-radius: 20px;
+  }
+}
 .presenting .frame-confirm-ask span { padding: 4px 8px; color: #e9e2d2; font-size: 0.8235rem; }
 .presenting .frame-controls button, .presenting .frame-controls a {
   min-height: var(--frame-control);
@@ -698,6 +713,16 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 :root:fullscreen .presenting .intro,
 :root:fullscreen .presenting p.hint:not([role="status"]) { display: none; }
 :root:fullscreen .presenting main { padding: 0; }
+:root:fullscreen .presenting .frame-dock {
+  position: fixed;
+  bottom: max(14px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  margin: 0;
+  padding: 0;
+  max-width: 96vw;
+}
 :root:fullscreen .presenting .frame-viewport { flex: none; height: 100vh; height: 100svh; max-height: none; }
 :root:fullscreen .presenting .frame-caption {
   position: fixed;
@@ -727,6 +752,8 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   .list-tools { grid-template-columns: minmax(0, 420px) repeat(2, minmax(0, 13rem)); }
   .list-tools .list-field:first-child { grid-column: auto; }
   .journal main { padding-top: 24px; padding-bottom: 60px; }
+  /* Frame keeps only the bottom dock's own offset from the edge. */
+  :root:not(:fullscreen) .journal.presenting main { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
   .journal-navigation {
     position: sticky;
     top: 0;

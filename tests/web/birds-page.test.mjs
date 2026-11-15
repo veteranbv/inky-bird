@@ -199,7 +199,7 @@ test('field notes that fail to load leave the rest of the bird page working', as
   });
   assert.deepEqual(problems, []);
   assert(findButton(main, 'Add to Favorites'), 'Favorites still works');
-  assert(findButton(main, 'Review adding to Saved birds'), 'Saved birds still works');
+  assert(findButton(main, 'Add to Saved birds'), 'Saved birds still works');
   assert(nodes(main).some((node) => node.textContent === 'Field notes are unavailable.'));
 });
 
@@ -211,7 +211,7 @@ test('field notes arrive below the bird actions, so nothing moves under a finger
   const holding = (target) => notes.children.findIndex((child) => child === target || nodes(child).includes(target));
   const fieldNotes = notes.children.findIndex((node) => node.classList.contains('field-notes'));
   const favorites = holding(findButton(main, 'Add to Favorites'));
-  const saved = holding(findButton(main, 'Review adding to Saved birds'));
+  const saved = holding(findButton(main, 'Add to Saved birds'));
   assert(favorites >= 0 && saved >= 0 && fieldNotes >= 0);
   assert(fieldNotes > favorites && fieldNotes > saved, 'field notes come after the actions');
 });
@@ -256,3 +256,101 @@ for (const [name, change] of [
     assert(!main.textContent.includes(welcome));
     assert(main.textContent.includes('Make room for a bird'));
   });
+
+for (const [plateReady, oneTap] of [
+  [true, true],
+  [false, false],
+])
+  test(`removing a saved bird ${plateReady ? 'with' : 'without'} approved art ${oneTap ? 'is one tap' : 'asks first'}`, async (t) => {
+    const changes = [];
+    const { main, assigned } = await open(t, { page: 'bird', bird: '4' }, {
+      state: withState({
+        birds: [{ ...bird(4, 'Demo Plover', 'd'), saved: true, plate_ready: plateReady }],
+        saved_taxon_ids: [4],
+      }),
+      respond(path, body) {
+        if (path === '/v1/owner/settings') return { revision: 'r'.repeat(64) };
+        if (path === '/v1/owner/saved/preview')
+          return { added_count: 0, removed_count: 1, migrated_legacy_queue_count: 0, collection_revision: sha('c') };
+        if (path === '/v1/owner/saved/change') {
+          changes.push(body);
+          return { operation_id: 'op1', kind: 'saved-collection', status: 'succeeded', result: {} };
+        }
+        throw new Error('unexpected ' + path);
+      },
+    });
+    findButton(main, 'Remove from Saved birds').click();
+    await flush();
+    assert.equal(changes.length, oneTap ? 1 : 0);
+    assert.equal(Boolean(findButton(main, 'Confirm Saved birds change')), !oneTap);
+    assert.equal(Boolean(findButton(main, 'Undo')), oneTap);
+    assert.deepEqual(assigned, []);
+  });
+
+test('a favorite that cannot be saved says so beside the bird', async (t) => {
+  const { main, problems } = await open(t, { page: 'bird', bird: '2' }, {
+    recordProblems: true,
+    respond(path) {
+      if (path === '/v1/owner/journal/collections/favorite')
+        throw Object.assign(new Error('The journal changed. Reload and try again.'), {
+          code: 'journal_changed',
+        });
+      throw new Error('unexpected ' + path);
+    },
+  });
+  const favorite = findButton(main, 'Add to Favorites');
+  favorite.fire('click', { currentTarget: favorite });
+  await flush();
+  assert.deepEqual(problems, []);
+  assert(nodes(main).some((node) => node.textContent === 'The journal changed. Reload and try again.'));
+  assert(findButton(main, 'Add to Saved birds'), 'the rest of the page stays');
+  assert.equal(favorite.disabled, false);
+});
+
+test('an action that cannot start says so in its own section', async (t) => {
+  const source = { name: 'inaturalist', enabled: true, status: 'ok', activity: {} };
+  const { main, problems } = await open(t, { page: 'sources' }, {
+    recordProblems: true,
+    state: withState({
+      management: {
+        available: true,
+        window: 'last-30-days',
+        refresh_minutes: 15,
+        sources: [source],
+        work: { complete: true, discovery_status: 'ok' },
+        activity: { entries: {} },
+        recent_detections: [],
+      },
+    }),
+    respond(path) {
+      if (path === '/v1/owner/settings') return { revision: null };
+      if (path === '/v1/owner/operations') return { operations: [] };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  findButton(main, 'Refresh observations').click();
+  await flush();
+  assert.deepEqual(problems, []);
+  assert.equal(main.querySelector('h1').textContent, 'Sources');
+  const message = 'This service has no authoritative configuration file.';
+  assert(nodes(main).some((node) => node.textContent === message));
+  findButton(main, 'Refresh observations').click();
+  await flush();
+  assert.equal(
+    nodes(main).filter((node) => node.tagName === 'P' && node.textContent === message).length,
+    1,
+  );
+});
+
+test('recently added puts the newest approved art first', async (t) => {
+  const state = () => {
+    const value = flock();
+    value.birds[0].approved_at = '2001-03-01T00:00:00+00:00';
+    value.birds[1].approved_at = '2001-05-01T00:00:00+00:00';
+    value.birds[2].approved_at = '2001-04-01T00:00:00+00:00';
+    return value;
+  };
+  const { main } = await open(t, { page: 'birds', sort: 'added' }, { state });
+  assert.equal(byId(main, 'bird-sort').value, 'added');
+  assert.deepEqual(names(main), ['Sample Finch', 'Test Heron', 'Example Wren', 'Demo Plover']);
+});

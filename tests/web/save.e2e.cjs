@@ -5,6 +5,17 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { layout, noSideways } = require('./e2e-layout.cjs');
+
+// Owner operations finish on a timer the page polls; the test clock drives it.
+async function shown(page, text) {
+  for (let n = 0; n < 20; n++) {
+    if (await page.getByText(text, { exact: true }).isVisible()) return;
+    await page.clock.runFor(1100);
+    await page.waitForTimeout(20);
+  }
+  await page.getByText(text, { exact: true }).waitFor();
+}
 
 // Favorites, eBird history, trips, portable collections and missing-plate requests.
 async function historyAndCollections(t) {
@@ -66,7 +77,7 @@ async function historyAndCollections(t) {
   await heading('5. Save your trip');
   for (const width of [320, 390, 1280]) {
     await page.setViewportSize({ width, height: 844 });
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, 'Trip review at ' + width + ' px');
   }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: fixture + '/trip-review-phone.png', fullPage: true });
@@ -156,12 +167,10 @@ async function historyAndCollections(t) {
   assert(!fs.existsSync(path.join(fixture, 'var/controller/generation-queue.json')));
   await page.getByRole('button', { name: 'Confirm these plate requests', exact: true }).click();
   await heading('Operation outcome');
-  for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
-    await page.clock.runFor(1100);
-    await page.waitForTimeout(20);
-  }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await shown(page, 'Finished');
+  // Every count the request returns stays on the outcome.
+  await shown(page, '1 plate request saved');
+  await shown(page, '0 birds still held');
   const queue = JSON.parse(
     fs.readFileSync(path.join(fixture, 'var/controller/generation-queue.json')),
   ).species;
@@ -181,7 +190,10 @@ async function collectionFilter(t) {
   // Filtering hides non-matching rows (role queries exclude hidden nodes)
   // while chosen birds stay chosen. Scientific names match too.
   await page.getByLabel('Find a bird to add', { exact: true }).fill('Turdus');
+  // Enter in the search box finishes the search; it does not save.
+  await page.getByLabel('Find a bird to add', { exact: true }).press('Enter');
   await page.getByRole('checkbox', { name: /American Robin/ }).waitFor();
+  await heading('New collection');
   assert.equal(await page.getByRole('checkbox', { name: /Northern Cardinal/ }).count(), 0);
   await page.getByRole('checkbox', { name: /American Robin/ }).check();
   await page.getByLabel('Find a bird to add', { exact: true }).fill('zz-no-such-bird');
@@ -208,12 +220,88 @@ async function collectionFilter(t) {
   await heading('Filter journey');
   await page.getByRole('link', { name: /Northern Cardinal/ }).first().waitFor();
   await page.getByRole('link', { name: /American Robin/ }).first().waitFor();
+  // On a phone the collection shows two plates side by side, like the birds list.
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 375, height: 812 });
+  const cards = page.locator('.bird-grid a.bird-card');
+  const pair = { first: await cards.nth(0).boundingBox(), second: await cards.nth(1).boundingBox() };
+  await layout(
+    page,
+    Math.round(pair.first.y) === Math.round(pair.second.y) &&
+      pair.second.x >= pair.first.x + pair.first.width,
+    'the collection does not show two plates side by side',
+    pair,
+  );
+  await noSideways(page, 'Collection');
+  await page.setViewportSize(viewport);
   // Remove the journey collection so later phases see the expected state.
   // The Remove action lives in the collection page's tools.
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Remove collection', exact: true }).click();
   await heading('Collections');
   assert.equal(await page.getByRole('link', { name: 'Filter journey', exact: true }).count(), 0);
+  await unresolvedMembers(t);
+}
+
+// An imported name that matched no bird can be removed, or resolved to the
+// bird with the same scientific name.
+async function unresolvedMembers(t) {
+  const { page, context, origin, heading, state, cardinal } = t;
+  t.phase = 'unresolved-members';
+  const session = (await (await context.request.get(origin + '/v1/owner/session')).json()).data;
+  const post = async (route, data) => {
+    const response = await context.request.post(origin + route, {
+      headers: { Origin: origin, 'X-Inky-CSRF': session.csrf },
+      data,
+    });
+    assert.equal(response.status(), 200, route);
+    return (await response.json()).data;
+  };
+  const document = {
+    format: 'inky-collection',
+    schema_version: 1,
+    label: 'Unresolved journey',
+    start_date: null,
+    end_date: null,
+    members: [
+      {
+        taxon_id: 990001,
+        common_name: '',
+        scientific_name: cardinal.scientific_name,
+        origin: 'saved-selection',
+      },
+      {
+        taxon_id: 990002,
+        common_name: '',
+        scientific_name: 'Synthetica nonexistens',
+        origin: 'saved-selection',
+      },
+    ],
+  };
+  const preview = await post('/v1/owner/journal/collections/import-preview', { document });
+  assert.equal(preview.unresolved.length, 2);
+  const collection_id = 'e'.repeat(32);
+  await post('/v1/owner/journal/collections/import', {
+    document,
+    revision: state().revision,
+    preview_hash: preview.preview_hash,
+    collection_id,
+  });
+  await page.goto(origin + '/app?page=edit-collection&view=' + collection_id);
+  await heading('Edit collection');
+  await page
+    .getByRole('checkbox', { name: cardinal.scientific_name + ' · matches Northern Cardinal' })
+    .uncheck();
+  await page.getByRole('checkbox', { name: 'Synthetica nonexistens', exact: true }).uncheck();
+  await page.getByRole('checkbox', { name: /^Northern Cardinal/ }).check();
+  await page.getByRole('button', { name: 'Save collection', exact: true }).click();
+  await heading('Collections');
+  const group = state().collections.find((item) => item.collection_id === collection_id);
+  assert.deepEqual(
+    group.members.map((member) => [member.taxon_id, member.scientific_name]),
+    [[cardinal.taxon_id, cardinal.scientific_name]],
+  );
+  await post('/v1/owner/journal/collections/remove', { revision: state().revision, collection_id });
 }
 
 async function community(t) {
@@ -233,21 +321,13 @@ async function community(t) {
     await page.getByLabel(label, { exact: true }).fill(value);
   await page.getByRole('button', { name: 'Check community reports', exact: true }).click();
   await heading('Operation outcome');
-  for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
-    await page.clock.runFor(1100);
-    await page.waitForTimeout(20);
-  }
+  await shown(page, 'Finished');
   await page.getByRole('link', { name: 'Review community selection', exact: true }).click();
   await heading('Synthetic community selection');
   assert(!state().collections.some((group) => group.kind === 'community-history'));
   await page.getByRole('button', { name: 'Save community collection', exact: true }).click();
   await heading('Operation outcome');
-  for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
-    await page.clock.runFor(1100);
-    await page.waitForTimeout(20);
-  }
+  await shown(page, 'Finished');
   const communityGroup = state().collections.find((group) => group.kind === 'community-history');
   assert.equal(communityGroup.members[0].origin, 'community-report');
   assert.deepEqual(communityGroup.members[0].evidence, []);
@@ -282,24 +362,54 @@ async function community(t) {
 
 async function savedBirds(t) {
   const { page, origin, fixture, heading, cardinal } = t;
-  t.phase = 'saved-birds-explicit-confirmation';
+  const stored = path.join(fixture, 'var/controller/collection.json');
+  const saved = () =>
+    fs.existsSync(stored)
+      ? JSON.parse(fs.readFileSync(stored)).taxa.map((bird) => bird.taxon_id)
+      : [];
+  // One tap saves a bird in place and Undo takes it back, on a phone and a desktop.
+  for (const [width, height] of [
+    [375, 812],
+    [1280, 800],
+  ]) {
+    t.phase = 'saved-birds-toggle-' + width;
+    await page.setViewportSize({ width, height });
+    await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
+    await heading('Northern Cardinal');
+    assert.deepEqual(saved(), []);
+    const url = page.url();
+    await page.getByRole('button', { name: 'Add to Saved birds', exact: true }).click();
+    await shown(page, 'Added to Saved birds.');
+    assert.equal(page.url(), url);
+    assert.deepEqual(saved(), [cardinal.taxon_id]);
+    await page.getByRole('button', { name: 'Remove from Saved birds', exact: true }).waitFor();
+    await noSideways(page, 'Bird page after saving');
+    await page.getByRole('button', { name: 'Undo', exact: true }).click();
+    await shown(page, 'Removed from Saved birds.');
+    assert.deepEqual(saved(), []);
+    assert.equal(await page.getByRole('button', { name: 'Undo', exact: true }).count(), 0);
+    await page.getByRole('button', { name: 'Add to Saved birds', exact: true }).waitFor();
+  }
+  t.phase = 'saved-birds-outcome-from-manage';
+  await page.setViewportSize({ width: 375, height: 812 });
   await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
   await heading('Northern Cardinal');
-  await page.getByRole('button', { name: 'Review adding to Saved birds', exact: true }).click();
-  await heading('Change Saved birds?');
-  assert(!fs.existsSync(path.join(fixture, 'var/controller/collection.json')));
-  await page.getByRole('button', { name: 'Confirm Saved birds change', exact: true }).click();
+  await page.getByRole('button', { name: 'Add to Saved birds', exact: true }).click();
+  await shown(page, 'Added to Saved birds.');
+  assert.deepEqual(saved(), [cardinal.taxon_id]);
+  await page.goto(origin + '/app?page=manage');
+  await heading('Manage');
+  await page.getByRole('link', { name: /^Sources/ }).click();
+  await heading('Sources');
+  await page
+    .getByRole('link', { name: 'Change Saved birds · Finished', exact: true })
+    .first()
+    .click();
   await heading('Operation outcome');
-  for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
-    await page.clock.runFor(1100);
-    await page.waitForTimeout(20);
-  }
-  assert.equal(
-    JSON.parse(fs.readFileSync(path.join(fixture, 'var/controller/collection.json'))).taxa[0]
-      .taxon_id,
-    cardinal.taxon_id,
-  );
+  await shown(page, '1 bird added');
+  const outcome = await page.locator('main').innerText();
+  assert(!/[0-9a-f]{16}/.test(outcome) && !outcome.includes('_'));
+  await noSideways(page, 'Operation outcome');
 }
 
 // Runs only when INKY_QA_UPLOAD_FILE names a real export.

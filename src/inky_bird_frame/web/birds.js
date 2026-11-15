@@ -1,3 +1,4 @@
+import { inlineProblem } from '/app/ui.js';
 // The list's search, sort and filter live in the address, so Back, the bird
 // page and its previous and next links all see the same list.
 function lastNoted(bird) {
@@ -14,6 +15,11 @@ const sorts = {
     (a, b) => (a.scientific_name || '').localeCompare(b.scientific_name || '') || byName(a, b),
   ],
   recent: ['Last noted', (a, b) => lastNoted(b).localeCompare(lastNoted(a)) || byName(a, b)],
+  // Birds without approved art, or from an older controller, sort last.
+  added: [
+    'Recently added',
+    (a, b) => (b.approved_at || '').localeCompare(a.approved_at || '') || byName(a, b),
+  ],
 };
 const shows = {
   all: ['All', () => true],
@@ -339,7 +345,7 @@ export async function renderBird(context) {
         location.reload();
       } catch (error) {
         control.disabled = false;
-        ui.showProblem(error);
+        inlineProblem(ui, notes, error);
       }
     }),
     note(
@@ -358,6 +364,7 @@ export async function renderBird(context) {
         bird.saved ? 'Review removal from Saved birds' : 'Review adding to Saved birds',
         bird.saved ? 'remove' : 'add',
         bird.taxon_id,
+        bird.plate_ready,
       ),
     );
   if (!bird.plate_ready) return;

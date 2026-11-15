@@ -84,6 +84,7 @@ export async function open(
     profile = () => ({ profile: null, notice: 'No field notes.' }),
     historyState = null,
     recordProblems = false,
+    respond = null,
   } = {},
 ) {
   if (!timed.has(t)) t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
@@ -138,11 +139,12 @@ export async function open(
       if (descriptor) Object.defineProperty(globalThis, name, descriptor);
       else delete globalThis[name];
   });
-  const api = async (path) => {
-    requests.push({ path, options: {} });
+  const api = async (path, body) => {
+    requests.push({ path, options: {}, body });
     if (path === '/v1/owner/journal') return state();
     const answer = path.match(/^\/v1\/owner\/journal\/birds\/(\d+)\/profile$/);
     if (answer) return profile(Number(answer[1]));
+    if (respond) return respond(path, body);
     throw new Error('unexpected ' + path);
   };
   const element = (tag, text, className) => {

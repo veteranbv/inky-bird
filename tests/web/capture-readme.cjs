@@ -105,10 +105,8 @@ async function capture() {
     await page.evaluate(() => scrollTo(0, 0));
     await image('journal-collection.png');
     await page.goto(origin + '/app?page=bird&bird=9083');
-    await page.getByRole('button', { name: 'Review adding to Saved birds', exact: true }).click();
-    await page.getByRole('button', { name: 'Confirm Saved birds change', exact: true }).click();
-    await page.getByRole('heading', { name: 'Operation outcome', exact: true }).waitFor();
-    await page.getByText('succeeded', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Add to Saved birds', exact: true }).click();
+    await page.getByText('Added to Saved birds.', { exact: true }).waitFor({ timeout: 30000 });
     await page.goto(origin + '/app');
     await page.getByRole('heading', { name: 'Your field journal', exact: true }).waitFor();
     await page.getByRole('link', { name: 'Play', exact: true }).waitFor();
