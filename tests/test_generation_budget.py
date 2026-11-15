@@ -18,7 +18,6 @@ from inky_bird_frame.birds import BirdSpecies, TaxonContext
 from inky_bird_frame.catalog import CandidateApprovalError
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
-    MAX_AUTOMATIC_GENERATION_TRIES,
     PROFILE_REFRESH_CORRECTION,
     STOPPED_GENERATION_ERROR,
     DiscoveryResult,
@@ -71,6 +70,10 @@ max_generation_attempts = 3
 controller_url = "http://controller.test:8793"
 state_dir = "display"
 """
+
+# The documented ceiling, written out so the tests fail if the code's value
+# changes: the twelfth counted failure stops a bird, about a week of backoff.
+TRIES_BEFORE_STOP = 12
 
 FIRST = BirdSpecies(1, "First Bird", "Avis prima", 3, "iNaturalist")
 SECOND = BirdSpecies(2, "Second Bird", "Avis secunda", 2, "iNaturalist")
@@ -390,7 +393,7 @@ class GenerationStopTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = load(temporary)
             refresh(config, [FIRST])
-            seed_failures(config, FIRST.taxon_id, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+            seed_failures(config, FIRST.taxon_id, TRIES_BEFORE_STOP - 1)
             with generation(stop), self.assertRaises(GenerationStopRequested):
                 run_generation_cycle(config)
             stopped = retries(config).get(FIRST.taxon_id)
@@ -425,7 +428,7 @@ class RetryCeilingTests(unittest.TestCase):
 
     def test_last_automatic_try_stops_the_bird_for_the_owner(self) -> None:
         config, result = self.cycle_with(
-            DataSourceError("source down"), MAX_AUTOMATIC_GENERATION_TRIES - 1
+            DataSourceError("source down"), TRIES_BEFORE_STOP - 1
         )
         failure = first_failure(result)
         work = read_generation_work(config)
@@ -444,7 +447,7 @@ class RetryCeilingTests(unittest.TestCase):
 
     def test_earlier_tries_keep_retrying_with_backoff(self) -> None:
         config, result = self.cycle_with(
-            DataSourceError("source down"), MAX_AUTOMATIC_GENERATION_TRIES - 2
+            DataSourceError("source down"), TRIES_BEFORE_STOP - 2
         )
         failure = first_failure(result)
         record = retries(config).get(FIRST.taxon_id)
@@ -455,7 +458,7 @@ class RetryCeilingTests(unittest.TestCase):
 
     def test_unexpected_errors_count_toward_the_ceiling(self) -> None:
         config, result = self.cycle_with(
-            RuntimeError("/private/path"), MAX_AUTOMATIC_GENERATION_TRIES - 1
+            RuntimeError("/private/path"), TRIES_BEFORE_STOP - 1
         )
         failure = first_failure(result)
 
@@ -466,7 +469,7 @@ class RetryCeilingTests(unittest.TestCase):
         retry_at = datetime.now(UTC) + timedelta(hours=3)
         config, result = self.cycle_with(
             ResearchLimitError("Daily research limit", retry_at=retry_at),
-            MAX_AUTOMATIC_GENERATION_TRIES + 3,
+            TRIES_BEFORE_STOP + 3,
         )
 
         self.assertIs(first_failure(result)["terminal"], False)
@@ -477,7 +480,7 @@ class RetryCeilingTests(unittest.TestCase):
             config = load(temporary)
             refresh(config, [FIRST])
             already_due = datetime.now(UTC) - timedelta(minutes=1)
-            for _ in range(MAX_AUTOMATIC_GENERATION_TRIES - 1):
+            for _ in range(TRIES_BEFORE_STOP - 1):
                 with generation(ResearchLimitError("Daily research limit", retry_at=already_due)):
                     waited = run_generation_cycle(config)
                 self.assertIs(first_failure(waited)["terminal"], False)
@@ -488,14 +491,14 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIs(first_failure(result)["terminal"], False)
         self.assertIsNotNone(record)
         if record is not None:
-            self.assertEqual(record.attempts, MAX_AUTOMATIC_GENERATION_TRIES)
+            self.assertEqual(record.attempts, TRIES_BEFORE_STOP)
             self.assertEqual(record.counted_failures, 1)
 
     def test_photo_waits_do_not_count_toward_the_ceiling(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary)
             refresh(config, [FIRST])
-            seed_failures(config, FIRST.taxon_id, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+            seed_failures(config, FIRST.taxon_id, TRIES_BEFORE_STOP - 1)
             path = retries(config).path
             raw = json.loads(path.read_text())
             raw["records"][0]["next_attempt_at"] = "2000-01-01T00:00:00+00:00"
@@ -507,7 +510,7 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIs(first_failure(result)["terminal"], False)
         self.assertIsNotNone(record)
         if record is not None:
-            self.assertEqual(record.counted_failures, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+            self.assertEqual(record.counted_failures, TRIES_BEFORE_STOP - 1)
 
     def test_long_photo_wait_from_an_earlier_release_starts_the_count_fresh(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -596,7 +599,7 @@ class RetryCeilingTests(unittest.TestCase):
     def test_owner_is_told_automatic_retries_stopped_at_the_ceiling(self) -> None:
         for error in (DataSourceError("source down"), GenerationError("model failed")):
             with self.subTest(error=type(error).__name__):
-                config, result = self.cycle_with(error, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+                config, result = self.cycle_with(error, TRIES_BEFORE_STOP - 1)
                 shown = owner_view(config)
 
                 self.assertIs(first_failure(result)["terminal"], True)
