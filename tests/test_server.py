@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 from argparse import Namespace
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +19,7 @@ from http.client import HTTPConnection, HTTPSConnection
 from ipaddress import ip_address
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import uvicorn
@@ -39,6 +40,9 @@ from inky_bird_frame.server import (
     serve_catalog,
 )
 from inky_bird_frame.web import create_app
+
+if TYPE_CHECKING:
+    from starlette.types import Message, Scope
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 GENERATED_AT = "2026-08-30T12:00:00+00:00"
@@ -464,7 +468,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(health_status, 200)
         self.assertNotIn("Access-Control-Allow-Origin", health_headers)
         self.assertEqual(heartbeat_status, 403)
-        self.assertEqual(get_status, 404)
+        self.assertEqual(get_status, 405)
         self.assertNotIn("Access-Control-Allow-Origin", heartbeat_headers)
         self.assertFalse(heartbeat_written)
 
@@ -844,7 +848,14 @@ class ServerTests(unittest.TestCase):
                     }
                 )
             )
-            rebuild_index_logging_failures(catalog_dir)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rebuild_index_logging_failures(catalog_dir)
+
+            self.assertFalse((catalog_dir / "index.json").exists())
+        log = json.loads(output.getvalue())
+        self.assertEqual(set(log), {"timestamp", "event"})
+        self.assertEqual(log["event"], "catalog_index_rebuild_failed")
 
     def test_staging_and_dot_paths_are_never_served(self) -> None:
         with self._environment() as (_, catalog_dir, state_dir):
@@ -866,19 +877,22 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(hidden_status, 404)
         self.assertNotIn(b"{}", staging_body)
 
-    def test_display_success_get_is_not_found_and_does_not_write(self) -> None:
+    def test_display_success_get_is_not_allowed_and_does_not_write(self) -> None:
         with (
             self._environment() as (_, catalog_dir, state_dir),
             _serving(catalog_dir, state_dir / "active-catalog.json", state_dir) as port,
         ):
-            status, _, body = _get(
+            status, headers, body = _get(
                 port,
                 "/v1/display-success",
                 headers={"User-Agent": USER_AGENT},
             )
 
-        self.assertEqual(status, 404)
-        self.assertEqual(json.loads(body), {"ok": False, "error": "not found"})
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), "POST")
+        self.assertEqual(
+            json.loads(body), {"ok": False, "error": "method not allowed", "schema_version": 1}
+        )
         self.assertFalse((state_dir / "display-last-success.json").exists())
 
     def test_asset_is_served_with_png_content_type(self) -> None:
@@ -1020,7 +1034,7 @@ class ServerTests(unittest.TestCase):
                 status, _, body = _get(port, "/v1/assets/species/1-robin/portrait.png")
 
         self.assertEqual(status, 404)
-        self.assertEqual(json.loads(body), {"ok": False, "error": "not found"})
+        self.assertEqual(json.loads(body), {"ok": False, "error": "not found", "schema_version": 1})
 
     def test_pathlib_loop_variants_return_the_same_controlled_not_found(self) -> None:
         for error in (RuntimeError("symlink loop"), OSError(errno.ELOOP, "symlink loop")):
@@ -1040,7 +1054,9 @@ class ServerTests(unittest.TestCase):
                 ):
                     status, _, body = _get(port, "/v1/assets/species/1-robin/portrait.png")
                 self.assertEqual(status, 404)
-                self.assertEqual(json.loads(body), {"ok": False, "error": "not found"})
+                self.assertEqual(
+                    json.loads(body), {"ok": False, "error": "not found", "schema_version": 1}
+                )
 
     def test_asset_path_traversal_is_rejected(self) -> None:
         secret = b"top secret"
@@ -1058,7 +1074,9 @@ class ServerTests(unittest.TestCase):
                     status, _, body = _get(port, path)
                     self.assertEqual(status, 404, path)
                     self.assertNotIn(secret, body, path)
-                    self.assertEqual(json.loads(body), {"ok": False, "error": "not found"})
+                    self.assertEqual(
+                        json.loads(body), {"ok": False, "error": "not found", "schema_version": 1}
+                    )
 
     def test_unknown_route_returns_json_not_found(self) -> None:
         with (
@@ -1069,7 +1087,7 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(status, 404)
         self.assertEqual(headers.get("Content-Type"), "application/json")
-        self.assertEqual(json.loads(body), {"ok": False, "error": "not found"})
+        self.assertEqual(json.loads(body), {"ok": False, "error": "not found", "schema_version": 1})
 
     def test_catalog_returns_503_when_active_catalog_is_missing(self) -> None:
         with (
@@ -1169,7 +1187,7 @@ class ServerTests(unittest.TestCase):
                 success_status, _, _ = _get(port, "/v1/display-success")
 
         self.assertEqual(catalog_status, 200)
-        self.assertEqual(success_status, 404)
+        self.assertEqual(success_status, 405)
         self.assertFalse((state_dir / "display-last-fetch.json").exists())
         self.assertFalse((state_dir / "display-last-success.json").exists())
 
@@ -1294,7 +1312,8 @@ class ServerTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(status, 501)
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("allow"), "GET, HEAD")
         self.assertNotIn("Access-Control-Allow-Origin", headers)
         self.assertNotIn("Access-Control-Allow-Private-Network", headers)
 
@@ -1365,6 +1384,7 @@ class ServerTests(unittest.TestCase):
                 "ok": True,
                 "approved_species": 2,
                 "active_species": 1,
+                "notification_dead_letters": 0,
                 "version": __version__,
                 "schema_version": 1,
             },
@@ -1385,10 +1405,228 @@ class ServerTests(unittest.TestCase):
                 "ok": True,
                 "approved_species": 0,
                 "active_species": 0,
+                "notification_dead_letters": 0,
                 "version": __version__,
                 "schema_version": 1,
             },
         )
+
+    def test_health_head_answers_like_get_for_uptime_probes(self) -> None:
+        with (
+            self._environment() as (_, catalog_dir, state_dir),
+            _serving(catalog_dir, state_dir / "active-catalog.json", state_dir) as port,
+        ):
+            get_status, get_headers, get_body = _get(port, "/health")
+            status, headers, body = _head(port, "/health")
+            embed_status, _, embed_body = _head(port, "/v1/embed/featured-plate")
+            wrong_status, wrong_headers, _ = _head(port, "/v1/display-fetch")
+
+        self.assertEqual((get_status, status), (200, 200))
+        self.assertEqual(body, b"")
+        self.assertEqual(headers["Content-Length"], str(len(get_body)))
+        self.assertEqual(headers["Content-Type"], get_headers["Content-Type"])
+        self.assertEqual((embed_status, embed_body), (503, b""))
+        self.assertEqual((wrong_status, wrong_headers.get("Allow")), (405, "POST"))
+
+    def test_health_reports_notification_dead_letters(self) -> None:
+        with self._environment() as (_, catalog_dir, state_dir):
+            notifications = state_dir / "notifications.json"
+            item = {"private": "never shown"}
+            notifications.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pending": [item],
+                        "dead_letters": [item, item],
+                        "delivered_ids": [],
+                    }
+                )
+            )
+            with _serving(catalog_dir, state_dir / "active-catalog.json", state_dir) as port:
+                _, _, recorded = _get(port, "/health")
+                notifications.write_text("{not json")
+                _, _, unreadable = _get(port, "/health")
+                notifications.unlink()
+                notifications.mkdir()  # Unreadable even for root, unlike a mode change.
+                _, _, denied = _get(port, "/health")
+            self.assertFalse((state_dir / "notifications.lock").exists())
+
+        self.assertEqual(json.loads(recorded)["notification_dead_letters"], 2)
+        self.assertNotIn(b"never shown", recorded)
+        self.assertIsNone(json.loads(unreadable)["notification_dead_letters"])
+        self.assertIsNone(json.loads(denied)["notification_dead_letters"])
+
+    def test_request_log_never_names_an_asset_or_arbitrary_path(self) -> None:
+        digest = hashlib.sha256(PNG_BYTES).hexdigest()
+        output = io.StringIO()
+        with self._environment() as (_, catalog_dir, state_dir):
+            active_catalog_path = state_dir / "active-catalog.json"
+            active_catalog_path.write_text(json.dumps(_active_catalog(_catalog_entry())))
+            asset = catalog_dir / "species" / "1-robin" / "portrait.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(PNG_BYTES)
+            with (
+                redirect_stdout(output),
+                _serving(catalog_dir, active_catalog_path, state_dir) as port,
+            ):
+                asset_status, _, _ = _get(
+                    port, f"/v1/assets/species/1-robin/portrait.png?sha256={digest}"
+                )
+                _get(port, "/private-birder-path")
+                _head(port, "/health")
+
+        self.assertEqual(asset_status, 200)
+        logs = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [(log["method"], log["route"]) for log in logs],
+            [("GET", "/v1/assets/{asset}"), ("GET", "/not-found"), ("HEAD", "/health")],
+        )
+        for leaked in ("robin", "portrait", digest, "private-birder-path"):
+            self.assertNotIn(leaked, output.getvalue())
+
+
+async def _complete(call: Awaitable[None]) -> None:
+    await call
+
+
+def _asgi_request(
+    config: ControllerConfig,
+    method: str,
+    path: str,
+    *,
+    headers: list[tuple[bytes, bytes]],
+    messages: list[Message],
+) -> tuple[int, dict[str, str], bytes]:
+    """Call the app directly, so no HTTP library can answer on its behalf."""
+    sent: list[Message] = []
+    queue = list(messages)
+
+    async def receive() -> Message:
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"127.0.0.1:8793"), *headers],
+        "client": ("127.0.0.1", 41000),
+        "server": ("127.0.0.1", 8793),
+    }
+    asyncio.run(_complete(create_app(config)(scope, receive, send)))
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body = b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    )
+    return (
+        start["status"],
+        {key.decode(): value.decode() for key, value in start["headers"]},
+        body,
+    )
+
+
+def _plain_config(root: Path) -> ControllerConfig:
+    return ControllerConfig(
+        root,
+        root / "catalog",
+        root / "state",
+        Path("codex"),
+        None,
+        "127.0.0.1",
+        8793,
+        3,
+        1,
+        3,
+    )
+
+
+def test_telemetry_rejects_an_invalid_content_length_itself(tmp_path: Path) -> None:
+    # Uvicorn refuses these headers before the app, so call the app directly.
+    config = _plain_config(tmp_path)
+    for value in (b"not-a-number", b"-1"):
+        status, _, body = _asgi_request(
+            config,
+            "POST",
+            "/v1/display-success",
+            headers=[(b"content-type", b"application/json"), (b"content-length", value)],
+            messages=[{"type": "http.request", "body": b'{"schema_version": 1}'}],
+        )
+        assert status == 400
+        assert json.loads(body)["error"] == "invalid content length"
+    assert not (config.state_dir / "display-last-success.json").exists()
+
+
+def test_telemetry_survives_deep_nesting_and_a_dropped_client(tmp_path: Path) -> None:
+    config = _plain_config(tmp_path)
+    # Python 3.11 raises RecursionError past 1000 levels; this body fits the cap.
+    nested = b"[" * MAX_TELEMETRY_REQUEST_BYTES
+    json_headers = [(b"content-type", b"application/json")]
+    status, _, body = _asgi_request(
+        config,
+        "POST",
+        "/v1/display-fetch",
+        headers=[*json_headers, (b"content-length", str(len(nested)).encode())],
+        messages=[{"type": "http.request", "body": nested}],
+    )
+    assert (status, json.loads(body)["error"]) == (400, "invalid JSON")
+    with patch("inky_bird_frame.server.json.loads", side_effect=RecursionError):
+        status, _, body = _asgi_request(
+            config,
+            "POST",
+            "/v1/display-fetch",
+            headers=[*json_headers, (b"content-length", b"2")],
+            messages=[{"type": "http.request", "body": b"[]"}],
+        )
+    assert (status, json.loads(body)["error"]) == (400, "invalid JSON")
+    status, _, body = _asgi_request(
+        config,
+        "POST",
+        "/v1/display-fetch",
+        headers=[*json_headers, (b"content-length", b"21")],
+        messages=[{"type": "http.request", "body": b'{"sche', "more_body": True}],
+    )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "request_incomplete"
+    assert not (config.state_dir / "display-last-fetch.json").exists()
+
+
+def test_asset_path_checks_hold_even_when_the_allowlist_names_an_escape(tmp_path: Path) -> None:
+    secret = b"\x89PNG private bytes outside the catalog"
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(secret)
+    digest = hashlib.sha256(secret).hexdigest()
+    config = _plain_config(tmp_path)
+    config.catalog_dir.mkdir()
+    for relative in (str(outside), "../outside.png"):
+        with patch(
+            "inky_bird_frame.server.CatalogService._load",
+            return_value=({}, {relative: digest}),
+        ):
+            status, _, body = _asgi_request(
+                config, "GET", "/v1/assets/" + relative, headers=[], messages=[]
+            )
+        assert status == 404, relative
+        assert secret not in body
+
+
+def test_production_server_keeps_logs_headers_and_proxies_off(tmp_path: Path) -> None:
+    config = _plain_config(tmp_path)
+    with patch("uvicorn.run") as run:
+        serve_catalog(config)
+    options = run.call_args.kwargs
+    assert options["access_log"] is False
+    assert options["server_header"] is False
+    assert options["proxy_headers"] is False
+    assert (options["host"], options["port"]) == ("127.0.0.1", 8793)
+    assert options["ssl_certfile"] is None and options["ssl_keyfile"] is None
 
 
 if __name__ == "__main__":

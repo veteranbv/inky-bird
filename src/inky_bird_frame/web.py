@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict
 from datetime import UTC, datetime
 from ipaddress import ip_address
@@ -18,9 +19,9 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Match, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -48,9 +49,9 @@ from .birdbuddy import (
 )
 from .catalog import read_json
 from .community import CommunityHistory
-from .config import AppConfig, ControllerConfig, OwnerAccessMode
+from .config import AppConfig, ControllerConfig, OIDCConfig, OwnerAccessMode
 from .controller import change_saved_collection, read_generation_work
-from .errors import CatalogError, DataSourceError
+from .errors import CatalogError, DataSourceError, MissingDependencyError
 from .imports import MAX_UPLOAD_BYTES, HistoryImports
 from .journal import (
     MAX_JOURNAL_BYTES,
@@ -70,7 +71,7 @@ from .owner_operations import (
 )
 from .plate_variants import PlateThumbnails
 from .presentation import GRANT_DAYS, PresentationAccess
-from .server import CatalogService
+from .server import HEAD_REQUEST, CatalogService, dead_letter_count
 from .settings import (
     SettingsConflictError,
     SettingsError,
@@ -90,8 +91,8 @@ LOCAL_OWNER_COOKIE = "inky-local-owner"
 PENDING_OIDC_COOKIE = "__Host-inky-sign-in"
 OWNER_CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
-    "connect-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; "
-    "frame-ancestors 'none'"
+    "connect-src 'self'; manifest-src 'self'; base-uri 'none'; object-src 'none'; "
+    "form-action 'self'; frame-ancestors 'none'"
 )
 STATIC_PAGES = {
     "/app": "index.html",
@@ -111,16 +112,85 @@ STATIC_PAGES = {
     "/app/presentation.js": "presentation.js",
     "/app/frame-tools.js": "frame-tools.js",
     "/app/work-status.js": "work-status.js",
+    "/app/manifest.webmanifest": "manifest.webmanifest",
     "/screen": "screen.html",
     "/app/access-guide": "access-guide.txt",
 }
 REVALIDATE = "no-cache"
+# Every code an error response can carry; part of the 1.x HTTP contract.
+HTTP_ERROR_CODES = (
+    "access_error",
+    "birdbuddy_account",
+    "confirmation_required",
+    "data_source_unavailable",
+    "dependency_missing",
+    "feature_unavailable",
+    "journal_changed",
+    "journal_error",
+    "journal_unavailable",
+    "method_not_allowed",
+    "not_found",
+    "operation_busy",
+    "operation_error",
+    "origin_denied",
+    "password_confirmation_failed",
+    "request_incomplete",
+    "secure_access_required",
+    "sign_in_rate_limited",
+    "sign_in_required",
+)
+PRIVATE_PREFIXES = ("/v1/owner/", "/v1/screen/", "/v1/integrations/", "/v1/dashboard/", "/wall/")
+# Unknown paths here get the owner error envelope; all others keep the legacy one.
+APP_PREFIXES = ("/app/", *PRIVATE_PREFIXES)
+OIDC_CALLBACK = "/v1/owner/oidc/callback"
+DIRECT_TLS_HSTS = b"max-age=31536000"
 # Private browser cache only; the URL's revision is the plate checksum, so a
 # changed plate always has a different URL.
 IMMUTABLE_IMAGE = "private, max-age=31536000, immutable"
 REVISIONED_IMAGE = re.compile(
     r"/v1/owner/journal/birds/\d+/(?:portrait|thumbnail)|/v1/screen/plates/\d+"
 )
+
+
+class FeatureUnavailableError(AccessError):
+    """The request is understood, but this installation has the feature turned off."""
+
+
+def _route_path(scope: Scope) -> str:
+    """The path the router matches: the request path without any root path."""
+    path = cast(str, scope["path"])
+    root = cast(str, scope.get("root_path", ""))
+    return path.removeprefix(root) if root and path.startswith(root) else path
+
+
+_ABSOLUTE_PATH = re.compile(r"(?<![\w:/.])(?:/[^/\s:]+)+/([^/\s:]+)")
+
+
+def _owner_message(exc: Exception, fallback: str) -> str:
+    """Keep an error's meaning but never a local directory."""
+    return _ABSOLUTE_PATH.sub(r"\1", str(exc)) or fallback
+
+
+@contextmanager
+def _readable_screen_state() -> Iterator[None]:
+    """Damaged screen or journal state is unavailable, not the caller's mistake."""
+    try:
+        yield
+    except (JournalConflictError, JournalViewRemovedError):
+        raise
+    except JournalError as exc:
+        raise CatalogError("Screen access state cannot be read") from exc
+
+
+def _storage_reason(exc: BaseException) -> str:
+    """Name the operating-system error behind a failure without its paths."""
+    cause: BaseException | None = exc
+    while cause is not None:
+        code = cause.errno if isinstance(cause, OSError) else None
+        if code is not None and code in errno.errorcode:
+            return errno.errorcode[code]
+        cause = cause.__cause__ or cause.__context__
+    return "unknown cause"
 
 
 def _loopback(value: str | None) -> bool:
@@ -224,7 +294,8 @@ async def _json_body(
             raise AccessError("Owner request exceeds the supported size")
     try:
         value: object = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # Python 3.11 raises RecursionError for deeply nested arrays.
         raise AccessError("Owner request contains invalid JSON") from exc
     if (
         not isinstance(value, dict)
@@ -256,29 +327,34 @@ class OwnerBoundary:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        path = _route_path(scope)
+        # HEAD answers exactly as GET does, without a body. The sign-in callback
+        # is single use, so a HEAD there must never spend it.
+        head = scope["method"] == "HEAD" and path != OIDC_CALLBACK
+        if head:
+            scope = {**scope, "method": "GET", HEAD_REQUEST: True}
         request = Request(scope)
-        private = request.url.path.startswith(
-            ("/v1/owner/", "/v1/screen/", "/v1/integrations/", "/v1/dashboard/", "/wall/")
-        )
+        private = path.startswith(PRIVATE_PREFIXES)
+        owner_page = private or path.startswith("/app") or path in {"/v1/access", "/screen"}
+        hsts = self.config.tls_certificate is not None and scope.get("scheme") == "https"
 
         async def protected_send(message: Message) -> None:
-            if message["type"] == "http.response.start" and (
-                private
-                or request.url.path.startswith("/app")
-                or request.url.path in {"/v1/access", "/screen"}
-            ):
+            if message["type"] == "http.response.start" and (owner_page or hsts):
                 headers = cast(list[tuple[bytes, bytes]], message.setdefault("headers", []))
-                offered = [value for key, value in headers if key == b"cache-control"]
-                headers[:] = [(key, value) for key, value in headers if key != b"cache-control"]
-                headers.extend(
-                    [
-                        (b"cache-control", _cache_control(request.url.path, offered)),
-                        (b"referrer-policy", b"no-referrer"),
-                        (b"x-content-type-options", b"nosniff"),
-                        (b"content-security-policy", OWNER_CSP.encode()),
-                    ]
-                )
-                if request.url.path == "/v1/dashboard/art":
+                if hsts:
+                    headers.append((b"strict-transport-security", DIRECT_TLS_HSTS))
+                if owner_page:
+                    offered = [value for key, value in headers if key == b"cache-control"]
+                    headers[:] = [(key, value) for key, value in headers if key != b"cache-control"]
+                    headers.extend(
+                        [
+                            (b"cache-control", _cache_control(path, offered)),
+                            (b"referrer-policy", b"no-referrer"),
+                            (b"x-content-type-options", b"nosniff"),
+                            (b"content-security-policy", OWNER_CSP.encode()),
+                        ]
+                    )
+                if path == "/v1/dashboard/art":
                     # Only this minimal explicitly enabled document can be framed.
                     # Its own CSP is built from validated installer-owned origins.
                     headers[:] = [
@@ -286,6 +362,10 @@ class OwnerBoundary:
                         for key, value in headers
                         if key != b"content-security-policy" or value != OWNER_CSP.encode()
                     ]
+            elif head and message["type"] == "http.response.pathsend":
+                message = {"type": "http.response.body", "body": b""}
+            elif head and message["type"] == "http.response.body":
+                message = {**message, "body": b""}
             await send(message)
 
         # The complete owner gate runs before an endpoint reads credentials.
@@ -296,11 +376,7 @@ class OwnerBoundary:
                 "Open the configured Inky address. Use HTTPS when this installation requires it.",
             )(scope, receive, protected_send)
             return
-        if (
-            private
-            and not request.url.path.startswith("/wall/")
-            and request.method not in {"GET", "HEAD"}
-        ):
+        if private and not path.startswith("/wall/") and request.method not in {"GET", "HEAD"}:
             origins = request.headers.getlist("origin")
             if (
                 origins != [_origin(request)]
@@ -311,6 +387,32 @@ class OwnerBoundary:
                 )
                 return
         await self.app(scope, receive, protected_send)
+
+
+class UnmatchedRequest:
+    """Answer every request no route accepted: 405 for a known path, else 404."""
+
+    def __init__(self, routes: Sequence[BaseRoute], catalog: CatalogService) -> None:
+        self.routes, self.catalog = routes, catalog
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        allowed = sorted(
+            {
+                method
+                for route in self.routes
+                if isinstance(route, Route) and route.matches(scope)[0] == Match.PARTIAL
+                for method in route.methods or ()
+            }
+        )
+        response: Response
+        if allowed:
+            response = _error(405, "method_not_allowed", "Use a supported method for this address")
+            response.headers["Allow"] = ", ".join(allowed)
+        elif _route_path(scope).startswith(APP_PREFIXES):
+            response = _error(404, "not_found", "This Inky address does not exist")
+        else:
+            response = await self.catalog.dispatch(Request(scope, receive))
+        await response(scope, receive, send)
 
 
 def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None) -> ASGIApp:
@@ -365,6 +467,12 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         set_session_cookie(request, credentials, response)
         return response
 
+    async def provider_ready(oidc: OIDCConfig) -> None:
+        await metadata(oidc)
+        # Do not return the secret or its reference to unsigned-in clients.
+        if not os.environ.get(oidc.client_secret_env, "").strip():
+            raise OIDCError("Sign-in provider secret is unavailable; ask the installer to check it")
+
     async def provider_status(
         request: Request, *, check_unlinked: bool = False
     ) -> dict[str, object] | None:
@@ -376,14 +484,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             provider = {"label": config.oidc.label, "ready": False, "linked": linked}
             if linked or check_unlinked:
                 try:
-                    await metadata(config.oidc)
-                    # Do not return the secret or its reference to unsigned-in clients.
-                    import os
-
-                    if not os.environ.get(config.oidc.client_secret_env, "").strip():
-                        raise OIDCError(
-                            "Sign-in provider secret is unavailable; ask the installer to check it"
-                        )
+                    await provider_ready(config.oidc)
                     provider["ready"] = True
                 except OIDCError as exc:
                     provider["error"] = str(exc)
@@ -424,7 +525,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
 
     async def login(request: Request) -> JSONResponse:
         if config.oidc and config.oidc.sso_only:
-            raise AccessDeniedError(
+            raise FeatureUnavailableError(
                 "Use single sign-on for this installation; "
                 "local operator recovery remains available"
             )
@@ -478,6 +579,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 # check authority again before leaving their reservation.
                 pass
         response = _result({"signed_out": True})
+        # Revisioned plates are cached for a year; drop them with the session.
+        response.headers["Clear-Site-Data"] = '"cache"'
         response.delete_cookie(
             _cookie_name(request),
             path="/",
@@ -508,7 +611,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     async def confirm_password(request: Request) -> JSONResponse:
         secret = await authorized(request)
         if config.oidc and config.oidc.sso_only:
-            raise AccessError(
+            raise FeatureUnavailableError(
                 "Local password confirmation is disabled; confirm with single sign-on"
             )
         body = await _json_body(request, {"passphrase"})
@@ -551,7 +654,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
 
     async def start_oidc(request: Request) -> JSONResponse:
         if config.oidc is None or request.url.scheme != "https":
-            raise AccessError("Single sign-on needs a configured HTTPS provider")
+            raise FeatureUnavailableError("Single sign-on needs a configured HTTPS provider")
         body = await _json_body(request, set(), optional={"remember", "return_to_access"})
         link = request.url.path.endswith("/link")
         confirm = body.get("return_to_access") is True and not link
@@ -559,7 +662,10 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         if not link and not await run_in_threadpool(
             store.oidc_linked, config.oidc.issuer, config.oidc.owner_subject
         ):
-            raise AccessDeniedError("Sign in locally and link your provider account first")
+            raise FeatureUnavailableError("Sign in locally and link your provider account first")
+        # Reach the provider before taking a sign-in slot, so an outage or a
+        # missing secret never pushes out a sign-in already in progress.
+        await provider_ready(config.oidc)
         tx, browser_secret = await run_in_threadpool(
             store.begin_oidc,
             remembered=body.get("remember") is True,
@@ -582,7 +688,9 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
 
     async def oidc_callback(request: Request) -> Response:
         if request.method != "GET":
-            return Response(status_code=405, headers={"Allow": "GET"})
+            refused = _error(405, "method_not_allowed", "Use a supported method for this address")
+            refused.headers["Allow"] = "GET"
+            return refused
         if config.oidc is None or str(request.url).partition("?")[0] != config.oidc.callback_url:
             return RedirectResponse("/app?sign_in=failed", status_code=303)
         response: Response
@@ -633,7 +741,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     async def unlink_oidc(request: Request) -> JSONResponse:
         secret = await authorized(request)
         if config.oidc and (config.oidc.sso_only or config.oidc.owner_subject is not None):
-            raise AccessError(
+            raise FeatureUnavailableError(
                 "This identity is managed in configuration. Enable local login "
                 "and remove the configured identity before unlinking."
             )
@@ -925,13 +1033,14 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
 
     async def screen_data(request: Request) -> Response:
         require_screen_transport(request)
-        grant = await run_in_threadpool(
-            presentation.authenticate, request.cookies.get(screen_cookie(request), ""), "viewer"
-        )
-        try:
-            entries = await run_in_threadpool(journal.view_entries, grant.view)
-        except JournalViewRemovedError:
-            entries = []  # Authoritative empty scope; never retain withdrawn art.
+        with _readable_screen_state():
+            grant = await run_in_threadpool(
+                presentation.authenticate, request.cookies.get(screen_cookie(request), ""), "viewer"
+            )
+            try:
+                entries = await run_in_threadpool(journal.view_entries, grant.view)
+            except JournalViewRemovedError:
+                entries = []  # Authoritative empty scope; never retain withdrawn art.
         id = request.path_params.get("taxon_id")
         if id is not None:
             entry = next((item for item in entries if item["taxon_id"] == id), None)
@@ -939,7 +1048,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 entry["portrait_sha256"]
             ]:
                 return _error(404, "not_found", "This approved image is outside the screen's view")
-            body = await run_in_threadpool(journal.portrait, id)
+            with _readable_screen_state():
+                body = await run_in_threadpool(journal.portrait, id)
             # The plate can be replaced after the view was read; cache only what was sent.
             return _plate(request, body, "image/png", hashlib.sha256(body).hexdigest())
         return _result(
@@ -964,6 +1074,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         # Forgetting a browser removes its cookie. Revoke the grant in Displays
         # too if the device was lost; no management authority is accepted here.
         response = _result({"forgotten": True})
+        response.headers["Clear-Site-Data"] = '"cache"'
         response.delete_cookie(
             screen_cookie(request),
             path="/",
@@ -974,12 +1085,13 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return response
 
     def integration_status(secret: str) -> dict[str, object]:
-        grant = presentation.authenticate(secret, "status")
-        try:
-            entries = journal.view_entries(grant.view)
-        except JournalViewRemovedError:
-            entries = []
-        approved = {cast(int, item["taxon_id"]) for item in journal.catalog()}
+        with _readable_screen_state():
+            grant = presentation.authenticate(secret, "status")
+            try:
+                entries = journal.view_entries(grant.view)
+            except JournalViewRemovedError:
+                entries = []
+            approved = {cast(int, item["taxon_id"]) for item in journal.catalog()}
         work = (
             read_generation_work(current_config(app_config), approved=approved)
             if app_config
@@ -1017,13 +1129,17 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _result(await run_in_threadpool(integration_status, values[0][7:]))
 
     async def wall_health(request: Request) -> JSONResponse:
-        entries = await run_in_threadpool(presentation.selected, "wall")
-        approved = await run_in_threadpool(journal.catalog)
+        with _readable_screen_state():
+            entries = await run_in_threadpool(presentation.selected, "wall")
+            approved = await run_in_threadpool(journal.catalog)
         return JSONResponse(
             {
                 "ok": True,
                 "approved_species": len(approved),
                 "active_species": len(entries),
+                "notification_dead_letters": await run_in_threadpool(
+                    dead_letter_count, config.state_dir
+                ),
                 "version": __version__,
                 "schema_version": 1,
             }
@@ -1033,7 +1149,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         destination: Literal["wall", "dashboard"] = (
             "wall" if request.url.path.startswith("/wall/") else "dashboard"
         )
-        entries = await run_in_threadpool(presentation.selected, destination)
+        with _readable_screen_state():
+            entries = await run_in_threadpool(presentation.selected, destination)
         relative = request.path_params.get("asset")
         if relative is not None:
             entry = next(
@@ -1047,10 +1164,11 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             if entry is None:
                 return _error(404, "not_found", "This asset is outside the selected view")
             kind = "portrait" if relative == entry["portrait_path"] else "display"
-            return Response(
-                await run_in_threadpool(journal.approved_asset, cast(int, entry["taxon_id"]), kind),
-                media_type="image/png",
-            )
+            with _readable_screen_state():
+                asset = await run_in_threadpool(
+                    journal.approved_asset, cast(int, entry["taxon_id"]), kind
+                )
+            return Response(asset, media_type="image/png")
         if destination == "wall":
             # Match the display-node catalog schema without altering /v1/catalog.
             return JSONResponse(
@@ -1473,6 +1591,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         filename = STATIC_PAGES[request.url.path]
         path = assets / filename
         download = None
+        media_type = "application/manifest+json" if filename == "manifest.webmanifest" else None
         if filename == "access-guide.txt":
             download = "Inky-access-guide.md"
             if not path.is_file():
@@ -1482,7 +1601,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             path,
             stat_result=await run_in_threadpool(os.stat, path),
             headers={"Cache-Control": REVALIDATE},
-            media_type="text/plain" if download else None,
+            media_type="text/plain" if download else media_type,
             filename=download,
         )
         # FileResponse sets an ETag but never answers a conditional request itself.
@@ -1518,6 +1637,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         Route("/app/presentation.js", page),
         Route("/app/frame-tools.js", page),
         Route("/app/work-status.js", page),
+        Route("/app/manifest.webmanifest", page),
         Route("/screen", page),
         Route("/app/access-guide", page),
         Route("/v1/access", safe_access_state),
@@ -1571,24 +1691,15 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         Route(
             "/v1/owner/journal/collections/{action}", journal_collection, methods=["GET", "POST"]
         ),
-        Route(
-            "/{path:path}",
-            catalog.dispatch,
-            methods=[
-                "GET",
-                "HEAD",
-                "POST",
-                "PUT",
-                "PATCH",
-                "DELETE",
-                "OPTIONS",
-                "TRACE",
-                "CONNECT",
-            ],
-        ),
     ]
+    # Takes every method, so no request falls through to a plain-text error.
+    routes.append(Route("/{path:path}", UnmatchedRequest(tuple(routes), catalog)))
 
     async def access_error(request: Request, exc: Exception) -> Response:
+        if isinstance(exc, (CatalogError, OSError)):
+            return await journal_error(request, exc)
+        if isinstance(exc, FeatureUnavailableError):
+            return _error(403, "feature_unavailable", str(exc))
         if isinstance(exc, AccessRateLimitError):
             return _error(429, "sign_in_rate_limited", str(exc))
         if isinstance(exc, AccessConfirmationRequiredError):
@@ -1600,20 +1711,39 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _error(400, "access_error", str(exc))
 
     async def journal_error(request: Request, exc: Exception) -> Response:
+        # Damaged local state is one 503, whichever module read it.
+        if isinstance(exc, (CatalogError, OSError)):
+            return _error(
+                503,
+                "journal_unavailable",
+                "The journal cannot read its local state. Check storage and the approved "
+                "catalog; do not delete private history.",
+            )
         if isinstance(exc, OwnerOperationBusyError):
             return _error(409, "operation_busy", str(exc))
         if isinstance(exc, OwnerOperationError):
             return _error(400, "operation_error", str(exc))
         if isinstance(exc, (JournalConflictError, SettingsConflictError)):
             return _error(409, "journal_changed", str(exc))
-        if isinstance(exc, (JournalError, SettingsError)):
-            return _error(400, "journal_error", str(exc))
+        return _error(400, "journal_error", str(exc))
+
+    async def data_source_error(request: Request, exc: Exception) -> Response:
         return _error(
             503,
-            "journal_unavailable",
-            "The journal cannot read its local state. Check storage and the approved catalog; "
-            "do not delete private history.",
+            "data_source_unavailable",
+            _owner_message(exc, "A bird data source cannot be read right now"),
         )
+
+    async def dependency_error(request: Request, exc: Exception) -> Response:
+        return _error(
+            503,
+            "dependency_missing",
+            _owner_message(exc, "A component Inky needs is not installed"),
+        )
+
+    async def incomplete_request(request: Request, exc: Exception) -> Response:
+        # The client has gone; this answer only keeps the failure out of the log.
+        return _error(400, "request_incomplete", "The request ended before it was complete")
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
@@ -1629,11 +1759,12 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                     warned = False
                 except OwnerOperationBusyError:
                     pass  # Never evict an upload or history operation in progress.
-                except OwnerOperationError:
+                except OwnerOperationError as exc:
                     if not warned:
                         logging.getLogger(__name__).warning(
-                            "Private import cleanup needs attention; "
-                            "inspect imports in the owner app"
+                            "Private import cleanup needs attention (%s); "
+                            "inspect imports in the owner app",
+                            _storage_reason(exc),
                         )
                         warned = True
                 with suppress(TimeoutError):
@@ -1666,6 +1797,9 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 OwnerOperationError: journal_error,
                 CatalogError: journal_error,
                 OSError: journal_error,
+                DataSourceError: data_source_error,
+                MissingDependencyError: dependency_error,
+                ClientDisconnect: incomplete_request,
             },
         ),
         config,

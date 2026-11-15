@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from .config import AppConfig
 
 CATALOG_SCHEMA_VERSION = 1
+# Scope key set when a HEAD request is answered as GET; the wire body is dropped.
+HEAD_REQUEST = "inky_bird_frame.head"
+_READ_PATHS = frozenset({"/health", "/v1/catalog", "/v1/embed/featured-plate"})
+_TELEMETRY_PATHS = frozenset({"/v1/display-fetch", "/v1/display-success"})
 MAX_TELEMETRY_REQUEST_BYTES = 1024
 FEATURED_PLATE_REFRESH_SECONDS = 15 * 60
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -178,6 +182,17 @@ def _species_count(path: Path) -> int:
     return 0
 
 
+def dead_letter_count(state_dir: Path) -> int | None:
+    """Count notifications that stopped retrying; None when their state is unreadable."""
+    # Delivery replaces this file atomically, so a read needs no delivery lock.
+    try:
+        value = read_json(state_dir / "notifications.json")
+    except CatalogError as exc:
+        return 0 if isinstance(exc.__cause__, FileNotFoundError) else None
+    dead_letters = value.get("dead_letters") if isinstance(value, dict) else None
+    return len(dead_letters) if isinstance(dead_letters, list) else None
+
+
 def featured_plate_entry(payload: dict[str, object]) -> dict[str, object] | None:
     raw_species = payload.get("species")
     if not isinstance(raw_species, list):
@@ -276,24 +291,27 @@ class CatalogService:
             headers=headers,
         )
 
+    def not_found(self, request: Request, *, browser: bool = False) -> Response:
+        return self._json(
+            request, 404, {"ok": False, "error": "not found", "schema_version": 1}, browser=browser
+        )
+
+    def health(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "approved_species": _species_count(self.config.catalog_dir / "index.json"),
+            "active_species": _species_count(self.active_catalog_path),
+            "notification_dead_letters": dead_letter_count(self.config.state_dir),
+            "version": __version__,
+            "schema_version": 1,
+        }
+
     def read_response(self, request: Request) -> Response:
         from starlette.responses import Response
 
         path = request.url.path
-        if request.method == "HEAD" and path != "/v1/catalog":
-            response = self._json(request, 404, {"ok": False, "error": "not found"})
-        elif path == "/health":
-            response = self._json(
-                request,
-                200,
-                {
-                    "ok": True,
-                    "approved_species": _species_count(self.config.catalog_dir / "index.json"),
-                    "active_species": _species_count(self.active_catalog_path),
-                    "version": __version__,
-                    "schema_version": 1,
-                },
-            )
+        if path == "/health":
+            response = self._json(request, 200, self.health())
         elif path == "/v1/catalog":
             try:
                 payload, _ = self._load()
@@ -343,10 +361,7 @@ class CatalogService:
         elif path.startswith("/v1/assets/"):
             response = self.asset_response(request)
         else:
-            response = self._json(request, 404, {"ok": False, "error": "not found"})
-        if request.method == "HEAD":
-            # Keep the content length of GET while suppressing the wire body.
-            response.body = b""
+            response = self.not_found(request)
         return response
 
     def asset_response(self, request: Request) -> Response:
@@ -364,7 +379,7 @@ class CatalogService:
             )
         digest = asset_hashes.get(relative_text)
         if digest is None:
-            return self._json(request, 404, {"ok": False, "error": "not found"}, browser=True)
+            return self.not_found(request, browser=True)
         try:
             root = self.config.catalog_dir.resolve()
             relative = Path(relative_text)
@@ -377,13 +392,13 @@ class CatalogService:
                 or resolved != candidate
                 or not candidate.is_file()
             ):
-                return self._json(request, 404, {"ok": False, "error": "not found"}, browser=True)
+                return self.not_found(request, browser=True)
             body = candidate.read_bytes()
         except (OSError, RuntimeError, ValueError) as exc:
             # Python 3.12 reports a symlink loop as RuntimeError; newer
             # pathlib versions can report ELOOP. Neither is a usable asset.
             if not isinstance(exc, OSError) or exc.errno == errno.ELOOP:
-                return self._json(request, 404, {"ok": False, "error": "not found"}, browser=True)
+                return self.not_found(request, browser=True)
             return self._json(
                 request,
                 503,
@@ -439,7 +454,7 @@ class CatalogService:
         # needs the route to tell that pause from a failed update.
         route = "wall" if request.url.path.startswith("/wall/") else "catalog"
         if event is None:
-            return self._json(request, 404, {"ok": False, "error": "not found"})
+            return self.not_found(request)
         if request.headers.getlist("origin"):
             return self._json(
                 request,
@@ -481,7 +496,8 @@ class CatalogService:
                 )
         try:
             payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # Python 3.11 raises RecursionError for deeply nested arrays.
             return self._json(
                 request, 400, {"ok": False, "error": "invalid JSON", "schema_version": 1}
             )
@@ -507,24 +523,26 @@ class CatalogService:
     async def dispatch(self, request: Request) -> Response:
         from starlette.concurrency import run_in_threadpool
 
-        if request.method in {"GET", "HEAD"}:
-            response = await run_in_threadpool(self.read_response, request)
-        elif request.method == "POST":
-            response = await self.telemetry_response(request)
-        else:
-            response = self._json(request, 501, {"ok": False, "error": "method not supported"})
-        # Never log a query, cookie, address, asset identity, or arbitrary path.
         path = request.url.path
+        readable = path in _READ_PATHS or path.startswith("/v1/assets/")
+        allowed = ("GET", "HEAD") if readable else ("POST",) if path in _TELEMETRY_PATHS else ()
+        if not allowed:
+            response = self.not_found(request)
+        elif request.method not in allowed:
+            response = self._json(
+                request,
+                405,
+                {"ok": False, "error": "method not allowed", "schema_version": 1},
+            )
+            response.headers["Allow"] = ", ".join(allowed)
+        elif readable:
+            response = await run_in_threadpool(self.read_response, request)
+        else:
+            response = await self.telemetry_response(request)
+        # Never log a query, cookie, address, asset identity, or arbitrary path.
         route = (
             path
-            if path
-            in {
-                "/health",
-                "/v1/catalog",
-                "/v1/embed/featured-plate",
-                "/v1/display-fetch",
-                "/v1/display-success",
-            }
+            if path in _READ_PATHS | _TELEMETRY_PATHS
             else "/v1/assets/{asset}"
             if path.startswith("/v1/assets/")
             else "/not-found"
@@ -534,7 +552,7 @@ class CatalogService:
                 {
                     "timestamp": utc_now(),
                     "event": "http_request",
-                    "method": request.method,
+                    "method": "HEAD" if request.scope.get(HEAD_REQUEST) else request.method,
                     "route": route,
                     "status": response.status_code,
                 }
