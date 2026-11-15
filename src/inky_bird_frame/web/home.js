@@ -15,7 +15,7 @@ export function renderHome(context) {
     el, main, data, byId, management, link, note, art, evidence, base, problems, playLink,
     whyThisBird,
   } = context;
-  base('Your field journal', 'Birds worth keeping close.');
+  base('Your journal', 'Birds worth keeping close.');
   problems();
   const onFrame = byId.get(data.featured_taxon_id);
   // When the frame's birds could not be read, it may not be empty.

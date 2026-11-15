@@ -539,8 +539,7 @@ def execute_owner_operation(
                 "Inky could not take this selection. Check In the works and try again."
             ) from exc
         return {
-            "message": "These birds will be tried again once any plate in progress is finished. "
-            "A plate you kept is never replaced. In the works shows how each one goes. "
+            "message": "A plate you kept is never replaced. In the works shows how each one goes. "
             + (
                 "Plate making is off. These birds wait until you turn it on."
                 if not config.controller.generation_enabled

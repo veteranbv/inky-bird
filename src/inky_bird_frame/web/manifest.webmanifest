@@ -1,7 +1,7 @@
 {
   "name": "Inky Bird",
   "short_name": "Inky",
-  "description": "Your bird journal",
+  "description": "Your journal",
   "start_url": "/app",
   "scope": "/app",
   "display": "standalone",

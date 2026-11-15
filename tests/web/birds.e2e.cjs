@@ -14,7 +14,7 @@ async function unreadableNotice(t) {
   const queueBefore = fs.existsSync(queuePath) ? fs.readFileSync(queuePath) : null;
   fs.writeFileSync(queuePath, '{ damaged');
   const queueNotice = 'The list of birds waiting for plates could not be read.';
-  for (const [query, title] of [['', 'Your field journal'], ['?page=birds', 'Your birds']]) {
+  for (const [query, title] of [['', 'Your journal'], ['?page=birds', 'Your birds']]) {
     await page.goto(origin + '/app' + query);
     await heading(title);
     await page.getByRole('status').filter({ hasText: queueNotice }).waitFor();
@@ -22,7 +22,7 @@ async function unreadableNotice(t) {
   if (queueBefore) fs.writeFileSync(queuePath, queueBefore);
   else fs.rmSync(queuePath);
   await page.goto(origin + '/app');
-  await heading('Your field journal');
+  await heading('Your journal');
   assert.equal(await page.getByText(queueNotice).count(), 0);
 }
 
@@ -99,7 +99,7 @@ async function startUp(t) {
   page.on('response', answered);
   page.on('requestfailed', lost);
   await page.goto(origin + '/app');
-  await heading('Your field journal');
+  await heading('Your journal');
   page.off('response', answered);
   page.off('requestfailed', lost);
   assert.deepEqual(failed, []);
@@ -283,7 +283,7 @@ async function layout(t) {
 
     t.phase = 'home-layout-' + size;
     await page.goto(origin + '/app');
-    await heading('Your field journal');
+    await heading('Your journal');
     await checkLayout(page, 'Home ' + size);
     await journalHeart(page, size);
     if (width >= 960) {

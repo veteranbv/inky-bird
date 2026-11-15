@@ -106,7 +106,7 @@ plate yet.
 
 | Word | Meaning |
 | --- | --- |
-| **Your field journal** | Everything you keep in Inky: your birds, their plates and your collections. |
+| **Your journal** | Everything you keep in Inky: your birds, their plates and your collections. |
 | **Plate** | One illustrated bird, checked against references and approved before it is shown. |
 | **Noted** | When a bird was recorded: a feeder photo, a microphone detection or a checklist. "Last noted" is the most recent. |
 | **Favorite** | A bird you saved with **Add to Favorites** on its page. |

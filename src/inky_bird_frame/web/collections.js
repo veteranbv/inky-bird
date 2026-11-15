@@ -651,13 +651,10 @@ function savedProblem(error, sent = true) {
   );
 }
 
-// The wall frame follows On my frame only while it shows it; otherwise the
-// name of what it shows. Null when that is On my frame or cannot be read.
-function wallElsewhere(wall) {
-  if (!wall || ['current', 'saved'].includes(wall)) return null;
-  return wall === 'favorites' ? WORDS.favorites : wall === 'all' ? WORDS.allBirds : 'another collection';
-}
-const wallKnown = (wall) => typeof wall === 'string' && wall !== '';
+// The page cannot see which address the wall frame uses, so it speaks about
+// the wall frame only while the wall view is one that follows On my frame on
+// either address.
+const wallFollows = (wall) => ['current', 'saved'].includes(wall);
 
 // The default wall view also keeps birds that are still being noted, so a
 // removed bird leaves it only when the controller's list no longer has it.
@@ -676,18 +673,13 @@ async function stillShown(api, taxonId) {
 // What the inline result can say for certain after one bird was added or removed.
 function toggleResult(name, saved, wall, stays) {
   const done = saved ? 'Added to On my frame.' : 'Removed from On my frame.';
-  if (!wallKnown(wall)) return done;
-  const elsewhere = wallElsewhere(wall);
-  if (elsewhere) return done + ' Your wall frame shows ' + elsewhere + ' for now.';
+  if (!wallFollows(wall)) return done;
   // The default view already shows a bird that is being noted.
   if (saved) return wall === 'saved' ? name + ' will show on your frame from the next refresh.' : done;
+  if (stays === false) return name + ' will leave your frame at the next refresh.';
   if (wall === 'current' && stays === true)
     return done + ' ' + name + ' stays on your wall frame while it is still being noted.';
-  if (wall === 'current' && stays !== false) return done;
-  // A frame on the main catalog address keeps showing a bird still being noted.
-  if (stays !== false)
-    return done + ' ' + name + ' leaves your wall frame at its next refresh if it uses the /wall address.';
-  return name + ' will leave your frame at the next refresh.';
+  return done;
 }
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
@@ -720,14 +712,8 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
     el('h2', 'Change what is on your frame?'),
     note(savedSummary(preview)),
     ...(reason ? [note(reason)] : []),
-    ...(wallKnown(preview.wall)
-      ? [
-          note(
-            wallElsewhere(preview.wall)
-              ? 'Your wall frame shows ' + wallElsewhere(preview.wall) + ' for now, so it does not change.'
-              : 'Your wall frame uses the new list from its next refresh.',
-          ),
-        ]
+    ...(wallFollows(preview.wall)
+      ? [note('Your wall frame uses the new list from its next refresh.')]
       : []),
     confirm,
     button('Cancel', () => location.reload()),

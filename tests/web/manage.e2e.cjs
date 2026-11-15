@@ -151,7 +151,7 @@ async function candidates(t) {
   t.phase = 'needs-a-hand';
   // Home greets new plates only; a plate that needs a hand lives in Manage.
   await page.goto(origin + '/app');
-  await heading('Your field journal');
+  await heading('Your journal');
   assert.equal(await page.getByText(/held for recovery|needs? a hand|ready to look at/i).count(), 0);
   // Manage counts the plate that needs a hand and links to it.
   await page.goto(origin + '/app?page=manage');

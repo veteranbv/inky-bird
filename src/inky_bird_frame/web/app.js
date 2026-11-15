@@ -352,8 +352,8 @@ function signIn(access, notice = '') {
   screen(
     setup ? 'Make Inky yours' : 'Welcome back',
     setup
-      ? 'Create the owner account for your bird journal. No email or online account is needed.'
-      : 'Sign in to your Inky bird journal.',
+      ? 'Create the owner account for your journal. No email or online account is needed.'
+      : 'Sign in to your journal.',
   );
   const mark = element('img', '', 'auth-mark');
   mark.src = '/app/icon-180.png';

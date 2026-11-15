@@ -232,7 +232,8 @@ class PresentationAccess:
                 and list(self._pending_clients.values()).count(client) >= MAX_PENDING_PER_CLIENT
             ):
                 raise AccessRateLimitError(
-                    "Pairing is busy. Wait a moment or remove an unused request in Displays."
+                    "Pairing is busy. Wait a moment or remove an unused request in "
+                    "Manage → Wall frame."
                 )
             secret = secrets.token_urlsafe(32)
             grant = PresentationGrant(

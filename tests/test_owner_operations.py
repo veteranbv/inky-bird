@@ -254,8 +254,9 @@ def test_retry_message_holds_whether_plate_making_is_on(
             config, kind, revision=str(settings_status(config)["revision"]), taxon_ids=[303]
         )
     message = str(result["message"])
-    assert message.endswith(ending), message
-    assert "drawn" not in message
+    assert message == (
+        "A plate you kept is never replaced. In the works shows how each one goes. " + ending
+    )
 
 
 def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_path: Path) -> None:

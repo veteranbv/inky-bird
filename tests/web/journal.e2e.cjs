@@ -68,7 +68,7 @@ async function ownerSetup(t) {
   await page.getByLabel('Choose your Inky password', { exact: true }).fill(password);
   await page.getByLabel('Confirm your password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Create account', exact: true }).click();
-  await heading('Your field journal');
+  await heading('Your journal');
   await page
     .getByText('No sources are checked for new birds. Plates and collections still work.', {
       exact: true,
@@ -166,7 +166,7 @@ async function finish(t) {
     const { default: AxeBuilder } = require(process.env.INKY_QA_AXE),
       audits = [];
     for (const [area, title] of [
-      ['home', 'Your field journal'],
+      ['home', 'Your journal'],
       ['birds', 'Your birds'],
       ['collections', 'Collections'],
       ['manage', 'Manage'],

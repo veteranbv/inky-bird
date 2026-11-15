@@ -683,13 +683,13 @@ test('an interrupted change says to check On my frame before trying again', asyn
   );
 });
 
-// What the wall frame shows is its own choice: a change to On my frame reaches
-// it only while it shows On my frame.
+// What the wall frame shows is its own choice, and the page cannot see which
+// address it uses, so other wall views get no promise about the wall frame.
 for (const [wall, added, removed] of [
-  ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
-  ['favorites', 'Added to On my frame. Your wall frame shows Favorites for now.', 'Removed from On my frame. Your wall frame shows Favorites for now.'],
-  ['all', 'Added to On my frame. Your wall frame shows All birds for now.', 'Removed from On my frame. Your wall frame shows All birds for now.'],
-  ['a'.repeat(32), 'Added to On my frame. Your wall frame shows another collection for now.', 'Removed from On my frame. Your wall frame shows another collection for now.'],
+  ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Removed from On my frame.'],
+  ['favorites', 'Added to On my frame.', 'Removed from On my frame.'],
+  ['all', 'Added to On my frame.', 'Removed from On my frame.'],
+  ['a'.repeat(32), 'Added to On my frame.', 'Removed from On my frame.'],
 ])
   test('adding and removing a bird while the wall frame shows ' + (wall.length === 32 ? 'a collection' : wall), async (t) => {
     const server = savedServer();
@@ -747,8 +747,8 @@ for (const [label, journal, removed] of [
 // controller's list no longer holds the bird.
 for (const [label, journal, removed] of [
   ['no longer listed', { active_taxon_ids: [8] }, 'Brown Creeper will leave your frame at the next refresh.'],
-  ['still being noted', { active_taxon_ids: [7, 8] }, 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
-  ['unreadable', null, 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
+  ['still being noted', { active_taxon_ids: [7, 8] }, 'Removed from On my frame.'],
+  ['unreadable', null, 'Removed from On my frame.'],
 ])
   test('removing a bird while the wall frame shows only On my frame, when it is ' + label, async (t) => {
     const server = savedServer();
@@ -810,8 +810,7 @@ test('a review of many birds says whether the wall frame follows', async (t) => 
   main.append(section);
   findButton(section, 'Add every bird with a plate').click();
   await settle(t);
-  assert(texts(section).includes('Your wall frame shows Favorites for now, so it does not change.'));
-  assert(!texts(section).includes('Your wall frame uses the new list from its next refresh.'));
+  assert(!texts(section).some((text) => text.includes('wall frame')), texts(section).join(' | '));
 });
 
 test('a review of many birds makes no promise about the wall frame when its view cannot be read', async (t) => {
