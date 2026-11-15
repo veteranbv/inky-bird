@@ -227,7 +227,7 @@ async function health(t) {
   t.phase = 'health-and-guides';
   await page.goto(origin + '/app?page=health');
   await heading('Health and help');
-  await page.getByRole('heading', { name: 'Approved catalog index · ok', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Your plates · Fine', exact: true }).waitFor();
   for (const [area, title] of [
     ['backups', 'Backups and upgrades'],
     ['advanced', 'Advanced tools'],

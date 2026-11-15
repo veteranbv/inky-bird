@@ -841,59 +841,63 @@ class JournalService:
             free = shutil.disk_usage(self.config.state_dir).free
         checks: list[dict[str, str]] = [
             {
-                "name": "Approved catalog index",
+                "name": "Your plates",
                 "status": "ok",
-                "detail": f"{len(entries)} approved entries parsed. "
-                "Each served image is checked against its approved hash.",
+                "detail": f"{len(entries)} {'plate' if len(entries) == 1 else 'plates'} read. "
+                "Each one shown is checked against its saved fingerprint.",
             },
             {
-                "name": "Private storage",
+                "name": "Storage",
                 "status": "info",
                 "detail": f"{free / (1024**3):.1f} GiB free. "
-                "History uploads require at least 2 GiB before admission.",
+                "A history upload needs at least 2 GiB free.",
             },
         ]
         if management.get("available"):
             work = cast(dict[str, object], management["work"])
             providers = cast(list[dict[str, object]], management["sources"])
             notifications = cast(dict[str, object], management["notifications"])
+            pending = cast(int, notifications["pending"])
+            undelivered = cast(int, notifications["dead_letters"])
             checks.extend(
                 [
                     {
-                        "name": "Discovery",
+                        "name": "Finding new birds",
                         "status": "ok" if work["complete"] else "attention",
-                        "detail": "Saved discovery state: " + cast(str, work["discovery_status"]),
+                        "detail": "The last check for new birds finished."
+                        if work["complete"]
+                        else "The last check for new birds did not finish.",
                     },
                     {
-                        "name": "Configured sources",
+                        "name": "Sources",
                         "status": "attention"
                         if any(item["enabled"] and item["status"] != "ok" for item in providers)
                         else "ok",
-                        "detail": "Inspect enabled source checks in Sources. "
+                        "detail": "Sources shows how each check went. "
                         "Imported history is not a live feed.",
                     },
                     {
-                        "name": "Notification delivery",
-                        "status": "attention" if notifications["dead_letters"] else "ok",
-                        "detail": f"{notifications['pending']} pending; "
-                        f"{notifications['dead_letters']} dead letters.",
+                        "name": "Notifications",
+                        "status": "attention" if undelivered else "ok",
+                        "detail": f"{pending} {'message' if pending == 1 else 'messages'} "
+                        f"waiting; {undelivered} could not be delivered.",
                     },
                     {
-                        "name": "Generation policy",
+                        "name": "Plate making",
                         "status": "info",
-                        "detail": "Enabled; AI allowance and review rules apply."
+                        "detail": "On, with your own image-generation account. "
+                        "Every new plate is checked before you keep it."
                         if management["generation_enabled"]
-                        else "Off by choice. No new model work starts.",
+                        else "Off. No new plates are drawn.",
                     },
                 ]
             )
         return {
             "version": __version__,
             "checks": checks,
-            "notice": "These are read-only application checks, not privileged host "
-            "or service validation. Run the controller doctor for installed services, "
-            "executables and network diagnostics. "
-            "No raw logs or secret configuration are returned.",
+            "notice": "These checks only read Inky's own files. For installed services "
+            "and the network, run the controller doctor. Logs and secret settings "
+            "are not shown here.",
         }
 
     def favorite(self, *, revision: object, taxon_id: object, favorite: object) -> JournalState:

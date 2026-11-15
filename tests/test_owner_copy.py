@@ -1,10 +1,15 @@
 """Owner-facing guidance shown verbatim in the web app reads in plain words."""
 
+import ast
 import re
+from pathlib import Path
+from typing import cast
 
 import pytest
 
-from inky_bird_frame.journal import failure_guidance
+from inky_bird_frame.catalog import rebuild_catalog_index
+from inky_bird_frame.config import ControllerConfig
+from inky_bird_frame.journal import JournalService, failure_guidance
 
 MACHINERY = re.compile(
     r"backoff|operator|serialized|artifact|evidence|eligibility|provenance|candidate|retained",
@@ -52,9 +57,6 @@ OWNER_ERRORS = {"JournalError", "JournalConflictError", "_error"}
 
 def _owner_messages(module: str) -> list[str]:
     """String messages a module raises or returns to the owner pages, as written."""
-    import ast
-    from pathlib import Path
-
     source = Path(__file__).parents[1] / "src/inky_bird_frame" / module
     messages = []
     for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
@@ -76,3 +78,32 @@ def test_owner_errors_use_the_names_the_pages_show(module: str) -> None:
     assert messages
     retired = [message for message in messages if RETIRED.search(message)]
     assert not retired, retired
+
+
+def test_health_reads_in_plain_words(tmp_path: Path) -> None:
+    controller = ControllerConfig(
+        tmp_path / "work",
+        tmp_path / "catalog",
+        tmp_path / "state",
+        Path("codex"),
+        None,
+        "127.0.0.1",
+        8000,
+        3,
+        1,
+        3,
+    )
+    (tmp_path / "state").mkdir()
+    rebuild_catalog_index(controller.catalog_dir)
+    health = JournalService(controller).health()
+    checks = cast(list[dict[str, str]], health["checks"])
+    shown = [cast(str, health["notice"]), *(f"{c['name']} {c['detail']}" for c in checks)]
+    for text in shown:
+        assert not re.search(
+            r"approved entries|catalog index|admission|privileged|raw logs", text
+        ), text
+    assert checks[0] == {
+        "name": "Your plates",
+        "status": "ok",
+        "detail": "0 plates read. Each one shown is checked against its saved fingerprint.",
+    }

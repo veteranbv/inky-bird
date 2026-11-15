@@ -256,8 +256,15 @@ export async function renderGuides(context) {
   if (area === 'health') {
     const health = await api('/v1/owner/health');
     main.append(note('Installed version: ' + health.version), note(health.notice));
+    // Good news reads as good news; an informational line needs no status.
+    const healthWords = { ok: 'Fine', attention: 'Needs a look' };
     for (const check of health.checks)
-      main.append(empty(check.name + ' · ' + check.status, check.detail));
+      main.append(
+        empty(
+          check.name + (healthWords[check.status] ? ' · ' + healthWords[check.status] : ''),
+          check.detail,
+        ),
+      );
     guide(
       'Operations',
       'operations.md',

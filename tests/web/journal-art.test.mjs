@@ -215,3 +215,24 @@ test('an install without plate work configured keeps its setup message', async (
   assert(main.textContent.includes('Start Inky with its usual serve command to see this page.'));
   assert.deepEqual(notices(main), []);
 });
+
+test('Health shows each check in plain words, never a raw status', async (t) => {
+  const { main } = await open(t, { page: 'health' }, {
+    respond(path) {
+      if (path === '/v1/owner/health')
+        return {
+          version: '1.0.0',
+          notice: 'These checks only read.',
+          checks: [
+            { name: 'Your plates', status: 'ok', detail: '3 plates read.' },
+            { name: 'Storage', status: 'info', detail: '9.0 GiB free.' },
+            { name: 'Notifications', status: 'attention', detail: '1 message could not be delivered.' },
+            { name: 'Something newer', status: 'unexpected', detail: 'A later check.' },
+          ],
+        };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  const headings = nodes(main).filter((node) => node.tagName === 'H2').map((node) => node.textContent);
+  assert.deepEqual(headings.slice(0, 4), ['Your plates · Fine', 'Storage', 'Notifications · Needs a look', 'Something newer']);
+});
