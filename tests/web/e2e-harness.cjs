@@ -237,9 +237,24 @@ function run(body) {
     context.on('response', (response) => {
       if (response.status() >= 500 || response.status() === 404) collectServerErrors(t);
     });
+    let shots = 0;
     async function heading(name) {
       await page.getByRole('heading', { name, exact: true }).waitFor();
       await plainWords(page, name);
+      // For reading every page as the owner would; never part of a normal run.
+      if (process.env.INKY_QA_SHOTS) {
+        const size = page.viewportSize();
+        const slug = String(++shots).padStart(3, '0') + '-' + name.replace(/[^A-Za-z0-9]+/g, '-');
+        for (const [width, height] of [[375, 812], [1280, 800]]) {
+          await page.setViewportSize({ width, height });
+          await page.waitForTimeout(100);
+          await page.screenshot({
+            path: path.join(process.env.INKY_QA_SHOTS, slug + '-' + width + '.png'),
+            fullPage: true,
+          });
+        }
+        await page.setViewportSize(size);
+      }
     }
     async function step(name) {
       for (let n = 0; n < 30; n++) {

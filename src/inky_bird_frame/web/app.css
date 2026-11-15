@@ -968,6 +968,8 @@ a.journal-card:hover h3 { color: var(--accent); }
   }
   :root:not(:fullscreen) .presenting .frame-side .frame-caption { margin-top: 4px; }
   :root:not(:fullscreen) .presenting .frame-side .hint { margin: 4px 0; }
+  /* The reason a bird is shown is a nicety; the controls must stay on screen. */
+  :root:not(:fullscreen) .presenting .frame-side .frame-why { display: none; }
   :root:not(:fullscreen) .presenting main > .frame-dock {
     grid-row: 6;
     margin-top: 0;
