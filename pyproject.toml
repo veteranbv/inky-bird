@@ -79,6 +79,10 @@ packages = ["src/inky_bird_frame"]
 [tool.hatch.build.targets.wheel.force-include]
 "docs/browser-access.md" = "inky_bird_frame/web/access-guide.txt"
 
+[tool.hatch.build.targets.sdist]
+# The plate catalog (over 1 GB) is published data, not package source.
+exclude = ["/catalog"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
