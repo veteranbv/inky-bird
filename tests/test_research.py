@@ -69,6 +69,33 @@ class ResearchBudgetTests(unittest.TestCase):
             budget.reset_species(1)
             self.assertFalse(budget.species_exhausted(1))
 
+    def test_refund_returns_one_search_to_the_species_and_the_day(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            budget = ResearchBudget(Path(temporary) / "budget.json", daily_limit=2, species_limit=2)
+            budget.consume(1, now)
+            budget.consume(1, now)
+            budget.refund(1, now)
+            budget.consume(1, now)
+            self.assertTrue(budget.species_exhausted(1))
+            with self.assertRaisesRegex(ResearchLimitError, "Daily research limit"):
+                budget.consume(2, now)
+
+    def test_refund_on_a_later_day_leaves_that_day_alone(self) -> None:
+        now = datetime(2026, 7, 10, 23, 59, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "budget.json"
+            budget = ResearchBudget(path, daily_limit=5, species_limit=1)
+            budget.consume(1, now)
+            budget.refund(1, now + timedelta(minutes=2))
+            saved = json.loads(path.read_text())
+            budget.refund(1, now + timedelta(minutes=3))
+            self.assertEqual(json.loads(path.read_text()), saved)
+        self.assertEqual(saved["species_totals"], {"1": 0})
+        self.assertEqual(
+            (saved["date"], saved["total"], saved["species"]), ("2026-07-10", 1, {"1": 1})
+        )
+
     def test_reset_without_a_record_writes_nothing(self) -> None:
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "budget.json"

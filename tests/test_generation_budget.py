@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from png_fixtures import write_png
 
 from inky_bird_frame.birds import BirdSpecies, TaxonContext
+from inky_bird_frame.catalog import CandidateApprovalError
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
     MAX_AUTOMATIC_GENERATION_TRIES,
@@ -544,8 +545,8 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIn("retry this bird", str(failure["error"]))
         self.assertIsNone(record)
         self.assertEqual(guidance["failure_kind"], "research_limit")
-        self.assertIn("Automatic retries have stopped", guidance["failure_message"])
-        self.assertNotIn("waits until", guidance["failure_message"])
+        self.assertIn("Automatic retries have stopped", str(guidance["failure_message"]))
+        self.assertNotIn("waits until", str(guidance["failure_message"]))
 
     def test_a_bird_out_of_research_is_told_so_when_the_daily_limit_was_hit_too(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -611,21 +612,85 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertNotIn("temporarily", shown["failure_message"])
 
 
+class Killed(BaseException):
+    """The process dying mid-call: nothing after it runs, so no retry is recorded."""
+
+
+class ResearchRunner:
+    """Profile research only; every call either fails as told or writes its answer."""
+
+    outcomes: list[BaseException | None] = []
+    writes_output_before_failing = False
+    calls = 0
+
+    def __init__(self, _executable: Path, workspace: Path, **_kwargs: object) -> None:
+        self.workspace = workspace
+
+    def create_profile(self, *args: object, **_kwargs: object) -> SpeciesProfileData:
+        output_path = args[-2]
+        assert isinstance(output_path, Path)
+        type(self).calls += 1
+        outcome = self.outcomes.pop(0)
+        if outcome is None or self.writes_output_before_failing:
+            output_path.write_text(json.dumps(PROFILE))
+        if outcome is not None:
+            raise outcome
+        return PROFILE
+
+    def generate_plate(self, *_args: object, **_kwargs: object) -> Path:
+        raise DataSourceError("image tool unavailable")
+
+
+@contextmanager
+def research_codex(
+    outcomes: list[BaseException | None], *, writes_output_before_failing: bool = False
+) -> Iterator[type[ResearchRunner]]:
+    ResearchRunner.outcomes = list(outcomes)
+    ResearchRunner.writes_output_before_failing = writes_output_before_failing
+    ResearchRunner.calls = 0
+    with (
+        patch("inky_bird_frame.controller.load_or_fetch_references", return_value=[]),
+        patch("inky_bird_frame.controller.fetch_taxon_context"),
+        patch("inky_bird_frame.controller.CodexRunner", ResearchRunner),
+        patch("inky_bird_frame.controller.rebuild_catalog_index", return_value=[]),
+    ):
+        yield ResearchRunner
+
+
+def make_due(config: AppConfig) -> None:
+    path = retries(config).path
+    if not path.exists():
+        return
+    raw = json.loads(path.read_text())
+    for record in raw["records"]:
+        record["next_attempt_at"] = "2000-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(raw))
+
+
+def research_count(config: AppConfig, taxon_id: int) -> int:
+    path = config.controller.state_dir / "research-budget.json"
+    if not path.exists():
+        return 0
+    totals = json.loads(path.read_text())["species_totals"]
+    assert isinstance(totals, dict)
+    return int(totals.get(str(taxon_id), 0))
+
+
 class ResearchAllowanceTests(unittest.TestCase):
     def budget(self, config: AppConfig) -> ResearchBudget:
         return ResearchBudget(
             config.controller.state_dir / "research-budget.json", daily_limit=9, species_limit=1
         )
 
-    def test_fresh_bird_gets_its_research_allowance_back(self) -> None:
+    def test_a_bird_starting_without_a_retry_keeps_its_earlier_research(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary)
             refresh(config, [FIRST])
             self.budget(config).consume(FIRST.taxon_id)
             with generation(DataSourceError("temporary")):
                 run_generation_cycle(config)
-            # The allowance is back, so one more search fits the limit of one.
-            self.budget(config).consume(FIRST.taxon_id)
+            with self.assertRaises(ResearchLimitError):
+                self.budget(config).consume(FIRST.taxon_id)
 
     def test_automatic_retry_keeps_counting_research(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -637,6 +702,96 @@ class ResearchAllowanceTests(unittest.TestCase):
                 run_generation_cycle(config)
             with self.assertRaises(ResearchLimitError):
                 self.budget(config).consume(FIRST.taxon_id)
+
+    def test_research_cut_off_by_a_dying_process_still_counts(self) -> None:
+        limit = 2
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            for _ in range(limit):
+                with research_codex([Killed()]), self.assertRaises(Killed):
+                    run_generation_cycle(config)
+                # The process died before any retry was recorded.
+                self.assertIsNone(retries(config).get(FIRST.taxon_id))
+            with research_codex([None]) as runner:
+                result = run_generation_cycle(config)
+            shown = owner_view(config)
+
+        self.assertEqual(runner.calls, 0)
+        self.assertIs(first_failure(result)["terminal"], True)
+        self.assertEqual(shown["failure_kind"], "research_limit")
+
+    def test_owner_retry_after_a_research_stop_researches_again(self) -> None:
+        from inky_bird_frame.recovery import retry_species
+
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            for _ in range(2):
+                with research_codex([Killed()]), self.assertRaises(Killed):
+                    run_generation_cycle(config)
+            with research_codex([None]):
+                stopped = run_generation_cycle(config)
+            retry_species(config, FIRST.taxon_id)
+            with research_codex([None]) as runner:
+                run_generation_cycle(config)
+
+        self.assertIs(first_failure(stopped)["terminal"], True)
+        self.assertEqual(runner.calls, 1)
+
+    def test_research_that_never_answered_does_not_use_the_allowance(self) -> None:
+        tries = 4
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            results = []
+            for _ in range(tries):
+                make_due(config)
+                with research_codex([GenerationError("Codex timed out")]):
+                    results.append(run_generation_cycle(config))
+            count = research_count(config, FIRST.taxon_id)
+            record = retries(config).get(FIRST.taxon_id)
+
+        self.assertEqual([first_failure(result)["terminal"] for result in results], [False] * 4)
+        self.assertEqual(count, 0)
+        self.assertIsNotNone(record)
+
+    def test_research_that_answered_unusably_uses_the_allowance(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            results = []
+            for _ in range(3):
+                make_due(config)
+                with research_codex(
+                    [GenerationError("Codex profile must cite at least two sources")],
+                    writes_output_before_failing=True,
+                ) as runner:
+                    results.append(run_generation_cycle(config))
+            calls_on_last_cycle = runner.calls
+
+        self.assertEqual(
+            [first_failure(result)["terminal"] for result in results], [False, False, True]
+        )
+        self.assertEqual(calls_on_last_cycle, 0)
+
+    def test_finished_run_returns_the_allowance_for_a_later_plate(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 1)
+            self.budget(config).consume(FIRST.taxon_id)
+            with (
+                generation([Path(temporary) / "candidate"]),
+                patch(
+                    "inky_bird_frame.controller.approve_candidate",
+                    side_effect=CandidateApprovalError("held"),
+                ),
+            ):
+                run_generation_cycle(config)
+            count = research_count(config, FIRST.taxon_id)
+
+        self.assertEqual(count, 0)
 
 
 class FakeRunner:

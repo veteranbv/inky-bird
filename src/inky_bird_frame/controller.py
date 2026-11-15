@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
@@ -2426,6 +2426,28 @@ def _research_budget(config: AppConfig) -> ResearchBudget:
     )
 
 
+def _research_profile(
+    config: AppConfig,
+    species: BirdSpecies,
+    output_path: Path,
+    create: Callable[[], SpeciesProfileData],
+) -> SpeciesProfileData:
+    """Count a research call before it runs; give it back if it never answered.
+
+    The count is saved first, so a process that dies mid-call keeps it. A call
+    that ends without writing its answer (a timeout or an agent outage) found
+    nothing usable; the automatic-try ceiling bounds those instead.
+    """
+    budget = _research_budget(config)
+    budget.consume(species.taxon_id)
+    try:
+        return create()
+    except Exception:
+        if not output_path.exists():
+            budget.refund(species.taxon_id)
+        raise
+
+
 def load_or_create_profile(
     config: AppConfig,
     species: BirdSpecies,
@@ -2471,15 +2493,20 @@ def load_or_create_profile(
             )
         if context is None:
             context = fetch_taxon_context(species.taxon_id)
-        _research_budget(config).consume(species.taxon_id)
-        profile = runner.create_profile(
+        researched_context = context
+        profile = _research_profile(
+            config,
             species,
-            context,
-            references,
-            reference_paths,
             output_path,
-            log_path,
-            allowed_domains=config.research.allowed_domains,
+            lambda: runner.create_profile(
+                species,
+                researched_context,
+                references,
+                reference_paths,
+                output_path,
+                log_path,
+                allowed_domains=config.research.allowed_domains,
+            ),
         )
     if (
         profile["taxon_id"] != species.taxon_id
@@ -2509,18 +2536,22 @@ def _refresh_profile_after_conflict(
     if not config.research.enabled:
         raise GenerationError("Profile conflict requires research, but research is disabled")
     context = fetch_taxon_context(species.taxon_id)
-    _research_budget(config).consume(species.taxon_id)
     write_json_atomic(log_path.parent / "profile-before-refresh.json", prior_profile)
-    researched_profile = runner.create_profile(
+    researched_profile = _research_profile(
+        config,
         species,
-        context,
-        references,
-        reference_paths,
         output_path,
-        log_path,
-        allowed_domains=config.research.allowed_domains,
-        prior_profile=prior_profile,
-        profile_conflicts=profile_conflicts,
+        lambda: runner.create_profile(
+            species,
+            context,
+            references,
+            reference_paths,
+            output_path,
+            log_path,
+            allowed_domains=config.research.allowed_domains,
+            prior_profile=prior_profile,
+            profile_conflicts=profile_conflicts,
+        ),
     )
     profile = _merge_refreshed_profile(prior_profile, researched_profile, profile_conflicts)
     cache_path = config.controller.state_dir / "profiles" / str(species.taxon_id) / "profile.json"
@@ -3390,6 +3421,8 @@ def _stop_for_owner(
             config.controller.state_dir, species, stopped, stop_reason=stop_reason
         )
         retry_store.clear(species.taxon_id)
+        # The owner's retry starts a new run with a full research allowance.
+        _research_budget(config).reset_species(species.taxon_id)
     return {
         "taxon_id": species.taxon_id,
         "common_name": species.common_name,
@@ -3513,10 +3546,6 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             )
             guidance = retry_store.quality_guidance(species.taxon_id)
             try:
-                if retry_store.get(species.taxon_id) is None:
-                    # A bird starting fresh, not as an automatic retry, gets
-                    # its research allowance back.
-                    _research_budget(config).reset_species(species.taxon_id)
                 if guidance is None:
                     generate_candidate(
                         config, species, config.controller.workspace_dir, retry_store=retry_store
@@ -3565,6 +3594,8 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         initial_profile_conflicts=profile_conflicts,
                         retry_store=retry_store,
                     )
+                # This run ended with a plate; a later run gets a full allowance.
+                _research_budget(config).reset_species(species.taxon_id)
                 progress("approving")
                 try:
                     with catalog_state_lock(config.controller.state_dir):
@@ -3683,6 +3714,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     else:
                         retry_store.clear_quality_guidance(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
+                    _research_budget(config).reset_species(species.taxon_id)
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,
@@ -3698,6 +3730,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 with catalog_state_lock(config.controller.state_dir):
                     retry_store.clear(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
+                    _research_budget(config).reset_species(species.taxon_id)
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,

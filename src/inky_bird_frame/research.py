@@ -13,8 +13,10 @@ from .http import write_json_atomic
 class ResearchBudget:
     """A daily search total plus a per-species total that does not reset by day.
 
-    The per-species total is cleared only by reset_species, which the generation
-    cycle calls when a bird starts fresh rather than as an automatic retry.
+    The per-species total covers one run of automatic work for a bird. The
+    generation cycle clears it with reset_species when that run ends, with a
+    plate or a stop for the owner, so a process that dies mid-research keeps
+    its count.
     """
 
     def __init__(self, path: Path, *, daily_limit: int, species_limit: int) -> None:
@@ -42,6 +44,18 @@ class ResearchBudget:
         species[taxon_id] = species.get(taxon_id, 0) + 1
         totals[taxon_id] = totals.get(taxon_id, 0) + 1
         self._write(current.date(), total + 1, species, totals)
+
+    def refund(self, taxon_id: int, now: datetime | None = None) -> None:
+        """Return one search that ended without an answer."""
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        day, total, species, totals = self._read()
+        if totals.get(taxon_id, 0) <= 0:
+            return
+        totals[taxon_id] -= 1
+        if day == current.date() and species.get(taxon_id, 0) > 0:
+            species[taxon_id] -= 1
+            total = max(total - 1, 0)
+        self._write(day, total, species, totals)
 
     def species_exhausted(self, taxon_id: int) -> bool:
         """Whether this species has used its whole allowance, which only a reset returns."""
