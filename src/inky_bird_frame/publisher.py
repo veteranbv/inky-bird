@@ -15,10 +15,13 @@ from contextlib import contextmanager, suppress
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
+from time import time_ns
 from typing import Literal, cast
 
+import PIL
 from PIL import Image
 
+from . import __version__
 from .catalog import (
     CatalogEntry,
     catalog_index_data,
@@ -26,6 +29,7 @@ from .catalog import (
     clear_catalog_staging,
     has_passing_sourced_review,
     is_bounded_generation,
+    mentions_private_text,
     read_catalog_entries,
     read_json,
     rebuild_catalog_index,
@@ -33,7 +37,7 @@ from .catalog import (
 )
 from .codex_runner import parse_species_profile
 from .config import AppConfig, PublicCatalogConfig
-from .errors import CatalogError, CatalogPublishError, GenerationError
+from .errors import BusyError, CatalogError, CatalogPublishError, GenerationError
 from .http import write_json_atomic
 from .timeutil import parse_utc_timestamp
 
@@ -108,6 +112,10 @@ _MINIMUM_PRIVATE_TERM_LENGTH = 3
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+class CatalogPublishBusyError(CatalogPublishError, BusyError):
+    """Raised when another catalog publication already holds the publish lock."""
+
+
 @contextmanager
 def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -115,11 +123,55 @@ def exclusive_publish_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise CatalogPublishError("Another catalog publication is running") from exc
+            raise CatalogPublishBusyError("Another catalog publication is running") from exc
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _snapshot_catalog(source: Path, destination: Path) -> None:
+    """Snapshot the live catalog while holding its lock, without copying every plate.
+
+    Finder metadata is left out: it is never published and would fail the layout checks.
+
+    Catalog files are only ever replaced by rename, never rewritten in place, so a hard
+    link keeps the snapshot's bytes; where linking is not possible the files are copied.
+    """
+    linking = True
+
+    def place(source_file: str, destination_file: str) -> object:
+        nonlocal linking
+        if linking:
+            try:
+                os.link(source_file, destination_file, follow_symlinks=False)
+                return destination_file
+            except OSError:
+                linking = False
+        return shutil.copy2(source_file, destination_file, follow_symlinks=False)
+
+    def writable(directory: str) -> None:
+        mode = os.lstat(directory).st_mode
+        if stat.S_ISDIR(mode):
+            os.chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU)
+
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(_FINDER_METADATA),
+            copy_function=place,
+        )
+    finally:
+        # Snapshot directories are its own, even after a failed copy: keep them writable, so
+        # removing the snapshot never resorts to changing permissions on a file it shares
+        # with the live catalog.
+        if destination.is_dir():
+            writable(str(destination))
+            for directory, directories, _ in os.walk(destination):
+                for name in directories:
+                    writable(os.path.join(directory, name))
 
 
 def _abandoned_publish_work(work_parent: Path) -> tuple[Path, ...]:
@@ -234,10 +286,8 @@ def _check_json_privacy(
         for child in value:
             _check_json_privacy(child, source, private_patterns)
         return
-    if isinstance(value, str) and private_patterns:
-        folded = value.casefold()
-        if any(pattern.search(folded) is not None for pattern in private_patterns):
-            raise CatalogPublishError(f"Private location or path text found in {source}")
+    if isinstance(value, str) and mentions_private_text(value, private_patterns):
+        raise CatalogPublishError(f"Private location or path text found in {source}")
     if isinstance(value, str) and (
         value.startswith("file://")
         or Path(value).is_absolute()
@@ -343,7 +393,10 @@ def _validate_species_directory(
 ) -> tuple[int, str]:
     if directory.is_symlink() or not directory.is_dir():
         raise CatalogPublishError(f"Species path must be a directory, not a symlink: {directory}")
-    files = {path.name for path in directory.iterdir()}
+    # A pending candidate's Finder metadata is left behind at approval; nothing publishes it.
+    ignored = {_FINDER_METADATA} if expected_status == "pending" else set()
+    paths = [path for path in directory.iterdir() if path.name not in ignored]
+    files = {path.name for path in paths}
     unexpected = files - _ALLOWED_SPECIES_FILES
     missing = {"manifest.json", "portrait.png", "display.png"} - files
     if unexpected:
@@ -354,7 +407,7 @@ def _validate_species_directory(
         raise CatalogPublishError(
             f"Required catalog files missing from {directory}: {', '.join(sorted(missing))}"
         )
-    for path in directory.iterdir():
+    for path in paths:
         if path.is_symlink() or not path.is_file():
             raise CatalogPublishError(f"Catalog entries must be regular files: {path}")
 
@@ -415,9 +468,13 @@ def _validate_species_directory(
     return taxon_id, slug
 
 
-def validate_pending_candidate(directory: Path) -> None:
+def validate_pending_candidate(
+    directory: Path, *, private_patterns: tuple[re.Pattern[str], ...] = ()
+) -> None:
     """Use the publication gates before ordinary owner approval, without legacy bypasses."""
-    _validate_species_directory(directory, expected_status="pending")
+    _validate_species_directory(
+        directory, expected_status="pending", private_patterns=private_patterns
+    )
     manifest = read_json(directory / "manifest.json")
     if not isinstance(manifest, dict):
         raise CatalogPublishError("Pending profile is invalid")
@@ -1217,7 +1274,8 @@ def _remote_repository(remote_url: str) -> str | None:
     return match.group("repository") if match is not None else None
 
 
-def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> str:
+def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> tuple[str, str]:
+    """Return the repository and the signed-in account that publishes to it."""
     if checkout.is_symlink() or not checkout.is_dir():
         raise CatalogPublishError(f"Repository checkout does not exist: {checkout}")
     repository = publication.repository
@@ -1253,8 +1311,17 @@ def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> str:
             ) from exc
         raise
     if authenticated.casefold() != owner.casefold():
-        raise CatalogPublishError(f"GitHub CLI must be authenticated as repository owner {owner!r}")
-    return repository
+        # An organisation is never the signed-in account; its administrators can still merge.
+        # A repository hidden from this account answers 404, so it is not an administrator.
+        administrator = _gh(
+            publication, "api", f"repos/{repository}", "--jq", ".permissions.admin", check=False
+        )
+        if administrator.returncode != 0 or administrator.stdout.strip() != "true":
+            raise CatalogPublishError(
+                f"GitHub CLI must be authenticated as repository owner {owner!r} "
+                f"or an administrator of {repository}"
+            )
+    return repository, authenticated
 
 
 def _commit_message(published: list[dict[str, object]]) -> str:
@@ -1400,10 +1467,11 @@ def _cleanup_stale_publications(
     checkout: Path,
     publication: PublicCatalogConfig,
     repository: str,
+    publisher: str,
     *,
     keep: str | None,
 ) -> list[str]:
-    """Close the owner's abandoned publication PRs and delete their branches."""
+    """Close the publishing account's abandoned publication PRs and delete their branches."""
     heads = _git(
         checkout,
         "ls-remote",
@@ -1418,7 +1486,7 @@ def _cleanup_stale_publications(
         if _PUBLICATION_BRANCH.fullmatch(name) is not None and name != keep:
             branches[name] = head
 
-    owner = repository.split("/", maxsplit=1)[0].casefold()
+    owner = publisher.casefold()
     cleaned: list[str] = []
     for name in sorted(branches):
         raw = _gh(
@@ -1570,6 +1638,99 @@ def _create_pull_request(
     ).stdout.strip()
 
 
+_VERIFICATION_RECORD = "catalog-publish-verified.json"
+_SETTLED_NS = 2_000_000_000
+_VERIFIED_RESULT_FIELDS = (
+    "published",
+    "replaced",
+    "retained_newer",
+    "retained_independent",
+    "already_present",
+    "skipped",
+)
+
+
+def _local_catalog_fingerprint(catalog_dir: Path) -> str | None:
+    """Identify the local catalog by its listing and file metadata.
+
+    Change time is left out because the publication snapshot's hard links change it. A
+    catalog written within the last moments gets no fingerprint, since coarse
+    timestamps cannot tell two writes in the same tick apart.
+    """
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    digest = hashlib.sha256()
+    newest = 0
+    for directory, directories, files in os.walk(catalog_dir, onerror=fail):
+        directories.sort()
+        for name in sorted([*directories, *files]):
+            path = Path(directory) / name
+            info = path.lstat()
+            newest = max(newest, info.st_mtime_ns)
+            digest.update(path.relative_to(catalog_dir).as_posix().encode())
+            fields = (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev)
+            digest.update(f"\0{fields}\0".encode())
+    if time_ns() - newest <= _SETTLED_NS:
+        return None
+    return digest.hexdigest()
+
+
+def _verification_key(
+    config: AppConfig, remote_catalog_tree: str, private_patterns: tuple[re.Pattern[str], ...]
+) -> str | None:
+    local_catalog = _local_catalog_fingerprint(config.controller.catalog_dir)
+    if local_catalog is None:
+        return None
+    publication = config.public_catalog
+    payload = {
+        "version": __version__,
+        # Pillow decodes every plate in the gates; a different release may judge them differently.
+        "pillow": PIL.__version__,
+        "repository": publication.repository,
+        "remote": publication.remote,
+        "base_branch": publication.base_branch,
+        "remote_catalog_tree": remote_catalog_tree,
+        "local_catalog": local_catalog,
+        "private_patterns": [pattern.pattern for pattern in private_patterns],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _reusable_verification(state_dir: Path, key: str) -> dict[str, object] | None:
+    """Return the outcome of the last fully validated no-change run for exactly this state."""
+    path = state_dir / _VERIFICATION_RECORD
+    if not path.is_file():
+        return None
+    try:
+        record = read_json(path)
+    except CatalogError:
+        return None
+    if not isinstance(record, dict) or record.get("key") != key:
+        return None
+    outcome = record.get("outcome")
+    if not isinstance(outcome, dict) or set(outcome) != set(_VERIFIED_RESULT_FIELDS):
+        return None
+    if any(not isinstance(outcome[field], list) for field in _VERIFIED_RESULT_FIELDS):
+        return None
+    return cast(dict[str, object], outcome)
+
+
+def _record_verification(state_dir: Path, key: str, result: dict[str, object]) -> None:
+    # Best effort: without the record the next run only validates everything again.
+    with suppress(OSError):
+        write_json_atomic(
+            state_dir / _VERIFICATION_RECORD,
+            {
+                "schema_version": 1,
+                "key": key,
+                "outcome": {field: result[field] for field in _VERIFIED_RESULT_FIELDS},
+            },
+            mode=0o600,
+        )
+
+
 def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str, object]:
     publication = config.public_catalog
     if not publication.enabled:
@@ -1585,7 +1746,7 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
         cleaned_work_directories = (
             0 if dry_run else _cleanup_abandoned_publish_work_locked(work_parent)
         )
-        repository = _validate_checkout(checkout, publication)
+        repository, publisher = _validate_checkout(checkout, publication)
         remote_ref = f"refs/remotes/{publication.remote}/{publication.base_branch}"
         _git(
             checkout,
@@ -1596,7 +1757,15 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             timeout=_TRANSFER_TIMEOUT_SECONDS,
         )
         _git(checkout, "worktree", "prune")
-        remote_species = _remote_catalog_species(checkout, remote_ref)
+        # Pin the fetched commit: the checkout's remote ref can move while this run works.
+        remote_commit = _git(checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}").stdout
+        remote_commit = remote_commit.strip()
+        remote_tree = _git(
+            checkout, "rev-parse", "--verify", "--quiet", f"{remote_commit}:catalog", check=False
+        )
+        remote_catalog_tree = remote_tree.stdout.strip() if remote_tree.returncode == 0 else None
+        remote_species = _remote_catalog_species(checkout, remote_commit)
+        private_patterns = publication_privacy_patterns(config)
         result: dict[str, object] = {
             "published": [],
             "replaced": [],
@@ -1613,24 +1782,40 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
             "abandoned_work_directories": abandoned_work_directories,
             "cleaned_work_directories": cleaned_work_directories,
             "cleaned_publication_branches": [],
+            "verification_reused": False,
         }
         with TemporaryDirectory(prefix="publish-", dir=work_parent) as temporary:
             source_snapshot = Path(temporary) / "source-catalog"
+            verification_key: str | None = None
+            reused: dict[str, object] | None = None
             with catalog_state_lock(config.controller.state_dir):
                 # Approval staging debris would fail the snapshot root check.
                 clear_catalog_staging(config.controller.catalog_dir)
-                try:
-                    shutil.copytree(
-                        config.controller.catalog_dir,
-                        source_snapshot,
-                        symlinks=True,
-                    )
-                except FileNotFoundError as exc:
-                    raise CatalogPublishError("Approved local catalog does not exist") from exc
+                if not dry_run and remote_catalog_tree is not None:
+                    with suppress(FileNotFoundError):
+                        verification_key = _verification_key(
+                            config, remote_catalog_tree, private_patterns
+                        )
+                if verification_key is not None:
+                    reused = _reusable_verification(config.controller.state_dir, verification_key)
+                if reused is None:
+                    try:
+                        _snapshot_catalog(config.controller.catalog_dir, source_snapshot)
+                    except FileNotFoundError as exc:
+                        raise CatalogPublishError("Approved local catalog does not exist") from exc
+            if reused is not None:
+                # Neither the remote catalog tree nor any local catalog file changed since a
+                # run that validated both in full and found nothing to publish.
+                result.update(reused)
+                result["verification_reused"] = True
+                result["cleaned_publication_branches"] = _cleanup_stale_publications(
+                    checkout, publication, repository, publisher, keep=None
+                )
+                return result
             result["skipped"] = _exclude_unpublishable_species(
                 source_snapshot,
                 _published_directory_names(remote_species),
-                publication_privacy_patterns(config),
+                private_patterns,
             )
             validate_public_catalog(source_snapshot)
 
@@ -1641,19 +1826,23 @@ def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str
                 "add",
                 "--detach",
                 str(worktree),
-                remote_ref,
+                remote_commit,
                 timeout=_CHECKOUT_TIMEOUT_SECONDS,
             )
             try:
-                return _publish_from_worktree(
+                outcome = _publish_from_worktree(
                     checkout,
                     worktree,
                     source_snapshot,
                     publication,
                     repository,
+                    publisher,
                     result,
                     dry_run=dry_run,
                 )
+                if verification_key is not None and outcome["changed"] is False:
+                    _record_verification(config.controller.state_dir, verification_key, outcome)
+                return outcome
             finally:
                 # Cleanup is best effort; the next run prunes, and it must not mask the outcome.
                 with suppress(CatalogPublishError):
@@ -1676,6 +1865,7 @@ def _publish_from_worktree(
     source_snapshot: Path,
     publication: PublicCatalogConfig,
     repository: str,
+    publisher: str,
     result: dict[str, object],
     *,
     dry_run: bool,
@@ -1707,7 +1897,7 @@ def _publish_from_worktree(
     if not changed:
         if not dry_run:
             result["cleaned_publication_branches"] = _cleanup_stale_publications(
-                checkout, publication, repository, keep=None
+                checkout, publication, repository, publisher, keep=None
             )
         return result
     if not typed_published:
@@ -1724,7 +1914,7 @@ def _publish_from_worktree(
     staged_tree = _git(worktree, "write-tree").stdout.strip()
     branch = f"catalog/publish-{_catalog_digest(source_snapshot)[:8]}-{base_commit[:8]}"
     result["cleaned_publication_branches"] = _cleanup_stale_publications(
-        checkout, publication, repository, keep=branch
+        checkout, publication, repository, publisher, keep=branch
     )
     remote_branch = _git(
         checkout,
