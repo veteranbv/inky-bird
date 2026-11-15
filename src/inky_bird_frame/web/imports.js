@@ -45,10 +45,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
     else node.textContent = error.message;
   }
   // A recovery button shows its own failure beside it instead of rejecting.
+  const recoveryAlerts = new WeakMap();
   function recovery(label, action) {
     const alert = problem();
-    return button(label, async (event) => {
-      const control = event.currentTarget;
+    const control = button(label, async () => {
       control.disabled = true;
       alert.textContent = '';
       try {
@@ -56,13 +56,19 @@ export async function renderImports(ui, { base, link, note, kind }) {
       } catch (error) {
         if (stopped) return;
         control.disabled = false;
-        fail(alert, error);
-        if (!alert.isConnected) {
-          if (control.isConnected) control.after(alert);
-          else content.append(alert);
-        }
+        recoveryFailed(control, error);
       }
     });
+    recoveryAlerts.set(control, alert);
+    return control;
+  }
+  function recoveryFailed(control, error) {
+    const alert = recoveryAlerts.get(control);
+    fail(alert, error);
+    if (!alert.isConnected) {
+      if (control.isConnected) control.after(alert);
+      else content.append(alert);
+    }
   }
   function operation(label, action, uploadId, extra, onSuccess = load) {
     const section = el('div'),
@@ -108,12 +114,9 @@ export async function renderImports(ui, { base, link, note, kind }) {
         () =>
           watch(id, done).catch((error) => {
             if (!stopped) {
-              const alert = problem();
-              fail(alert, error);
-              content.append(
-                alert,
-                recovery('Check this operation again', () => watch(id, done)),
-              );
+              const retry = recovery('Check this operation again', () => watch(id, done));
+              content.append(retry);
+              recoveryFailed(retry, error);
             }
           }),
         document.hidden ? 5000 : 1000,
@@ -361,8 +364,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
       error,
       recheck,
     );
-    const mib = (bytes, total) =>
-      (bytes / (1024 * 1024)).toFixed(total < 10 * 1024 * 1024 ? 1 : 0);
+    const MIB = 1024 * 1024;
+    const unit = (total) => (total < MIB ? ' KiB' : ' MiB');
+    const amount = (bytes, total) =>
+      total < MIB ? String(Math.ceil(bytes / 1024)) : (bytes / MIB).toFixed(total < 10 * MIB ? 1 : 0);
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const source = file.files[0];
@@ -378,20 +383,23 @@ export async function renderImports(ui, { base, link, note, kind }) {
       transfer = new AbortController();
       error.textContent = '';
       recheck.hidden = true;
+      recoveryAlerts.get(recheck).remove();
       progress.textContent =
         'Uploading ' +
-        mib(source.size, source.size) +
-        ' MiB privately. No history has changed. Keep this page open.';
+        amount(source.size, source.size) +
+        unit(source.size) +
+        ' privately. No history has changed. Keep this page open.';
       const sent = (loaded, total) => {
         if (stopped || !total) return;
         progress.textContent =
           'Uploading privately: ' +
           Math.floor((100 * Math.min(loaded, total)) / total) +
           '% (' +
-          mib(Math.min(loaded, total), total) +
+          amount(Math.min(loaded, total), total) +
           ' of ' +
-          mib(total, total) +
-          ' MiB). No history has changed. Keep this page open.';
+          amount(total, total) +
+          unit(total) +
+          '). No history has changed. Keep this page open.';
       };
       try {
         const suffix = observed?.value ? '?observed_on=' + encodeURIComponent(observed.value) : '';

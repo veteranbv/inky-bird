@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setImmediate } from 'node:timers/promises';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 
 const source = await readFile(
@@ -192,6 +192,83 @@ test('a failed check after a failed upload shows its error once', async () => {
 
   const alerts = findAll(env.main, (node) => node.getAttribute('role') === 'alert');
   assert.ok(alerts.some((node) => text(node) === 'Inky cannot be reached.'));
+});
+
+test('a new upload clears the failure of an earlier saved-upload check', async () => {
+  let fail = false;
+  let failUpload = true;
+  const env = setup({
+    '/v1/owner/operations': { operations: [] },
+    '/v1/owner/imports': () =>
+      fail ? new RequestError('Inky cannot be reached.', 'offline') : { preview: null },
+    upload: () => {
+      if (failUpload) throw new RequestError('Upload failed.', 'offline');
+      return new Promise(() => {});
+    },
+  });
+  await renderImports(env.ui, env.helpers);
+  const form = findAll(env.main, (node) => node.tagName === 'FORM')[0];
+  const input = findAll(form, (node) => node.tagName === 'INPUT')[0];
+  input.files = [{ size: 10 }];
+  form.fire('submit', {});
+  await setImmediate();
+  fail = true;
+  await click(findButton(form, 'Check saved upload'));
+  await settled(env.actions);
+  const reached = () =>
+    findAll(env.main, (node) => node.getAttribute('role') === 'alert').filter(
+      (node) => text(node) === 'Inky cannot be reached.',
+    );
+  assert.equal(reached().length, 1);
+  failUpload = false;
+  form.fire('submit', {});
+  await setImmediate();
+
+  assert.equal(reached().length, 0);
+});
+
+test('a repeated failure to check a running step shows one error', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    let polls = 0;
+    const env = setup({
+      '/v1/owner/operations': { operations: [{ operation_id: 'op-3', kind: 'import-preview', status: 'running' }] },
+      '/v1/owner/imports': { preview: null },
+      '/v1/owner/operations/op-3': () =>
+        ++polls === 1 ? { status: 'running' } : new RequestError('Inky cannot be reached.', 'offline'),
+    });
+    await renderImports(env.ui, env.helpers);
+    mock.timers.tick(1000);
+    await setImmediate();
+    await setImmediate();
+    await click(findButton(env.main, 'Check this operation again'));
+    await settled(env.actions);
+
+    const alerts = findAll(env.main, (node) => node.getAttribute('role') === 'alert').filter(
+      (node) => text(node) === 'Inky cannot be reached.',
+    );
+    assert.equal(alerts.length, 1);
+    assert.ok(polls >= 3);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a small upload is described in KiB', async () => {
+  const env = setup({
+    '/v1/owner/operations': { operations: [] },
+    '/v1/owner/imports': { preview: null },
+    upload: () => new Promise(() => {}),
+  });
+  await renderImports(env.ui, env.helpers);
+  const form = findAll(env.main, (node) => node.tagName === 'FORM')[0];
+  const input = findAll(form, (node) => node.tagName === 'INPUT')[0];
+  input.files = [{ size: 300 }];
+  form.fire('submit', {});
+  await setImmediate();
+
+  const status = findAll(form, (node) => node.getAttribute('role') === 'status')[0];
+  assert.match(text(status), /Uploading 1 KiB privately/);
 });
 
 test('the controller, not the browser clock, decides that a preview expired', async () => {
