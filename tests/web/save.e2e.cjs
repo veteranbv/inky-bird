@@ -5,6 +5,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { layout, noSideways } = require('./e2e-layout.cjs');
 
 // Owner operations finish on a timer the page polls; the test clock drives it.
 async function shown(page, text) {
@@ -76,7 +77,7 @@ async function historyAndCollections(t) {
   await heading('5. Save your trip');
   for (const width of [320, 390, 1280]) {
     await page.setViewportSize({ width, height: 844 });
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, 'Trip review at ' + width + ' px');
   }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: fixture + '/trip-review-phone.png', fullPage: true });
@@ -223,10 +224,15 @@ async function collectionFilter(t) {
   const viewport = page.viewportSize();
   await page.setViewportSize({ width: 375, height: 812 });
   const cards = page.locator('.bird-grid a.bird-card');
-  const [first, second] = [await cards.nth(0).boundingBox(), await cards.nth(1).boundingBox()];
-  assert.equal(Math.round(first.y), Math.round(second.y));
-  assert(second.x >= first.x + first.width);
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  const pair = { first: await cards.nth(0).boundingBox(), second: await cards.nth(1).boundingBox() };
+  await layout(
+    page,
+    Math.round(pair.first.y) === Math.round(pair.second.y) &&
+      pair.second.x >= pair.first.x + pair.first.width,
+    'the collection does not show two plates side by side',
+    pair,
+  );
+  await noSideways(page, 'Collection');
   await page.setViewportSize(viewport);
   // Remove the journey collection so later phases see the expected state.
   // The Remove action lives in the collection page's tools.
@@ -377,7 +383,7 @@ async function savedBirds(t) {
     assert.equal(page.url(), url);
     assert.deepEqual(saved(), [cardinal.taxon_id]);
     await page.getByRole('button', { name: 'Remove from Saved birds', exact: true }).waitFor();
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, 'Bird page after saving');
     await page.getByRole('button', { name: 'Undo', exact: true }).click();
     await shown(page, 'Removed from Saved birds.');
     assert.deepEqual(saved(), []);
@@ -403,7 +409,7 @@ async function savedBirds(t) {
   await shown(page, '1 bird added');
   const outcome = await page.locator('main').innerText();
   assert(!/[0-9a-f]{16}/.test(outcome) && !outcome.includes('_'));
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Operation outcome');
 }
 
 // Runs only when INKY_QA_UPLOAD_FILE names a real export.

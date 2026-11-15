@@ -4,6 +4,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { noSideways } = require('./e2e-layout.cjs');
 const { execFileSync } = require('node:child_process');
 
 async function birdBuddySettings(t) {
@@ -170,7 +171,7 @@ async function integrations(t) {
   });
   assert.equal(aggregate.status(), 200);
   assert(!JSON.stringify(await aggregate.json()).includes(trip.label));
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Integrations');
   await Promise.all([
     page.waitForEvent('load'),
     page.getByRole('button', { name: 'I saved it · clear this copy', exact: true }).click(),
@@ -208,7 +209,7 @@ async function health(t) {
   ]) {
     await page.goto(origin + '/app?page=' + area);
     await heading(title);
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, title);
   }
 }
 

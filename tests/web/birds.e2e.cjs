@@ -4,6 +4,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const measured = require('./e2e-layout.cjs');
 
 async function unreadableNotice(t) {
   const { page, origin, fixture, heading } = t;
@@ -133,12 +134,12 @@ function controls(page) {
 async function checkLayout(page, label) {
   // Problems are collected so a failure lists every one of them.
   const problems = [];
-  if (!(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)))
-    problems.push(label + ': sideways scrolling');
+  const wide = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, width: innerWidth }));
+  if (wide.scrollWidth > wide.width) problems.push({ problem: label + ': sideways scrolling', ...wide });
   const found = await controls(page);
   for (const { name, box } of found)
     if (box.right - box.left < 44 - 0.5 || box.bottom - box.top < 44 - 0.5)
-      problems.push(label + ': ' + name + ' is smaller than 44 px');
+      problems.push({ problem: label + ': ' + name + ' is smaller than 44 px', box });
   // The bottom navigation floats over the page, so each layer is checked on its own.
   for (const [n, a] of found.entries())
     for (const b of found.slice(n + 1))
@@ -149,7 +150,7 @@ async function checkLayout(page, label) {
         a.box.bottom > b.box.top + 0.5 &&
         b.box.bottom > a.box.top + 0.5
       )
-        problems.push(label + ': ' + a.name + ' overlaps ' + b.name);
+        problems.push({ problem: label + ': ' + a.name + ' overlaps ' + b.name, boxes: [a.box, b.box] });
   // A word split across lines means its button is too narrow for the label.
   const split = await page.evaluate(() =>
     [...document.querySelectorAll('main button, main .primary-link')]
@@ -173,8 +174,8 @@ async function checkLayout(page, label) {
       })
       .map((node) => (node.getAttribute('aria-label') || node.textContent).trim().slice(0, 60)),
   );
-  for (const name of split) problems.push(label + ': ' + name + ' splits a word over two lines');
-  assert.deepEqual(problems, []);
+  for (const name of split) problems.push({ problem: label + ': ' + name + ' splits a word over two lines' });
+  await measured.layout(page, problems.length === 0, label + ' has layout problems', { problems });
 }
 
 const box = (locator) => locator.evaluate((node) => node.getBoundingClientRect().toJSON());
@@ -182,6 +183,7 @@ const box = (locator) => locator.evaluate((node) => node.getBoundingClientRect()
 // Birds list, bird page and Home at phone, small-phone and desktop sizes.
 async function layout(t) {
   const { page, origin, heading, cardinal } = t;
+  const check = (ok, what, boxes) => measured.layout(page, ok, what, boxes);
   for (const [width, height] of [
     [375, 812],
     [320, 568],
@@ -197,18 +199,20 @@ async function layout(t) {
     assert(await cards.count() >= 2, 'the list has at least two birds to lay out');
     const [first, second] = [await box(cards.nth(0)), await box(cards.nth(1))];
     if (width < 560) {
-      assert.equal(Math.round(first.top), Math.round(second.top), size + ': two cards side by side');
-      assert(second.left > first.right, size + ': two columns');
+      await check(Math.round(first.top) === Math.round(second.top), size + ': two cards not side by side', { first, second });
+      await check(second.left > first.right, size + ': not two columns', { first, second });
     }
     const plate = await box(page.locator('.bird-grid img').first());
     const room = await page.locator('.bird-grid img').first().evaluate((image) => {
       const card = image.parentElement, style = getComputedStyle(card);
       return card.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
     });
-    assert(plate.width >= room - 0.5, size + ': the plate fills its card');
-    if (width === 375) assert(plate.top < height, size + ': the first plate starts on the first screen');
-    if (width >= 820)
-      assert((await box(page.locator('#bird-search'))).width <= 420.5, size + ': search keeps a readable width');
+    await check(plate.width >= room - 0.5, size + ': the plate does not fill its card', { plate, room });
+    if (width === 375) await check(plate.top < height, size + ': the first plate starts below the first screen', { plate });
+    if (width >= 820) {
+      const search = await box(page.locator('#bird-search'));
+      await check(search.width <= 420.5, size + ': search is wider than a readable width', { search });
+    }
 
     t.phase = 'bird-layout-' + size;
     await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
@@ -217,15 +221,13 @@ async function layout(t) {
     await checkLayout(page, 'Bird ' + size);
     const back = await box(page.getByRole('link', { name: 'Back to birds', exact: true }));
     const title = await box(page.getByRole('heading', { name: 'Northern Cardinal', exact: true }));
-    assert(back.bottom <= title.top + 0.5, size + ': Back comes before the title');
+    await check(back.bottom <= title.top + 0.5, size + ': Back does not come before the title', { back, title });
     const [left, right] = [await box(page.locator('.bird-plate')), await box(page.locator('.bird-notes'))];
     if (width >= 960) {
-      assert(left.right <= right.left, size + ': notes sit beside the plate');
-      assert(
-        (await box(page.getByRole('button', { name: /Favorites$/ }))).width <= 420.5,
-        size + ': buttons keep a readable width',
-      );
-    } else assert(right.top >= left.bottom - 0.5, size + ': notes follow the plate');
+      await check(left.right <= right.left, size + ': notes do not sit beside the plate', { left, right });
+      const favorites = await box(page.getByRole('button', { name: /Favorites$/ }));
+      await check(favorites.width <= 420.5, size + ': buttons are wider than a readable width', { favorites });
+    } else await check(right.top >= left.bottom - 0.5, size + ': notes do not follow the plate', { left, right });
 
     // Collections keep one card to a row on phones; only bird lists pair up.
     t.phase = 'collections-layout-' + size;
@@ -236,7 +238,7 @@ async function layout(t) {
       const groups = page.locator('.bird-grid > .journal-card');
       assert(await groups.count() >= 2, 'Collections lists at least two groups');
       const [one, two] = [await box(groups.nth(0)), await box(groups.nth(1))];
-      assert(two.top >= one.bottom, size + ': one collection to a row');
+      await check(two.top >= one.bottom, size + ': more than one collection to a row', { one, two });
     }
 
     t.phase = 'home-layout-' + size;
@@ -245,7 +247,7 @@ async function layout(t) {
     await checkLayout(page, 'Home ' + size);
     if (width >= 960) {
       const [hero, rail] = [await box(page.locator('.featured-art')), await box(page.locator('.home-rail'))];
-      assert(hero.right <= rail.left, size + ': the caption sits beside the plate');
+      await check(hero.right <= rail.left, size + ': the caption does not sit beside the plate', { hero, rail });
     }
   }
   await page.setViewportSize({ width: 390, height: 844 });
