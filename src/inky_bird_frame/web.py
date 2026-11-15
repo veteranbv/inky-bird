@@ -72,7 +72,7 @@ from .owner_operations import (
 )
 from .plate_variants import PlateThumbnails
 from .presentation import GRANT_DAYS, PresentationAccess
-from .server import HEAD_REQUEST, CatalogService, dead_letter_count
+from .server import HEAD_REQUEST, CatalogService, dead_letter_count, log_request
 from .settings import (
     SettingsConflictError,
     SettingsError,
@@ -419,14 +419,17 @@ class UnmatchedRequest:
         if _route_path(scope) == OIDC_CALLBACK:
             methods.discard("HEAD")  # The single-use callback refuses HEAD.
         allowed = sorted(methods)
-        response: Response
+        request = Request(scope, receive)
+        if not allowed and not _route_path(scope).startswith(APP_PREFIXES):
+            # The catalog routes log their own request line.
+            await (await self.catalog.dispatch(request))(scope, receive, send)
+            return
         if allowed:
             response = _error(405, "method_not_allowed", "Use a supported method for this address")
             response.headers["Allow"] = ", ".join(allowed)
-        elif _route_path(scope).startswith(APP_PREFIXES):
-            response = _error(404, "not_found", "This Inky address does not exist")
         else:
-            response = await self.catalog.dispatch(Request(scope, receive))
+            response = _error(404, "not_found", "This Inky address does not exist")
+        log_request(request, "/not-found", response.status_code)
         await response(scope, receive, send)
 
 

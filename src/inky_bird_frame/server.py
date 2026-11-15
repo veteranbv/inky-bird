@@ -560,18 +560,23 @@ class CatalogService:
             if path.startswith("/v1/assets/")
             else "/not-found"
         )
-        print(
-            json.dumps(
-                {
-                    "timestamp": utc_now(),
-                    "event": "http_request",
-                    "method": "HEAD" if request.scope.get(HEAD_REQUEST) else request.method,
-                    "route": route,
-                    "status": response.status_code,
-                }
-            )
-        )
+        log_request(request, route, response.status_code)
         return response
+
+
+def log_request(request: Request, route: str, status: int) -> None:
+    """Write one request line; ``route`` is a fixed name, never the requested path."""
+    print(
+        json.dumps(
+            {
+                "timestamp": utc_now(),
+                "event": "http_request",
+                "method": "HEAD" if request.scope.get(HEAD_REQUEST) else request.method,
+                "route": route,
+                "status": status,
+            }
+        )
+    )
 
 
 def rebuild_index_logging_failures(catalog_dir: Path) -> None:

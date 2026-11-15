@@ -1489,12 +1489,21 @@ class ServerTests(unittest.TestCase):
                 )
                 _get(port, "/private-birder-path")
                 _head(port, "/health")
+                # Unknown owner-app paths and refused methods are logged the same way.
+                _get(port, "/app/private-birder-path")
+                _post(port, "/app")
 
         self.assertEqual(asset_status, 200)
         logs = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(
-            [(log["method"], log["route"]) for log in logs],
-            [("GET", "/v1/assets/{asset}"), ("GET", "/not-found"), ("HEAD", "/health")],
+            [(log["method"], log["route"], log["status"]) for log in logs],
+            [
+                ("GET", "/v1/assets/{asset}", 200),
+                ("GET", "/not-found", 404),
+                ("HEAD", "/health", 200),
+                ("GET", "/not-found", 404),
+                ("POST", "/not-found", 405),
+            ],
         )
         for leaked in ("robin", "portrait", digest, "private-birder-path"):
             self.assertNotIn(leaked, output.getvalue())
