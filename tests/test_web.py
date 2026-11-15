@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
+from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
+from starlette.datastructures import Headers
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp, Message, Scope
 
 from inky_bird_frame.access import AccessDeniedError, AccessStore
-from inky_bird_frame.config import ControllerConfig, OIDCConfig, OwnerAccessMode, load_config
+from inky_bird_frame.config import (
+    AppConfig,
+    ControllerConfig,
+    OIDCConfig,
+    OwnerAccessMode,
+    load_config,
+)
+from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.oidc import VerifiedIdentity, provider_id
 from inky_bird_frame.settings import initialize_config
 from inky_bird_frame.web import LOCAL_OWNER_COOKIE, OWNER_COOKIE, create_app
@@ -194,7 +206,10 @@ def test_https_only_blocks_a_direct_backend_even_on_loopback(tmp_path: Path) -> 
         )
 
 
-def test_oidc_link_requires_owner_csrf_and_callback_is_one_use(tmp_path: Path) -> None:
+def test_oidc_link_requires_owner_csrf_and_callback_is_one_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYNTHETIC_SECRET", "synthetic client secret")
     oidc = OIDCConfig(
         "https://id.example.test/",
         "client",
@@ -217,9 +232,12 @@ def test_oidc_link_requires_owner_csrf_and_callback_is_one_use(tmp_path: Path) -
         csrf = created.json()["data"]["csrf"]
         original_cookie = client.cookies.get(OWNER_COOKIE)
         assert original_cookie is not None
-        with patch(
-            "inky_bird_frame.web.authorization_url",
-            return_value="https://id.example.test/authorize",
+        with (
+            patch("inky_bird_frame.web.metadata", new=AsyncMock(return_value={})),
+            patch(
+                "inky_bird_frame.web.authorization_url",
+                return_value="https://id.example.test/authorize",
+            ),
         ):
             started = client.post(
                 "/v1/owner/oidc/link",
@@ -234,7 +252,8 @@ def test_oidc_link_requires_owner_csrf_and_callback_is_one_use(tmp_path: Path) -
         tx = json.loads(store.path.read_text())["oidc_transactions"][0]
         assert tx["return_to_access"] is True and tx["remembered"] is False
         callback = "/v1/owner/oidc/callback?state=" + tx["state"] + "&code=synthetic-code"
-        assert client.head(callback).status_code == 405
+        head = client.head(callback)
+        assert (head.status_code, head.headers["allow"]) == (405, "GET")
         assert len(json.loads(store.path.read_text())["oidc_transactions"]) == 1
         with patch(
             "inky_bird_frame.web.verified_identity",
@@ -296,7 +315,9 @@ def test_sso_only_cannot_use_password_to_confirm_browser_changes(tmp_path: Path)
             json={"passphrase": PASSPHRASE},
             headers={"Origin": origin, "X-Inky-CSRF": sso.csrf},
         )
-        assert result.status_code == 400
+        # The feature is off for this installation; the session is still valid.
+        assert result.status_code == 403
+        assert result.json()["error"]["code"] == "feature_unavailable"
         assert "disabled" in result.json()["error"]["message"]
 
 
@@ -322,6 +343,29 @@ def test_incorrect_confirmation_password_keeps_the_session_and_allows_retry(tmp_
             ).status_code
             == 200
         )
+
+
+def test_single_sign_on_over_plain_http_asks_for_secure_access(tmp_path: Path) -> None:
+    oidc = OIDCConfig(
+        "https://id.example.test/",
+        "client",
+        "https://inky.example.test/v1/owner/oidc/callback",
+        "SYNTHETIC_SECRET",
+        owner_subject="owner-subject",
+    )
+    origin = "http://127.0.0.1:8000"
+    with (
+        TestClient(
+            create_app(replace(_config(tmp_path), oidc=oidc)),
+            base_url=origin,
+            client=("127.0.0.1", 41000),
+        ) as client,
+        patch("inky_bird_frame.web.authorization_url") as provider,
+    ):
+        response = client.post("/v1/owner/oidc/start", json={}, headers={"Origin": origin})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "secure_access_required"
+    provider.assert_not_called()
 
 
 def test_oidc_confirmation_requires_a_session_and_csrf_before_contacting_provider(
@@ -361,7 +405,10 @@ def test_oidc_confirmation_requires_a_session_and_csrf_before_contacting_provide
         provider.assert_not_called()
 
 
-def test_oidc_confirmation_callback_rotates_only_the_current_session(tmp_path: Path) -> None:
+def test_oidc_confirmation_callback_rotates_only_the_current_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYNTHETIC_SECRET", "synthetic client secret")
     oidc = OIDCConfig(
         "https://id.example.test/",
         "client",
@@ -384,9 +431,12 @@ def test_oidc_confirmation_callback_rotates_only_the_current_session(tmp_path: P
     origin = "https://inky.example.test"
     with TestClient(create_app(config), base_url=origin) as client:
         client.cookies.set(OWNER_COOKIE, current.secret, domain="inky.example.test", path="/")
-        with patch(
-            "inky_bird_frame.web.authorization_url",
-            return_value="https://id.example.test/authorize",
+        with (
+            patch("inky_bird_frame.web.metadata", new=AsyncMock(return_value={})),
+            patch(
+                "inky_bird_frame.web.authorization_url",
+                return_value="https://id.example.test/authorize",
+            ),
         ):
             started = client.post(
                 "/v1/owner/oidc/start",
@@ -666,8 +716,6 @@ def test_bundled_owner_page_uses_external_assets_and_cannot_frame(tmp_path: Path
 def test_blank_sign_in_secret_is_reported_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
-    from unittest.mock import AsyncMock
-
     oidc = OIDCConfig(
         "https://id.example.test/",
         "client",
@@ -692,3 +740,687 @@ def test_blank_sign_in_secret_is_reported_unavailable(
     assert provider["error"] == (
         "Sign-in provider secret is unavailable; ask the installer to check it"
     )
+
+
+ORIGIN = "https://inky.example.test"
+
+
+def _app_config(root: Path) -> AppConfig:
+    path = root / "config.toml"
+    initialize_config(path)
+    path.write_text(
+        path.read_text().replace(
+            '["controller"]', '["controller"]\nowner_allowed_origins = ["' + ORIGIN + '"]'
+        )
+    )
+    return load_config(path, load_secrets=False)
+
+
+def _owner_headers(client: TestClient, config: ControllerConfig) -> dict[str, str]:
+    return {"Origin": ORIGIN, "X-Inky-CSRF": _setup(client, config, ORIGIN)}
+
+
+def test_collection_actions_name_the_method_they_accept(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with TestClient(create_app(config), base_url=ORIGIN) as client:
+        _owner_headers(client, config)
+        response = client.get("/v1/owner/journal/collections/queue")
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+    assert response.headers["Allow"] == "POST"
+
+
+def _linked_sso(tmp_path: Path) -> tuple[ControllerConfig, AccessStore]:
+    oidc = OIDCConfig(
+        "https://id.example.test/",
+        "client",
+        "https://inky.example.test/v1/owner/oidc/callback",
+        "SYNTHETIC_SECRET",
+    )
+    config = replace(_config(tmp_path), oidc=oidc)
+    store = AccessStore(config.state_dir, oidc_provider_id=provider_id(oidc))
+    store.setup_owner("birder", PASSPHRASE)
+    tx, browser = store.begin_oidc(link_secret=store.login(PASSPHRASE, username="birder").secret)
+    store.complete_oidc(
+        store.consume_oidc(tx.state, browser),
+        oidc.issuer,
+        "owner-subject",
+        authenticated_at=datetime.now(UTC).timestamp(),
+    )
+    return config, store
+
+
+def test_provider_outage_does_not_push_out_an_owner_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from inky_bird_frame.access import MAX_OIDC_TRANSACTIONS, OIDCTransaction
+    from inky_bird_frame.oidc import OIDCError
+
+    config, _ = _linked_sso(tmp_path)
+    monkeypatch.setenv("SYNTHETIC_SECRET", "synthetic client secret")
+    started: list[OIDCTransaction] = []
+    outage = False
+
+    def provider(*args: object) -> object:
+        if outage:
+            raise OIDCError("Sign-in provider is unavailable")
+        if len(args) == 1:
+            return {}
+        assert isinstance(args[1], OIDCTransaction)
+        started.append(args[1])
+        return "https://id.example.test/authorize"
+
+    with (
+        patch("inky_bird_frame.web.metadata", new=AsyncMock(side_effect=provider)),
+        patch("inky_bird_frame.web.authorization_url", new=AsyncMock(side_effect=provider)),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        owner = client.post("/v1/owner/oidc/start", json={}, headers={"Origin": ORIGIN})
+        assert owner.status_code == 200
+        transaction = started[-1]
+        outage = True
+        # Each failed start used to take a slot and push out the oldest start.
+        for _ in range(MAX_OIDC_TRANSACTIONS + 1):
+            failed = client.post("/v1/owner/oidc/start", json={}, headers={"Origin": ORIGIN})
+            assert failed.status_code == 400
+            assert failed.json()["error"]["message"] == "Sign-in provider is unavailable"
+        with patch(
+            "inky_bird_frame.web.verified_identity",
+            return_value=VerifiedIdentity("owner-subject", datetime.now(UTC).timestamp()),
+        ):
+            completed = client.get(
+                "/v1/owner/oidc/callback?code=synthetic-code&state=" + transaction.state,
+                follow_redirects=False,
+            )
+    assert completed.headers["location"] == "/app"
+
+
+def test_unreadable_retained_history_keeps_its_owner_message(tmp_path: Path) -> None:
+    app_config = _app_config(tmp_path)
+    config = app_config.controller
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    retained = config.state_dir / "ebird-archive-observations.json"
+    retained.write_bytes(b"not json")
+    retained.chmod(0o600)
+    with TestClient(create_app(config, app_config=app_config), base_url=ORIGIN) as client:
+        headers = _owner_headers(client, config)
+        response = client.post("/v1/owner/imports/retained", json={}, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "data_source_unavailable",
+        "message": "Invalid eBird archive state",
+    }
+    assert retained.read_bytes() == b"not json"
+
+
+def test_owner_json_survives_deep_nesting(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    config = _config(tmp_path)
+    with (
+        caplog.at_level("INFO", logger="inky_bird_frame.web"),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        headers = _owner_headers(client, config)
+        # Python 3.11 raises RecursionError for nesting far below this body cap.
+        with patch("inky_bird_frame.web.json.loads", side_effect=RecursionError):
+            refused = client.post(
+                "/v1/owner/login",
+                content=b'{"passphrase": "synthetic"}',
+                headers={"Origin": ORIGIN, "Content-Type": "application/json"},
+            )
+        nested = b'{"document": ' + b"[" * 200_000 + b"}"
+        deep = client.post(
+            "/v1/owner/journal/collections/import-preview",
+            content=nested,
+            headers={**headers, "Content-Type": "application/json"},
+        )
+    for response in (refused, deep):
+        assert response.status_code == 400
+        assert response.json()["error"] == {
+            "code": "access_error",
+            "message": "Owner request contains invalid JSON",
+        }
+    # Before 1.0 this was a logged server error; the log still records it.
+    assert len(_logged_failures(caplog, RecursionError)) >= 1
+
+
+async def _complete(call: Awaitable[None]) -> None:
+    await call
+
+
+def _asgi(app: ASGIApp, scope: Scope, messages: list[Message]) -> tuple[int, Headers, bytes]:
+    sent: list[Message] = []
+    queue = list(messages)
+
+    async def receive() -> Message:
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    asyncio.run(_complete(app(scope, receive, send)))
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return start["status"], Headers(raw=start["headers"]), body
+
+
+def _scope(method: str, path: str, **overrides: object) -> Scope:
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"inky.example.test"),
+            (b"origin", ORIGIN.encode()),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("192.0.2.2", 41000),
+        "server": ("192.0.2.1", 443),
+    }
+    scope.update(overrides)
+    return scope
+
+
+def _logged_failures(
+    caplog: pytest.LogCaptureFixture, failure: BaseException | type[BaseException]
+) -> list[logging.LogRecord]:
+    """Web log records that carry ``failure`` (or one of its type) with a traceback."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "inky_bird_frame.web"
+        and record.exc_info is not None
+        and record.exc_info[2] is not None
+        and (
+            record.exc_info[1] is failure
+            if isinstance(failure, BaseException)
+            else isinstance(record.exc_info[1], failure)
+        )
+    ]
+
+
+def test_a_client_that_disconnects_mid_body_gets_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    from starlette.requests import ClientDisconnect
+
+    app = create_app(_config(tmp_path))
+    with caplog.at_level("INFO", logger="inky_bird_frame.web"):
+        status, _, body = _asgi(
+            app,
+            _scope("POST", "/v1/owner/login"),
+            [{"type": "http.request", "body": b'{"pass', "more_body": True}],
+        )
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "request_incomplete"
+    # No unhandled server error, but the private log still records what happened.
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert [r.levelname for r in _logged_failures(caplog, ClientDisconnect)] == ["INFO"]
+
+
+def test_owner_boundary_classifies_the_path_the_router_matches(tmp_path: Path) -> None:
+    # The router strips root_path; the boundary must judge the same path.
+    app = create_app(_config(tmp_path))
+    status, headers, body = _asgi(
+        app,
+        _scope(
+            "GET",
+            "/prefix/v1/owner/journal",
+            root_path="/prefix",
+            scheme="http",
+            headers=[(b"host", b"inky.example.test")],
+        ),
+        [],
+    )
+    assert status == 403
+    assert json.loads(body)["error"]["code"] == "secure_access_required"
+    assert headers["cache-control"] == "no-store"
+    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+
+
+@pytest.mark.parametrize(
+    ("path", "root_path"),
+    [
+        ("/v1/owner/journal", ""),
+        ("/prefix/v1/owner/journal", "/prefix"),
+        ("/prefix", "/prefix"),
+        ("/prefixed/v1/owner", "/prefix"),
+        ("/other/v1/owner", "/prefix"),
+    ],
+)
+def test_route_path_matches_starlette(path: str, root_path: str) -> None:
+    # Starlette keeps this helper private; this pins the local copy to it.
+    from starlette._utils import get_route_path
+
+    from inky_bird_frame.web import _route_path
+
+    scope = _scope("GET", path, root_path=root_path)
+    assert _route_path(scope) == get_route_path(scope)
+
+
+def test_direct_tls_sends_no_host_wide_https_policy(tmp_path: Path) -> None:
+    # HSTS binds every port on the hostname, including services that are not Inky.
+    direct = replace(
+        _config(tmp_path),
+        tls_certificate=tmp_path / "cert.pem",
+        tls_private_key=tmp_path / "key.pem",
+    )
+    with TestClient(create_app(direct), base_url=ORIGIN) as client:
+        for path in ("/app", "/health", "/v1/access", "/v1/owner/journal", "/nope"):
+            assert "strict-transport-security" not in client.get(path).headers
+
+
+def test_owner_boundary_strips_a_root_path_only_at_a_segment(tmp_path: Path) -> None:
+    # The router keeps "/v1/owner/journal" whole under root "/v", so the boundary must too.
+    app = create_app(_config(tmp_path))
+    status, _, body = _asgi(
+        app,
+        _scope(
+            "GET",
+            "/v1/owner/journal",
+            root_path="/v",
+            scheme="http",
+            headers=[(b"host", b"inky.example.test")],
+        ),
+        [],
+    )
+    assert status == 403
+    assert json.loads(body)["error"]["code"] == "secure_access_required"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        b"inky.example.test@evil.test",
+        b"inky.example.test/x",
+        b"inky.example.test:abc",
+        b"[::1",
+        b"inky.example.test, evil.test",
+        b"evil.test#inky.example.test",
+    ],
+)
+def test_a_malformed_host_is_never_taken_for_the_owner_origin(tmp_path: Path, host: bytes) -> None:
+    app = create_app(_config(tmp_path))
+    status, _, body = _asgi(
+        app,
+        _scope("GET", "/v1/owner/journal", headers=[(b"host", host), (b"origin", ORIGIN.encode())]),
+        [],
+    )
+    assert status == 403
+    assert json.loads(body)["error"]["code"] == "secure_access_required"
+
+
+def test_manifest_lets_the_app_be_added_to_a_home_screen(tmp_path: Path) -> None:
+    with TestClient(create_app(_config(tmp_path))) as client:
+        page = client.get("/app")
+        assert '<link rel="manifest" href="/app/manifest.webmanifest">' in page.text
+        response = client.get("/app/manifest.webmanifest")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/manifest+json"
+        assert response.headers["cache-control"] == "no-cache"
+        manifest = response.json()
+        assert manifest["start_url"] == "/app"
+        assert manifest["scope"] == "/app"
+        assert manifest["display"] == "standalone"
+        sizes = set()
+        for icon in manifest["icons"]:
+            image = client.get(icon["src"])
+            assert image.status_code == 200
+            assert image.headers["content-type"] == icon["type"] == "image/png"
+            with Image.open(io.BytesIO(image.content)) as decoded:
+                assert icon["sizes"] == f"{decoded.width}x{decoded.height}"
+            sizes.add(icon["sizes"])
+        assert {"180x180", "512x512"} <= sizes
+        assert "manifest-src 'self'" in client.get("/app").headers["content-security-policy"]
+
+
+def test_signing_out_and_forgetting_a_screen_clear_cached_images(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with TestClient(create_app(config), base_url=ORIGIN) as client:
+        headers = _owner_headers(client, config)
+        signed_out = client.post("/v1/owner/logout", json={}, headers=headers)
+        forgotten = client.post("/v1/screen/forget", json={}, headers={"Origin": ORIGIN})
+    for response in (signed_out, forgotten):
+        assert response.status_code == 200
+        assert response.headers["clear-site-data"] == '"cache"'
+
+
+def test_import_cleanup_warning_names_the_storage_problem(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import errno
+
+    from inky_bird_frame.owner_operations import OwnerOperationError
+
+    app_config = _app_config(tmp_path)
+    failure = OwnerOperationError("Private import cleanup could not finish")
+    failure.__cause__ = PermissionError(errno.EACCES, "Permission denied", str(tmp_path))
+    with (
+        caplog.at_level("WARNING", logger="inky_bird_frame.web"),
+        patch("inky_bird_frame.web.HistoryImports.cleanup_expired", side_effect=failure),
+        TestClient(create_app(app_config.controller, app_config=app_config)) as client,
+    ):
+        client.get("/v1/access")
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Private import cleanup needs attention (EACCES); inspect imports in the owner app"
+    ]
+    assert str(tmp_path) not in caplog.text
+
+
+@pytest.mark.parametrize("damaged", ['{"schema_version": 1}', "{bad"])
+def test_corrupt_screen_state_is_unavailable_not_a_request_error(
+    tmp_path: Path, damaged: str
+) -> None:
+    config = _config(tmp_path)
+    config.state_dir.mkdir(parents=True)
+    state = config.state_dir / "presentation-access.json"
+    state.write_text(damaged)
+    state.chmod(0o600)
+    with TestClient(create_app(config), base_url=ORIGIN) as client:
+        client.cookies.set("__Host-inky-screen", "s" * 43, domain="inky.example.test", path="/")
+        responses = [
+            client.get("/wall/v1/catalog"),
+            client.get("/wall/health"),
+            client.get("/v1/screen/view"),
+            client.get("/v1/dashboard/art"),
+            client.get("/v1/integrations/status", headers={"Authorization": "Bearer " + "s" * 43}),
+        ]
+    for response in responses:
+        assert response.status_code == 503, response.request.url
+        assert response.json()["error"] == {
+            "code": "journal_unavailable",
+            # The specific recovery step survives, so the owner restores the right file.
+            "message": "Presentation access state is invalid. Restore its matching private backup.",
+        }
+    assert state.read_text() == damaged
+
+
+@pytest.mark.parametrize(
+    ("raised", "shown"),
+    [
+        ("Presentation access storage is full", "Presentation access storage is full"),
+        (
+            "Cannot read /srv/private/state/presentation-access.json",
+            "Screen access state cannot be read",
+        ),
+    ],
+)
+def test_screen_state_failures_keep_their_safe_message(
+    tmp_path: Path, raised: str, shown: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from inky_bird_frame.journal import JournalError
+
+    config = _config(tmp_path)
+    failure = JournalError(raised)
+    with (
+        patch("inky_bird_frame.web.PresentationAccess.authenticate", side_effect=failure),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        client.cookies.set("__Host-inky-screen", "s" * 43, domain="inky.example.test", path="/")
+        response = client.get("/v1/screen/view")
+    assert response.status_code == 503
+    assert response.json()["error"] == {"code": "journal_unavailable", "message": shown}
+    # Whatever the owner is shown, the private log keeps the original error.
+    logged = _logged_failures(caplog, CatalogError)
+    assert [r.levelname for r in logged] == ["WARNING"]
+    assert logged[0].exc_info is not None and logged[0].exc_info[1] is not None
+    assert logged[0].exc_info[1].__cause__ is failure
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(5, "Input/output error", "/srv/example/state/journal.json"),
+        CatalogError("Invalid catalog index: /srv/example/catalog/index.json"),
+    ],
+)
+def test_unreadable_local_state_is_logged_with_its_cause(
+    tmp_path: Path, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _config(tmp_path)
+    with (
+        patch("inky_bird_frame.web.JournalService.catalog", side_effect=failure),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        response = client.get("/wall/health")
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "journal_unavailable"
+    assert "/srv/example" not in response.text
+    assert [r.levelname for r in _logged_failures(caplog, failure)] == ["WARNING"]
+
+
+def test_missing_image_support_is_reported_as_unavailable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from inky_bird_frame.errors import MissingDependencyError
+
+    config = _config(tmp_path)
+    missing = MissingDependencyError("Install Pillow with JPEG support to make thumbnails")
+    with (
+        patch("inky_bird_frame.web.PlateThumbnails.cached", side_effect=missing),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        _owner_headers(client, config)
+        response = client.get("/v1/owner/journal/birds/1/thumbnail")
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "dependency_missing",
+        "message": "Install Pillow with JPEG support to make thumbnails",
+    }
+    assert [r.getMessage() for r in _logged_failures(caplog, missing)] == [
+        "An owner request needs a component that is not installed"
+    ]
+
+
+def test_https_only_refuses_a_status_credential_over_plain_http(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), owner_access_mode=OwnerAccessMode.HTTPS_ONLY)
+    with (
+        TestClient(
+            create_app(config), base_url="http://127.0.0.1:8000", client=("127.0.0.1", 41000)
+        ) as client,
+        patch("inky_bird_frame.web.PresentationAccess.authenticate") as authenticate,
+    ):
+        response = client.get(
+            "/v1/integrations/status", headers={"Authorization": "Bearer " + "s" * 43}
+        )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "secure_access_required"
+    authenticate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid taxonomy crosswalk: {root}/state/crosswalk.json",
+        "Could not read /Users/Example Person/Library/Application Support/inky/x.json",
+        "/var/lib/inky/state/a b.json is bad",
+        "Request failed: https://birds.example.test/v2/obs?lat=1.0&lng=2.0",
+    ],
+)
+def test_data_source_messages_never_show_a_path_or_address(
+    tmp_path: Path, message: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from inky_bird_frame.errors import DataSourceError
+
+    app_config = _app_config(tmp_path)
+    config = app_config.controller
+    failure = DataSourceError(message.format(root=tmp_path))
+    with (
+        patch("inky_bird_frame.web.HistoryImports.use_retained_history", side_effect=failure),
+        TestClient(create_app(config, app_config=app_config), base_url=ORIGIN) as client,
+    ):
+        headers = _owner_headers(client, config)
+        response = client.post("/v1/owner/imports/retained", json={}, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "data_source_unavailable",
+        "message": "A bird data source cannot be read right now",
+    }
+    # The owner sees safe text; the private log keeps the cause and traceback.
+    assert [r.getMessage() for r in _logged_failures(caplog, failure)] == [
+        "An owner request could not read a bird data source"
+    ]
+
+
+def test_storage_reason_stops_at_a_cycle_of_causes() -> None:
+    from inky_bird_frame.web import _storage_reason
+
+    first, second = RuntimeError("first"), RuntimeError("second")
+    first.__context__, second.__context__ = second, first
+    assert _storage_reason(first) == "unknown cause"
+
+
+def test_the_pairing_pause_applies_to_each_caller_not_the_household(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    AccessStore(config.state_dir).setup_owner("birder", PASSPHRASE)
+    app = create_app(config)
+    kitchen = TestClient(app, base_url=ORIGIN, client=("192.0.2.10", 41000))
+    hallway = TestClient(app, base_url=ORIGIN, client=("192.0.2.11", 41000))
+    first = kitchen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    # A second screen is not held up by the first one's pause.
+    second = hallway.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    kitchen.cookies.clear()
+    again = kitchen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    assert [first.status_code, second.status_code] == [200, 200]
+    assert first.json()["data"]["pairing_code"] != second.json()["data"]["pairing_code"]
+    assert (again.status_code, again.json()["error"]["code"]) == (429, "sign_in_rate_limited")
+
+
+def test_a_trusted_proxy_keeps_each_screen_on_its_own_pairing_pause(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), trusted_proxy_addresses=("192.0.2.1",))
+    AccessStore(config.state_dir).setup_owner("birder", PASSPHRASE)
+    app = create_app(config)
+    proxied = [TestClient(app, base_url=ORIGIN, client=("192.0.2.1", 41000)) for _ in range(3)]
+    statuses = [
+        client.post(
+            "/v1/screen/pair", json={}, headers={"Origin": ORIGIN, "X-Forwarded-For": forwarded}
+        ).status_code
+        for client, forwarded in zip(
+            proxied, ["198.51.100.7", "198.51.100.8", "198.51.100.7"], strict=True
+        )
+    ]
+    assert statuses == [200, 200, 429]
+
+
+def test_saving_keys_or_delivery_addresses_needs_a_recent_sign_in(tmp_path: Path) -> None:
+    from test_config import CONFIG
+
+    origin = "https://inky.example.test"
+    path = tmp_path / "config.toml"
+    path.write_text(
+        CONFIG.replace(
+            "[controller]\n",
+            '[controller]\nconfiguration_ownership = "app"\n'
+            f'owner_allowed_origins = ["{origin}"]\n',
+        )
+    )
+    path.chmod(0o600)
+    config = load_config(path, load_secrets=False)
+    store = AccessStore(config.controller.state_dir)
+    store.setup_owner("fixture-owner", PASSPHRASE)
+    with TestClient(create_app(config.controller, app_config=config), base_url=origin) as client:
+        signed = client.post(
+            "/v1/owner/login",
+            json={"username": "fixture-owner", "passphrase": PASSPHRASE},
+            headers={"Origin": origin},
+        )
+        headers = {"Origin": origin, "X-Inky-CSRF": signed.json()["data"]["csrf"]}
+        raw = json.loads(store.path.read_text())
+        raw["sessions"][0]["authenticated_at"] -= 601
+        store.path.write_text(json.dumps(raw))
+
+        def save(changes: dict[str, object]) -> tuple[int, str]:
+            revision = client.get("/v1/owner/settings").json()["data"]["revision"]
+            response = client.post(
+                "/v1/owner/settings",
+                json={"revision": revision, "changes": changes},
+                headers=headers,
+            )
+            return response.status_code, response.json().get("error", {}).get("code", "")
+
+        before = path.read_bytes()
+        sensitive: list[dict[str, object]] = [
+            {"discovery": {"ebird_api_key": "synthetic-key"}},
+            {
+                "notifications": {
+                    "destinations": [{"name": "Phone", "url": "json://example.test/hook"}]
+                }
+            },
+        ]
+        for changes in sensitive:
+            assert save(changes) == (403, "confirmation_required")
+            assert path.read_bytes() == before
+        # A malformed destination is a request mistake, not a server failure.
+        assert save({"notifications": {"destinations": [{"name": ["x"]}]}}) == (
+            400,
+            "journal_error",
+        )
+        assert path.read_bytes() == before
+        # Everything else saves as before, so an older page keeps working.
+        assert save({"discovery": {"radius_km": 9}}) == (200, "")
+        stale = client.post(
+            "/v1/owner/settings",
+            json={"revision": "0" * 64, "changes": {"discovery": {"radius_km": 8}}},
+            headers=headers,
+        )
+        assert (stale.status_code, stale.json()["error"]["code"]) == (409, "journal_changed")
+        client.post("/v1/owner/confirm-password", json={"passphrase": PASSPHRASE}, headers=headers)
+        assert save({"discovery": {"ebird_api_key": "synthetic-key"}}) == (200, "")
+
+
+@pytest.mark.parametrize(
+    ("installation", "message"),
+    [
+        ("no-file", "This installation has no editable configuration file"),
+        ("managed", "These settings are managed by the installer, not the browser"),
+    ],
+)
+def test_a_settings_save_the_installation_refuses_keeps_its_own_reason(
+    tmp_path: Path, installation: str, message: str
+) -> None:
+    from test_config import CONFIG
+
+    origin = "https://inky.example.test"
+    path = tmp_path / "config.toml"
+    path.write_text(
+        CONFIG.replace("[controller]\n", f'[controller]\nowner_allowed_origins = ["{origin}"]\n')
+    )
+    path.chmod(0o600)
+    config = load_config(path, load_secrets=False)
+    if installation == "no-file":
+        config = replace(config, configuration_path=None)
+    store = AccessStore(config.controller.state_dir)
+    store.setup_owner("fixture-owner", PASSPHRASE)
+    with TestClient(create_app(config.controller, app_config=config), base_url=origin) as client:
+        signed = client.post(
+            "/v1/owner/login",
+            json={"username": "fixture-owner", "passphrase": PASSPHRASE},
+            headers={"Origin": origin},
+        )
+        headers = {"Origin": origin, "X-Inky-CSRF": signed.json()["data"]["csrf"]}
+        raw = json.loads(store.path.read_text())
+        raw["sessions"][0]["authenticated_at"] -= 601
+        store.path.write_text(json.dumps(raw))
+        revision = client.get("/v1/owner/settings").json()["data"]["revision"]
+        before = path.read_bytes()
+        for changes in (
+            {"discovery": {"radius_km": 9}},
+            {"discovery": {"ebird_api_key": "synthetic-key"}},
+        ):
+            response = client.post(
+                "/v1/owner/settings",
+                json={"revision": revision or "x", "changes": changes},
+                headers=headers,
+            )
+            assert (response.status_code, response.json()["error"]) == (
+                400,
+                {"code": "journal_error", "message": message},
+            )
+            assert path.read_bytes() == before

@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
@@ -36,6 +36,7 @@ from .birds import (
     EbirdArchiveSpecies,
     EbirdSpecies,
     ObservationWindow,
+    TaxonContext,
     fetch_birdnet_go_species,
     fetch_birdweather_species,
     fetch_ebird_observations,
@@ -98,6 +99,7 @@ from .errors import (
 from .geo import DiscoveryLocation, resolve_discovery_location
 from .http import read_private_json, write_json_atomic
 from .images import prepare_generated_plate
+from .installation import generation_species_timeout_seconds
 from .models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from .notifications import safe_notify, safe_record_degradation, safe_record_recovery
 from .prompts import PROMPT_VERSION
@@ -128,7 +130,23 @@ CARRY_FORWARD_REFRESHES = 3
 CARRY_FORWARD_MAXIMUM = timedelta(hours=24)
 NEW_SPECIES_NOTICE_NAMES = 10
 NEW_SPECIES_NOTICES_MAX_BYTES = 1024 * 1024
+# Failed tries after which a bird waits for the owner's retry instead of
+# retrying by itself; with the default backoff this is about a week.
+MAX_AUTOMATIC_GENERATION_TRIES = 12
+STOPPED_GENERATION_ERROR = "Generation was stopped before it finished"
 _LOG = logging.getLogger(__name__)
+
+
+class GenerationStopRequested(BaseException):
+    """Raised from a stop-signal handler so the running bird's try is recorded.
+
+    It is not an Exception, so the per-bird handlers that keep a cycle going
+    cannot swallow it.
+    """
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
 
 
 @dataclass(frozen=True)
@@ -995,8 +1013,8 @@ def queue_owner_selection_locked(
         )
         _write_generation_queue(config, current)
     return {
-        "message": "Missing-plate requests saved. Existing holds and retry dates remain. "
-        "No model started, and Saved birds and wall selection did not change.",
+        "message": "The missing plates were asked for. Birds already waiting or held "
+        "are left as they are. Nothing is drawn yet, and your frame did not change.",
         "queued": len(new_ids),
         "already_queued": len(cast(list[int], plan["already_queued"])),
         "held": len(cast(list[int], plan["held"])),
@@ -1294,14 +1312,17 @@ def _write_active_catalog(
 def refresh_observations(config: AppConfig) -> dict[str, object]:
     try:
         result = run_refresh_cycle(config)
-    except (InkyBirdFrameError, OSError) as exc:
-        safe_record_degradation(
-            config,
-            key="observation-refresh",
-            title="Bird discovery is degraded",
-            body=f"Observation refresh failed ({type(exc).__name__}). "
-            "Check controller logs for details.",
-        )
+    except Exception as exc:
+        from .cli import _failure_notification, _is_busy
+
+        # Another refresh already running is not a failure of discovery.
+        if not _is_busy(exc):
+            safe_record_degradation(
+                config,
+                key="observation-refresh",
+                title="Bird discovery is degraded",
+                body=_failure_notification("Observation refresh", exc),
+            )
         raise
     safe_record_recovery(
         config,
@@ -1622,10 +1643,12 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
                 },
             )
             active_count = _write_active_catalog(config, species_list)
+    # Scheduled runs print this result to service logs; the place stays only in
+    # private controller state. The keys stay for 1.x output compatibility.
     return {
         "refreshed_at": refreshed_at.isoformat(),
-        "place_name": place_name,
-        "state": state,
+        "place_name": "",
+        "state": "",
         "window": config.discovery.observation_window.value,
         "radius_km": config.discovery.radius_km,
         "source": discovery_source_label(config.discovery.sources),
@@ -2017,6 +2040,7 @@ def retry_approved_candidate(
                     cache_sources,
                 )
                 active_count = _write_active_catalog(config, observed)
+                reset_research_allowance(config, taxon_id)
                 return {
                     "taxon_id": taxon_id,
                     "status": "eligible",
@@ -2107,6 +2131,8 @@ def retry_approved_candidate(
                     )
                 active_count = _write_active_catalog_after_removal(config, observed, taxon_id)
                 moved.extend(_archive_controller_paths(config.controller.state_dir, [withdrawn]))
+            # The owner's replacement starts a new run.
+            reset_research_allowance(config, taxon_id)
 
     return {
         "taxon_id": taxon_id,
@@ -2203,9 +2229,7 @@ def _change_collection(
                 ).encode()
             ).hexdigest()
             if expected_revision is not None and expected_revision != revision:
-                raise CatalogError(
-                    "Saved birds or approved artwork changed. Review this action again."
-                )
+                raise CatalogError("On my frame or your plates changed. Review this again.")
             requested_taxa = (
                 {entry.taxon_id for entry in approved} if taxon_ids is None else taxon_ids
             )
@@ -2267,11 +2291,11 @@ def change_saved_collection(
     if action not in {"add", "remove", "import-approved"} or (action == "import-approved") != (
         taxon_id is None
     ):
-        raise ValueError("Choose a supported Saved birds action")
+        raise ValueError("Choose a supported change to On my frame")
     if action == "add" and not any(
         entry.taxon_id == taxon_id for entry in read_catalog_entries(config.controller.catalog_dir)
     ):
-        raise CatalogError("Choose approved artwork before adding it to Saved birds")
+        raise CatalogError("Choose a bird with a plate before adding it to On my frame")
     with catalog_state_lock(config.controller.state_dir) if dry_run else nullcontext():
         return _change_collection(
             config,
@@ -2394,6 +2418,41 @@ def _timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _research_budget(config: AppConfig) -> ResearchBudget:
+    return ResearchBudget(
+        config.controller.state_dir / "research-budget.json",
+        daily_limit=config.research.max_searches_per_day,
+        species_limit=config.research.max_searches_per_species,
+    )
+
+
+def reset_research_allowance(config: AppConfig, taxon_id: int) -> None:
+    """Give a bird a full research allowance for a new run; the daily total stays."""
+    _research_budget(config).reset_species(taxon_id)
+
+
+def _research_profile(
+    config: AppConfig,
+    species: BirdSpecies,
+    output_path: Path,
+    create: Callable[[], SpeciesProfileData],
+) -> SpeciesProfileData:
+    """Count a research call before it runs; give it back if it never answered.
+
+    The count is saved first, so a process that dies mid-call keeps it. A call
+    that ends without writing its answer (a timeout or an agent outage) found
+    nothing usable; the automatic-try ceiling bounds those instead.
+    """
+    budget = _research_budget(config)
+    budget.consume(species.taxon_id)
+    try:
+        return create()
+    except Exception:
+        if not output_path.exists():
+            budget.refund(species.taxon_id)
+        raise
+
+
 def load_or_create_profile(
     config: AppConfig,
     species: BirdSpecies,
@@ -2405,6 +2464,7 @@ def load_or_create_profile(
 ) -> tuple[SpeciesProfileData, Path]:
     cache_path = config.controller.state_dir / "profiles" / str(species.taxon_id) / "profile.json"
     cached = cache_path.is_file()
+    context: TaxonContext | None = None
     if cached:
         try:
             raw = json.loads(cache_path.read_text())
@@ -2414,25 +2474,44 @@ def load_or_create_profile(
             profile = parse_species_profile(raw, config.research.allowed_domains)
         except GenerationError as exc:
             raise SpeciesStateError(f"Invalid cached species profile: {cache_path}") from exc
-    else:
+        if (
+            config.research.enabled
+            and profile["taxon_id"] == species.taxon_id
+            and (
+                profile["common_name"] != species.common_name
+                or profile["scientific_name"] != species.scientific_name
+            )
+        ):
+            # Archive the researched profile only when iNaturalist itself now uses
+            # the new name; a stale discovery name must not cost a new search.
+            context = fetch_taxon_context(species.taxon_id)
+            if (context.common_name, context.scientific_name) == (
+                species.common_name,
+                species.scientific_name,
+            ):
+                _archive_controller_paths(config.controller.state_dir, [cache_path.parent])
+                cached = False
+    if not cached:
         if not config.research.enabled:
             raise GenerationError(
                 f"Taxon {species.taxon_id} has no cached profile and research is disabled"
             )
-        context = fetch_taxon_context(species.taxon_id)
-        ResearchBudget(
-            config.controller.state_dir / "research-budget.json",
-            daily_limit=config.research.max_searches_per_day,
-            species_limit=config.research.max_searches_per_species,
-        ).consume(species.taxon_id)
-        profile = runner.create_profile(
+        if context is None:
+            context = fetch_taxon_context(species.taxon_id)
+        researched_context = context
+        profile = _research_profile(
+            config,
             species,
-            context,
-            references,
-            reference_paths,
             output_path,
-            log_path,
-            allowed_domains=config.research.allowed_domains,
+            lambda: runner.create_profile(
+                species,
+                researched_context,
+                references,
+                reference_paths,
+                output_path,
+                log_path,
+                allowed_domains=config.research.allowed_domains,
+            ),
         )
     if (
         profile["taxon_id"] != species.taxon_id
@@ -2462,22 +2541,22 @@ def _refresh_profile_after_conflict(
     if not config.research.enabled:
         raise GenerationError("Profile conflict requires research, but research is disabled")
     context = fetch_taxon_context(species.taxon_id)
-    ResearchBudget(
-        config.controller.state_dir / "research-budget.json",
-        daily_limit=config.research.max_searches_per_day,
-        species_limit=config.research.max_searches_per_species,
-    ).consume(species.taxon_id)
     write_json_atomic(log_path.parent / "profile-before-refresh.json", prior_profile)
-    researched_profile = runner.create_profile(
+    researched_profile = _research_profile(
+        config,
         species,
-        context,
-        references,
-        reference_paths,
         output_path,
-        log_path,
-        allowed_domains=config.research.allowed_domains,
-        prior_profile=prior_profile,
-        profile_conflicts=profile_conflicts,
+        lambda: runner.create_profile(
+            species,
+            context,
+            references,
+            reference_paths,
+            output_path,
+            log_path,
+            allowed_domains=config.research.allowed_domains,
+            prior_profile=prior_profile,
+            profile_conflicts=profile_conflicts,
+        ),
     )
     profile = _merge_refreshed_profile(prior_profile, researched_profile, profile_conflicts)
     cache_path = config.controller.state_dir / "profiles" / str(species.taxon_id) / "profile.json"
@@ -2547,6 +2626,7 @@ def generate_candidate(
     initial_correction_source: Path | None = None,
     invariant_correction_findings: tuple[str, ...] = (),
     initial_profile_conflicts: tuple[ProfileConflict, ...] = (),
+    retry_store: RetryStore | None = None,
 ) -> Path:
     state_dir = config.controller.state_dir
     if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
@@ -2599,234 +2679,264 @@ def generate_candidate(
         profile_refresh_used = False
         terminal_detail: str | None = None
         history: list[dict[str, object]] = []
-        for attempt in range(1, config.controller.max_generation_attempts + 1):
-            progress("generating", attempt=attempt)
-            attempt_dir = work / f"attempt-{attempt:02d}"
-            attempt_dir.mkdir()
-            portrait_path = attempt_dir / "portrait.png"
-            display_path = attempt_dir / "display.png"
-            carried_invariants = _deduplicate_findings(
-                invariant_correction_findings,
-                resolved_corrections,
-            )
-            history_entry: dict[str, object] = {
-                "attempt": attempt,
-                "started_at": utc_now(),
-                "prompt_version": PROMPT_VERSION,
-                "generator": "Codex subscription / built-in gpt-image-2",
-                "requested_model": config.controller.codex_model,
-                "has_correction_source": correction_source is not None,
-                "carried_invariant_count": len(carried_invariants),
-            }
-            generation_started = monotonic()
-            try:
-                with TemporaryDirectory(
-                    prefix=f"{species.taxon_id}-attempt-{attempt:02d}-",
-                    dir=generation_parent,
-                ) as generation_temporary:
-                    generated_path = Path(generation_temporary) / "generated.png"
-                    correction_source_sha256 = (
-                        sha256_file(correction_source) if correction_source is not None else None
-                    )
-                    runner.generate_plate(
-                        species,
-                        profile,
-                        references,
-                        reference_paths,
-                        generated_path,
-                        logs / f"02-generation-attempt-{attempt:02d}.log",
-                        correction_findings,
-                        correction_source_path=correction_source,
-                        invariant_findings=carried_invariants,
-                    )
-                    prepare_generated_plate(generated_path, portrait_path, display_path)
-            except Exception as exc:
-                history_entry["generation_seconds"] = round(monotonic() - generation_started, 3)
-                history_entry["outcome"] = "generation_error"
-                history_entry["error_type"] = type(exc).__name__
-                history.append(history_entry)
-                _write_attempt_history(logs, work, history)
-                raise
-            history_entry["generation_seconds"] = round(monotonic() - generation_started, 3)
-
-            progress("reviewing")
-            review_started = monotonic()
-            reviewed_corrections = _deduplicate_findings(
-                prior_review_corrections,
-                tuple(
-                    finding
-                    for finding in correction_findings
-                    if finding not in {PROFILE_REFRESH_CORRECTION, REVIEW_FAILURE_FALLBACK}
-                ),
-            )
-            try:
-                review = runner.review_plate(
-                    species,
-                    profile,
-                    references,
-                    portrait_path,
-                    reference_paths,
-                    attempt_dir / "quality-review.json",
-                    logs / f"03-quality-review-attempt-{attempt:02d}.log",
-                    allowed_domains=config.research.allowed_domains,
-                    prior_corrections=reviewed_corrections,
-                    prior_profile_conflicts=prior_profile_conflicts,
+        corrections_ready = False
+        passed = False
+        try:
+            for attempt in range(1, config.controller.max_generation_attempts + 1):
+                progress("generating", attempt=attempt)
+                attempt_dir = work / f"attempt-{attempt:02d}"
+                attempt_dir.mkdir()
+                portrait_path = attempt_dir / "portrait.png"
+                display_path = attempt_dir / "display.png"
+                carried_invariants = _deduplicate_findings(
+                    invariant_correction_findings,
+                    resolved_corrections,
                 )
-            except Exception as exc:
-                history_entry["review_seconds"] = round(monotonic() - review_started, 3)
-                history_entry["outcome"] = "review_error"
-                history_entry["error_type"] = type(exc).__name__
-                history.append(history_entry)
-                _write_attempt_history(logs, work, history)
-                raise
-            history_entry["review_seconds"] = round(monotonic() - review_started, 3)
-            write_json_atomic(attempt_dir / "quality-review.json", review.as_dict())
-            history_entry["quality_review"] = review.as_dict()
-            history_entry["outcome"] = (
-                "passed"
-                if review.passed
-                else "profile_conflict"
-                if review.profile_conflicts
-                else "correction_required"
-            )
-            if correction_source_sha256 is not None:
-                history_entry["correction_source_sha256"] = correction_source_sha256
-            current_scores = {
-                "species_accuracy": review.species_accuracy,
-                "anatomy_accuracy": review.anatomy_accuracy,
-                "text_accuracy": review.text_accuracy,
-                "composition_quality": review.composition_quality,
-            }
-            history_entry["failed_axes"] = [
-                axis for axis, score in current_scores.items() if score < 4
-            ] + ([] if review.location_free else ["location_free"])
-            new_correction_keys = {_finding_key(finding) for finding in review.correction_findings}
-            resolved_candidates = _deduplicate_findings(
-                resolved_corrections,
-                review.resolved_corrections,
-            )
-            resolved_keys = {_finding_key(finding) for finding in resolved_candidates}
-            history_entry["newly_resolved_findings"] = list(review.resolved_corrections)
-            history_entry["regressed_findings"] = [
-                finding
-                for finding in review.correction_findings
-                if _finding_key(finding) in resolved_keys
-            ]
-            history_entry["regressed_axes"] = (
-                [
-                    axis
-                    for axis, score in current_scores.items()
-                    if previous_scores is not None and previous_scores[axis] >= 4 and score < 4
-                ]
-                if previous_scores is not None
-                else []
-            )
-            prior_conflict_values = {
-                conflict["field"]: conflict["observed_value"]
-                for conflict in prior_profile_conflicts
-            }
-            history_entry["profile_reversals"] = [
-                conflict["field"]
-                for conflict in review.profile_conflicts
-                if conflict["field"] in prior_conflict_values
-                and prior_conflict_values[conflict["field"]] != conflict["observed_value"]
-            ]
-            history.append(history_entry)
-            _write_attempt_history(logs, work, history)
-            if review.passed:
-                shutil.copy2(profile_path, attempt_dir / "profile.json")
-                write_candidate_manifest(
-                    attempt_dir,
-                    species,
-                    profile,
-                    references,
-                    review,
-                    generator="Codex subscription / built-in gpt-image-2",
-                    prompt_version=PROMPT_VERSION,
-                    attempt=attempt,
-                    max_attempts=config.controller.max_generation_attempts,
-                    correction_source_sha256=correction_source_sha256,
-                )
-                # Build the candidate outside pending/ and rename it in, so a
-                # crash never leaves a partial directory that looks approvable.
-                staged_candidate = work / "pending-candidate"
-                shutil.copytree(attempt_dir, staged_candidate)
-                fsync_tree(staged_candidate)
-                with catalog_state_lock(state_dir):
-                    if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
-                        raise CatalogError(f"Taxon {species.taxon_id} is already approved")
-                    if find_taxon_directory(state_dir / "pending", species.taxon_id) is not None:
-                        raise CatalogError(
-                            f"Taxon {species.taxon_id} already has a pending candidate"
-                        )
-                    destination = candidate_directory(state_dir, species)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    staged_candidate.rename(destination)
-                    fsync_directory(destination.parent)
-                return destination
-
-            resolved_corrections = tuple(
-                finding
-                for finding in resolved_candidates
-                if _finding_key(finding) not in new_correction_keys
-            )
-            prior_review_corrections = _deduplicate_findings(
-                reviewed_corrections,
-                review.correction_findings,
-            )
-            prior_profile_conflicts = review.profile_conflicts
-            previous_scores = current_scores
-            if review.profile_conflicts:
-                if not config.research.enabled:
-                    terminal_detail = (
-                        "a profile conflict requires research, but research is disabled"
-                    )
-                    history_entry["profile_refresh"] = "disabled"
-                    _write_attempt_history(logs, work, history)
-                    break
-                if profile_refresh_used:
-                    terminal_detail = "a profile conflict remained after one source-backed refresh"
-                    history_entry["profile_refresh"] = "conflict_remained"
-                    _write_attempt_history(logs, work, history)
-                    break
-                if attempt == config.controller.max_generation_attempts:
-                    terminal_detail = "a profile conflict was found on the final attempt"
-                    history_entry["profile_refresh"] = "not_run_no_attempt_remaining"
-                    _write_attempt_history(logs, work, history)
-                    break
-                before_refresh = profile
+                history_entry: dict[str, object] = {
+                    "attempt": attempt,
+                    "started_at": utc_now(),
+                    "prompt_version": PROMPT_VERSION,
+                    "generator": "Codex subscription / built-in gpt-image-2",
+                    "requested_model": config.controller.codex_model,
+                    "has_correction_source": correction_source is not None,
+                    "carried_invariant_count": len(carried_invariants),
+                }
+                generation_started = monotonic()
                 try:
-                    profile = _refresh_profile_after_conflict(
-                        config,
-                        species,
-                        references,
-                        reference_paths,
-                        runner,
-                        profile,
-                        review.profile_conflicts,
-                        profile_output_path,
-                        logs / f"04-profile-refresh-attempt-{attempt:02d}.log",
-                    )
+                    with TemporaryDirectory(
+                        prefix=f"{species.taxon_id}-attempt-{attempt:02d}-",
+                        dir=generation_parent,
+                    ) as generation_temporary:
+                        generated_path = Path(generation_temporary) / "generated.png"
+                        correction_source_sha256 = (
+                            sha256_file(correction_source)
+                            if correction_source is not None
+                            else None
+                        )
+                        runner.generate_plate(
+                            species,
+                            profile,
+                            references,
+                            reference_paths,
+                            generated_path,
+                            logs / f"02-generation-attempt-{attempt:02d}.log",
+                            correction_findings,
+                            correction_source_path=correction_source,
+                            invariant_findings=carried_invariants,
+                        )
+                        prepare_generated_plate(generated_path, portrait_path, display_path)
                 except Exception as exc:
-                    history_entry["profile_refresh"] = "failed"
-                    history_entry["profile_refresh_error_type"] = type(exc).__name__
+                    history_entry["generation_seconds"] = round(monotonic() - generation_started, 3)
+                    history_entry["outcome"] = "generation_error"
+                    history_entry["error_type"] = type(exc).__name__
+                    history.append(history_entry)
                     _write_attempt_history(logs, work, history)
                     raise
-                profile_refresh_used = True
-                refreshed_fields = {conflict["field"] for conflict in review.profile_conflicts}
-                prior_profile_conflicts = tuple(
-                    conflict
-                    for conflict in prior_profile_conflicts
-                    if conflict["field"] not in refreshed_fields
+                history_entry["generation_seconds"] = round(monotonic() - generation_started, 3)
+
+                progress("reviewing")
+                review_started = monotonic()
+                reviewed_corrections = _deduplicate_findings(
+                    prior_review_corrections,
+                    tuple(
+                        finding
+                        for finding in correction_findings
+                        if finding not in {PROFILE_REFRESH_CORRECTION, REVIEW_FAILURE_FALLBACK}
+                    ),
                 )
-                history_entry["profile_refresh"] = "completed"
-                history_entry["profile_changed"] = before_refresh != profile
+                try:
+                    review = runner.review_plate(
+                        species,
+                        profile,
+                        references,
+                        portrait_path,
+                        reference_paths,
+                        attempt_dir / "quality-review.json",
+                        logs / f"03-quality-review-attempt-{attempt:02d}.log",
+                        allowed_domains=config.research.allowed_domains,
+                        prior_corrections=reviewed_corrections,
+                        prior_profile_conflicts=prior_profile_conflicts,
+                    )
+                except Exception as exc:
+                    history_entry["review_seconds"] = round(monotonic() - review_started, 3)
+                    history_entry["outcome"] = "review_error"
+                    history_entry["error_type"] = type(exc).__name__
+                    history.append(history_entry)
+                    _write_attempt_history(logs, work, history)
+                    raise
+                history_entry["review_seconds"] = round(monotonic() - review_started, 3)
+                write_json_atomic(attempt_dir / "quality-review.json", review.as_dict())
+                history_entry["quality_review"] = review.as_dict()
+                history_entry["outcome"] = (
+                    "passed"
+                    if review.passed
+                    else "profile_conflict"
+                    if review.profile_conflicts
+                    else "correction_required"
+                )
+                if correction_source_sha256 is not None:
+                    history_entry["correction_source_sha256"] = correction_source_sha256
+                current_scores = {
+                    "species_accuracy": review.species_accuracy,
+                    "anatomy_accuracy": review.anatomy_accuracy,
+                    "text_accuracy": review.text_accuracy,
+                    "composition_quality": review.composition_quality,
+                }
+                history_entry["failed_axes"] = [
+                    axis for axis, score in current_scores.items() if score < 4
+                ] + ([] if review.location_free else ["location_free"])
+                new_correction_keys = {
+                    _finding_key(finding) for finding in review.correction_findings
+                }
+                resolved_candidates = _deduplicate_findings(
+                    resolved_corrections,
+                    review.resolved_corrections,
+                )
+                resolved_keys = {_finding_key(finding) for finding in resolved_candidates}
+                history_entry["newly_resolved_findings"] = list(review.resolved_corrections)
+                history_entry["regressed_findings"] = [
+                    finding
+                    for finding in review.correction_findings
+                    if _finding_key(finding) in resolved_keys
+                ]
+                history_entry["regressed_axes"] = (
+                    [
+                        axis
+                        for axis, score in current_scores.items()
+                        if previous_scores is not None and previous_scores[axis] >= 4 and score < 4
+                    ]
+                    if previous_scores is not None
+                    else []
+                )
+                prior_conflict_values = {
+                    conflict["field"]: conflict["observed_value"]
+                    for conflict in prior_profile_conflicts
+                }
+                history_entry["profile_reversals"] = [
+                    conflict["field"]
+                    for conflict in review.profile_conflicts
+                    if conflict["field"] in prior_conflict_values
+                    and prior_conflict_values[conflict["field"]] != conflict["observed_value"]
+                ]
+                history.append(history_entry)
                 _write_attempt_history(logs, work, history)
-            correction_findings = _deduplicate_findings(
-                review.correction_findings,
-                (PROFILE_REFRESH_CORRECTION,) if review.profile_conflicts else (),
-            ) or (REVIEW_FAILURE_FALLBACK,)
-            correction_source = portrait_path
+                # Ready before the profile refresh, so a failure there keeps this review.
+                correction_findings = _deduplicate_findings(
+                    review.correction_findings,
+                    (PROFILE_REFRESH_CORRECTION,) if review.profile_conflicts else (),
+                ) or (REVIEW_FAILURE_FALLBACK,)
+                correction_source = portrait_path
+                corrections_ready = True
+                if review.passed:
+                    passed = True
+                    shutil.copy2(profile_path, attempt_dir / "profile.json")
+                    write_candidate_manifest(
+                        attempt_dir,
+                        species,
+                        profile,
+                        references,
+                        review,
+                        generator="Codex subscription / built-in gpt-image-2",
+                        prompt_version=PROMPT_VERSION,
+                        attempt=attempt,
+                        max_attempts=config.controller.max_generation_attempts,
+                        correction_source_sha256=correction_source_sha256,
+                    )
+                    # Build the candidate outside pending/ and rename it in, so a
+                    # crash never leaves a partial directory that looks approvable.
+                    staged_candidate = work / "pending-candidate"
+                    shutil.copytree(attempt_dir, staged_candidate)
+                    fsync_tree(staged_candidate)
+                    with catalog_state_lock(state_dir):
+                        if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
+                            raise CatalogError(f"Taxon {species.taxon_id} is already approved")
+                        if (
+                            find_taxon_directory(state_dir / "pending", species.taxon_id)
+                            is not None
+                        ):
+                            raise CatalogError(
+                                f"Taxon {species.taxon_id} already has a pending candidate"
+                            )
+                        destination = candidate_directory(state_dir, species)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        staged_candidate.rename(destination)
+                        fsync_directory(destination.parent)
+                    return destination
+
+                resolved_corrections = tuple(
+                    finding
+                    for finding in resolved_candidates
+                    if _finding_key(finding) not in new_correction_keys
+                )
+                prior_review_corrections = _deduplicate_findings(
+                    reviewed_corrections,
+                    review.correction_findings,
+                )
+                prior_profile_conflicts = review.profile_conflicts
+                previous_scores = current_scores
+                if review.profile_conflicts:
+                    if not config.research.enabled:
+                        terminal_detail = (
+                            "a profile conflict requires research, but research is disabled"
+                        )
+                        history_entry["profile_refresh"] = "disabled"
+                        _write_attempt_history(logs, work, history)
+                        break
+                    if profile_refresh_used:
+                        terminal_detail = (
+                            "a profile conflict remained after one source-backed refresh"
+                        )
+                        history_entry["profile_refresh"] = "conflict_remained"
+                        _write_attempt_history(logs, work, history)
+                        break
+                    if attempt == config.controller.max_generation_attempts:
+                        terminal_detail = "a profile conflict was found on the final attempt"
+                        history_entry["profile_refresh"] = "not_run_no_attempt_remaining"
+                        _write_attempt_history(logs, work, history)
+                        break
+                    before_refresh = profile
+                    try:
+                        profile = _refresh_profile_after_conflict(
+                            config,
+                            species,
+                            references,
+                            reference_paths,
+                            runner,
+                            profile,
+                            review.profile_conflicts,
+                            profile_output_path,
+                            logs / f"04-profile-refresh-attempt-{attempt:02d}.log",
+                        )
+                    except Exception as exc:
+                        history_entry["profile_refresh"] = "failed"
+                        history_entry["profile_refresh_error_type"] = type(exc).__name__
+                        _write_attempt_history(logs, work, history)
+                        raise
+                    profile_refresh_used = True
+                    refreshed_fields = {conflict["field"] for conflict in review.profile_conflicts}
+                    prior_profile_conflicts = tuple(
+                        conflict
+                        for conflict in prior_profile_conflicts
+                        if conflict["field"] not in refreshed_fields
+                    )
+                    history_entry["profile_refresh"] = "completed"
+                    history_entry["profile_changed"] = before_refresh != profile
+                    _write_attempt_history(logs, work, history)
+        except BaseException:
+            if corrections_ready and not passed and correction_source is not None:
+                _keep_interrupted_attempts(
+                    state_dir,
+                    species,
+                    work,
+                    retry_store or RetryStore(state_dir / "generation-retries.json"),
+                    findings=correction_findings,
+                    source=correction_source,
+                    invariant_findings=_deduplicate_findings(
+                        invariant_correction_findings, resolved_corrections
+                    ),
+                    profile_conflicts=prior_profile_conflicts,
+                )
+            raise
 
         with catalog_state_lock(state_dir):
             failed = state_dir / "failed" / f"{species.taxon_id}-{_timestamp()}"
@@ -2842,6 +2952,106 @@ def generate_candidate(
             f"artifacts retained at {failed}",
             profile_conflicts=prior_profile_conflicts,
         )
+
+
+def _keep_interrupted_attempts(
+    state_dir: Path,
+    species: BirdSpecies,
+    work: Path,
+    retry_store: RetryStore,
+    *,
+    findings: tuple[str, ...],
+    source: Path,
+    invariant_findings: tuple[str, ...],
+    profile_conflicts: tuple[ProfileConflict, ...],
+) -> None:
+    """Keep reviewed attempts when a later step fails, so the next try resumes from them.
+
+    Never raises: the failure that stopped generation is the one to report.
+    """
+    try:
+        attempt = source.relative_to(work).parts[0]
+        # Stage inside the run, which is removed if this is interrupted, so the
+        # archive only ever holds complete kept runs.
+        staged = work / "kept-run"
+        staged.mkdir()
+        for name in ("profile.json", "attempt-history.json"):
+            if (work / name).is_file():
+                shutil.copy2(work / name, staged / name)
+        (work / attempt).rename(staged / attempt)
+        fsync_tree(staged)
+        destination = state_dir / "archive" / f"{species.taxon_id}-{_timestamp()}-interrupted"
+        counter = 1
+        while destination.exists():
+            destination = destination.with_name(f"{destination.name}-{counter}")
+            counter += 1
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staged.rename(destination)
+        fsync_directory(destination.parent)
+        retry_store.set_quality_guidance(
+            species.taxon_id,
+            findings,
+            source_plate=(destination / source.relative_to(work)).relative_to(state_dir).as_posix(),
+            invariant_findings=invariant_findings,
+            profile_conflicts=profile_conflicts,
+        )
+        _remove_unused_kept_runs(state_dir, retry_store, species.taxon_id)
+    except (OSError, ValueError, CatalogError) as exc:
+        _LOG.warning(
+            "Earlier attempts for taxon %s could not be kept (%s)",
+            species.taxon_id,
+            type(exc).__name__,
+        )
+
+
+def _remove_unused_kept_runs(state_dir: Path, retry_store: RetryStore, taxon_id: int) -> None:
+    """Remove a bird's kept interrupted runs except the one its next try resumes from.
+
+    Never raises: a run left behind is removed the next time this runs.
+    """
+    guidance = retry_store.quality_guidance(taxon_id)
+    source = guidance.source_plate if guidance is not None else None
+    parts = Path(source).parts if source is not None else ()
+    resumed = parts[1] if len(parts) > 2 and parts[0] == "archive" else None
+    archive = state_dir / "archive"
+    try:
+        runs = list(archive.glob(f"{taxon_id}-*-interrupted*")) if archive.is_dir() else []
+        for run in runs:
+            if run.name != resumed and run.is_dir() and not run.is_symlink():
+                shutil.rmtree(run)
+    except OSError as exc:
+        _LOG.warning(
+            "Earlier attempts for taxon %s could not be removed (%s)", taxon_id, type(exc).__name__
+        )
+
+
+def _forget_approved_bird_retries(state_dir: Path, retry_store: RetryStore, taxon_id: int) -> None:
+    """Drop what an approved bird kept for another try; it is never generated again."""
+    retry_store.clear(taxon_id)
+    retry_store.clear_quality_guidance(taxon_id)
+    _remove_unused_kept_runs(state_dir, retry_store, taxon_id)
+
+
+def _forget_approved_birds_retries(
+    state_dir: Path, retry_store: RetryStore, approved: set[int]
+) -> None:
+    """Catch up birds approved outside the cycle, such as by the owner's approval.
+
+    Callers hold the catalog lock, so a replacement that withdraws a bird's plate
+    and sets its guidance is never seen half done.
+    """
+    archive = state_dir / "archive"
+    runs = archive.glob("*-interrupted*") if archive.is_dir() else ()
+    prefixes = {run.name.partition("-")[0] for run in runs}
+    kept = {int(prefix) for prefix in prefixes if prefix.isascii() and prefix.isdigit()}
+    retrying = {record.taxon_id for record in retry_store.records()}
+    for taxon_id in sorted(approved):
+        if (
+            taxon_id in kept
+            or taxon_id in retrying
+            or retry_store.quality_guidance(taxon_id) is not None
+        ):
+            _forget_approved_bird_retries(state_dir, retry_store, taxon_id)
 
 
 def _retry_source_plate(state_dir: Path, relative_path: str | None) -> Path | None:
@@ -3081,24 +3291,35 @@ def read_generation_queue_partition(
     )
 
 
-def record_failure(state_dir: Path, species: BirdSpecies, error: InkyBirdFrameError) -> Path:
+def record_failure(
+    state_dir: Path,
+    species: BirdSpecies,
+    error: InkyBirdFrameError,
+    *,
+    stop_reason: str | None = None,
+) -> Path:
+    """Save a failure that waits for the owner.
+
+    stop_reason says why automatic work stopped when the error type alone
+    describes something that would otherwise be retried.
+    """
     existing = sorted((state_dir / "failed").glob(f"{species.taxon_id}-*"))
     if existing:
         return existing[-1]
     destination = state_dir / "failed" / f"{species.taxon_id}-{_timestamp()}"
-    write_json_atomic(
-        destination / "failure.json",
-        {
-            "schema_version": 1,
-            "status": "failed",
-            "failed_at": utc_now(),
-            "taxon_id": species.taxon_id,
-            "common_name": species.common_name,
-            "scientific_name": species.scientific_name,
-            "error_type": type(error).__name__,
-            "error": str(error),
-        },
-    )
+    failure: dict[str, object] = {
+        "schema_version": 1,
+        "status": "failed",
+        "failed_at": utc_now(),
+        "taxon_id": species.taxon_id,
+        "common_name": species.common_name,
+        "scientific_name": species.scientific_name,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    if stop_reason is not None:
+        failure["stop_reason"] = stop_reason
+    write_json_atomic(destination / "failure.json", failure)
     return destination
 
 
@@ -3126,6 +3347,7 @@ def approve_passing_candidates(
     """Approve reviewed pending candidates; a candidate that fails stays pending."""
     published: list[dict[str, object]] = []
     clear_catalog_staging(config.controller.catalog_dir)
+    retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
     pending_root = config.controller.state_dir / "pending"
     for manifest_path in sorted(pending_root.glob("*/manifest.json")):
         directory = manifest_path.parent
@@ -3157,6 +3379,7 @@ def approve_passing_candidates(
                     _held_candidate_failure(directory, taxon_id, manifest.get("common_name"))
                 )
             continue
+        _forget_approved_bird_retries(config.controller.state_dir, retry_store, taxon_id)
         published.append(entry.as_dict())
     return published
 
@@ -3187,11 +3410,89 @@ def _sweep_abandoned_generation_work(config: AppConfig) -> None:
             shutil.rmtree(candidate)
 
 
+def _retry_or_stop(
+    config: AppConfig,
+    retry_store: RetryStore,
+    species: BirdSpecies,
+    error: Exception,
+    *,
+    retry_at: datetime | None = None,
+    message: str | None = None,
+    counts_toward_limit: bool = True,
+    may_stop_for_owner: bool = True,
+) -> dict[str, object]:
+    """Schedule a bird's next try, or stop it for the owner after too many."""
+    now = datetime.now(UTC)
+    retry = retry_store.record_failure(
+        species.taxon_id,
+        error,
+        now=now,
+        initial_minutes=config.controller.retry_initial_minutes,
+        maximum_minutes=config.controller.retry_max_minutes,
+        retry_at=None if retry_at is None else max(retry_at, now),
+        species=species,
+        message=message,
+        counts_toward_limit=counts_toward_limit,
+    )
+    if (
+        not counts_toward_limit
+        or not may_stop_for_owner
+        or retry.counted_failures < MAX_AUTOMATIC_GENERATION_TRIES
+    ):
+        return {
+            "taxon_id": species.taxon_id,
+            "common_name": species.common_name,
+            "error": retry.error,
+            "retry_at": retry.next_attempt_at.isoformat(),
+            "terminal": False,
+        }
+    text = (
+        f"Stopped after {retry.counted_failures} failed tries; retry this bird to try again. "
+        f"Last error: {retry.error}"
+    )
+    # Keep the owner's guidance about the cause: a source outage stays a source problem.
+    return _stop_for_owner(
+        config,
+        retry_store,
+        species,
+        DataSourceError(text) if isinstance(error, DataSourceError) else GenerationError(text),
+        stop_reason="retry_limit",
+    )
+
+
+def _stop_for_owner(
+    config: AppConfig,
+    retry_store: RetryStore,
+    species: BirdSpecies,
+    stopped: InkyBirdFrameError,
+    *,
+    stop_reason: str,
+) -> dict[str, object]:
+    with catalog_state_lock(config.controller.state_dir):
+        failure_path = record_failure(
+            config.controller.state_dir, species, stopped, stop_reason=stop_reason
+        )
+        retry_store.clear(species.taxon_id)
+        # The owner's retry starts a new run with a full research allowance.
+        _research_budget(config).reset_species(species.taxon_id)
+        _remove_unused_kept_runs(config.controller.state_dir, retry_store, species.taxon_id)
+    return {
+        "taxon_id": species.taxon_id,
+        "common_name": species.common_name,
+        "error": str(stopped),
+        "failure": str(failure_path),
+        "terminal": True,
+    }
+
+
 def run_generation_cycle(config: AppConfig) -> dict[str, object]:
     # The command is also an explicit safety boundary for old timers and callers.
     # Disabled mode must not approve, migrate, dequeue or start a model process.
     if not config.controller.generation_enabled:
         return {"generation_enabled": False, "generated": [], "published": []}
+    # The service timeout is this cycle's budget plus a margin, so every
+    # moment of the run counts, including waiting for the lock and preparation.
+    cycle_started = monotonic()
     with (
         exclusive_cycle_lock(config.controller.state_dir),
         activity_run(config.controller.state_dir, "generation"),
@@ -3215,13 +3516,19 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 )
             held_candidates: list[dict[str, object]] = []
             published = approve_passing_candidates(config, held=held_candidates)
+            approved = approved_taxon_ids(config.controller.catalog_dir)
+            _forget_approved_birds_retries(
+                config.controller.state_dir,
+                RetryStore(config.controller.state_dir / "generation-retries.json"),
+                approved,
+            )
         snapshot = _read_discovery_snapshot(config)
         species_list = snapshot.species
         retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
         work = calculate_generation_work(
             snapshot=snapshot,
             queued_species=queued_species,
-            approved=approved_taxon_ids(config.controller.catalog_dir),
+            approved=approved,
             terminal_states=_generation_terminal_states(
                 config.controller.state_dir,
                 species_list,
@@ -3277,6 +3584,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         generated: list[dict[str, object]] = []
         failures: list[dict[str, object]] = list(held_candidates)
         attempted_count = 0
+        stopped_for_time = False
+        species_seconds = generation_species_timeout_seconds(config)
+        cycle_seconds = species_seconds * config.controller.max_species_attempts_per_cycle
         for species in eligible:
             if len(generated) >= config.controller.generations_per_cycle:
                 break
@@ -3284,6 +3594,11 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 break
             if not retry_store.due(species.taxon_id, datetime.now(UTC)):
                 continue
+            # Start a later bird only when its longest possible run still fits,
+            # so a service timeout sized from the same budget never cuts one off.
+            if attempted_count and monotonic() - cycle_started + species_seconds > cycle_seconds:
+                stopped_for_time = True
+                break
             attempted_count += 1
             progress(
                 "starting", taxon_id=species.taxon_id, common_name=species.common_name, attempt=None
@@ -3291,7 +3606,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             guidance = retry_store.quality_guidance(species.taxon_id)
             try:
                 if guidance is None:
-                    generate_candidate(config, species, config.controller.workspace_dir)
+                    generate_candidate(
+                        config, species, config.controller.workspace_dir, retry_store=retry_store
+                    )
                 else:
                     try:
                         profile_conflicts = parse_retry_profile_conflicts(
@@ -3334,7 +3651,10 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         initial_correction_source=correction_source,
                         invariant_correction_findings=guidance.invariant_findings,
                         initial_profile_conflicts=profile_conflicts,
+                        retry_store=retry_store,
                     )
+                # This run ended with a plate; a later run gets a full allowance.
+                _research_budget(config).reset_species(species.taxon_id)
                 progress("approving")
                 try:
                     with catalog_state_lock(config.controller.state_dir):
@@ -3364,8 +3684,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         "published": entry.as_dict(),
                     }
                 )
-                retry_store.clear(species.taxon_id)
-                retry_store.clear_quality_guidance(species.taxon_id)
+                _forget_approved_bird_retries(
+                    config.controller.state_dir, retry_store, species.taxon_id
+                )
             except InsufficientReferencesError as exc:
                 retry = retry_store.record_failure(
                     species.taxon_id,
@@ -3375,6 +3696,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     maximum_minutes=config.controller.retry_max_minutes,
                     fixed_minutes=config.controller.insufficient_references_retry_minutes,
                     species=species,
+                    counts_toward_limit=False,
                 )
                 failures.append(
                     {
@@ -3386,43 +3708,53 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     }
                 )
             except DataSourceError as exc:
-                retry = retry_store.record_failure(
-                    species.taxon_id,
-                    exc,
-                    now=datetime.now(UTC),
-                    initial_minutes=config.controller.retry_initial_minutes,
-                    maximum_minutes=config.controller.retry_max_minutes,
-                    species=species,
-                )
-                failures.append(
-                    {
-                        "taxon_id": species.taxon_id,
-                        "common_name": species.common_name,
-                        "error": str(exc),
-                        "retry_at": retry.next_attempt_at.isoformat(),
-                        "terminal": False,
-                    }
-                )
+                failures.append(_retry_or_stop(config, retry_store, species, exc))
             except ResearchLimitError as exc:
-                now = datetime.now(UTC)
-                retry = retry_store.record_failure(
-                    species.taxon_id,
-                    exc,
-                    now=now,
-                    initial_minutes=config.controller.retry_initial_minutes,
-                    maximum_minutes=config.controller.retry_max_minutes,
-                    retry_at=max(exc.retry_at, now),
-                    species=species,
-                )
-                failures.append(
-                    {
-                        "taxon_id": species.taxon_id,
-                        "common_name": species.common_name,
-                        "error": str(exc),
-                        "retry_at": retry.next_attempt_at.isoformat(),
-                        "terminal": False,
-                    }
-                )
+                if _research_budget(config).species_exhausted(species.taxon_id):
+                    # Only the owner's retry returns this bird's allowance.
+                    failures.append(
+                        _stop_for_owner(
+                            config,
+                            retry_store,
+                            species,
+                            ResearchLimitError(
+                                "This bird used its research limit of "
+                                f"{config.research.max_searches_per_species} searches; "
+                                "retry this bird to try again.",
+                                retry_at=exc.retry_at,
+                            ),
+                            stop_reason="research_limit",
+                        )
+                    )
+                else:
+                    failures.append(
+                        _retry_or_stop(
+                            config,
+                            retry_store,
+                            species,
+                            exc,
+                            retry_at=exc.retry_at,
+                            # The shared daily allowance is not this bird's failure.
+                            counts_toward_limit=False,
+                        )
+                    )
+            except GenerationStopRequested:
+                if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
+                    _forget_approved_bird_retries(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
+                else:
+                    failures.append(
+                        _retry_or_stop(
+                            config,
+                            retry_store,
+                            species,
+                            GenerationError(STOPPED_GENERATION_ERROR),
+                            # A stop is not the bird's fault; a later real failure decides.
+                            may_stop_for_owner=False,
+                        )
+                    )
+                raise
             except QualityReviewError as exc:
                 with catalog_state_lock(config.controller.state_dir):
                     retry_store.clear(species.taxon_id)
@@ -3443,6 +3775,10 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     else:
                         retry_store.clear_quality_guidance(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
+                    _research_budget(config).reset_species(species.taxon_id)
+                    _remove_unused_kept_runs(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,
@@ -3458,6 +3794,10 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 with catalog_state_lock(config.controller.state_dir):
                     retry_store.clear(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
+                    _research_budget(config).reset_species(species.taxon_id)
+                    _remove_unused_kept_runs(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,
@@ -3470,44 +3810,18 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             except CatalogError:
                 raise
             except InkyBirdFrameError as exc:
-                retry = retry_store.record_failure(
-                    species.taxon_id,
-                    exc,
-                    now=datetime.now(UTC),
-                    initial_minutes=config.controller.retry_initial_minutes,
-                    maximum_minutes=config.controller.retry_max_minutes,
-                    species=species,
-                )
-                failures.append(
-                    {
-                        "taxon_id": species.taxon_id,
-                        "common_name": species.common_name,
-                        "error": str(exc),
-                        "retry_at": retry.next_attempt_at.isoformat(),
-                        "terminal": False,
-                    }
-                )
+                failures.append(_retry_or_stop(config, retry_store, species, exc))
             except Exception as exc:
                 # One bird's unexpected failure must not stop the rest of the
                 # cycle; its text may name local paths, so only the type is kept.
-                message = f"Generation stopped unexpectedly ({type(exc).__name__})"
-                retry = retry_store.record_failure(
-                    species.taxon_id,
-                    exc,
-                    now=datetime.now(UTC),
-                    initial_minutes=config.controller.retry_initial_minutes,
-                    maximum_minutes=config.controller.retry_max_minutes,
-                    species=species,
-                    message=message,
-                )
                 failures.append(
-                    {
-                        "taxon_id": species.taxon_id,
-                        "common_name": species.common_name,
-                        "error": message,
-                        "retry_at": retry.next_attempt_at.isoformat(),
-                        "terminal": False,
-                    }
+                    _retry_or_stop(
+                        config,
+                        retry_store,
+                        species,
+                        exc,
+                        message=f"Generation stopped unexpectedly ({type(exc).__name__})",
+                    )
                 )
 
         with catalog_state_lock(config.controller.state_dir):
@@ -3532,8 +3846,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         return {
             "discovery": {
                 "refreshed_at": snapshot.refreshed_at.isoformat(),
-                "place_name": snapshot.place_name,
-                "state": snapshot.state,
+                # Printed to service logs; the place stays in private state.
+                "place_name": "",
+                "state": "",
                 "window": config.discovery.observation_window.value,
                 "radius_km": config.discovery.radius_km,
                 "species_count": len(species_list),
@@ -3555,6 +3870,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             "terminal_blocked": [entry.as_dict() for entry in queue_partition.terminal_blocked],
             "generated": generated,
             "failures": failures,
+            "stopped_for_time": stopped_for_time,
         }
 
 

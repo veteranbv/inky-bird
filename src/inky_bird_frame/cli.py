@@ -13,7 +13,8 @@ import threading
 import time
 import tomllib
 import warnings
-from contextlib import ExitStack, nullcontext
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from .config import (
     parse_config_bytes,
 )
 from .controller import (
+    GenerationStopRequested,
     add_collection_member,
     collection_status,
     discover_species,
@@ -79,6 +81,7 @@ from .notifications import (
     dispatch_notifications,
     notification_state_path,
     notification_status,
+    record_controller_start,
     requeue_dead_letters,
     safe_notify,
     safe_record_degradation,
@@ -253,8 +256,40 @@ def discover_command(args: argparse.Namespace) -> int:
     return 0
 
 
+@contextmanager
+def _stop_signal_raises() -> Iterator[None]:
+    """Turn a stop signal into an exception so the running bird's try is saved."""
+    previous = signal.getsignal(signal.SIGTERM)
+    if threading.current_thread() is not threading.main_thread() or previous == signal.SIG_IGN:
+        yield
+        return
+
+    def handle(signum: int, _frame: object) -> None:
+        # One stop is enough; ignore repeats while the try is saved.
+        signal.signal(signum, signal.SIG_IGN)
+        raise GenerationStopRequested(signum)
+
+    signal.signal(signal.SIGTERM, handle)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _end_as_stopped(stopped: GenerationStopRequested) -> int:
+    # The try is saved; end the way the stop signal itself would have.
+    signal.signal(stopped.signum, signal.SIG_DFL)
+    os.kill(os.getpid(), stopped.signum)
+    return 128 + stopped.signum
+
+
 def controller_cycle_command(args: argparse.Namespace) -> int:
-    print_result(run_controller_cycle(_config(args)))
+    try:
+        with _stop_signal_raises():
+            result = run_controller_cycle(_config(args))
+    except GenerationStopRequested as stopped:
+        return _end_as_stopped(stopped)
+    print_result(result)
     return 0
 
 
@@ -269,7 +304,10 @@ def generate_command(args: argparse.Namespace) -> int:
         print_result(run_generation_cycle(config))
         return 0
     try:
-        result = run_generation_cycle(config)
+        with _stop_signal_raises():
+            result = run_generation_cycle(config)
+    except GenerationStopRequested as stopped:
+        return _end_as_stopped(stopped)
     except Exception as exc:
         if not _is_busy(exc):
             safe_record_degradation(
@@ -295,10 +333,13 @@ def generate_command(args: argparse.Namespace) -> int:
                 and isinstance(common_name, str)
             ):
                 notified_taxa.add(taxon_id)
+                entry = item.get("published", item)
+                plate = entry.get("portrait_sha256") if isinstance(entry, dict) else None
                 safe_notify(
                     config,
                     NotificationEvent.GENERATION_APPROVED,
-                    dedupe_key=str(taxon_id),
+                    # A replacement plate for the same bird is a new approval.
+                    dedupe_key=f"{taxon_id}:{plate}" if isinstance(plate, str) else str(taxon_id),
                     title=f"{common_name} plate approved",
                     body="The generated plate passed factual and visual review.",
                 )
@@ -663,6 +704,8 @@ def access_recover_command(args: argparse.Namespace) -> int:
 
 def serve_command(args: argparse.Namespace) -> int:
     config = _config(args, load_secrets=False)
+    # Display checks allow one rotation for the display to reach a restarted server.
+    record_controller_start(config)
     serve_catalog(config.controller, app_config=config)
     return 0
 

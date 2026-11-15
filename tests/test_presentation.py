@@ -21,7 +21,12 @@ from inky_bird_frame.journal import (
     remove_collection,
     save_collection,
 )
-from inky_bird_frame.presentation import PresentationAccess
+from inky_bird_frame.presentation import (
+    MAX_GRANTS,
+    MAX_PENDING,
+    MAX_PENDING_PER_CLIENT,
+    PresentationAccess,
+)
 from inky_bird_frame.server import project_catalog
 from inky_bird_frame.web import create_app
 
@@ -236,9 +241,9 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
         TestClient(create_app(config), base_url=ORIGIN) as owner,
         TestClient(create_app(config), base_url=ORIGIN) as screen,
     ):
-        assert (
-            screen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN}).status_code == 401
-        )
+        # Pairing is off until the owner exists: not a sign-in problem.
+        early = screen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+        assert (early.status_code, early.json()["error"]["code"]) == (403, "feature_unavailable")
         AccessStore(config.state_dir).setup_owner("fixture-owner", "long synthetic password")
         login = owner.post(
             "/v1/owner/login",
@@ -277,7 +282,11 @@ def test_readonly_http_boundaries_selected_wall_and_minimal_embed(tmp_path: Path
         assert plate.headers["cache-control"] == "private, max-age=31536000, immutable"
         assert screen.get("/v1/owner/journal").status_code == 401
         assert screen.get("/v1/screen/plates/999?revision=" + "a" * 64).status_code == 404
-        assert screen.get("/v1/dashboard/art").status_code == 401
+        art_off = screen.get("/v1/dashboard/art")
+        assert (art_off.status_code, art_off.json()["error"]["code"]) == (
+            403,
+            "feature_unavailable",
+        )
         assert (
             owner.post(
                 "/v1/owner/presentation",
@@ -400,10 +409,14 @@ def test_local_owner_access_does_not_permit_plain_lan_screen_credentials(tmp_pat
     with TestClient(create_app(config), base_url=origin, client=("192.168.1.20", 41000)) as client:
         assert client.get("/v1/access").status_code == 200
         result = client.post("/v1/screen/pair", json={}, headers={"Origin": origin})
-        assert result.status_code == 401
+        assert (result.status_code, result.json()["error"]["code"]) == (
+            403,
+            "secure_access_required",
+        )
         assert "HTTPS or" in result.json()["error"]["message"]
         assert "inky-local-screen" not in client.cookies
-        assert client.get("/v1/screen/view").status_code == 401
+        view = client.get("/v1/screen/view")
+        assert (view.status_code, view.json()["error"]["code"]) == (403, "secure_access_required")
         assert access.status()["grants"] == []
 
 
@@ -448,3 +461,86 @@ def test_screen_plate_replaced_after_authorization_is_not_cached_as_the_old_revi
         )
         assert current.content == replacement
         assert current.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.at = datetime(2026, 10, 15, 12, tzinfo=UTC)
+
+    def now(self, tz: object = None) -> datetime:
+        return self.at
+
+
+def test_a_waiting_screen_keeps_its_code_while_another_client_keeps_asking(
+    tmp_path: Path,
+) -> None:
+    # Called exactly as the web route calls it: no client is named.
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        screen, first = access.request_pair("")
+        for _ in range(MAX_PENDING - 1):
+            clock.at += timedelta(seconds=16)
+            access.request_pair("")
+        saved = access.path.read_bytes()
+        clock.at += timedelta(seconds=16)
+        # The pending allowance is full: refuse the newcomer, never evict the
+        # screen whose code the owner may be about to approve.
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("")
+        assert access.path.read_bytes() == saved
+        resumed = access.request_pair(screen)[1]
+        assert resumed == {"status": "pending", "pairing_code": first["pairing_code"]}
+
+
+def test_pairing_pause_is_per_client_and_forgets_finished_pauses(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        access.request_pair("", client="198.51.100.7")
+        access.request_pair("", client="192.0.2.1")
+        saved = access.path.read_bytes()
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("", client="198.51.100.7")
+        assert access.path.read_bytes() == saved
+        clock.at += timedelta(seconds=16)
+        access.request_pair("", client="198.51.100.7")
+        # Only pauses still running are remembered, so the table stays as
+        # small as the pending allowance and no entry is dropped early.
+        assert set(access._pair_requests) == {"198.51.100.7"}
+
+
+def test_a_full_screen_list_still_refuses_new_pairing(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    for index in range(MAX_GRANTS):
+        access.update(
+            revision=access.status()["revision"],
+            action="status",
+            name=f"Credential {index}",
+            view="all",
+            confirm=True,
+        )
+    with pytest.raises(AccessRateLimitError):
+        access.request_pair("", client="198.51.100.7")
+
+
+def test_one_client_cannot_hold_more_than_two_waiting_requests(tmp_path: Path) -> None:
+    _, _, access = fixture(tmp_path)
+    clock = _Clock()
+    with patch("inky_bird_frame.presentation.datetime", clock):
+        for _ in range(MAX_PENDING_PER_CLIENT):
+            access.request_pair("", client="198.51.100.7")
+            clock.at += timedelta(seconds=16)
+        saved = access.path.read_bytes()
+        with pytest.raises(AccessRateLimitError):
+            access.request_pair("", client="198.51.100.7")
+        assert access.path.read_bytes() == saved
+        # Another screen still pairs.
+        other, _ = access.request_pair("", client="192.0.2.1")
+        clock.at += timedelta(seconds=16)
+        # Removing one of the client's requests frees its place again.
+        status = cast(dict[str, Any], access.status())
+        first = status["grants"][0]["id"]
+        access.update(revision=status["revision"], action="revoke", id=first, confirm=True)
+        access.request_pair("", client="198.51.100.7")
+        assert other

@@ -4,21 +4,41 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
-from collections.abc import Mapping
-from http.client import HTTPException, HTTPMessage, HTTPResponse
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from http.client import HTTPConnection, HTTPException, HTTPMessage, HTTPResponse, HTTPSConnection
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import IO, cast
+from time import monotonic
+from typing import IO, TYPE_CHECKING, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    BaseHandler,
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    Request,
+    build_opener,
+)
 
+from . import __version__
 from .errors import DataSourceError
+
+if TYPE_CHECKING:
+    from urllib.request import _HTTPConnectionProtocol
 
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_ASSET_BYTES = 64 * 1024 * 1024
-USER_AGENT = "inky-bird-frame/0.1"
+USER_AGENT = f"inky-bird/{__version__}"
+# The timeout bounds each socket read. A server that trickles bytes inside it
+# could hold a worker indefinitely, so a whole exchange, redirects included,
+# also ends after this many timeouts unless the caller sets its own deadline.
+DEADLINE_TIMEOUTS = 4
 
 
 def read_private_json(path: Path, *, maximum: int) -> object:
@@ -44,7 +64,114 @@ def _read_capped(response: HTTPResponse, limit: int, display_url: str) -> bytes:
     body = response.read(limit + 1)
     if len(body) > limit:
         raise DataSourceError(f"Response from {display_url} exceeds {limit} bytes")
+    remaining = response.length
+    if isinstance(remaining, int) and remaining > 0:
+        # read(amount) returns what arrived before the connection closed;
+        # http.client keeps the bytes still owed, and none for a chunked body.
+        raise HTTPException("response shorter than its declared length")
     return body
+
+
+class _Deadline:
+    """Shut down this exchange's sockets once its total time is spent."""
+
+    def __init__(self, seconds: float) -> None:
+        self.ends_at = monotonic() + seconds
+        self.expired = False
+        self._sockets: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.cancel()
+
+    @property
+    def spent(self) -> bool:
+        return self.expired or monotonic() >= self.ends_at
+
+    def watch(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._sockets.append(sock)
+            if self.expired:
+                _shut_down(sock)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            for sock in self._sockets:
+                _shut_down(sock)
+
+
+def _shut_down(sock: socket.socket) -> None:
+    # Shut down the descriptor itself, not the TLS layer: a read blocked in
+    # another thread then returns instead of racing a TLS teardown.
+    with suppress(OSError):
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+_current_deadline: ContextVar[_Deadline | None] = ContextVar("inky_http_deadline", default=None)
+
+
+def _watch_connection(connection: HTTPConnection) -> None:
+    deadline = _current_deadline.get()
+    if deadline is not None and connection.sock is not None:
+        deadline.watch(connection.sock)
+
+
+def _bound_connect_timeout(connection: HTTPConnection) -> None:
+    deadline = _current_deadline.get()
+    if deadline is None:
+        return
+    remaining = deadline.ends_at - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("timed out")
+    current = connection.timeout
+    if not isinstance(current, (int, float)) or current > remaining:
+        connection.timeout = remaining
+
+
+class _DeadlineHTTPConnection(HTTPConnection):
+    def connect(self) -> None:
+        _bound_connect_timeout(self)
+        super().connect()
+        _watch_connection(self)
+
+
+class _DeadlineHTTPSConnection(HTTPSConnection):
+    def connect(self) -> None:
+        _bound_connect_timeout(self)
+        super().connect()
+        _watch_connection(self)
+
+
+class _DeadlineHTTPHandler(HTTPHandler):
+    def do_open(
+        self, http_class: _HTTPConnectionProtocol, req: Request, **http_conn_args: object
+    ) -> HTTPResponse:
+        return super().do_open(_DeadlineHTTPConnection, req, **http_conn_args)
+
+
+class _DeadlineHTTPSHandler(HTTPSHandler):
+    def do_open(
+        self, http_class: _HTTPConnectionProtocol, req: Request, **http_conn_args: object
+    ) -> HTTPResponse:
+        return super().do_open(_DeadlineHTTPSConnection, req, **http_conn_args)
+
+
+@contextmanager
+def _total_deadline(seconds: float) -> Iterator[_Deadline]:
+    deadline = _Deadline(seconds)
+    token = _current_deadline.set(deadline)
+    deadline.start()
+    try:
+        yield deadline
+    finally:
+        deadline.stop()
+        _current_deadline.reset(token)
 
 
 def _checked_request(
@@ -100,36 +227,74 @@ class _SameOriginRedirectHandler(_HTTPOnlyRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _transport_error(exc: Exception, display_url: str) -> DataSourceError:
+    if isinstance(exc, HTTPError):
+        return DataSourceError(f"HTTP {exc.code} from {display_url}")
+    if isinstance(exc, URLError):
+        return DataSourceError(f"Could not reach {display_url}: {exc.reason}")
+    if isinstance(exc, TimeoutError):
+        return DataSourceError(f"Timed out reading {display_url}")
+    if isinstance(exc, HTTPException):
+        return DataSourceError(f"Invalid HTTP response from {display_url}")
+    return DataSourceError(f"Could not read response from {display_url}")
+
+
+def _fetch(
+    request: Request,
+    redirects: type[BaseHandler],
+    *,
+    timeout_seconds: float,
+    deadline_seconds: float | None,
+    limit: int,
+    display_url: str,
+) -> bytes:
+    total = timeout_seconds * DEADLINE_TIMEOUTS if deadline_seconds is None else deadline_seconds
+    with _total_deadline(total) as deadline:
+        try:
+            # Python 3.14 snapshots default CA trust when creating the handler.
+            # Build it after the caller has selected this process's native trust.
+            opener = build_opener(redirects, _DeadlineHTTPHandler, _DeadlineHTTPSHandler)
+            with opener.open(request, timeout=timeout_seconds) as response:
+                http_response = cast(HTTPResponse, response)
+                # A declared length or chunked framing proves the whole body
+                # arrived; a read cut short by the deadline raises instead.
+                framed = http_response.chunked or http_response.length is not None
+                body = _read_capped(http_response, limit, display_url)
+        except DataSourceError:
+            raise
+        except (URLError, HTTPException, OSError) as exc:
+            # A spent deadline shuts the socket down or refuses to connect;
+            # whatever the interrupted step raised, it is the timeout. A status
+            # the server already sent is its answer, however late.
+            if deadline.spent and not isinstance(exc, HTTPError):
+                raise DataSourceError(f"Timed out reading {display_url}") from exc
+            raise _transport_error(exc, display_url) from exc
+        if deadline.expired and not framed:
+            raise DataSourceError(f"Timed out reading {display_url}")
+        return body
+
+
 def get_json(
     url: str,
     timeout_seconds: float = 10.0,
     *,
     headers: Mapping[str, str] | None = None,
     error_label: str | None = None,
+    deadline_seconds: float | None = None,
 ) -> object:
     request_headers = {"User-Agent": USER_AGENT}
     if headers is not None:
         request_headers.update(headers)
     display_url = error_label or url
     request = _checked_request(url, request_headers)
-    try:
-        # Python 3.14 snapshots default CA trust when creating the handler.
-        # Build it after the caller has selected this process's native trust.
-        with build_opener(_HTTPOnlyRedirectHandler).open(
-            request, timeout=timeout_seconds
-        ) as response:
-            body = _read_capped(cast(HTTPResponse, response), MAX_JSON_BYTES, display_url)
-    except HTTPError as exc:
-        raise DataSourceError(f"HTTP {exc.code} from {display_url}") from exc
-    except URLError as exc:
-        raise DataSourceError(f"Could not reach {display_url}: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise DataSourceError(f"Timed out reading {display_url}") from exc
-    except HTTPException as exc:
-        raise DataSourceError(f"Invalid HTTP response from {display_url}") from exc
-    except OSError as exc:
-        raise DataSourceError(f"Could not read response from {display_url}") from exc
-
+    body = _fetch(
+        request,
+        _HTTPOnlyRedirectHandler,
+        timeout_seconds=timeout_seconds,
+        deadline_seconds=deadline_seconds,
+        limit=MAX_JSON_BYTES,
+        display_url=display_url,
+    )
     try:
         return cast(object, json.loads(body))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -143,6 +308,7 @@ def post_json(
     *,
     headers: Mapping[str, str] | None = None,
     error_label: str | None = None,
+    deadline_seconds: float | None = None,
 ) -> object:
     request_headers = {
         "Accept": "application/json",
@@ -157,45 +323,32 @@ def post_json(
     except (TypeError, ValueError) as exc:
         raise ValueError("JSON request body was not serializable") from exc
     request = _checked_request(url, request_headers, data=encoded, method="POST")
-    try:
-        with build_opener(_SameOriginRedirectHandler).open(
-            request, timeout=timeout_seconds
-        ) as response:
-            body = _read_capped(cast(HTTPResponse, response), MAX_JSON_BYTES, display_url)
-    except HTTPError as exc:
-        raise DataSourceError(f"HTTP {exc.code} from {display_url}") from exc
-    except URLError as exc:
-        raise DataSourceError(f"Could not reach {display_url}: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise DataSourceError(f"Timed out reading {display_url}") from exc
-    except HTTPException as exc:
-        raise DataSourceError(f"Invalid HTTP response from {display_url}") from exc
-    except OSError as exc:
-        raise DataSourceError(f"Could not read response from {display_url}") from exc
-
+    body = _fetch(
+        request,
+        _SameOriginRedirectHandler,
+        timeout_seconds=timeout_seconds,
+        deadline_seconds=deadline_seconds,
+        limit=MAX_JSON_BYTES,
+        display_url=display_url,
+    )
     try:
         return cast(object, json.loads(body))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DataSourceError(f"Invalid JSON from {display_url}") from exc
 
 
-def get_bytes(url: str, timeout_seconds: float = 30.0) -> bytes:
+def get_bytes(
+    url: str, timeout_seconds: float = 30.0, *, deadline_seconds: float | None = None
+) -> bytes:
     request = _checked_request(url, {"User-Agent": USER_AGENT})
-    try:
-        with build_opener(_HTTPOnlyRedirectHandler).open(
-            request, timeout=timeout_seconds
-        ) as response:
-            return _read_capped(cast(HTTPResponse, response), MAX_ASSET_BYTES, url)
-    except HTTPError as exc:
-        raise DataSourceError(f"HTTP {exc.code} from {url}") from exc
-    except URLError as exc:
-        raise DataSourceError(f"Could not reach {url}: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise DataSourceError(f"Timed out reading {url}") from exc
-    except HTTPException as exc:
-        raise DataSourceError(f"Invalid HTTP response from {url}") from exc
-    except OSError as exc:
-        raise DataSourceError(f"Could not read response from {url}") from exc
+    return _fetch(
+        request,
+        _HTTPOnlyRedirectHandler,
+        timeout_seconds=timeout_seconds,
+        deadline_seconds=deadline_seconds,
+        limit=MAX_ASSET_BYTES,
+        display_url=url,
+    )
 
 
 def _fsync_directory(directory: Path) -> None:

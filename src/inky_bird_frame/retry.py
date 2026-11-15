@@ -28,11 +28,15 @@ class RetryRecord:
     next_attempt_at: datetime
     common_name: str | None = None
     scientific_name: str | None = None
+    # Failures that count toward the automatic-try ceiling; waits for shared
+    # capacity or photos do not. Records from earlier releases start at zero.
+    counted_failures: int = 0
 
     def as_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
             "taxon_id": self.taxon_id,
             "attempts": self.attempts,
+            "counted_failures": self.counted_failures,
             "error_type": self.error_type,
             "error": self.error,
             "first_failed_at": self.first_failed_at.isoformat(),
@@ -120,6 +124,7 @@ class RetryStore:
         retry_at: datetime | None = None,
         species: BirdSpecies | None = None,
         message: str | None = None,
+        counts_toward_limit: bool = True,
     ) -> RetryRecord:
         previous = self.get(taxon_id)
         if species is not None and species.taxon_id != taxon_id:
@@ -135,6 +140,9 @@ class RetryStore:
             common_name = previous.common_name if previous is not None else None
             scientific_name = previous.scientific_name if previous is not None else None
         attempts = (previous.attempts if previous is not None else 0) + 1
+        counted_failures = (previous.counted_failures if previous is not None else 0) + (
+            1 if counts_toward_limit else 0
+        )
         if retry_at is not None:
             if fixed_minutes is not None:
                 raise ValueError("retry_at and fixed_minutes are mutually exclusive")
@@ -164,6 +172,7 @@ class RetryStore:
             next_attempt_at=next_attempt_at,
             common_name=common_name,
             scientific_name=scientific_name,
+            counted_failures=counted_failures,
         )
         self._records[taxon_id] = record
         self._write()
@@ -278,6 +287,7 @@ def _parse_record(raw: object, source: Path) -> RetryRecord:
     error = raw.get("error")
     common_name = raw.get("common_name")
     scientific_name = raw.get("scientific_name")
+    counted_failures = raw.get("counted_failures", 0)
     if (
         not isinstance(taxon_id, int)
         or isinstance(taxon_id, bool)
@@ -285,6 +295,9 @@ def _parse_record(raw: object, source: Path) -> RetryRecord:
         or not isinstance(attempts, int)
         or isinstance(attempts, bool)
         or attempts <= 0
+        or not isinstance(counted_failures, int)
+        or isinstance(counted_failures, bool)
+        or not 0 <= counted_failures <= attempts
         or not isinstance(error_type, str)
         or not error_type
         or not isinstance(error, str)
@@ -311,6 +324,7 @@ def _parse_record(raw: object, source: Path) -> RetryRecord:
         next_attempt_at=_parse_datetime(raw.get("next_attempt_at"), source),
         common_name=common_name,
         scientific_name=scientific_name,
+        counted_failures=counted_failures,
     )
 
 

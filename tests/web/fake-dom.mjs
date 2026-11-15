@@ -1,6 +1,9 @@
-// A minimal DOM for the Frame unit tests: tree containment, attributes,
-// listeners and focus. Events do not bubble; tests dispatch where needed,
-// except click(), which runs the document's listeners first.
+// A minimal DOM for the web unit tests: tree containment, attributes,
+// listeners and focus. Events dispatch like a browser's: capture listeners on
+// ancestors first, then the element, then, for events that bubble, ancestors
+// nearest first, until a listener stops propagation.
+const bubbles = new Set(['input', 'change', 'click', 'submit', 'keydown']);
+
 export class Element {
   constructor(tag = 'div') {
     this.tagName = tag.toUpperCase();
@@ -8,6 +11,7 @@ export class Element {
     this.parent = null;
     this.attributes = new Map();
     this.listeners = new Map();
+    this.captureListeners = new Set();
     this.classes = new Set();
     this.hidden = false;
     this.disabled = false;
@@ -119,12 +123,14 @@ export class Element {
     this.attributes.delete(name);
     if (name === 'src') delete this.src;
   }
-  addEventListener(type, listener) {
+  addEventListener(type, listener, options) {
     if (!this.listeners.has(type)) this.listeners.set(type, new Set());
     this.listeners.get(type).add(listener);
+    if (options === true || options?.capture) this.captureListeners.add(listener);
   }
   removeEventListener(type, listener) {
     this.listeners.get(type)?.delete(listener);
+    this.captureListeners.delete(listener);
   }
   fire(type, init = {}) {
     const event = {
@@ -134,26 +140,46 @@ export class Element {
       pointerType: 'touch',
       defaultPrevented: false,
       stopped: false,
+      immediateStopped: false,
       preventDefault() {
         this.defaultPrevented = true;
       },
       stopPropagation() {
         this.stopped = true;
       },
+      stopImmediatePropagation() {
+        this.stopped = this.immediateStopped = true;
+      },
       ...init,
     };
-    for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
+    const ancestors = [];
+    for (let item = this.parent; item; item = item.parent) ancestors.push(item);
+    const run = (node, phase) => {
+      if (event.stopped) return;
+      event.currentTarget = node;
+      for (const listener of [...(node.listeners.get(type) || [])]) {
+        const capture = node.captureListeners.has(listener);
+        if ((phase === 'capture' && !capture) || (phase === 'bubble' && capture)) continue;
+        listener(event);
+        if (event.immediateStopped) return;
+      }
+    };
+    for (const node of [...ancestors].reverse()) run(node, 'capture');
+    run(this, 'target');
+    if (bubbles.has(type)) for (const node of ancestors) run(node, 'bubble');
     return event;
   }
   // Like a script's element.click(): an untrusted click that the document's
   // capture listeners see first and may stop.
   click() {
     if (this.disabled) return;
-    const event = globalThis.document?.fire('click', { target: this, isTrusted: false });
-    if (!event?.stopped) this.fire('click', event);
+    this.fire('click', { isTrusted: false });
   }
   focus() {
     globalThis.document.activeElement = this;
+  }
+  scrollIntoView(options) {
+    this.scrolledIntoView = options ?? true;
   }
   blur() {
     if (globalThis.document.activeElement === this)
@@ -202,6 +228,11 @@ export function fakeDocument() {
   doc.documentElement = {};
   doc.createElement = (tag) => (tag === 'img' ? new ImageElement() : new Element(tag));
   doc.createElementNS = (_namespace, tag) => new Element(tag);
+  doc.createTextNode = (text) => {
+    const node = new Element('#text');
+    node.text = String(text);
+    return node;
+  };
   return doc;
 }
 

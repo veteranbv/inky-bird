@@ -1,138 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { setImmediate } from 'node:timers/promises';
 import test from 'node:test';
-import { Element, ImageElement, fakeDocument, findButton } from './fake-dom.mjs';
+import { findButton } from './fake-dom.mjs';
+import { flush, images, journal, nodes, open, plates, png, sha, withState } from './journal-harness.mjs';
 
-const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
-const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
-const dependencies = {
-  '/app/settings.js': 'export function renderSettings() {}',
-  '/app/imports.js': 'export function renderImports() {}',
-  '/app/presentation.js': 'export function renderPresentation() {}',
-};
-for (const name of ['frame-tools.js', 'ui.js', 'work-status.js'])
-  dependencies['/app/' + name] = await readFile(new URL(name, web), 'utf8');
-let journalSource = await readFile(new URL('journal.js', web), 'utf8');
-for (const [path, source] of Object.entries(dependencies))
-  journalSource = journalSource.replace(`'${path}'`, JSON.stringify(moduleURL(source)));
-let loads = 0;
-const timed = new WeakSet();
-
-const sha = (letter) => letter.repeat(64);
-const bird = (taxon_id, common_name, letter) => ({
-  taxon_id,
-  common_name,
-  scientific_name: 'Exemplum ' + common_name.toLowerCase(),
-  known: true,
-  saved: false,
-  plate_ready: true,
-  sources: [],
-  portrait_url: `/v1/owner/journal/birds/${taxon_id}/portrait`,
-  portrait_sha256: sha(letter),
-});
-function journal() {
-  return {
-    revision: 3,
-    birds: [bird(1, 'Example Wren', 'a'), bird(2, 'Sample Finch', 'b'), bird(3, 'Test Heron', 'c')],
-    collections: [],
-    saved_taxon_ids: [],
-    active_taxon_ids: [1, 2, 3],
-    featured_taxon_id: 1,
-    management: { available: false },
-    history_coverage: [],
-    unresolved_history: [],
-  };
-}
-const png = () => new Response(new Blob([new Uint8Array([1])], { type: 'image/png' }));
 const hang = (options) =>
   new Promise((_resolve, reject) =>
     options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))),
   );
-async function flush() {
-  for (let n = 0; n < 20; n++) await setImmediate();
-}
-function images(node, found = []) {
-  for (const child of node.children) {
-    if (child instanceof ImageElement) found.push(child);
-    images(child, found);
-  }
-  return found;
-}
-
-// Opens one owner page. `state()` is what /v1/owner/journal returns now.
-async function open(t, query, { state = journal, plate = () => Promise.resolve(png()) } = {}) {
-  if (!timed.has(t)) t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
-  timed.add(t);
-  const names = ['document', 'window', 'location', 'fetch', 'navigator'];
-  const saved = Object.fromEntries(
-    names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
-  );
-  const doc = fakeDocument();
-  const header = new Element('header');
-  const main = new Element('main');
-  main.id = 'main';
-  doc.body.append(header, main);
-  const requests = [];
-  const define = (name, value) =>
-    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
-  define('document', doc);
-  define('window', { isSecureContext: false });
-  define('navigator', {});
-  define('location', {
-    href: 'https://inky.example.test/app?' + new URLSearchParams(query),
-    reload() {},
-    assign() {},
-  });
-  define('fetch', (path, options = {}) => {
-    requests.push({ path, options });
-    return plate(path, options);
-  });
-  let close = () => {};
-  t.after(() => {
-    close();
-    for (const [name, descriptor] of Object.entries(saved))
-      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
-      else delete globalThis[name];
-  });
-  const api = async (path) => {
-    requests.push({ path, options: {} });
-    if (path === '/v1/owner/journal') return state();
-    if (path.endsWith('/profile')) return { profile: null, notice: 'No field notes.' };
-    throw new Error('unexpected ' + path);
-  };
-  const element = (tag, text, className) => {
-    const node = doc.createElement(tag);
-    if (text) node.textContent = text;
-    if (className) node.className = className;
-    return node;
-  };
-  const ui = {
-    api,
-    element,
-    button(text, action) {
-      const node = element('button', text, 'secondary');
-      node.addEventListener('click', action);
-      return node;
-    },
-    screen(title, description) {
-      main.replaceChildren(element('h1', title), element('p', description, 'intro'));
-    },
-    showProblem(error) {
-      throw error;
-    },
-    sessionExpired() {},
-  };
-  loads += 1;
-  const { openJournal, closeJournal } = await import(
-    moduleURL(journalSource + '\n// load ' + loads)
-  );
-  close = closeJournal;
-  await openJournal(ui);
-  await flush();
-  return { doc, main, requests };
-}
-const plates = (requests) => requests.filter(({ path }) => /\/(portrait|thumbnail)\?/.test(path));
 
 test('grid cards ask for the small plate lazily and reserve its size', async (t) => {
   const { main } = await open(t, { page: 'birds' });
@@ -157,6 +31,15 @@ test('collection covers use the small plate', async (t) => {
   const covers = images(main);
   assert(covers.length > 0);
   for (const image of covers) assert.match(image.src, /\/thumbnail\?revision=[a-f]{64}$/);
+});
+
+test('every collection card has its own title', async (t) => {
+  const { main } = await open(t, { page: 'collections' });
+  const titles = nodes(main)
+    .filter((node) => node.className === 'collection-title')
+    .map((node) => node.textContent);
+  assert(titles.length >= 4, titles.join(' | '));
+  assert.equal(new Set(titles).size, titles.length, titles.join(' | '));
 });
 
 test('search hides cards instead of rebuilding them', async (t) => {
@@ -271,16 +154,8 @@ test('an unchanged check after an outage clears the offline notice', async (t) =
 });
 
 // Parts the controller could not read reach the owner as plain text.
-function nodes(node, found = []) {
-  for (const child of node.children) {
-    found.push(child);
-    nodes(child, found);
-  }
-  return found;
-}
 const notices = (main) =>
   nodes(main).filter((node) => node.classList.contains('notice') && node.getAttribute('role') === 'status');
-const withState = (change) => () => Object.assign(journal(), change);
 const markup = 'Plates waiting for review could not be read. <img src=x onerror=alert(1)>';
 
 for (const page of ['home', 'birds'])
@@ -321,7 +196,7 @@ for (const [name, change] of [
     });
 
 test('plate work that could not be read says so instead of asking for setup', async (t) => {
-  const message = 'Plate work could not be read. Manage shows it again once its files are readable.';
+  const message = 'In the works could not be read. Manage shows it again once its files can be read.';
   const { main } = await open(t, { page: 'work' }, {
     state: withState({
       management: { available: false, reason: 'unreadable' },
@@ -329,8 +204,8 @@ test('plate work that could not be read says so instead of asking for setup', as
     }),
   });
   const text = main.textContent;
-  assert(!text.includes('Full configuration unavailable'));
-  assert(!text.includes('documented serve command'));
+  assert(!text.includes('Settings are not available here'));
+  assert(!text.includes('usual serve command'));
   const [box] = notices(main);
   assert.equal(box?.textContent, message);
 });
@@ -339,13 +214,34 @@ test('unreadable plate work without its notice still says it could not be read',
   const { main } = await open(t, { page: 'sources' }, {
     state: withState({ management: { available: false, reason: 'unreadable' } }),
   });
-  assert(!main.textContent.includes('Full configuration unavailable'));
-  assert.equal(notices(main)[0]?.textContent, 'Plate work could not be read.');
+  assert(!main.textContent.includes('Settings are not available here'));
+  assert.equal(notices(main)[0]?.textContent, 'Plates in the works could not be read.');
 });
 
 test('an install without plate work configured keeps its setup message', async (t) => {
   const { main } = await open(t, { page: 'work' });
-  assert(main.textContent.includes('Full configuration unavailable'));
-  assert(main.textContent.includes('Start Inky through its documented serve command'));
+  assert(main.textContent.includes('Settings are not available here'));
+  assert(main.textContent.includes('Start Inky with its usual serve command to see this page.'));
   assert.deepEqual(notices(main), []);
+});
+
+test('Health shows each check in plain words, never a raw status', async (t) => {
+  const { main } = await open(t, { page: 'health' }, {
+    respond(path) {
+      if (path === '/v1/owner/health')
+        return {
+          version: '1.0.0',
+          notice: 'These checks only read.',
+          checks: [
+            { name: 'Your plates', status: 'ok', detail: '3 plates read.' },
+            { name: 'Storage', status: 'info', detail: '9.0 GiB free.' },
+            { name: 'Notifications', status: 'attention', detail: '1 message could not be delivered.' },
+            { name: 'Something newer', status: 'unexpected', detail: 'A later check.' },
+          ],
+        };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  const headings = nodes(main).filter((node) => node.tagName === 'H2').map((node) => node.textContent);
+  assert.deepEqual(headings.slice(0, 4), ['Your plates · Fine', 'Storage', 'Notifications · Needs a look', 'Something newer']);
 });

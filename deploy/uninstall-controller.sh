@@ -12,25 +12,38 @@ service_prefix="" app_dir="" support_dir="" config_path=""
 eval "${native_names}"
 agents_dir="${HOME}/Library/LaunchAgents"
 uid=$(id -u)
+failures=()
 
 # controller-cycle is the legacy single-agent layout replaced by the labels below.
 for label in serve refresh generate catalog-publish notifications scheduler controller-cycle; do
   agent="com.${service_prefix}.${label}"
   plist="${agents_dir}/${agent}.plist"
   if launchctl print "gui/${uid}/${agent}" >/dev/null 2>&1; then
-    launchctl bootout "gui/${uid}/${agent}"
+    if ! launchctl bootout "gui/${uid}/${agent}"; then
+      # Keep the plist so the agent can be found and removed on a rerun.
+      failures+=("${agent}")
+      continue
+    fi
     echo "Booted out LaunchAgent: ${agent}"
   else
     echo "LaunchAgent is not loaded: ${agent}"
   fi
   if [ -f "${plist}" ]; then
-    rm -f "${plist}"
-    echo "Removed plist: ${plist}"
+    if rm -f "${plist}"; then
+      echo "Removed plist: ${plist}"
+    else
+      failures+=("${plist}")
+    fi
   else
     echo "Plist is not installed: ${plist}"
   fi
 done
 
+if [ "${#failures[@]}" -gt 0 ]; then
+  echo "Uninstall did not finish. Could not remove: ${failures[*]}." >&2
+  echo "Fix the cause shown above and run the uninstaller again." >&2
+  exit 1
+fi
 echo "Controller LaunchAgents uninstalled."
 echo "Intentionally left in place:"
 echo "  Application runtime and managed catalog: ${app_dir}"

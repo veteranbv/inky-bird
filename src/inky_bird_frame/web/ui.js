@@ -1,4 +1,4 @@
-// Shared presentation helpers. Static markup only: no state, storage or network.
+// Shared presentation helpers. Markup only: no storage or network.
 const PATHS = {
   feather:
     '<path d="M20.5 3.5c-5 0-9.5 2-12.5 5.5-2.4 2.8-3.5 6.5-3.7 10.8 4.3-.2 8-1.3 10.8-3.7 3.5-3 5.4-7.6 5.4-12.6z"/><path d="M4.5 19.5C8.5 14 13 9.5 18 6"/>',
@@ -22,6 +22,35 @@ const PATHS = {
   pulse: '<path d="M3 12.5h3.6l2.4-6 4 11 2.4-5h5.6"/>',
 };
 
+// A failure after a page is drawn stays beside the part it concerns, and the
+// rest of the page keeps working. Each place keeps at most one message, so a
+// repeated failure replaces it instead of stacking. An ended session still
+// goes to sign-in.
+const problems = new WeakMap();
+export function inlineProblem(ui, place, error, retry) {
+  if (error?.code === 'sign_in_required') {
+    ui.showProblem(error);
+    return null;
+  }
+  let box = problems.get(place);
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'inline-problem';
+    problems.set(place, box);
+  }
+  const message = document.createElement('p');
+  message.className = 'error';
+  message.setAttribute('role', 'alert');
+  message.textContent = error?.message || 'Inky could not complete this request.';
+  box.replaceChildren(message);
+  if (retry) box.append(ui.button(retry.label, retry.action));
+  if (!box.isConnected) place.append(box);
+  return box;
+}
+export function clearProblem(place) {
+  problems.get(place)?.remove();
+}
+
 export function icon(name, className = 'icon') {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', '0 0 24 24');
@@ -29,4 +58,48 @@ export function icon(name, className = 'icon') {
   svg.setAttribute('class', className);
   svg.innerHTML = PATHS[name];
   return svg;
+}
+
+// A status notice beside a plate shows at most two lines; the rest is behind
+// More, which goes right after it. The status element always holds the whole
+// text, so assistive technology reads all of it. `button(text, action)` makes
+// the control.
+let notices = 0;
+export function clampedNotice(status, button) {
+  status.classList.add('clamped');
+  if (!status.id) status.id = 'notice-' + ++notices;
+  const more = button('More', () => show(!status.classList.contains('open')));
+  more.className = 'notice-more';
+  more.setAttribute('aria-controls', status.id);
+  function show(open) {
+    status.classList.toggle('open', open);
+    more.textContent = open ? 'Less' : 'More';
+    more.setAttribute('aria-label', open ? 'Less of this notice' : 'More of this notice');
+    more.setAttribute('aria-expanded', String(open));
+  }
+  function measure() {
+    more.hidden =
+      !status.textContent ||
+      (!status.classList.contains('open') && status.scrollHeight <= status.clientHeight + 1);
+  }
+  show(false);
+  more.hidden = true;
+  const watchers = [];
+  if (typeof MutationObserver === 'function') {
+    // New text starts folded again; the same text written again stays as it is.
+    let shown = status.textContent;
+    const changed = new MutationObserver(() => {
+      if (status.textContent !== shown) show(false);
+      shown = status.textContent;
+      measure();
+    });
+    changed.observe(status, { childList: true, characterData: true, subtree: true });
+    watchers.push(changed);
+  }
+  if (typeof ResizeObserver === 'function') {
+    const resized = new ResizeObserver(measure);
+    resized.observe(status);
+    watchers.push(resized);
+  }
+  return { control: more, stop: () => watchers.forEach((watcher) => watcher.disconnect()) };
 }

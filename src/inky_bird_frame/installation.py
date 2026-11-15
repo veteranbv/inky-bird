@@ -275,13 +275,18 @@ def native_tls_environment(config_path: Path) -> dict[str, str]:
     return {"SSL_CERT_FILE": str(bundle)}
 
 
+def generation_species_timeout_seconds(config: AppConfig) -> int:
+    """The longest one bird can take: its agent calls at their timeout."""
+    # A profile, one profile refresh, and per attempt one generation and one review.
+    calls = 2 + 2 * config.controller.max_generation_attempts
+    return calls * CODEX_CALL_TIMEOUT_SECONDS
+
+
 def generation_cycle_timeout_seconds(config: AppConfig) -> int:
     """Bound one generation cycle by the agent calls its configuration allows."""
-    # Each species may need a profile, one profile refresh, and per attempt one
-    # generation and one review. Deferred species still count toward the cap.
-    calls_per_species = 2 + 2 * config.controller.max_generation_attempts
-    calls = config.controller.max_species_attempts_per_cycle * calls_per_species
-    return calls * CODEX_CALL_TIMEOUT_SECONDS + GENERATION_UNIT_MARGIN_SECONDS
+    # Deferred species still count toward the cap.
+    birds = config.controller.max_species_attempts_per_cycle
+    return birds * generation_species_timeout_seconds(config) + GENERATION_UNIT_MARGIN_SECONDS
 
 
 def controller_systemd_units(
