@@ -186,8 +186,15 @@ class Ledger:
         line = json.dumps({"at": now(), "event": event, **details}, sort_keys=True)
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            with self.path.open("a+b") as handle:
+                # A crash can leave a partial last line; end it so this record
+                # is not joined to it and lost.
+                size = handle.seek(0, 2)
+                if size:
+                    handle.seek(size - 1)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+                handle.write((line + "\n").encode("utf-8"))
                 handle.flush()
 
     def entries(self) -> list[dict[str, object]]:

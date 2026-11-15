@@ -349,17 +349,18 @@ def score_judge(
     for item, original, repeat in items:
         votes = [vote for pair in (original, repeat) for vote in pair.votes if vote.judge == judge]
         judged += len(votes)
-        for vote in votes:
-            if item.kind == "anchor":
-                anchors.append(prefers_first(vote))
-            else:
-                recall.append(flags_planted(vote, item.kind))
-                preference.append(prefers_first(vote))
-        if len(votes) == 2:
-            first, second = votes
-            consistent.append(
-                (first.anatomy, first.lettering) == (second.anatomy, second.lettering)
-            )
+        # Each item is shown twice. A verdict the judge never returned counts
+        # against it, so a judge cannot pass on the few pairs it answered.
+        missing = [False] * (2 - len(votes))
+        if item.kind == "anchor":
+            anchors.extend([prefers_first(vote) for vote in votes] + missing)
+        else:
+            recall.extend([flags_planted(vote, item.kind) for vote in votes] + missing)
+            preference.extend([prefers_first(vote) for vote in votes] + missing)
+        consistent.append(
+            len(votes) == 2
+            and (votes[0].anatomy, votes[0].lettering) == (votes[1].anatomy, votes[1].lettering)
+        )
     result = {
         "anchor_accuracy": (_share(anchors), config.anchor_accuracy_threshold),
         "planted_recall": (_share(recall), config.planted_recall_threshold),

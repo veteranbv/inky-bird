@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import shlex
 import shutil
@@ -320,3 +321,34 @@ def test_codex_generator_sends_the_arm_wording_and_references(
     assert Path((captured / "cwd").read_text().strip()).resolve() == directory.resolve()
     assert ("grey", panel[0].taxon_id, 1) in done
     assert "synthetic-key-value" not in (captured / "env").read_text()
+
+
+def test_a_sample_made_from_other_species_facts_is_not_reused(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    generate_samples(
+        run,
+        ColourGenerator(),
+        [arm],
+        [(panel[0], frozen_references(run, panel[0]))],
+        1,
+        budget=Budget(1),
+    )
+    changed = dataclasses.replace(
+        panel[0], profile={**panel[0].profile, "habitat": "Somewhere else entirely"}
+    )
+
+    assert completed_sample(run, arm, panel[0], 1) is not None
+    with pytest.raises(HarnessError, match="other species facts"):
+        completed_sample(run, arm, changed, 1)
+
+
+def test_a_record_after_a_cut_off_line_is_still_read(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    ledger.record("generation-started", sample="a")
+    with ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write('{"event": "generation-fin')
+
+    ledger.record("generation-started", sample="b")
+
+    assert ledger.count("generation-started") == 2

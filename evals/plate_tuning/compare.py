@@ -233,7 +233,14 @@ def compare(
     """
     with_references = [(entry, frozen_references(run, entry)) for entry in species]
     done, report = generate_samples(
-        run, generator, [first, second], with_references, samples, budget=budget, parallel=parallel
+        run,
+        generator,
+        [first, second],
+        with_references,
+        samples,
+        budget=budget,
+        parallel=parallel,
+        max_characters=config.max_candidate_characters,
     )
     specs = pair_specs(scope, first, second, with_references, done, samples)
     pairs = judge_pairs(run, specs, judges, config, parallel=parallel)

@@ -25,6 +25,7 @@ from plate_tuning.judges import (
     BlindVerdict,
     Choice,
     Defect,
+    JudgeError,
     JudgeRequest,
     PlateAssessment,
 )
@@ -320,3 +321,35 @@ def test_anchors_may_name_any_approved_catalog_species(tmp_path: Path) -> None:
     (anchors / "999").mkdir()
     with pytest.raises(HarnessError, match="catalog entry"):
         anchor_items(anchors, [(off_panel, frozen_references(run, off_panel))])
+
+
+class QuittingJudge(CalibrationJudge):
+    """Answers the first few requests well, then fails every later one."""
+
+    def __init__(self, name: str, approved: dict[str, bytes], answers: int) -> None:
+        super().__init__(name, approved)
+        self.answers = answers
+
+    def judge(self, request: JudgeRequest) -> BlindVerdict:
+        if self.answers <= 0:
+            raise JudgeError("no verdict")
+        self.answers -= 1
+        return super().judge(request)
+
+
+def test_a_judge_that_stops_answering_cannot_pass_on_what_it_answered(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+    anchors = tmp_path / "anchors"
+    (anchors / "101").mkdir(parents=True)
+    Image.new("RGB", (120, 160), (10, 10, 10)).save(anchors / "101" / "rejected-first.png")
+    reencoded = tmp_path / "reencoded.png"
+    with Image.open(panel[0].portrait_path) as image:
+        image.convert("RGB").save(reencoded, format="PNG")
+    judge = QuittingJudge("fake-1", {panel[0].key: reencoded.read_bytes()}, answers=2)
+
+    (result,) = calibrate(run, config(), [judge], species, anchors=anchors)
+
+    assert result.judged == 2
+    assert not result.passed
+    assert result.swap_consistency is not None and result.swap_consistency < 1.0

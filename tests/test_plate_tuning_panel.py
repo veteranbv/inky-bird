@@ -23,6 +23,7 @@ from inky_bird_frame.references import ReferenceCandidate
 REPOSITORY_CATALOG = Path(__file__).resolve().parents[1] / "catalog"
 
 
+@pytest.mark.repository_catalog
 def test_checked_in_panel_matches_the_committed_catalog() -> None:
     panel = load_panel(REPOSITORY_CATALOG, DEFAULT_PANEL)
 

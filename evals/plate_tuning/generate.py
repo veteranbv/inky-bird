@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import inspect
+import json
 import random
 import re
 import shutil
@@ -371,6 +372,11 @@ class Sample:
     portrait: Path
 
 
+def profile_sha256(species: PanelSpecies) -> str:
+    """Fingerprint of the facts a plate is generated from and judged against."""
+    return sha256_text(json.dumps(species.profile, sort_keys=True))
+
+
 def sample_dir(run: Run, arm: Arm, species: PanelSpecies, index: int) -> Path:
     return run.path(arm.name, species.key, str(index))
 
@@ -384,6 +390,12 @@ def completed_sample(run: Run, arm: Arm, species: PanelSpecies, index: int) -> S
     record = read_object(record_path)
     if record.get("instructions_sha256") != arm.sha256:
         raise HarnessError(f"Sample {directory.name} of {arm.name} was made with other wording")
+    # Records written before profiles were fingerprinted carry no digest.
+    if record.get("profile_sha256", profile_sha256(species)) != profile_sha256(species):
+        raise HarnessError(
+            f"Sample {arm.name}/{species.key}/{index} was made from other species facts;"
+            " use a new run directory"
+        )
     if record.get("portrait_sha256") != sha256_file(portrait):
         raise HarnessError(f"Sample {arm.name}/{species.key}/{index} portrait was altered")
     return Sample(arm.name, species.taxon_id, index, portrait)
@@ -426,6 +438,7 @@ def _finish(run: Run, request: GenerationRequest, index: int, usage: Usage | Non
             "instructions_sha256": request.arm.sha256,
             "taxon_id": request.species.taxon_id,
             "index": index,
+            "profile_sha256": profile_sha256(request.species),
             "portrait_sha256": sha256_file(directory / PORTRAIT),
             "usage": None if usage is None else dict(usage),
         },
