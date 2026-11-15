@@ -9,6 +9,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/app/icon-32.png">
   <link rel="icon" type="image/png" sizes="64x64" href="/app/icon-64.png">
   <link rel="apple-touch-icon" href="/app/icon-180.png">
+  <link rel="manifest" href="/app/manifest.webmanifest">
   <link rel="stylesheet" href="/app/app.css">
   <script type="module" src="/app/app.js"></script>
   <link rel="modulepreload" href="/app/journal.js">
@@ -35,7 +36,7 @@
   </header>
   <main id="main" aria-busy="true">
     <h1>Open your field journal</h1>
-    <p id="status" role="status">Checking your connection…</p>
+    <p id="status" role="status">Checking your connection… <span class="start-stalled">This is taking too long. Check the connection and reload, or open Inky in an up-to-date browser.</span></p>
     <noscript><p>Turn on JavaScript in this browser to set up or sign in to Inky. Your password is never sent until you submit the form.</p></noscript>
   </main>
 </body>

@@ -1,5 +1,8 @@
 import { frameTools, compact, glyph, stepIndex } from '/app/frame-tools.js';
 
+// Longer than one playing turn, so a slow plate is replaced by the next turn first.
+const PLATE_TIMEOUT = 90000;
+
 export function renderFrame(context) {
   const {
     ui, el, button, api, main, view, data, byId, plateURL, href, link, note, members, viewLabel,
@@ -7,11 +10,43 @@ export function renderFrame(context) {
   } = context;
   let birds = members(view).filter((bird) => bird.plate_ready);
   base(viewLabel(view));
+  // The members of this view in the journal `current`; undefined when removed.
+  const viewIds = (current) =>
+    view === 'favorites'
+      ? current.collections.find((group) => group.kind === 'favorites')?.taxon_ids || []
+      : view === 'all'
+        ? current.birds.map((bird) => bird.taxon_id)
+        : view === 'current'
+          ? current.active_taxon_ids
+          : view === 'saved'
+            ? current.saved_taxon_ids
+            : current.collections.find((group) => group.collection_id === view)?.taxon_ids;
+  const ready = (current, ids) =>
+    Boolean(ids) &&
+    ids.some((id) => current.birds.some((bird) => bird.taxon_id === id && bird.plate_ready));
   if (!birds.length) {
-    main.append(
-      empty('No approved plates in this view', 'Inky will not switch to another collection.'),
-      link('Exit Frame', 'collections'),
-    );
+    const card = empty('No approved plates in this view', 'Inky will not switch to another collection.');
+    main.append(card, link('Exit Frame', 'collections'));
+    let left = false;
+    // A view that is empty for now starts playing once its plates arrive.
+    const waiting = setInterval(async () => {
+      if (document.hidden) return;
+      try {
+        const current = await api('/v1/owner/journal');
+        if (left || !card.isConnected) return;
+        if (ready(current, viewIds(current))) location.reload();
+      } catch (error) {
+        if (left || !card.isConnected) return;
+        if (['sign_in_required', 'secure_access_required'].includes(error.code)) {
+          clearInterval(waiting);
+          ui.showProblem(error);
+        }
+      }
+    }, 60000);
+    setStopScreen(() => {
+      left = true;
+      clearInterval(waiting);
+    });
     return;
   }
   document.body.classList.add('presenting');
@@ -71,20 +106,28 @@ export function renderFrame(context) {
     }
     const request = new AbortController();
     loading = request;
-    let nextURL;
+    let nextURL,
+      timedOut = false;
+    // A hung plate request must not hold Frame: it ends by this deadline.
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      request.abort();
+    }, PLATE_TIMEOUT);
     try {
       const response = await fetch(plateURL(bird), {
         credentials: 'same-origin',
         signal: request.signal,
       });
-      if (request.signal.aborted || !image.isConnected) return;
+      if ((request.signal.aborted && !timedOut) || !image.isConnected) return;
       if ([401, 403].includes(response.status)) {
         signedOut();
         return;
       }
       if (!response.ok || response.headers.get('content-type')?.split(';')[0] !== 'image/png')
         throw new Error('Plate unavailable');
-      nextURL = URL.createObjectURL(await response.blob());
+      const body = await response.blob();
+      clearTimeout(deadline);
+      nextURL = URL.createObjectURL(body);
       const nextImage = el('img', '', 'frame-art');
       nextImage.draggable = false;
       nextImage.src = nextURL;
@@ -108,13 +151,14 @@ export function renderFrame(context) {
     } catch (error) {
       // One failed plate never stops playback: the next turn moves past it.
       // While paused, Previous and Next stay relative to the plate shown.
-      if (!request.signal.aborted && !expired && image.isConnected) {
+      if ((timedOut || !request.signal.aborted) && !expired && image.isConnected) {
         if (!paused) position = index;
         status.textContent = paused
           ? 'Plate unavailable. Keeping the last approved plate. Try Next when the connection returns.'
           : 'Plate unavailable. Keeping the last approved plate. Playback continues.';
       }
     } finally {
+      clearTimeout(deadline);
       if (nextURL) URL.revokeObjectURL(nextURL);
     }
   }
@@ -185,22 +229,10 @@ export function renderFrame(context) {
     try {
       const current = await api('/v1/owner/journal');
       if (!image.isConnected || expired) return;
-      const ids =
-        view === 'favorites'
-          ? current.collections.find((group) => group.kind === 'favorites')?.taxon_ids || []
-          : view === 'all'
-            ? current.birds.map((bird) => bird.taxon_id)
-            : view === 'current'
-              ? current.active_taxon_ids
-              : view === 'saved'
-                ? current.saved_taxon_ids
-                : current.collections.find((group) => group.collection_id === view)?.taxon_ids;
+      const ids = viewIds(current);
       // An empty or removed view clears the plate but keeps checking, so
       // plates that return play again without a reload.
-      if (
-        !ids ||
-        !ids.some((id) => current.birds.some((bird) => bird.taxon_id === id && bird.plate_ready))
-      ) {
+      if (!ready(current, ids)) {
         birds = [];
         withdraw();
         details.hidden = true;
@@ -263,5 +295,7 @@ export function renderFrame(context) {
     dock,
     note('Plates change once a minute while playing. This does not refresh the wall panel.'),
   );
+  if (!window.isSecureContext)
+    main.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
   show();
 }

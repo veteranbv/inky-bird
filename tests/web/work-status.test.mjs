@@ -27,3 +27,16 @@ test('preparation success is not confused with a later held or deferred plate', 
   assert.match(requestState({ status: 'blocked', outcome: 'interrupted' }, {}), /not replayed/);
   assert.match(requestState({ status: 'approved' }, {}), /no regeneration/);
 });
+
+// A tab left open across an upgrade can meet a value this page does not know.
+test('an unknown request status is not reported as finished', () => {
+  const text = requestState({ taxon_id: 7, status: 'future-status' }, {});
+  assert.doesNotMatch(text, /completed|eligible/);
+  assert.match(text, /future-status/);
+  assert.match(requestState({ taxon_id: 7, status: 'eligible' }, {}), /eligible under the current policy/);
+});
+
+test('an incomplete saved check is named', () => {
+  assert.match(sourceState({ enabled: true, status: 'degraded' }, true), /incomplete/);
+  assert.equal(sourceState({ enabled: true, status: 'not_checked' }, true), 'No recorded check');
+});

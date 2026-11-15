@@ -1,8 +1,15 @@
 // Settings edit the controller's authoritative file. Secrets are write-only.
+import { inlineProblem } from '/app/ui.js';
+
+const secretNames = {
+  ebird_api_key: 'eBird API key',
+  birdweather_token: 'BirdWeather station token',
+  geoapify_api_key: 'Geoapify API key',
+};
+
 export async function renderSettings(ui, { base, link, note, sourceNames, source }) {
   const { element: el, button, api } = ui;
   const main = document.querySelector('#main');
-  const settings = await api('/v1/owner/settings');
   base(
     source ? sourceNames[source][0] : 'Settings and backups',
     source
@@ -18,6 +25,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   );
   if (location.protocol === 'http:') main.append(privateNotice);
   if (source === 'birdbuddy') await birdBuddyAccount(ui, main, note);
+  let settings;
+  try {
+    settings = await api('/v1/owner/settings');
+  } catch (error) {
+    inlineProblem(ui, main, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
   if (settings.restart_required) {
     main.append(
       el('h2', 'Finish switching configuration ownership'),
@@ -134,9 +148,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       'Include ' + sourceNames[source][0] + ' in scheduled discovery',
       fields.sources.includes(source),
       (checked) => {
-        changes.discovery.sources = Object.keys(sourceNames).filter((key) =>
-          key === source ? checked : fields.sources.includes(key),
-        );
+        // Sources this page does not know, such as one from a newer release, stay.
+        const others = fields.sources.filter((key) => key !== source);
+        changes.discovery.sources = checked
+          ? fields.sources.includes(source)
+            ? [...fields.sources]
+            : [...others, source]
+          : others;
       },
     );
     if (['inaturalist', 'ebird'].includes(source))
@@ -307,7 +325,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         ? 'Already set. Leave empty to keep.'
         : 'Apprise notification URL';
       row.append(name, url);
-      const events = [
+      const known = [
         'discovery',
         'generation_approved',
         'terminal_error',
@@ -318,6 +336,8 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         'display_stale',
         'display_recovered',
       ];
+      // An event this page does not list stays with its destination.
+      const events = [...known, ...(saved.events || []).filter((event) => !known.includes(event))];
       const checked = [];
       for (const event of events) {
         const label = el('label', '', 'check-label'),
@@ -328,7 +348,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         row.append(label);
         checked.push([event, field]);
       }
-      row.append(button('Remove destination', () => row.remove()));
+      row.append(
+        button('Remove destination', () => {
+          row.remove();
+          withdrawReview();
+        }),
+      );
       destinationRows.append(row);
       destinationReaders.push(() =>
         row.isConnected
@@ -348,7 +373,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       );
     else {
       for (const saved of settings.notifications.destinations) destination(saved);
-      notifications.append(button('Add destination', () => destination()));
+      notifications.append(
+        button('Add destination', () => {
+          destination();
+          withdrawReview();
+        }),
+      );
       read.push(() => {
         changes.notifications.destinations = destinationReaders.map((get) => get()).filter(Boolean);
       });
@@ -363,9 +393,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   submit.type = 'submit';
   form.append(submit, problem, review);
   main.append(form);
-  form.addEventListener('input', () => {
+  // A review describes one set of choices; any later change withdraws it.
+  function withdrawReview() {
     review.hidden = true;
-  });
+    review.replaceChildren();
+  }
+  form.addEventListener('input', withdrawReview);
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     problem.textContent = '';
@@ -390,6 +423,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
           'Generation: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
           'Notifications: ' + (changes.notifications.enabled ? 'on' : 'off') + '.',
         );
+      summary.push(...differences(settings, changes));
       review.append(
         el('h2', 'Save these choices?'),
         ...summary.map(note),
@@ -408,8 +442,9 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             for (const field of form.querySelectorAll('input[type="password"]')) field.value = '';
             location.reload();
           } catch (error) {
-            problem.textContent = error.message;
             control.disabled = false;
+            if (error.code === 'sign_in_required') ui.showProblem(error);
+            else problem.textContent = error.message;
           }
         }),
         button('Keep editing', () => {
@@ -425,11 +460,65 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   });
 }
 
+// What a save changes beyond the fixed summary: location, limits, secrets and
+// destinations, so nothing is removed or replaced without being named.
+function differences(settings, changes) {
+  const fields = settings.discovery,
+    next = changes.discovery,
+    lines = [];
+  const place = (values) =>
+    values.latitude != null
+      ? 'latitude ' + values.latitude + ', longitude ' + values.longitude
+      : values.zip_code
+        ? 'US ZIP code ' + values.zip_code
+        : values.postal_code
+          ? 'postal code ' + values.postal_code + (values.country_code ? ', ' + values.country_code : '')
+          : 'no community location';
+  const keys = ['latitude', 'longitude', 'zip_code', 'postal_code', 'country_code'];
+  if (keys.some((key) => key in next)) {
+    const after = Object.fromEntries(keys.map((key) => [key, key in next ? next[key] : fields[key]]));
+    if (place(after) !== place(fields)) lines.push('Community location: ' + place(after) + '.');
+  }
+  if ('radius_km' in next && next.radius_km !== (fields.radius_km ?? null))
+    lines.push('Radius: ' + (next.radius_km ?? 'not set') + (next.radius_km == null ? '.' : ' km.'));
+  if ('species_limit' in next && next.species_limit !== (fields.species_limit ?? null))
+    lines.push('Live species limit: ' + (next.species_limit ?? 'not set') + '.');
+  if ('birdnet_go_url' in next && next.birdnet_go_url !== (fields.birdnet_go_url ?? null))
+    lines.push('BirdNET-Go base URL: ' + (next.birdnet_go_url ?? 'not set') + '.');
+  for (const [key, name] of Object.entries(secretNames)) {
+    if (!(key in next)) continue;
+    const saved = settings.credentials[key]?.configured;
+    if (next[key] === null) {
+      if (saved) lines.push('Clear the saved ' + name + '.');
+    } else lines.push((saved ? 'Replace the saved ' : 'Save a new ') + name + '.');
+  }
+  const destinations = changes.notifications.destinations;
+  if (destinations) {
+    const before = settings.notifications.destinations.map((item) => item.name);
+    const after = destinations.map((item) => item.name);
+    for (const name of before)
+      if (!after.includes(name)) lines.push('Remove notification destination: ' + name + '.');
+    for (const item of destinations)
+      if (!before.includes(item.name)) lines.push('Add notification destination: ' + item.name + '.');
+      else if (item.url) lines.push('Replace the private URL for ' + item.name + '.');
+  }
+  return lines;
+}
+
 async function birdBuddyAccount(ui, main, note) {
   const { api, element: el, button } = ui;
-  const response = await api('/v1/owner/birdbuddy'),
-    state = response.state;
   const section = el('section', '', 'journal-card');
+  let response;
+  try {
+    response = await api('/v1/owner/birdbuddy');
+  } catch (error) {
+    // The rest of the page, including the switch for this source, still works.
+    section.append(el('h2', 'Bird Buddy account'));
+    main.append(section);
+    inlineProblem(ui, section, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
+  const state = response.state;
   section.append(
     el('h2', 'Bird Buddy account'),
     note(

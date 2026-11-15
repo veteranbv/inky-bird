@@ -276,12 +276,100 @@ jobs:
       - name: Run tests
         run: uv run pytest -m "not repository_catalog"
 
+  browser-acceptance:
+    name: Browser acceptance
+    runs-on: ubuntu-latest
+    # No run history yet: about 2 minutes locally plus browser installation.
+    timeout-minutes: 20
+    steps:
+      # The journeys need only the plates tests/web/e2e-harness.cjs and
+      # frame.e2e.cjs copy, not the whole catalog.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/catalog/species/*/*.png
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out the fixture plates
+        run: |
+          set -euo pipefail
+          # Cardinal and robin by name, then the first other species, as the journeys pick them.
+          mapfile -t folders < <(jq -r '
+            [.species[] | select(.common_name == "Northern Cardinal")][0],
+            [.species[] | select(.common_name == "American Robin")][0],
+            [.species[]
+              | select(.common_name != "Northern Cardinal" and .common_name != "American Robin")][0]
+            | .portrait_path | split("/")[0:2] | join("/")
+          ' catalog/index.json)
+          test "${#folders[@]}" -eq 3
+          patterns=()
+          for folder in "${folders[@]}"; do
+            patterns+=("/catalog/${folder}/*.png")
+          done
+          git sparse-checkout add "${patterns[@]}"
+          for folder in "${folders[@]}"; do
+            test -s "catalog/${folder}/portrait.png"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: "false"
+
+      - name: Install dependencies
+        run: uv sync --extra dev --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      # Exact versions, including the peer packages npm would otherwise float.
+      - name: Install pinned browser test tools
+        env:
+          PLAYWRIGHT_VERSION: "1.62.1"
+          AXE_CORE_VERSION: "4.14.0"
+          AXE_PLAYWRIGHT_VERSION: "4.14.0"
+        run: |
+          set -euo pipefail
+          qa_tools="${RUNNER_TEMP}/qa-tools"
+          npm install --prefix "$qa_tools" --ignore-scripts --no-audit --no-fund --save-exact \
+            "playwright@${PLAYWRIGHT_VERSION}" "playwright-core@${PLAYWRIGHT_VERSION}" \
+            "axe-core@${AXE_CORE_VERSION}" "@axe-core/playwright@${AXE_PLAYWRIGHT_VERSION}"
+          for package in playwright playwright-core axe-core @axe-core/playwright; do
+            npm ls --prefix "$qa_tools" --all "$package" > /dev/null
+          done
+          test "$(node -p "require('${qa_tools}/node_modules/playwright-core/package.json').version")" \
+            = "$PLAYWRIGHT_VERSION"
+          "$qa_tools/node_modules/.bin/playwright" install --with-deps chromium
+
+      # Evidence screenshots and cookies hold synthetic credentials, so the
+      # evidence directory is not uploaded; the log names the failing phase.
+      - name: Run the browser journeys
+        run: |
+          set -euo pipefail
+          qa_tools="${RUNNER_TEMP}/qa-tools"
+          INKY_QA_PLAYWRIGHT="$qa_tools/node_modules/playwright" \
+          INKY_QA_AXE="$qa_tools/node_modules/@axe-core/playwright" \
+            node tests/web/journal.e2e.cjs
+
   quality:
     name: quality
     if: always()
     needs:
       - core-quality
       - python-compatibility
+      - browser-acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -289,6 +377,8 @@ jobs:
         env:
           CORE_RESULT: ${{ needs.core-quality.result }}
           COMPATIBILITY_RESULT: ${{ needs.python-compatibility.result }}
+          BROWSER_RESULT: ${{ needs.browser-acceptance.result }}
         run: |
           test "$CORE_RESULT" = "success"
           test "$COMPATIBILITY_RESULT" = "success"
+          test "$BROWSER_RESULT" = "success"

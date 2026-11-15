@@ -19,9 +19,10 @@ for (const name of ['pointerdown', 'keydown'])
   });
 
 class RequestError extends Error {
-  constructor(message, code) {
+  constructor(message, code, status) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -37,17 +38,41 @@ function unreachable() {
   return new RequestError('Inky cannot be reached. Check your connection and try again.', 'offline');
 }
 
+function stoppedUpload() {
+  return new RequestError('Upload stopped. No history changed.', 'stopped');
+}
+
+// A hung request must not hold a page: every request ends by this deadline.
+// Uploads are bounded by their own progress instead.
+const REQUEST_TIMEOUT = 60000;
+
+// A write that timed out may still have been applied by Inky.
+function notAnswered(write) {
+  return new RequestError(
+    write
+      ? 'Inky did not answer in time. The change may still have been saved, so reload before trying again.'
+      : 'Inky did not answer in time. Check your connection and try again.',
+    'timeout',
+  );
+}
+
 // fetch cannot report how much of a request body has been sent.
 async function upload(path, file, signal, onProgress) {
   const response = await new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(unreachable());
+      reject(stoppedUpload());
       return;
     }
     const xhr = new XMLHttpRequest();
     const stop = () => xhr.abort();
+    // Leaving the page would end the transfer, so the browser asks first.
+    const stay = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
     const settle = (finish) => {
       signal?.removeEventListener('abort', stop);
+      removeEventListener('beforeunload', stay);
       finish();
     };
     xhr.onload = () =>
@@ -58,7 +83,8 @@ async function upload(path, file, signal, onProgress) {
           json: async () => JSON.parse(xhr.responseText),
         }),
       );
-    xhr.onerror = xhr.ontimeout = xhr.onabort = () => settle(() => reject(unreachable()));
+    xhr.onerror = xhr.ontimeout = () => settle(() => reject(unreachable()));
+    xhr.onabort = () => settle(() => reject(signal?.aborted ? stoppedUpload() : unreachable()));
     if (onProgress)
       xhr.upload.onprogress = (event) =>
         onProgress(event.loaded, event.lengthComputable ? event.total : 0);
@@ -66,23 +92,39 @@ async function upload(path, file, signal, onProgress) {
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Inky-CSRF', csrf);
     signal?.addEventListener('abort', stop);
+    addEventListener('beforeunload', stay);
     xhr.send(file);
   });
   return reply(response);
 }
 
 async function request(path, options) {
-  let response;
+  const control = new AbortController();
+  let timedOut = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    control.abort();
+  }, REQUEST_TIMEOUT);
   try {
-    response = await fetch(path, {
-      ...options,
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
-  } catch {
-    throw unreachable();
+    let response;
+    try {
+      response = await fetch(path, {
+        ...options,
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: control.signal,
+      });
+    } catch {
+      throw timedOut ? notAnswered(options.method === 'POST') : unreachable();
+    }
+    try {
+      return await reply(response);
+    } catch (error) {
+      throw timedOut ? notAnswered(options.method === 'POST') : error;
+    }
+  } finally {
+    clearTimeout(deadline);
   }
-  return reply(response);
 }
 
 async function reply(response) {
@@ -103,6 +145,7 @@ async function reply(response) {
     throw new RequestError(
       result.error?.message || 'Inky could not complete this request.',
       result.error?.code,
+      response.status,
     );
   return result.data;
 }
@@ -806,8 +849,17 @@ function showProblem(error) {
     return;
   }
   screen('Inky needs attention', error.message);
+  main.append(button('Try again', () => load()));
+  // A signed-in owner can always leave a page that cannot be drawn.
+  if (csrf)
+    main.append(
+      button('Go to Home', () => {
+        history.replaceState(null, '', '/app');
+        load();
+      }),
+      button('Sign out', signOut),
+    );
   main.append(
-    button('Try again', () => load()),
     help('If the problem continues', [
       'Check that Inky is running and your home network or private VPN is connected. For a private-state error, check storage and permissions. Do not delete state to hide an error.',
     ]),

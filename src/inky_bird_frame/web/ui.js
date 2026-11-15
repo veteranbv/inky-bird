@@ -1,4 +1,4 @@
-// Shared presentation helpers. Static markup only: no state, storage or network.
+// Shared presentation helpers. Markup only: no storage or network.
 const PATHS = {
   feather:
     '<path d="M20.5 3.5c-5 0-9.5 2-12.5 5.5-2.4 2.8-3.5 6.5-3.7 10.8 4.3-.2 8-1.3 10.8-3.7 3.5-3 5.4-7.6 5.4-12.6z"/><path d="M4.5 19.5C8.5 14 13 9.5 18 6"/>',
@@ -21,6 +21,35 @@ const PATHS = {
     '<path d="M14.8 6.3a4.3 4.3 0 0 0-5.6 5.2L4 16.7 7.3 20l5.2-5.2a4.3 4.3 0 0 0 5.2-5.6L14.9 12 12 9.1z"/>',
   pulse: '<path d="M3 12.5h3.6l2.4-6 4 11 2.4-5h5.6"/>',
 };
+
+// A failure after a page is drawn stays beside the part it concerns, and the
+// rest of the page keeps working. Each place keeps at most one message, so a
+// repeated failure replaces it instead of stacking. An ended session still
+// goes to sign-in.
+const problems = new WeakMap();
+export function inlineProblem(ui, place, error, retry) {
+  if (error?.code === 'sign_in_required') {
+    ui.showProblem(error);
+    return null;
+  }
+  let box = problems.get(place);
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'inline-problem';
+    problems.set(place, box);
+  }
+  const message = document.createElement('p');
+  message.className = 'error';
+  message.setAttribute('role', 'alert');
+  message.textContent = error?.message || 'Inky could not complete this request.';
+  box.replaceChildren(message);
+  if (retry) box.append(ui.button(retry.label, retry.action));
+  if (!box.isConnected) place.append(box);
+  return box;
+}
+export function clearProblem(place) {
+  problems.get(place)?.remove();
+}
 
 export function icon(name, className = 'icon') {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
