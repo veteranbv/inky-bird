@@ -18,20 +18,29 @@ With one fault every rollback command works, so every unit must be exactly as
 it was; only when the rollback itself fails (sudo expired, or a second fault)
 may the output name a unit instead.
 
-The default run executes every case for the macOS and both Linux controller
-upgrades from the single-directory layout, the Linux upgrade with a disabled
-timer and the display upgrade on a Pi that also runs the controller, and every
-fourth cleanup step of their second pass plus every cleanup step that moves,
-links or removes a runtime; plus every eighth step of every other
-scenario and start state. Run every case, and the second pass of every
-upgrade, with::
+The default run fails the first and the middle call of every scenario and
+start state, stops the installer at that middle call, and fails every cleanup
+step that moves, links or removes a runtime after a failed upgrade from the
+single-directory layout on both controllers and on a shared Pi's display;
+about 200 tests. Run every case, and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
 
-Cases run one at a time, each group in a fixed directory, so the absolute
-paths an installation records stay valid when its starting state is copied
-back before every case. Every run has its own process group and a time limit;
-nothing it starts may outlive it.
+Case ids read ``<scenario>/<state>/<step>-<tool>-<mode>`` (``-after<step>``
+for the second pass; ``<scenario>-uninstall`` for an uninstaller), so ``-k``
+selects them, e.g. ``-k "linux-timers/single/ and rm-fail"``. Also:
+
+- ``INKY_MATRIX_TOUCHING=rm,I6`` runs only the cases whose failed call is one
+  of those tools, or whose last recorded result had something to check for one
+  of those invariants (results are kept in ``build/installer-matrix``).
+- ``INKY_MATRIX_SHARD=2/6`` runs the second of six equal parts, as CI does.
+- ``INKY_MATRIX_WORKERS`` sets how many cases run at once (default 6).
+- ``INKY_INSTALLER_MATRIX_ONLY=install:macos:single`` records only some groups.
+
+Each starting state is built once and cloned for every run (a filesystem clone
+where there is one), with the absolute paths it records pointed at the clone.
+Every run has its own process group, a time limit and a process budget, and
+starts under an account-wide process ceiling; nothing it starts may outlive it.
 """
 
 from __future__ import annotations
@@ -41,13 +50,20 @@ import contextlib
 import hashlib
 import json
 import os
+import platform
 import plistlib
 import re
+import resource
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
+import threading
+import time
+from collections import Counter
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,11 +77,6 @@ from test_installer_behaviour import (
     running_generation,
 )
 
-FULL = os.environ.get("INKY_INSTALLER_MATRIX") == "full"
-# Every eighth step of every group, for a quick pass across all of them.
-SAMPLE = os.environ.get("INKY_INSTALLER_MATRIX") == "sample"
-# Narrow a run to some groups while working on one, e.g. "install:macos:single".
-ONLY = set(filter(None, os.environ.get("INKY_INSTALLER_MATRIX_ONLY", "").split(",")))
 # The single-directory installers as of 5ded22f, the last commit before the
 # staged layout; they build the starting state every upgrade is tested from.
 SINGLE_DIRECTORY = ROOT / "tests/fake_bin/single_directory"
@@ -82,9 +93,6 @@ TIMER_UNITS = "controller.service refresh.service refresh.timer generate.service
 APP_UNITS = "controller.service scheduler.service"
 AGENTS = "serve refresh catalog-publish"
 SECRET = "synthetic-matrix-secret"
-DEFAULT_STRIDE = 8
-# Every fourth step of a failed run's cleanup in the default subset.
-DEFAULT_SECOND_STRIDE = 4
 KILL_STRIDE = 3
 STOP_MODES = ("kill", "interrupt", "hangup")
 
@@ -202,17 +210,6 @@ SCENARIOS = {
         ),
     )
 }
-# Every step of these runs in the default subset.
-DEFAULT_FULL = {
-    ("install", "macos", "single"),
-    ("install", "linux-timers", "single"),
-    ("install", "linux-timers", "disabled"),
-    ("install", "linux-app", "single"),
-    ("install", "display", "shared-single"),
-}
-UNINSTALL_STATES = ("single", "staged", "shared")
-# States in which this role is already installed, so an upgrade checks for a plate.
-UPGRADE_STATES = ("single", "staged", "disabled", "rolled-back", "shared-single", "shared-both")
 
 
 # Machine state -----------------------------------------------------------------
@@ -251,13 +248,14 @@ def display_venv(host: Host) -> None:
 class Machine(Host):
     """One synthetic computer for a group of cases, in a fixed directory."""
 
-    def __init__(self, root: Path, scenario: Scenario) -> None:
-        super().__init__(root, scenario.system, number_file_commands=True)
+    def __init__(self, root: Path, scenario: Scenario, *, create: bool = True) -> None:
+        super().__init__(root, scenario.system, number_file_commands=True, create=create)
         self.scenario = scenario
-        self.config.write_text(f"synthetic private config {SECRET}\n")
         self.key = root / "synthetic-key"
-        self.key.write_text("synthetic key\n")
-        display_venv(self)
+        if create:
+            self.config.write_text(f"synthetic private config {SECRET}\n")
+            self.key.write_text("synthetic key\n")
+            display_venv(self)
 
     # Building starting states.
     def checkout(self, tag: str) -> Path:
@@ -281,7 +279,14 @@ class Machine(Host):
     def execute(
         self, script: Path, scenario: Scenario, **extra: str
     ) -> subprocess.CompletedProcess[str]:
-        return run_contained([scenario.shell, str(script)], self.environment_for(scenario, **extra))
+        """Run under the account-wide process ceiling and this run's own budget."""
+        caps = limits()
+        command = [scenario.shell, "-c", 'ulimit -u "$0" && exec "$@"', str(caps.ceiling)]
+        return run_contained(
+            [*command, scenario.shell, str(script)],
+            self.environment_for(scenario, **extra),
+            watch=caps.watch,
+        )
 
     def survivors(self) -> list[str]:
         """Kill and name any process still running from this machine's directory."""
@@ -675,9 +680,10 @@ class Case:
 
     @property
     def id(self) -> str:
-        after = "" if self.first is None else f"after{self.first:03d}-"
-        name = f"{self.kind}-{self.scenario}-{self.state}-{after}{self.mode}"
-        return f"{name}-{self.step:03d}-{self.tool}"
+        """``<scenario>/<state>/<step>-<tool>-<mode>``: stable across runs, selectable with -k."""
+        scenario = self.scenario if self.kind == "install" else f"{self.scenario}-uninstall"
+        after = "" if self.first is None else f"-after{self.first:03d}"
+        return f"{scenario}/{self.state}/{self.step:03d}-{self.tool}-{self.mode}{after}"
 
 
 @dataclass
@@ -685,6 +691,8 @@ class Outcome:
     returncode: int
     output: str
     violations: list[str] = field(default_factory=list)
+    # The invariants whose checks had something to check in this case.
+    covered: set[str] = field(default_factory=set)
 
 
 PATH_PATTERN = re.compile(r"/[^\s'\"<>:;,]+")
@@ -708,8 +716,12 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
     """I1, I5, I7 and I9: hold after every run, installs and uninstalls alike."""
     report = outcome.violations
     output = outcome.output
+    covered = outcome.covered
+    covered.add("I9")
     # I1: every recorded process still finds the directory it started from,
     # and every enabled or running unit would start from an existing runtime.
+    if machine.state_of("processes"):
+        covered.add("I1")
     for name, process in machine.state_of("processes").items():
         directory = Path(str(process["directory"]))
         if not directory.exists() or directory.stat().st_ino != process["inode"]:
@@ -719,6 +731,7 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
         for unit, (enabled, active) in current.units.items():
             if not (enabled or active):
                 continue
+            covered.add("I1")
             executable = executable_of(machine, unit)
             if executable is None:
                 if active:
@@ -733,6 +746,7 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
     else:
         other = view(machine, "controller")
     if before.other.tag is not None:
+        covered.add("I5")
         if other.code != before.other_code:
             report.append("I5: the other role's runtime changed")
         if other.units != before.other.units or other.files != before.other.files:
@@ -744,6 +758,8 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
     # I7: no definition was deleted for a unit that is still running.
     current = view(machine, scenario.role)
     for unit, (_, active) in current.units.items():
+        if active:
+            covered.add("I7")
         if active and current.files[unit] == "absent":
             report.append(f"I7: {unit} is still running but its definition was deleted")
     # I9: nothing private is printed.
@@ -810,6 +826,12 @@ def check_install(
     check_common(machine, scenario, before, outcome)
     after = view(machine, scenario.role)
     failed = outcome.returncode != 0
+    covered = outcome.covered
+    covered.update(("I2", "I8", "I10") if after.processes else ("I8", "I10"))
+    if before.role.tag is not None:
+        covered.add("I6")
+    if failed or after.units != before.role.units:
+        covered.add("I4")
     # I8: an injected failure never reports success, and a kill is never silent.
     stopped = case.mode in STOP_MODES
     if outcome.returncode == 0:
@@ -1014,6 +1036,7 @@ def check_uninstall(
 ) -> None:
     report = outcome.violations
     check_common(machine, scenario, before, outcome)
+    outcome.covered.update(("U1", "U2", "U3"))
     after = view(machine, scenario.role)
     remaining = [
         unit
@@ -1040,6 +1063,7 @@ def check_uninstall(
 def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
     """I3: the installer the installed command would pick works once the fault is gone."""
     machine.reset_run()
+    outcome.covered.add("I3")
     script = installed_script(machine, scenario)
     if scenario.role == "display":
         # setup asks the owner to stop the display timer before an upgrade.
@@ -1075,51 +1099,206 @@ def installed_script(machine: Machine, scenario: Scenario) -> Path:
     return machine.script(name)
 
 
+# Process limits ---------------------------------------------------------------
+
+WORKERS = max(1, int(os.environ.get("INKY_MATRIX_WORKERS", "6")))
+# How many processes one run may have at once before its whole group is killed.
+RUN_PROCESS_BUDGET = 100
+WATCH_INTERVAL_SECONDS = 0.25
+
+
+def account_tasks() -> int:
+    """What this account runs now, as the process limit counts it: processes
+    on macOS, threads on Linux."""
+    uid = str(os.getuid())
+    if platform.system() == "Linux":
+        command = ["/bin/ps", "-L", "-U", uid, "-o", "lwp="]
+    else:
+        command = ["/bin/ps", "-U", uid, "-o", "pid="]
+    listing = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+    return len(listing.split())
+
+
+class Limits:
+    """Keep every run's processes bounded.
+
+    ``ulimit -u`` counts every process of the account, not those of one
+    shell, so it cannot give each worker a share: every run starts under one
+    ceiling a little above what the account already runs plus every worker's
+    budget, which keeps a runaway far from the machine's limit, and a watchdog
+    kills any one run's process group that grows past its own budget.
+    """
+
+    def __init__(self, budget: int = RUN_PROCESS_BUDGET) -> None:
+        self.budget = budget
+        configured = os.environ.get("INKY_MATRIX_PROCESS_CEILING")
+        self.ceiling = (
+            int(configured) if configured else account_tasks() + 64 + WORKERS * RUN_PROCESS_BUDGET
+        )
+        soft, _ = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft != resource.RLIM_INFINITY and self.ceiling > soft - 64:
+            raise RuntimeError(
+                f"the matrix would allow {self.ceiling} processes, too close to this "
+                f"account's limit of {soft}; use fewer INKY_MATRIX_WORKERS"
+            )
+        self.lock = threading.Lock()
+        # Each watched process group, and the most processes it was seen with.
+        self.groups: dict[int, int] = {}
+        self.thread: threading.Thread | None = None
+
+    @contextlib.contextmanager
+    def watch(self, group: int) -> Iterator[None]:
+        with self.lock:
+            self.groups[group] = 0
+            if self.thread is None:
+                self.thread = threading.Thread(target=self.loop, daemon=True)
+                self.thread.start()
+        try:
+            yield
+        finally:
+            with self.lock:
+                peak = self.groups.pop(group)
+            if peak > self.budget:
+                raise AssertionError(
+                    f"the run had {peak} processes at once, over its budget of "
+                    f"{self.budget}, and was killed"
+                )
+
+    def loop(self) -> None:
+        while True:
+            time.sleep(WATCH_INTERVAL_SECONDS)
+            with self.lock:
+                if not self.groups:
+                    self.thread = None
+                    return
+                watched = set(self.groups)
+            listing = subprocess.run(
+                ["/bin/ps", "-ax", "-o", "pgid="], capture_output=True, text=True, check=False
+            ).stdout
+            counts = Counter(int(value) for value in listing.split())
+            for group in watched:
+                if counts[group] <= self.budget:
+                    continue
+                with self.lock:
+                    # Only a run still being watched; its ID may be reused once it ends.
+                    if group not in self.groups:
+                        continue
+                    self.groups[group] = max(self.groups[group], counts[group])
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
+
+
+LIMITS: Limits | None = None
+LIMITS_LOCK = threading.Lock()
+
+
+def limits() -> Limits:
+    global LIMITS
+    with LIMITS_LOCK:
+        if LIMITS is None:
+            LIMITS = Limits()
+        return LIMITS
+
+
+# Cloning starting states ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Template:
+    """A machine built once; ``rewrites`` names the files and links that
+    record its own absolute path, which every clone points at itself."""
+
+    root: Path
+    rewrites: tuple[str, ...]
+
+
+def entries(root: Path) -> Iterator[Path]:
+    """Every file, link and directory below ``root``, without following links."""
+    for directory, names, files in os.walk(root):
+        for name in sorted(names + files):
+            yield Path(directory) / name
+
+
+def freeze(root: Path) -> Template:
+    # Compiled bytecode records its source's path in a length-prefixed string that
+    # a rewrite would corrupt; Python compiles it again in each clone instead.
+    for cache in [path for path in entries(root) if path.name == "__pycache__"]:
+        shutil.rmtree(cache)
+    needle = str(root)
+    rewrites = []
+    for path in entries(root):
+        if path.is_symlink():
+            if needle in os.readlink(path):
+                rewrites.append(str(path.relative_to(root)))
+        elif path.is_file() and needle.encode() in path.read_bytes():
+            rewrites.append(str(path.relative_to(root)))
+    return Template(root, tuple(rewrites))
+
+
+def clone_tree(source: Path, target: Path) -> None:
+    """Copy a tree with a filesystem clone where the filesystem offers one."""
+    option = "-c" if platform.system() == "Darwin" else "--reflink=auto"
+    result = subprocess.run(
+        ["/bin/cp", option, "-pR", str(source), str(target)], capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        shutil.rmtree(target, ignore_errors=True)
+        shutil.copytree(source, target, symlinks=True)
+
+
+def thaw(template: Template, target: Path) -> None:
+    """Make ``target`` a copy of the template, recording ``target`` as its path."""
+    shutil.rmtree(target, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    clone_tree(template.root, target)
+    # The realpath form (/private/var for /var on macOS) contains the plain one.
+    old, new = str(template.root), str(target)
+    for name in template.rewrites:
+        path = target / name
+        if path.is_symlink():
+            destination = os.readlink(path).replace(old, new)
+            path.unlink()
+            path.symlink_to(destination)
+        else:
+            path.write_bytes(path.read_bytes().replace(old.encode(), new.encode()))
+
+
 # Running cases ----------------------------------------------------------------
 
 
-class Group:
-    """Cases that share a starting state, run one after another in one directory."""
+def fix_inodes(machine: Machine) -> None:
+    """A copy is the same machine; processes keep running from the same places."""
+    processes = machine.state_of("processes")
+    for process in processes.values():
+        directory = Path(str(process["directory"]))
+        process["inode"] = directory.stat().st_ino if directory.exists() else 0
+    machine.save_state("processes", processes)
 
-    def __init__(self, base: Path, kind: str, scenario: Scenario, state: str) -> None:
+
+class Group:
+    """Cases that share a starting state; every run starts from a fresh clone of it."""
+
+    def __init__(self, kind: str, scenario: Scenario, state: str, template: Template) -> None:
         self.kind = kind
         self.scenario = scenario
         self.state = state
-        self.directory = base / "machine"
-        self.template = base / "template"
-        self.machine = Machine(self.directory, scenario)
-        self.machine.build(scenario, state)
-        if kind == "install":
-            self.machine.script(scenario.script)
-            if scenario.name == "remote-display":
-                self.machine.script("install-display-local.sh")
-        else:
-            self.machine.script(scenario.uninstall)
-        self.machine.reset_run()
-        shutil.copytree(self.directory, self.template, symlinks=True)
+        self.template = template
 
-    def restore(self) -> None:
-        shutil.rmtree(self.directory)
-        shutil.copytree(self.template, self.directory, symlinks=True)
-        # A copy is the same machine; processes keep running from the same places.
-        processes = self.machine.state_of("processes")
-        for process in processes.values():
-            directory = Path(str(process["directory"]))
-            process["inode"] = directory.stat().st_ino if directory.exists() else 0
-        self.machine.save_state("processes", processes)
+    def machine(self, slot: Path) -> Machine:
+        thaw(self.template, slot)
+        machine = Machine(slot, self.scenario, create=False)
+        fix_inodes(machine)
+        return machine
 
-    def script(self) -> Path:
+    def script(self, machine: Machine) -> Path:
         name = self.scenario.script if self.kind == "install" else self.scenario.uninstall
-        return self.machine.source / "deploy" / name
+        return machine.source / "deploy" / name
 
-    def run(self, injection: str | None, *, fresh: bool = True) -> tuple[Outcome, list[list[str]]]:
-        if fresh:
-            self.restore()
-        machine = self.machine
+    def run(self, machine: Machine, injection: str | None) -> tuple[Outcome, list[list[str]]]:
         if injection is not None:
             (machine.fake / "inject").write_text(injection + "\n")
         try:
-            result = machine.execute(self.script(), self.scenario)
+            result = machine.execute(self.script(machine), self.scenario)
             outcome = Outcome(result.returncode, result.stdout + result.stderr)
         except AssertionError as error:
             outcome = Outcome(-1, "", [f"the run was not contained: {error}"])
@@ -1127,19 +1306,24 @@ class Group:
         (machine.fake / "inject").unlink(missing_ok=True)
         return outcome, steps
 
-    def record(self) -> list[list[str]]:
-        outcome, steps = self.run(None)
-        assert outcome.returncode == 0 and not outcome.violations, outcome
-        assert not self.machine.survivors()
+    def record(self, slot: Path, injection: str | None = None) -> list[list[str]]:
+        """The calls of one run: a clean one, or the cleanup after a first failure."""
+        machine = self.machine(slot)
+        outcome, steps = self.run(machine, injection)
+        if injection is None:
+            assert outcome.returncode == 0 and not outcome.violations, outcome
+        else:
+            assert outcome.returncode != 0 and not outcome.violations, outcome
+        assert not machine.survivors()
         return steps
 
-    def rerun(self, outcome: Outcome) -> None:
+    def rerun(self, machine: Machine, outcome: Outcome) -> None:
         try:
             if self.kind == "install":
-                check_rerun(self.machine, self.scenario, outcome)
+                check_rerun(machine, self.scenario, outcome)
             else:
-                self.machine.reset_run()
-                rerun = self.machine.execute(self.script(), self.scenario)
+                machine.reset_run()
+                rerun = machine.execute(self.script(machine), self.scenario)
                 if rerun.returncode != 0:
                     outcome.violations.append(
                         "I3: a second uninstall failed: " + rerun.stderr[-800:]
@@ -1147,14 +1331,14 @@ class Group:
         except AssertionError as error:
             outcome.violations.append(f"I3: the rerun was not contained: {error}")
 
-    def evaluate(self, case: Case, recorded: list[list[str]]) -> Outcome:
-        self.restore()
-        before = snapshot(self.machine, self.scenario)
+    def evaluate(self, case: Case, recorded: list[list[str]], slot: Path) -> Outcome:
+        machine = self.machine(slot)
+        before = snapshot(machine, self.scenario)
         injection = f"{case.step} {case.mode}"
         if case.first is not None:
             injection = f"{case.first} fail\n{injection}"
-        outcome, steps = self.run(injection)
-        survivors = self.machine.survivors()
+        outcome, steps = self.run(machine, injection)
+        survivors = machine.survivors()
         if survivors:
             outcome.violations.append(f"processes outlived the run: {survivors}")
         if len(steps) <= case.step or steps[case.step][2] != recorded[case.step][2]:
@@ -1163,47 +1347,74 @@ class Group:
             )
             return outcome
         if self.kind == "install":
-            check_install(self.machine, self.scenario, case, before, outcome)
+            check_install(machine, self.scenario, case, before, outcome)
         else:
-            check_uninstall(self.machine, self.scenario, before, outcome)
-        self.rerun(outcome)
-        survivors = self.machine.survivors()
+            check_uninstall(machine, self.scenario, before, outcome)
+        self.rerun(machine, outcome)
+        survivors = machine.survivors()
         if survivors:
             outcome.violations.append(f"processes outlived the rerun: {survivors}")
         return outcome
 
-    def busy(self) -> Outcome:
+    def busy(self, slot: Path) -> Outcome:
         """I8: a plate being made stops an upgrade with exit 3 and no change."""
-        self.restore()
-        before = snapshot(self.machine, self.scenario)
-        with running_generation(self.machine):
-            # The lock is held on this copy's state; do not copy it again.
-            outcome, _ = self.run(None, fresh=False)
-        survivors = self.machine.survivors()
+        machine = self.machine(slot)
+        before = snapshot(machine, self.scenario)
+        with running_generation(machine):
+            outcome, _ = self.run(machine, None)
+        outcome.covered.add("I8")
+        survivors = machine.survivors()
         if survivors:
             outcome.violations.append(f"processes outlived the run: {survivors}")
         if outcome.returncode != 3:
             outcome.violations.append(f"I8: busy run exited {outcome.returncode}, not 3")
-        after = snapshot(self.machine, self.scenario)
+        after = snapshot(machine, self.scenario)
         if after.tree != before.tree or after.stray != before.stray:
             outcome.violations.append("I8: a busy run changed the machine")
         return outcome
 
 
-def selected(kind: str, scenario: str, state: str, position: int) -> bool:
-    if SAMPLE:
-        return position % DEFAULT_STRIDE == 0
-    if FULL or (kind, scenario, state) in DEFAULT_FULL:
-        return True
-    return position % DEFAULT_STRIDE == 0
+# Which cases run --------------------------------------------------------------
+
+# INKY_INSTALLER_MATRIX: unset for the default subset, "sample" or "full".
+MODE = os.environ.get("INKY_INSTALLER_MATRIX", "")
+assert MODE in ("", "sample", "full"), f"INKY_INSTALLER_MATRIX={MODE!r} is not sample or full"
+FULL = MODE == "full"
+SAMPLE = MODE == "sample"
+# Narrow a run to some groups while working on one, e.g. "install:macos:single".
+ONLY = set(filter(None, os.environ.get("INKY_INSTALLER_MATRIX_ONLY", "").split(",")))
+# "<i>/<n>": run the i-th of n equal parts of the selected cases, as CI does.
+SHARD = os.environ.get("INKY_MATRIX_SHARD", "")
+# Tools (sudo, rm, launchctl) or invariants (I6, U2): run only the cases whose
+# failed or stopped call is one of these tools, or whose checks of one of these
+# invariants had something to check in the last recorded result for that case.
+TOUCHING = set(filter(None, os.environ.get("INKY_MATRIX_TOUCHING", "").split(",")))
+INVARIANT = re.compile(r"[IU]\d+")
+STATE_DIRECTORY = Path(
+    os.environ.get("INKY_MATRIX_STATE_DIR") or str(ROOT / "build/installer-matrix")
+)
+# The default subset fails the first and the middle call of every scenario and
+# start state, stops the installer at that middle call, and fails each cleanup
+# step that moves, links or removes a runtime after a failed upgrade from the
+# single-directory layout on both controllers and on a shared Pi's display.
+# "sample" fails every eighth call of every group instead.
+SAMPLE_STRIDE = 8
+DEFAULT_SECOND_PASS = {
+    ("install", "macos", "single"),
+    ("install", "linux-timers", "single"),
+    ("install", "display", "shared-single"),
+}
+UNINSTALL_STATES = ("single", "staged", "shared")
+# States in which this role is already installed, so an upgrade checks for a plate.
+UPGRADE_STATES = ("single", "staged", "disabled", "rolled-back", "shared-single", "shared-both")
 
 
 def second_pass(kind: str, scenario: str, state: str) -> bool:
     """Groups whose cleanup is failed a second time: every upgrade when the
-    whole matrix runs, otherwise the groups that run every step."""
+    whole matrix runs, otherwise the default subset's three."""
     if kind != "install" or SAMPLE:
         return False
-    return FULL or (kind, scenario, state) in DEFAULT_FULL
+    return FULL or (kind, scenario, state) in DEFAULT_SECOND_PASS
 
 
 def first_failures(steps: list[list[str]]) -> list[int]:
@@ -1244,68 +1455,247 @@ def busy_checked(scenario: str, state: str) -> bool:
     return SCENARIOS[scenario].role == "controller" and state in UPGRADE_STATES
 
 
-def plan_groups() -> list[tuple[str, Scenario, str]]:
-    groups: list[tuple[str, Scenario, str]] = []
+GroupKey = tuple[str, str, str]
+CleanupKey = tuple[str, str, str, int]
+
+
+def plan_groups() -> list[GroupKey]:
+    groups: list[GroupKey] = []
     for scenario in SCENARIOS.values():
-        groups.extend(("install", scenario, state) for state in scenario.states)
+        groups.extend(("install", scenario.name, state) for state in scenario.states)
         if scenario.uninstall:
             # Only a Pi runs both roles.
             states = UNINSTALL_STATES if scenario.system == "Linux" else UNINSTALL_STATES[:-1]
-            groups.extend(("uninstall", scenario, state) for state in states)
+            groups.extend(("uninstall", scenario.name, state) for state in states)
     if ONLY:
-        groups = [group for group in groups if f"{group[0]}:{group[1].name}:{group[2]}" in ONLY]
+        groups = [group for group in groups if ":".join(group) in ONLY]
     return groups
 
 
+def shard(items: list[str]) -> set[str]:
+    """The ids of this shard: every n-th of the sorted ids, from the i-th."""
+    if not SHARD:
+        return set(items)
+    index, count = (int(part) for part in SHARD.split("/"))
+    assert 1 <= index <= count, SHARD
+    return {item for number, item in enumerate(sorted(items)) if number % count == index - 1}
+
+
+# Recordings and results -------------------------------------------------------
+
+
+def fingerprint() -> str:
+    """Everything a recording depends on; a change records every group again."""
+    hasher = hashlib.sha256()
+    sources = [
+        *sorted((ROOT / "deploy").glob("*.sh")),
+        *sorted((ROOT / "tests/fake_bin").rglob("*.py")),
+        *sorted(SINGLE_DIRECTORY.glob("*.sh")),
+        ROOT / "tests/test_installer_matrix.py",
+        ROOT / "tests/test_installer_behaviour.py",
+    ]
+    for path in sources:
+        hasher.update(str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes())
+    hasher.update(f"{platform.system()} {MACOS_BASH} {sys.version_info[:2]}".encode())
+    return hasher.hexdigest()
+
+
+def signature(steps: list[list[str]]) -> list[tuple[str, str, str]]:
+    """What a case relies on in a recording: each call's number, kind and tool."""
+    return [(index, kind_of_call, tool) for index, kind_of_call, tool, *_ in steps]
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    temporary.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def read_json(path: Path) -> dict[str, object]:
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def group_name(key: GroupKey) -> str:
+    return ":".join(key)
+
+
+def cleanup_name(key: CleanupKey) -> str:
+    return ":".join((*key[:3], str(key[3])))
+
+
 class Matrix:
-    """Record every group once; cases then run one at a time, never in parallel."""
+    """Build each starting state once and run cases from clones of it, in parallel.
+
+    Recordings are cached under ``STATE_DIRECTORY`` by ``fingerprint()`` so
+    cases can be listed without running anything; a group's recording is
+    still made again before its first case runs, and a difference fails it.
+    """
 
     def __init__(self) -> None:
-        self.base = Path(tempfile.mkdtemp(prefix="installer-matrix-"))
+        # A shell started with SIGINT ignored, as a background job is, cannot trap
+        # it, so every interrupt case would pass through; Ctrl-C never finds that.
+        if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.root = Path(tempfile.mkdtemp(prefix="installer-matrix-"))
         # Collecting alone records every group; remove them even if no case runs.
-        atexit.register(shutil.rmtree, self.base, True)
-        self.groups: dict[tuple[str, str, str], Group] = {}
-        self.recordings: dict[tuple[str, str, str], list[list[str]]] = {}
-        for number, (kind, scenario, state) in enumerate(plan_groups()):
-            group = Group(self.base / f"g{number:02d}", kind, scenario, state)
-            key = (kind, scenario.name, state)
-            self.groups[key] = group
-            self.recordings[key] = group.record()
-        # The steps a failed run takes after its failure, mostly its cleanup.
-        self.cleanups: dict[tuple[str, str, str, int], list[list[str]]] = {}
-        for key, steps in self.recordings.items():
-            if not second_pass(*key):
-                continue
-            group = self.groups[key]
-            for first in first_failures(steps):
-                outcome, failed = group.run(f"{first} fail")
-                assert outcome.returncode != 0 and not group.machine.survivors(), outcome
-                self.cleanups[(*key, first)] = failed
+        atexit.register(shutil.rmtree, self.root, True)
+        self.pool = ThreadPoolExecutor(WORKERS, thread_name_prefix="matrix")
+        atexit.register(self.pool.shutdown, wait=False, cancel_futures=True)
+        self.lock = threading.Lock()
+        self.slots = threading.local()
+        self.slot_count = 0
+        self.locks: dict[object, threading.Lock] = {}
+        self.bases: dict[tuple[str, str], Template] = {}
+        self.groups: dict[GroupKey, Group] = {}
+        self.verified: dict[object, str] = {}
+        self.futures: dict[str, Future[Outcome]] = {}
+        self.cases_by_id: dict[str, Case] = {}
+        self.fingerprint = fingerprint()
+        self.cache_path = STATE_DIRECTORY / "recordings.json"
+        self.results_path = STATE_DIRECTORY / "results.json"
+        cache = read_json(self.cache_path)
+        if cache.get("fingerprint") != self.fingerprint:
+            cache = {}
+        groups = cache.get("groups", {})
+        cleanups = cache.get("cleanups", {})
+        assert isinstance(groups, dict) and isinstance(cleanups, dict)
+        self.recordings: dict[GroupKey, list[list[str]]] = {}
+        self.cleanups: dict[CleanupKey, list[list[str]]] = {}
+        planned = plan_groups()
+        missing = [key for key in planned if group_name(key) not in groups]
+        for key, steps in zip(missing, self.pool.map(self.record, missing), strict=True):
+            groups[group_name(key)] = steps
+        for key in planned:
+            self.recordings[key] = groups[group_name(key)]
+        wanted = [
+            (*key, first)
+            for key in planned
+            if second_pass(*key)
+            for first in first_failures(self.recordings[key])
+        ]
+        missing_cleanups = [key for key in wanted if cleanup_name(key) not in cleanups]
+        found = self.pool.map(self.record_cleanup, missing_cleanups)
+        for cleanup, steps in zip(missing_cleanups, found, strict=True):
+            cleanups[cleanup_name(cleanup)] = steps
+        for cleanup in wanted:
+            self.cleanups[cleanup] = cleanups[cleanup_name(cleanup)]
+        if missing or missing_cleanups:
+            cache = {"fingerprint": self.fingerprint, "groups": groups, "cleanups": cleanups}
+            write_json(self.cache_path, cache)
 
+    # Machines.
+    def slot(self) -> Path:
+        """This worker's own directory, where each of its runs builds its machine."""
+        slot: Path | None = getattr(self.slots, "path", None)
+        if slot is None:
+            with self.lock:
+                self.slot_count += 1
+                number = self.slot_count
+            slot = self.root / "slots" / f"w{number:02d}" / "machine"
+            self.slots.path = slot
+        return slot
+
+    def once(self, key: object) -> threading.Lock:
+        with self.lock:
+            return self.locks.setdefault(key, threading.Lock())
+
+    def base(self, scenario: Scenario, state: str) -> Template:
+        """The starting state as its installers left it, built once."""
+        built = SCENARIOS[scenario.start] if scenario.start else scenario
+        key = (built.name, state)
+        with self.once(("base", key)):
+            if key not in self.bases:
+                directory = self.root / "bases" / f"{built.name}-{state}" / "machine"
+                machine = Machine(directory, built)
+                machine.build(built, state)
+                assert not machine.survivors()
+                self.bases[key] = freeze(directory)
+            return self.bases[key]
+
+    def group(self, key: GroupKey) -> Group:
+        with self.once(("group", key)):
+            if key not in self.groups:
+                kind, name, state = key
+                scenario = SCENARIOS[name]
+                directory = self.root / "templates" / "-".join(key) / "machine"
+                thaw(self.base(scenario, state), directory)
+                machine = Machine(directory, scenario, create=False)
+                if kind == "install":
+                    machine.script(scenario.script)
+                    if scenario.name == "remote-display":
+                        machine.script("install-display-local.sh")
+                else:
+                    machine.script(scenario.uninstall)
+                machine.reset_run()
+                self.groups[key] = Group(kind, scenario, state, freeze(directory))
+            return self.groups[key]
+
+    # Recordings.
+    def record(self, key: GroupKey) -> list[list[str]]:
+        steps = self.group(key).record(self.slot())
+        self.verified[key] = ""
+        return steps
+
+    def record_cleanup(self, key: CleanupKey) -> list[list[str]]:
+        steps = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
+        self.verified[key] = ""
+        return steps
+
+    def verify(self, key: GroupKey | CleanupKey, cached: list[list[str]]) -> str:
+        """Record again what a cached recording says; a difference is the reason."""
+        with self.once(("verify", key)):
+            if key not in self.verified:
+                if len(key) == 3:
+                    fresh = self.group(key[:3]).record(self.slot())
+                else:
+                    fresh = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
+                self.verified[key] = (
+                    ""
+                    if signature(fresh) == signature(cached)
+                    else f"the recording of {key} changed since it was cached; run again"
+                )
+            return self.verified[key]
+
+    # Cases.
     def cases(self) -> list[Case]:
         found: list[Case] = []
-        for (kind, scenario, state), steps in self.recordings.items():
-            position = 0
-            for index, (_, kind_of_call, tool, *arguments) in enumerate(steps):
-                if kind_of_call != "action":
+        for number, ((kind, scenario, state), steps) in enumerate(self.recordings.items()):
+            actions = [
+                (index, tool, tuple(arguments))
+                for index, (_, kind_of_call, tool, *arguments) in enumerate(steps)
+                if kind_of_call == "action"
+            ]
+            middle = len(actions) // 2
+            for position, (index, tool, called) in enumerate(actions):
+                # Alternate a stop of the installer, an interrupt of its whole
+                # process group (Ctrl-C) and a hangup.
+                if FULL or SAMPLE:
+                    chosen = position % (1 if FULL else SAMPLE_STRIDE) == 0
+                    stop = position % KILL_STRIDE == 0
+                    signal_mode = STOP_MODES[(position // KILL_STRIDE) % len(STOP_MODES)]
+                else:
+                    chosen = position in (0, middle)
+                    stop = position == middle
+                    signal_mode = STOP_MODES[number % len(STOP_MODES)]
+                if not chosen:
                     continue
-                if selected(kind, scenario, state, position):
-                    call = (kind, scenario, state, index)
-                    found.append(Case(*call, "fail", tool, tuple(arguments)))
-                    if tool == "sudo":
-                        found.append(Case(*call, "expire", tool))
-                    if position % KILL_STRIDE == 0:
-                        # Alternate a stop of the installer, an interrupt of its
-                        # whole process group (Ctrl-C) and a hangup.
-                        signal_mode = STOP_MODES[(position // KILL_STRIDE) % len(STOP_MODES)]
-                        found.append(Case(*call, signal_mode, tool))
-                position += 1
+                call = (kind, scenario, state, index)
+                found.append(Case(*call, "fail", tool, called))
+                if tool == "sudo":
+                    found.append(Case(*call, "expire", tool))
+                if stop:
+                    found.append(Case(*call, signal_mode, tool))
         for (kind, scenario, state, first), steps in self.cleanups.items():
             position = 0
             for index, (_, kind_of_call, tool, *arguments) in enumerate(steps):
                 if index <= first or kind_of_call != "action":
                     continue
-                if FULL or position % DEFAULT_SECOND_STRIDE == 0 or switches_back(tool, arguments):
+                if FULL or switches_back(tool, arguments):
                     call = (kind, scenario, state, index)
                     found.append(Case(*call, "fail", tool, tuple(arguments), first))
                     if position % KILL_STRIDE == 0:
@@ -1313,19 +1703,110 @@ class Matrix:
                         signal_mode = STOP_MODES[(position // KILL_STRIDE) % len(STOP_MODES)]
                         found.append(Case(*call, signal_mode, tool, (), first))
                 position += 1
+        kept = shard([case.id for case in found])
+        found = [case for case in found if case.id in kept and self.touches(case.id, case.tool)]
+        self.cases_by_id.update((case.id, case) for case in found)
         return found
+
+    def busy_groups(self) -> list[tuple[str, str]]:
+        names = [
+            (scenario, state)
+            for kind, scenario, state in plan_groups()
+            if kind == "install" and busy_checked(scenario, state)
+        ]
+        kept = shard([busy_id(*name) for name in names])
+        return [name for name in names if busy_id(*name) in kept and self.touches(busy_id(*name))]
+
+    def touches(self, case_id: str, tool: str = "busy") -> bool:
+        if not TOUCHING:
+            return True
+        if tool in TOUCHING:
+            return True
+        wanted = {item for item in TOUCHING if INVARIANT.fullmatch(item)}
+        if not wanted:
+            return False
+        results = read_json(self.results_path).get("cases")
+        if not isinstance(results, dict) or not results:
+            raise RuntimeError(
+                "selecting by invariant needs an earlier run's results; run the matrix first"
+            )
+        entry = results.get(case_id)
+        if not isinstance(entry, dict):
+            return False
+        checked = set(entry.get("covered", []))
+        checked |= {str(item).split(":", 1)[0] for item in entry.get("violations", [])}
+        return bool(checked & wanted)
+
+    # Running.
+    def start(self, wanted: list[str]) -> None:
+        """Queue the selected cases in the order pytest will report them, after
+        recording again every run they rely on, so no worker waits for another."""
+        checks: dict[GroupKey | CleanupKey, list[list[str]]] = {}
+        for name in wanted:
+            case = self.cases_by_id.get(name)
+            if case is None:
+                continue
+            key = (case.kind, case.scenario, case.state)
+            if case.first is None:
+                checks[key] = self.recordings[key]
+            else:
+                checks[(*key, case.first)] = self.cleanups[(*key, case.first)]
+        for check, recorded in checks.items():
+            if check not in self.verified:
+                self.pool.submit(self.verify, check, recorded)
+        for name in wanted:
+            if name in self.futures:
+                continue
+            if name in self.cases_by_id:
+                self.futures[name] = self.pool.submit(self.evaluate, self.cases_by_id[name])
+            elif name.startswith("clone:"):
+                kind, scenario, state = name.removeprefix("clone:").split(":")
+                self.futures[name] = self.pool.submit(compare_clone, self, (kind, scenario, state))
+            else:
+                scenario, state, _ = name.split("/")
+                self.futures[name] = self.pool.submit(self.busy, scenario, state)
+
+    def outcome(self, name: str) -> Outcome:
+        return self.futures[name].result()
 
     def evaluate(self, case: Case) -> Outcome:
         key = (case.kind, case.scenario, case.state)
+        check: GroupKey | CleanupKey = key
+        recorded = self.recordings[key]
         if case.first is not None:
-            return self.groups[key].evaluate(case, self.cleanups[(*key, case.first)])
-        return self.groups[key].evaluate(case, self.recordings[key])
+            check = (*key, case.first)
+            recorded = self.cleanups[check]
+        changed = self.verify(check, recorded)
+        if changed:
+            return Outcome(-1, "", [changed])
+        return self.group(key).evaluate(case, recorded, self.slot())
 
     def busy(self, scenario: str, state: str) -> Outcome:
-        return self.groups[("install", scenario, state)].busy()
+        return self.group(("install", scenario, state)).busy(self.slot())
 
     def close(self) -> None:
-        shutil.rmtree(self.base, ignore_errors=True)
+        self.pool.shutdown(wait=True, cancel_futures=True)
+        results = read_json(self.results_path).get("cases")
+        stored = results if isinstance(results, dict) else {}
+        for name, future in self.futures.items():
+            if not future.done() or future.cancelled() or future.exception() is not None:
+                continue
+            outcome = future.result()
+            case = self.cases_by_id.get(name)
+            stored[name] = {
+                "passed": not outcome.violations,
+                "exit": outcome.returncode,
+                "tool": case.tool if case else "busy",
+                "covered": sorted(outcome.covered),
+                "violations": outcome.violations,
+            }
+        if self.futures:
+            write_json(self.results_path, {"fingerprint": self.fingerprint, "cases": stored})
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def busy_id(scenario: str, state: str) -> str:
+    return f"{scenario}/{state}/busy"
 
 
 MATRIX: Matrix | None = None
@@ -1343,17 +1824,27 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         cases = matrix().cases()
         metafunc.parametrize("case", cases, ids=[case.id for case in cases])
     if "busy_group" in metafunc.fixturenames:
-        names = [
-            (scenario.name, state)
-            for kind, scenario, state in plan_groups()
-            if kind == "install" and busy_checked(scenario.name, state)
-        ]
-        metafunc.parametrize("busy_group", names, ids=[f"{name}-{state}" for name, state in names])
+        names = matrix().busy_groups()
+        metafunc.parametrize("busy_group", names, ids=[busy_id(*name) for name in names])
 
 
 @pytest.fixture(scope="module")
-def executed() -> Iterator[Matrix]:
+def executed(request: pytest.FixtureRequest) -> Iterator[Matrix]:
     runner = matrix()
+    wanted = []
+    for item in request.session.items:
+        callspec = getattr(item, "callspec", None)
+        if callspec is None or getattr(item, "module", None) is not sys.modules[__name__]:
+            continue
+        # An empty parametrization leaves one skipped item without a value.
+        value = next(iter(callspec.params.values()), None)
+        if isinstance(value, Case):
+            wanted.append(value.id)
+        elif "busy_group" in callspec.params and isinstance(value, tuple):
+            wanted.append(busy_id(*value))
+        elif "key" in callspec.params and isinstance(value, tuple) and not (TOUCHING or ONLY):
+            wanted.append(clone_id(value))
+    runner.start(wanted)
     yield runner
     runner.close()
 
@@ -1369,7 +1860,7 @@ def report(name: str, outcome: Outcome) -> None:
 
 
 def test_installer_case(case: Case, executed: Matrix) -> None:
-    outcome = executed.evaluate(case)
+    outcome = executed.outcome(case.id)
     report(case.id, outcome)
     assert not outcome.violations, (
         "\n".join(outcome.violations) + f"\nexit {outcome.returncode}\n" + outcome.output[-4000:]
@@ -1377,8 +1868,9 @@ def test_installer_case(case: Case, executed: Matrix) -> None:
 
 
 def test_busy_plate_changes_nothing(busy_group: tuple[str, str], executed: Matrix) -> None:
-    outcome = executed.busy(*busy_group)
-    report("busy-" + "-".join(busy_group), outcome)
+    name = busy_id(*busy_group)
+    outcome = executed.outcome(name)
+    report(name, outcome)
     assert not outcome.violations, "\n".join(outcome.violations) + "\n" + outcome.output[-2000:]
 
 
@@ -1391,6 +1883,127 @@ def test_matrix_covers_every_action_step(executed: Matrix) -> None:
         tools |= {tool for _, kind_of_call, tool, *_ in steps if kind_of_call == "action"}
     assert {"mv", "ln", "rm", "mktemp", "sudo", "uv", "rsync", "ssh", "inky-bird"} <= tools
     assert {"launchctl", "systemctl", "venv-python", "python3"} <= tools
+
+
+# A run of each kind of scenario, compared on a fresh build and on a clone.
+CLONE_CHECKS = (
+    ("install", "macos", "single"),
+    ("install", "linux-timers", "shared-single"),
+    ("install", "linux-app", "staged"),
+    ("install", "display", "shared-both"),
+    ("install", "remote-display", "single"),
+    ("uninstall", "linux-timers", "shared"),
+)
+RANDOM_NAME = re.compile(
+    r"((?:runtime|install|tmp|catalog-publish-recovery|inky-bird-stage)\.)[A-Za-z0-9]{6,12}"
+)
+
+
+def normalized(text: str, root: Path) -> str:
+    """Text with a machine's own path and mktemp's random names replaced."""
+    for form in (os.path.realpath(root), str(root)):
+        text = text.replace(form, "<machine>")
+    return RANDOM_NAME.sub(r"\1<random>", text)
+
+
+def machine_tree(root: Path) -> list[tuple[str, str]]:
+    """Every entry's kind and content, as a machine at any path would have it."""
+    found = []
+    for path in entries(root):
+        if "__pycache__" in path.parts:
+            continue
+        name = normalized(str(path.relative_to(root)), root)
+        if path.is_symlink():
+            found.append((name, "link " + normalized(os.readlink(path), root)))
+        elif path.is_dir():
+            found.append((name, "directory"))
+        elif path.name == "processes.json":
+            # Inodes differ between copies; each must match its own directory.
+            processes = json.loads(path.read_text())
+            for process in processes.values():
+                directory = Path(str(process["directory"]))
+                current = directory.stat().st_ino if directory.exists() else 0
+                process["inode"] = process["inode"] == current
+            found.append((name, normalized(json.dumps(processes, sort_keys=True), root)))
+        else:
+            data = path.read_bytes()
+            text = data.decode("utf-8", "backslashreplace")
+            found.append((name, f"mode {path.stat().st_mode:o} " + normalized(text, root)))
+    return sorted(found)
+
+
+@pytest.mark.parametrize("key", CLONE_CHECKS, ids=[group_name(key) for key in CLONE_CHECKS])
+def test_a_cloned_machine_is_the_machine_built_fresh(key: GroupKey, executed: Matrix) -> None:
+    """A clone has the same tree as a fresh build and behaves the same: a clean
+    run and a failed one leave the same calls, output and machine."""
+    if TOUCHING or ONLY:
+        pytest.skip("a targeted run")
+    executed.outcome(clone_id(key))
+
+
+def clone_id(key: GroupKey) -> str:
+    return f"clone:{group_name(key)}"
+
+
+def compare_clone(executed: Matrix, key: GroupKey) -> Outcome:
+    kind, name, state = key
+    scenario = SCENARIOS[name]
+    # Beside the matrix's own machines, so both paths take the same form.
+    directory = executed.root / "equivalence" / "-".join(key)
+    fresh = Machine(directory / "fresh", scenario)
+    fresh.build(SCENARIOS[scenario.start] if scenario.start else scenario, state)
+    if kind == "install":
+        fresh.script(scenario.script)
+        if scenario.name == "remote-display":
+            fresh.script("install-display-local.sh")
+    else:
+        fresh.script(scenario.uninstall)
+    fresh.reset_run()
+    group = executed.group(key)
+    template = directory / "template"
+    shutil.copytree(fresh.root, template, symlinks=True)
+    clone = group.machine(directory / "clone")
+    assert machine_tree(clone.root) == machine_tree(fresh.root)
+    steps = executed.recordings[key]
+    middle = [index for index, kind_of_call, *_ in steps if kind_of_call == "action"]
+    for injection in (None, f"{middle[len(middle) // 2]} fail"):
+        results = []
+        for machine in (fresh, clone):
+            outcome, recorded = group.run(machine, injection)
+            assert not machine.survivors()
+            results.append(
+                (
+                    outcome.returncode,
+                    normalized(outcome.output, machine.root),
+                    [normalized("\t".join(step), machine.root) for step in recorded],
+                    machine_tree(machine.root),
+                )
+            )
+        assert results[0] == results[1], injection
+        # Both runs start again from the same state.
+        shutil.rmtree(fresh.root)
+        shutil.copytree(template, fresh.root, symlinks=True)
+        fix_inodes(fresh)
+        clone = group.machine(directory / "clone")
+    return Outcome(0, "")
+
+
+def test_a_run_over_its_process_budget_is_killed() -> None:
+    """The watchdog ends a run with more processes than its budget, and all of them."""
+    caps = Limits(budget=3)
+    command = "for n in 1 2 3 4 5; do sleep 60 & done; wait"
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="over its budget of 3"):
+        run_contained(["/bin/sh", "-c", command], {"PATH": "/bin:/usr/bin"}, watch=caps.watch)
+    assert time.monotonic() - started < 30
+
+
+def test_runs_start_under_the_process_ceiling(tmp_path: Path) -> None:
+    machine = Machine(tmp_path / "machine", SCENARIOS["linux-timers"])
+    script = tmp_path / "limit.sh"
+    script.write_text("ulimit -u\n")
+    result = machine.execute(script, SCENARIOS["linux-timers"])
+    assert result.returncode == 0 and result.stdout.strip() == str(limits().ceiling)
 
 
 def test_single_directory_installers_are_the_pinned_copies() -> None:
