@@ -1,4 +1,7 @@
 // Owner-only controls. Screen cookies and status credentials are not owner logins.
+import { inlineProblem, clearProblem } from '/app/ui.js';
+import { confirmAction } from '/app/frame-tools.js';
+
 export async function renderPresentation(ui, { base, link, note, data, area }) {
   const { api, element: el, button } = ui,
     main = document.querySelector('#main');
@@ -6,7 +9,14 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     area === 'integrations' ? 'Integrations' : 'Displays',
     'Choose what each destination may see. A browser never reports a physical panel update.',
   );
-  const state = await api('/v1/owner/presentation');
+  let state;
+  try {
+    state = await api('/v1/owner/presentation');
+  } catch (error) {
+    main.append(link('Back to Manage', 'manage'));
+    inlineProblem(ui, main, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
   const label = (key) =>
     key === 'current'
       ? 'Current and saved'
@@ -29,6 +39,9 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   ];
   let serial = 0,
     busy = false;
+  // At most one open confirmation per section.
+  const confirmations = new WeakMap();
+  const refuse = (section, text) => inlineProblem(ui, section, new Error(text));
   function field(section, title, type = 'text', value = '') {
     const label = el('label', title),
       input = el('input');
@@ -58,16 +71,25 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     section.append(name, input);
     return input;
   }
+  // Resolves true once the change was made, false when it was not.
   async function update(body, section, done = () => location.reload()) {
-    if (busy) return;
+    if (busy) return false;
     busy = true;
     try {
-      done(
-        await api('/v1/owner/presentation', { revision: state.revision, confirm: true, ...body }),
-      );
+      const result = await api('/v1/owner/presentation', {
+        revision: state.revision,
+        confirm: true,
+        ...body,
+      });
+      clearProblem(section);
+      done(result);
+      return true;
     } catch (error) {
       if (error.code === 'confirmation_required') {
+        clearProblem(section);
+        confirmations.get(section)?.remove();
         const notice = el('section', '', 'notice');
+        confirmations.set(section, notice);
         notice.append(
           note(
             'Confirm it is you before granting or changing access. Your choices stay on this page.',
@@ -85,7 +107,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
                 await update(body, section, done);
               } catch (failure) {
                 password.value = '';
-                notice.append(el('p', failure.message, 'error'));
+                inlineProblem(ui, notice, failure);
               }
             }),
           );
@@ -93,17 +115,35 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
         }
         if (ui.singleSignOnReady)
           notice.append(
-            button('Confirm with single sign-on', () => ui.confirmWithSSO()),
+            button('Confirm with single sign-on', async () => {
+              try {
+                await ui.confirmWithSSO();
+              } catch (failure) {
+                inlineProblem(ui, notice, failure);
+              }
+            }),
             note(
               'Sign-in returns to Account and access. Return here and repeat this change; unsaved entries will clear.',
             ),
           );
         notice.append(button('Cancel confirmation', () => notice.remove()));
         section.append(notice);
-      } else section.append(el('p', error.message, 'error'));
+      } else inlineProblem(ui, section, error);
+      return false;
     } finally {
       busy = false;
     }
+  }
+  // Revoking takes two presses: the first only asks.
+  function revoke(section, id, label, question, keep) {
+    return confirmAction({
+      button,
+      label,
+      question,
+      confirmLabel: label.startsWith('Remove') ? 'Remove' : 'Revoke',
+      cancelLabel: keep,
+      action: () => update({ action: 'revoke', id }, section),
+    }).node;
   }
   main.append(link('Back to Manage', 'manage'));
   if (area === 'displays') {
@@ -137,7 +177,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
         section.append(
           button('Pair this screen', () => {
             if (!consent.checked) {
-              section.append(el('p', 'Match the code and confirm first.', 'error'));
+              refuse(section, 'Match the code and confirm first.');
               return;
             }
             update(
@@ -164,9 +204,15 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
           ),
         );
       section.append(
-        button(grant.kind === 'pending' ? 'Remove request' : 'Revoke screen', () =>
-          update({ action: 'revoke', id: grant.id }, section),
-        ),
+        grant.kind === 'pending'
+          ? revoke(section, grant.id, 'Remove request', 'Remove this pairing request?', 'Keep request')
+          : revoke(
+              section,
+              grant.id,
+              'Revoke screen',
+              'Revoke this screen? It stops showing birds at its next check.',
+              'Keep access',
+            ),
         note(
           'Revocation clears an online screen on its next check. An offline screen cannot receive it until it reconnects.',
         ),
@@ -189,7 +235,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     wall.append(
       button('Confirm wall selection', () => {
         if (consent.checked) update({ action: 'wall', view: view.value }, wall);
-        else wall.append(el('p', 'Confirm the wall change first.', 'error'));
+        else refuse(wall, 'Confirm the wall change first.');
       }),
       note(
         'One-time operator setup: set display_node.controller_url to ' +
@@ -223,7 +269,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   art.append(
     button('Enable this art view', () => {
       if (consent.checked) update({ action: 'dashboard', view: view.value }, art);
-      else art.append(el('p', 'Read and confirm the exposure first.', 'error'));
+      else refuse(art, 'Read and confirm the exposure first.');
     }),
   );
   if (state.dashboard_view)
@@ -271,41 +317,44 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   days.min = '1';
   days.max = '365';
   name.maxLength = 128;
-  status.append(
-    button('Create status credential', () =>
-      update(
-        { action: 'status', name: name.value, view: permitted.value, days: Number(days.value) },
-        status,
-        (result) => {
-          state.revision += 1;
-          const once = el('section', '', 'notice'),
-            secret = el('pre');
-          secret.textContent = result.secret;
-          once.append(
-            el('h2', 'Copy this credential now'),
-            note(
-              'It is shown once. Store it in your dashboard secret store. Reloading loses this copy; revoke and create another if needed.',
-            ),
-            secret,
-          );
-          const config = el('pre');
-          config.textContent =
-            'GET ' +
-            location.origin +
-            '/v1/integrations/status\nAuthorization: Bearer <saved status credential>\n\nHome Assistant:\nrest:\n  - resource: ' +
-            location.origin +
-            '/v1/integrations/status\n    headers:\n      Authorization: !secret inky_status_authorization\n    scan_interval: 60\n    sensor:\n      - name: Inky plates in rotation\n        value_template: "{{ value_json.data.view_ready_count }}"\n      - name: Inky approved plates\n        value_template: "{{ value_json.data.approved_count }}"\n\nHomepage customapi:\nwidget:\n  type: customapi\n  url: ' +
-            location.origin +
-            '/v1/integrations/status\n  headers:\n    Authorization: "Bearer {{HOMEPAGE_VAR_INKY_STATUS}}"\n  mappings:\n    - field: data.view_ready_count\n      label: In rotation\n      format: number\n    - field: data.approved_count\n      label: Approved\n      format: number';
-          once.append(
-            config,
-            button('I saved it · clear this copy', () => location.reload()),
-          );
-          status.append(once);
-        },
-      ),
-    ),
-  );
+  // One press makes one credential: the button stays off once it is made.
+  const create = button('Create status credential', async () => {
+    create.disabled = true;
+    const made = await update(
+      { action: 'status', name: name.value, view: permitted.value, days: Number(days.value) },
+      status,
+      (result) => {
+        create.disabled = true;
+        state.revision += 1;
+        const once = el('section', '', 'notice'),
+          secret = el('pre');
+        secret.textContent = result.secret;
+        once.append(
+          el('h2', 'Copy this credential now'),
+          note(
+            'It is shown once. Store it in your dashboard secret store. Reloading loses this copy; revoke and create another if needed.',
+          ),
+          secret,
+        );
+        const config = el('pre');
+        config.textContent =
+          'GET ' +
+          location.origin +
+          '/v1/integrations/status\nAuthorization: Bearer <saved status credential>\n\nHome Assistant:\nrest:\n  - resource: ' +
+          location.origin +
+          '/v1/integrations/status\n    headers:\n      Authorization: !secret inky_status_authorization\n    scan_interval: 60\n    sensor:\n      - name: Inky plates in rotation\n        value_template: "{{ value_json.data.view_ready_count }}"\n      - name: Inky approved plates\n        value_template: "{{ value_json.data.approved_count }}"\n\nHomepage customapi:\nwidget:\n  type: customapi\n  url: ' +
+          location.origin +
+          '/v1/integrations/status\n  headers:\n    Authorization: "Bearer {{HOMEPAGE_VAR_INKY_STATUS}}"\n  mappings:\n    - field: data.view_ready_count\n      label: In rotation\n      format: number\n    - field: data.approved_count\n      label: Approved\n      format: number';
+        once.append(
+          config,
+          button('I saved it · clear this copy', () => location.reload()),
+        );
+        status.append(once);
+      },
+    );
+    if (!made) create.disabled = false;
+  });
+  status.append(create);
   for (const grant of state.grants.filter((grant) => grant.kind === 'status'))
     status.append(
       el('h3', grant.name),

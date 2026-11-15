@@ -225,7 +225,9 @@ async function pairedScreen(t) {
   assert(await screen.evaluate(() => document.body.classList.contains('presenting')));
   await screen.getByRole('button', { name: 'Forget this screen', exact: true }).waitFor();
   await screenContext.unroute('**/v1/screen/forget');
+  // Revoking asks first; the first press changes nothing.
   await page.getByRole('button', { name: 'Revoke screen', exact: true }).click();
+  await page.getByRole('button', { name: 'Revoke', exact: true }).click();
   await screen.clock.runFor(15100);
   await screen.getByRole('heading', { name: 'Screen access ended', exact: true }).waitFor();
   assert.equal(await screen.locator('img').count(), 0);
