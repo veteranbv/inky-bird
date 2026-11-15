@@ -132,8 +132,9 @@ terminal and requires `retry TAXON_ID`.
 After 12 failed automatic tries (about a week with the default backoff), a bird
 stops as a terminal failure, the `terminal_error` notice is sent, and the bird
 waits for `retry TAXON_ID`. Waits for missing reference photos and for the
-shared daily research limit do not count toward the 12. A bird that was already
-past 12 tries before an upgrade stops at its next failure.
+shared daily research limit do not count toward the 12. Failures from before
+this release are not counted; an upgraded bird gets 12 counted tries from its
+next failure.
 
 A stop signal during generation (a systemd timeout, `docker stop`, or the
 scheduler shutting down) saves the running bird's try with a backoff retry

@@ -53,7 +53,7 @@ birdbuddy_include_manual_sightings = false
 # New installs show approved artwork only. Set true to create new artwork with
 # your own image-generation account; that provider's charges apply. After changing
 # it, re-run native setup, or for Docker run config-sync and restart the services.
-# Older files without this line keep generation on.
+# Older files without this line keep generation on, unless app-managed.
 generation_enabled = false
 # Private upload previews expire after 24 hours; choose 1–168. Cleanup never
 # removes confirmed history or saved trips. Restart after changing this policy.
@@ -180,7 +180,8 @@ enabled = false
 degradation_failure_threshold = 3
 degradation_window_minutes = 30
 cooldown_minutes = 360
-# The first retry waits delivery_retry_minutes; later waits double, up to 6 hours.
+# The first retry waits delivery_retry_minutes; later waits double,
+# up to 6 hours, or delivery_retry_minutes if that is longer.
 delivery_retry_minutes = 5
 max_delivery_attempts = 20
 

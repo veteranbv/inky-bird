@@ -21,6 +21,7 @@ FENCED_BLOCK = re.compile(r"^\s*```.*?^\s*```\s*$", re.MULTILINE | re.DOTALL)
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(\s*(?P<target><[^>]+>|[^\s)]+)(?:\s+[^)]*)?\s*\)")
 HTML_LINK = re.compile(r"\b(?:href|src|srcset)\s*=\s*[\"'](?P<target>[^\"']+)[\"']")
 REFERENCE_LINK = re.compile(r"^\s*\[[^\]]+\]:\s*(?P<target>\S+)", re.MULTILINE)
+UI_TEXT = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"|`([^`]*)`|>([^<>]+)<")
 HEADING = re.compile(r"^#{1,6}\s+(?P<title>.+?)\s*#*\s*$", re.MULTILINE)
 
 
@@ -838,16 +839,41 @@ def test_docs_say_head_answers_like_get() -> None:
 def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     web = ROOT / "src/inky_bird_frame/web"
-    screen = " ".join(
-        path.read_text(encoding="utf-8").lower()
+    literals = [
+        next(group for group in match.groups() if group is not None).strip()
         for path in sorted(web.iterdir())
         if path.suffix in {".js", ".html"}
-    )
+        for match in UI_TEXT.finditer(path.read_text(encoding="utf-8"))
+    ]
+    # Text a person reads starts with a capital; identifiers, classes and routes do not.
+    shown = [text for text in literals if text[:1].isupper() and "/" not in text]
     rows = _markdown_table(readme, "| Word | Meaning |")
     assert rows
-    for word, meaning in rows:
-        term = word.strip("*").lower()
-        assert term in screen, word
-        # Describe controls the page really has.
-        heart = re.compile(r"\bheart\b")
-        assert not heart.search(meaning.lower()) or heart.search(screen), word
+    for word, _meaning in rows:
+        label = re.compile(rf"\b{re.escape(word.strip('*'))}s?\b", re.IGNORECASE)
+        assert any(label.search(text) for text in shown), word
+
+
+def test_operations_guide_says_upgraded_birds_get_twelve_counted_tries() -> None:
+    guide = " ".join((ROOT / "docs/operations.md").read_text(encoding="utf-8").split())
+    assert "past 12 tries before an upgrade stops at its next failure" not in guide
+    assert "Failures from before this release are not counted" in guide
+
+
+def test_installation_guide_describes_when_upgrade_skips_the_plate_check() -> None:
+    guide = " ".join((ROOT / "docs/installation.md").read_text(encoding="utf-8").split())
+    assert "If the installed version cannot run at all, setup refuses" not in guide
+    assert "If the installed version cannot be loaded" in guide
+    assert "refuses only if the check itself fails to run" in guide
+
+
+def test_example_config_matches_retry_cap_and_generation_default() -> None:
+    example = " ".join((ROOT / "config.example.toml").read_text(encoding="utf-8").split())
+    assert "up to 6 hours, or delivery_retry_minutes if that is longer" in example
+    assert "Older files without this line keep generation on, unless app-managed" in example
+
+
+def test_notifications_guide_says_the_new_species_record_fails_quietly() -> None:
+    guide = " ".join((ROOT / "docs/notifications.md").read_text(encoding="utf-8").split())
+    assert "A notice or health record that cannot be saved" not in guide
+    assert "A queued notice or health record that cannot be saved leaves a warning" in guide

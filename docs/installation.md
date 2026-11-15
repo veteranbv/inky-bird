@@ -653,11 +653,13 @@ uv run inky-bird doctor controller --config "$CONFIG"
 Before it changes anything, controller setup waits up to 30 minutes for a plate
 that is being made. If one is still being made, setup stops with "A plate is
 still being made. Run the upgrade again after it finishes. No changes made."
-(`setup` then reports "Installer exited with status 3"). If the installed version cannot read your configuration (for
-example after you edited it for the new release), setup says it cannot check
-for a plate being made and continues without waiting. If the installed version
-cannot run at all, setup refuses with "Could not check whether a plate is being
-made. No changes made."
+(`setup` then reports "Installer exited with status 3"). If the installed version
+cannot be loaded, or cannot read your configuration (for example after you
+edited it for the new release), setup says it cannot check for a plate and
+continues without waiting; with no installed version, it continues without a
+message. Setup refuses only if the check itself fails to run, for example when
+it cannot open the lock in `state_dir`: "Could not check whether a plate is
+being made. No changes made."
 
 On a Linux controller, setup then stops the scheduler and job timers and waits
 up to 30 more minutes for a running refresh, generate, catalog-publish or
