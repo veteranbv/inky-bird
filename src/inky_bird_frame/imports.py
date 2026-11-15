@@ -384,6 +384,9 @@ class HistoryImports:
         self._verify_file(value)
         if value["kind"] == "ebird-archive":
             history_revision, old = read_ebird_checklists(config.controller.state_dir)
+            # Release the retained history before the upload is parsed twice.
+            old_names = _live_names(old, config)
+            del old
             stats = import_ebird_archive(
                 self.path,
                 config.controller.state_dir,
@@ -392,7 +395,7 @@ class HistoryImports:
                 expected_revision=history_revision,
             ).as_dict()
             incoming = preview_ebird_checklists(self.path)
-            old_names, new_names = _live_names(old, config), _live_names(incoming, config)
+            new_names = _live_names(incoming, config)
             incoming_links = {
                 (record.checklist_hash, species.scientific_name): record.observed_on
                 for record in incoming

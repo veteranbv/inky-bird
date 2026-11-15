@@ -47,11 +47,14 @@ MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 # This is separate from the streamed CSV limit and needs no custom ZIP parser.
 MAX_ZIP_METADATA_BYTES = 46 + 3 * (2**16 - 1)
 # The byte ceiling alone still lets a hostile file of tiny rows or of distinct
-# names exhaust a small controller's memory. These bounds sit well above the
-# largest personal exports: the official export has 23 columns and a row is a
-# few hundred characters.
-MAX_ROWS = 3_000_000
-MAX_CHECKLISTS = 500_000
+# names exhaust a small controller's memory. Rows and checklists come from a
+# measured budget (CPython 3.14, 64-bit, peak resident memory): an archive at
+# both limits takes about 160 MB to parse for import and 360 MB to preview
+# with long location labels. Reading back a retained history of that size
+# takes about 440 MB, so checking it against an equally large upload peaks
+# near 650 MB.
+MAX_ROWS = 1_000_000
+MAX_CHECKLISTS = 150_000
 MAX_SPECIES = 50_000
 MAX_COLUMNS = 256
 MAX_LINE_CHARACTERS = 256 * 1024
@@ -173,14 +176,19 @@ def _revision(state_dir: Path) -> str:
 def _records(
     checklists: dict[str, _StoredChecklist], locations: dict[str, str] | None = None
 ) -> tuple[EbirdChecklist, ...]:
+    shared: dict[_StoredSpecies, EbirdArchiveSpecies] = {}
+
+    def species(item: _StoredSpecies) -> EbirdArchiveSpecies:
+        found = shared.get(item)
+        if found is None:
+            found = shared[item] = EbirdArchiveSpecies(item.common_name, item.scientific_name, 1)
+        return found
+
     return tuple(
         EbirdChecklist(
             key,
             checklist.observed_on,
-            tuple(
-                EbirdArchiveSpecies(item.common_name, item.scientific_name, 1)
-                for item in checklist.species
-            ),
+            tuple(species(item) for item in checklist.species),
             (locations or {}).get(key),
         )
         for key, checklist in sorted(checklists.items())
@@ -252,7 +260,7 @@ def _parse_date(value: object, label: str) -> date:
     return parsed
 
 
-def _parse_species(value: object) -> _StoredSpecies:
+def _parse_species(value: object, known: dict[_StoredSpecies, _StoredSpecies]) -> _StoredSpecies:
     if not isinstance(value, dict):
         raise DataSourceError("Invalid eBird archive species state")
     common_name = value.get("common_name")
@@ -264,17 +272,20 @@ def _parse_species(value: object) -> _StoredSpecies:
         or not scientific_name.strip()
     ):
         raise DataSourceError("Invalid eBird archive species state")
-    return _StoredSpecies(scientific_name.strip(), common_name.strip())
+    species = _StoredSpecies(scientific_name.strip(), common_name.strip())
+    return known.setdefault(species, species)
 
 
-def _parse_checklist(value: object) -> _StoredChecklist:
+def _parse_checklist(
+    value: object, known: dict[_StoredSpecies, _StoredSpecies]
+) -> _StoredChecklist:
     if not isinstance(value, dict):
         raise DataSourceError("Invalid eBird archive checklist state")
     observed_on = _parse_date(value.get("observed_on"), "checklist date")
     raw_species = value.get("species")
     if not isinstance(raw_species, list) or not raw_species:
         raise DataSourceError("Invalid eBird archive checklist state")
-    species = tuple(sorted(_parse_species(item) for item in raw_species))
+    species = tuple(sorted(_parse_species(item, known) for item in raw_species))
     scientific_names = {item.scientific_name for item in species}
     if len(scientific_names) != len(species):
         raise DataSourceError("Duplicate species in eBird archive checklist state")
@@ -295,8 +306,18 @@ def _read_state(
     except OSError as exc:
         raise DataSourceError("Could not read eBird archive state") from exc
     _require_private_file(path)
+    # Equal species entries share one parsed dictionary; otherwise reading a
+    # large history holds a separate copy for every stored observation.
+    shared_entries: dict[tuple[str, str], dict[str, object]] = {}
+
+    def share(value: dict[str, object]) -> dict[str, object]:
+        common_name, scientific_name = value.get("common_name"), value.get("scientific_name")
+        if len(value) == 2 and isinstance(common_name, str) and isinstance(scientific_name, str):
+            return shared_entries.setdefault((common_name, scientific_name), value)
+        return value
+
     try:
-        payload: object = json.loads(path.read_text())
+        payload: object = json.loads(path.read_text(), object_hook=share)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DataSourceError("Invalid eBird archive state") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
@@ -305,6 +326,7 @@ def _read_state(
     if not isinstance(raw_checklists, dict):
         raise DataSourceError("Invalid eBird archive state")
     checklists: dict[str, _StoredChecklist] = {}
+    known: dict[_StoredSpecies, _StoredSpecies] = {}
     for fingerprint, raw_checklist in raw_checklists.items():
         if (
             not isinstance(fingerprint, str)
@@ -312,7 +334,7 @@ def _read_state(
             or any(character not in "0123456789abcdef" for character in fingerprint)
         ):
             raise DataSourceError("Invalid eBird archive checklist fingerprint")
-        checklists[fingerprint] = _parse_checklist(raw_checklist)
+        checklists[fingerprint] = _parse_checklist(raw_checklist, known)
     history_started_at = _timestamp(payload.get("history_started_at"), "history start")
     last_imported_at = _timestamp(payload.get("last_imported_at"), "last import")
     earliest = _parse_date(payload.get("earliest_observed_on"), "earliest date")
@@ -491,7 +513,7 @@ def _parse_archive(
                         )
                     known_species[species] = species
                 species = known_species[species]
-                existing = species_by_name.get(scientific_name)
+                existing = species_by_name.get(species.scientific_name)
                 if existing is not None:
                     if existing != species:
                         raise DataSourceError(
@@ -499,7 +521,7 @@ def _parse_archive(
                         )
                     duplicate_rows += 1
                     continue
-                species_by_name[scientific_name] = species
+                species_by_name[species.scientific_name] = species
         except csv.Error as exc:
             raise DataSourceError("Invalid eBird archive CSV") from exc
         except UnicodeDecodeError as exc:

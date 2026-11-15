@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import stat
+import tracemalloc
 import unittest
 import zipfile
 from datetime import UTC, date, datetime
@@ -20,8 +21,10 @@ from inky_bird_frame.ebird_archive import (
     MAX_NAME_LENGTH,
     MAX_ZIP_METADATA_BYTES,
     REQUIRED_COLUMNS,
+    _parse_archive,
     import_ebird_archive,
     read_ebird_archive_history,
+    read_ebird_checklists,
 )
 from inky_bird_frame.errors import DataSourceError
 
@@ -535,6 +538,55 @@ class EbirdArchiveBoundsTests(unittest.TestCase):
                     with patch(f"inky_bird_frame.ebird_archive.{limit}", 5):
                         import_ebird_archive(csv_path, root / "state", dry_run=True)
             self.assertFalse((root / "state/ebird-archive-observations.json").exists())
+
+    def _peak_parse_bytes(self, path: Path) -> int:
+        tracemalloc.start()
+        try:
+            _parse_archive(path)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_names_repeated_across_checklists_are_held_once(self) -> None:
+        # Each stored observation may cost a dictionary slot, but not its own
+        # copy of a name that other checklists already hold.
+        checklists = 3000
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            single, repeated = root / "single.csv", root / "repeated.csv"
+            _write_csv(single, self._rows(checklists, checklists=checklists, species=50))
+            _write_csv(
+                repeated,
+                [
+                    _row(
+                        f"S{index // 6}",
+                        f"Fixture bird {index % 50}",
+                        f"Fixturus avis{index % 50}",
+                        "2026-08-08",
+                    )
+                    for index in range(checklists * 6)
+                ],
+            )
+            extra_pairs = checklists * 5
+            growth = self._peak_parse_bytes(repeated) - self._peak_parse_bytes(single)
+            self.assertLess(growth / extra_pairs, 50)
+
+    def test_stored_history_shares_species_between_checklists(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            _write_csv(
+                csv_path,
+                [
+                    _row("S1", "Eastern Bluebird", "Sialia sialis", "2026-08-08"),
+                    _row("S2", "Eastern Bluebird", "Sialia sialis", "2026-08-09"),
+                ],
+            )
+            import_ebird_archive(csv_path, root / "state")
+            _, (first, second) = read_ebird_checklists(root / "state")
+            self.assertEqual(first.species, second.species)
+            self.assertIs(first.species[0], second.species[0])
+            self.assertIs(first.species[0].scientific_name, second.species[0].scientific_name)
 
     def test_header_column_count_is_capped(self) -> None:
         with TemporaryDirectory() as temporary:
