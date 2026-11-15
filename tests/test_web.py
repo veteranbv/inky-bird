@@ -1038,6 +1038,8 @@ def test_a_malformed_host_is_never_taken_for_the_owner_origin(tmp_path: Path, ho
 
 def test_manifest_lets_the_app_be_added_to_a_home_screen(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path))) as client:
+        page = client.get("/app")
+        assert '<link rel="manifest" href="/app/manifest.webmanifest">' in page.text
         response = client.get("/app/manifest.webmanifest")
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/manifest+json"
