@@ -187,7 +187,7 @@ for (const [name, change] of [
     });
 
 test('plate work that could not be read says so instead of asking for setup', async (t) => {
-  const message = 'Plate work could not be read. Manage shows it again once its files are readable.';
+  const message = 'In the works could not be read. Manage shows it again once its files can be read.';
   const { main } = await open(t, { page: 'work' }, {
     state: withState({
       management: { available: false, reason: 'unreadable' },
@@ -195,8 +195,8 @@ test('plate work that could not be read says so instead of asking for setup', as
     }),
   });
   const text = main.textContent;
-  assert(!text.includes('Full configuration unavailable'));
-  assert(!text.includes('documented serve command'));
+  assert(!text.includes('Settings are not available here'));
+  assert(!text.includes('usual serve command'));
   const [box] = notices(main);
   assert.equal(box?.textContent, message);
 });
@@ -205,13 +205,13 @@ test('unreadable plate work without its notice still says it could not be read',
   const { main } = await open(t, { page: 'sources' }, {
     state: withState({ management: { available: false, reason: 'unreadable' } }),
   });
-  assert(!main.textContent.includes('Full configuration unavailable'));
+  assert(!main.textContent.includes('Settings are not available here'));
   assert.equal(notices(main)[0]?.textContent, 'Plates in the works could not be read.');
 });
 
 test('an install without plate work configured keeps its setup message', async (t) => {
   const { main } = await open(t, { page: 'work' });
-  assert(main.textContent.includes('Full configuration unavailable'));
-  assert(main.textContent.includes('Start Inky through its documented serve command'));
+  assert(main.textContent.includes('Settings are not available here'));
+  assert(main.textContent.includes('Start Inky with its usual serve command to see this page.'));
   assert.deepEqual(notices(main), []);
 });

@@ -1004,9 +1004,9 @@ def test_unrelated_unavailable_history_still_allows_changes_for_listed_birds(
     assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
     assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
     # A bird missing from the list may be in the unreadable history: say so.
-    with pytest.raises(JournalError, match="^Retained history needs attention"):
+    with pytest.raises(JournalError, match="^Your saved history from this source cannot be read"):
         service.favorite(revision=2, taxon_id=900, favorite=True)
-    with pytest.raises(JournalError, match="^Retained history needs attention"):
+    with pytest.raises(JournalError, match="^Your saved history from this source cannot be read"):
         service.save_selection(revision=2, label="Later", taxon_ids=[1, 900])
 
 

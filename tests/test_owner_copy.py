@@ -41,3 +41,38 @@ def test_stopped_guidance_says_what_happened_once(stop_reason: str) -> None:
     assert not MACHINERY.search(message), message
     assert not re.search(r"\bfor retry\b|\bchoose\b", message, re.IGNORECASE), message
     assert message.endswith(".")
+
+
+RETIRED = re.compile(
+    r"Saved birds|Plate work|candidate|operator recovery|approved art|operator migration",
+    re.IGNORECASE,
+)
+OWNER_ERRORS = {"JournalError", "JournalConflictError", "_error"}
+
+
+def _owner_messages(module: str) -> list[str]:
+    """String messages a module raises or returns to the owner pages, as written."""
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).parents[1] / "src/inky_bird_frame" / module
+    messages = []
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", getattr(node.func, "attr", ""))
+        if name in OWNER_ERRORS:
+            messages += [
+                argument.value
+                for argument in node.args
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+            ]
+    return messages
+
+
+@pytest.mark.parametrize("module", ["recovery.py", "web.py"])
+def test_owner_errors_use_the_names_the_pages_show(module: str) -> None:
+    messages = _owner_messages(module)
+    assert messages
+    retired = [message for message in messages if RETIRED.search(message)]
+    assert not retired, retired

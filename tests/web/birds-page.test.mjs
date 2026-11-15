@@ -334,13 +334,53 @@ test('an action that cannot start says so in its own section', async (t) => {
   await flush();
   assert.deepEqual(problems, []);
   assert.equal(main.querySelector('h1').textContent, 'Sources');
-  const message = 'This service has no authoritative configuration file.';
+  const message = 'Inky was started without its settings file, so this cannot run here.';
   assert(nodes(main).some((node) => node.textContent === message));
   findButton(main, 'Check sources now').click();
   await flush();
   assert.equal(
     nodes(main).filter((node) => node.tagName === 'P' && node.textContent === message).length,
     1,
+  );
+});
+
+// The confirm step says what will happen in the owner's words, once.
+test('a confirm step is named for what it does and a lost answer says what to check', async (t) => {
+  const source = { name: 'inaturalist', enabled: true, status: 'ok', activity: {} };
+  const { main } = await open(t, { page: 'sources' }, {
+    state: withState({
+      management: {
+        available: true,
+        window: 'last-30-days',
+        refresh_minutes: 15,
+        sources: [source],
+        work: { complete: true, discovery_status: 'ok' },
+        activity: { entries: {} },
+        recent_detections: [],
+      },
+    }),
+    respond(path, body) {
+      if (path === '/v1/owner/settings') return { revision: 'r'.repeat(64) };
+      if (path === '/v1/owner/operations' && body)
+        throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+      if (path === '/v1/owner/operations') return { operations: [] };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  findButton(main, 'Check sources now').click();
+  await flush();
+  const shown = nodes(main).filter((node) => !node.children.length).map((node) => node.textContent);
+  assert(nodes(main).some((node) => node.tagName === 'H2' && node.textContent === 'Check sources now'));
+  for (const old of ['Refresh observations', 'Confirm action']) assert(!shown.includes(old), old);
+  const confirm = findButton(main, 'Confirm');
+  confirm.fire('click', { currentTarget: confirm });
+  await flush();
+  assert(
+    nodes(main).some(
+      (node) =>
+        node.textContent ===
+        'Inky cannot be reached. If the connection dropped, check this page before trying again.',
+    ),
   );
 });
 

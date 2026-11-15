@@ -118,7 +118,7 @@ def test_saved_membership_preview_binds_catalog_and_uses_existing_collection(
             expected_revision=str(preview["collection_revision"]),
         )
     assert 10 in [entry.taxon_id for entry in read_collection(application.controller.state_dir)]
-    with pytest.raises(CatalogError, match="approved"):
+    with pytest.raises(CatalogError, match="a bird with a plate"):
         change_saved_collection(application, action="add", taxon_id=999, dry_run=True)
 
 

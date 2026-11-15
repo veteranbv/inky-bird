@@ -142,7 +142,7 @@ test('one bird is saved with one tap, an inline result and Undo', async (t) => {
   const server = savedServer();
   const { context, main, assigned } = page(t, server.respond);
   context.byId.set(7, { taxon_id: 7, common_name: 'Brown Creeper' });
-  const section = collections.savedChange(context, 'Review adding to Saved birds', 'add', 7);
+  const section = collections.savedChange(context, 'Put this bird on my frame', 'add', 7);
   main.append(section);
   findButton(section, 'Add to my frame').click();
   await settle(t);
@@ -169,7 +169,7 @@ test('one bird is saved with one tap, an inline result and Undo', async (t) => {
 test('a single-bird change that would touch other birds still asks first', async (t) => {
   const server = savedServer({ migrated_legacy_queue_count: 1 });
   const { context, main } = page(t, server.respond);
-  const section = collections.savedChange(context, 'Review adding to Saved birds', 'add', 7);
+  const section = collections.savedChange(context, 'Put this bird on my frame', 'add', 7);
   main.append(section);
   findButton(section, 'Add to my frame').click();
   await settle(t);
@@ -182,14 +182,14 @@ test('a single-bird change that would touch other birds still asks first', async
 test('a failed toggle stays on the page with its message', async (t) => {
   const { context, main, requests } = page(t, (path) => {
     if (path === '/v1/owner/settings') return { revision: 'r' };
-    throw new Error('Saved birds or approved artwork changed. Review this action again.');
+    throw new Error('On my frame or your plates changed. Review this again.');
   });
   const section = collections.savedToggle(context, { taxon_id: 7, saved: true });
   main.append(section);
   findButton(section, 'Remove from my frame').click();
   await settle(t);
   assert.equal(requests.at(-1).path, '/v1/owner/saved/preview');
-  assert(texts(section).includes('Saved birds or approved artwork changed. Review this action again.'));
+  assert(texts(section).includes('On my frame or your plates changed. Review this again.'));
   assert.equal(findButton(section, 'Remove from my frame').disabled, false);
 });
 
@@ -212,7 +212,7 @@ for (const [saved, shown, label] of [
   });
 
 test('a change the controller refused does not flip the toggle', async (t) => {
-  const message = 'Saved birds or approved artwork changed. Review this action again.';
+  const message = 'On my frame or your plates changed. Review this again.';
   const server = savedServer({}, 'failed', { message });
   const { context, main } = page(t, server.respond);
   const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
@@ -568,7 +568,7 @@ function membershipServer(members, approved) {
   const receipts = new Map();
   const preview = (body) => {
     if (body.action === 'add' && !approved.has(body.taxon_id))
-      throw new Error('Choose approved artwork before adding it to Saved birds');
+      throw new Error('Choose a bird with a plate before adding it to On my frame');
     const has = members.has(body.taxon_id);
     return {
       added_count: body.action === 'add' && !has ? 1 : 0,
@@ -854,7 +854,7 @@ const serverMessages = {
   retry: "Retry requests saved. Check Plate work for each bird's outcome. No model was started by this action.",
   'notification-retry': 'Dead letters were returned to the existing outbox.',
   refresh: 'Discovery refreshed. Provider results remain separate; existing generation policy applies.',
-  'queue-plates': 'Missing-plate requests saved. No model started, and Saved birds and wall selection did not change.',
+  'queue-plates': 'The missing plates were asked for. Birds already waiting or held are left as they are. Nothing is drawn yet, and your frame did not change.',
 };
 async function outcome(t, receipt) {
   const { context, main } = page(t, () => ({ operation_id: 'op1', ...receipt }));

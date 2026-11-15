@@ -59,13 +59,13 @@ const notedOn = {
 };
 
 const sourceNames = {
-  inaturalist: ['iNaturalist', 'Community reports'],
-  ebird: ['eBird nearby', 'Community reports'],
-  'ebird-archive': ['eBird Archive', 'Your eBird checklists'],
-  birdweather: ['BirdWeather', 'Station detections'],
-  'birdnet-go': ['BirdNET-Go', 'Station detections'],
-  'birdnet-analyzer': ['BirdNET Analyzer', 'Imported detections'],
-  birdbuddy: ['Bird Buddy', 'Feeder records'],
+  inaturalist: ['iNaturalist', 'Birds seen nearby'],
+  ebird: ['eBird nearby', 'Birds seen nearby'],
+  'ebird-archive': ['eBird Archive', 'Birds in your checklists'],
+  birdweather: ['BirdWeather', 'Birds on your microphone'],
+  'birdnet-go': ['BirdNET-Go', 'Birds on your microphone'],
+  'birdnet-analyzer': ['BirdNET Analyzer', 'Birds from your microphone recordings'],
+  birdbuddy: ['Bird Buddy', 'Birds at your feeder'],
 };
 
 export async function openJournal(ui, message = '') {
@@ -212,18 +212,18 @@ export async function openJournal(ui, message = '') {
   }
   const management = data.management;
   const operationNames = {
-    refresh: 'Refresh observations',
-    retry: 'Queue plates for retry',
-    'retry-now': 'Retry as soon as the current cycle allows',
-    'notification-test': 'Test notification delivery',
-    'notification-retry': 'Retry notification dead letters',
+    refresh: 'Check sources now',
+    retry: 'Try at the next check',
+    'retry-now': 'Try as soon as possible',
+    'notification-test': 'Send a test notification',
+    'notification-retry': 'Send undelivered messages again',
     'import-preview': 'Check history file',
     'import-commit': 'Confirm history update',
-    'trip-preview': 'Review trip selection',
+    'trip-preview': 'Check the trip',
     'trip-save': 'Save trip',
-    'queue-plates': 'Queue missing plates',
-    'approve-candidate': 'Approve candidate locally',
-    'reject-candidate': 'Reject candidate',
+    'queue-plates': 'Ask for the missing plates',
+    'approve-candidate': 'Keep this plate',
+    'reject-candidate': 'Send this plate back',
     'community-preview': 'Check community history',
     'community-save': 'Save community collection',
   };
@@ -246,7 +246,7 @@ export async function openJournal(ui, message = '') {
           throw new Error('Select between 1 and 32 birds.');
         const settings = await api('/v1/owner/settings');
         revision = settings.revision;
-        if (!revision) throw new Error('This service has no authoritative configuration file.');
+        if (!revision) throw new Error('Inky was started without its settings file, so this cannot run here.');
         key = randomHex(24);
       } catch (error) {
         preview = null;
@@ -256,8 +256,8 @@ export async function openJournal(ui, message = '') {
       preview.append(
         el('h2', operationNames[kind]),
         note(explanation),
-        ...(Array.isArray(targets) ? [note('Selected: ' + targets.map((id) => byId.get(id)?.common_name || 'Taxon ' + id).join(', '))] : []),
-        button('Confirm action', async (event) => {
+        ...(Array.isArray(targets) ? [note('Selected: ' + targets.map((id) => byId.get(id)?.common_name || 'Bird ' + id).join(', '))] : []),
+        button('Confirm', async (event) => {
           const control = event.currentTarget;
           control.disabled = true;
           try {
@@ -270,7 +270,7 @@ export async function openJournal(ui, message = '') {
             if (error.code === 'sign_in_required') ui.showProblem(error);
             else {
               problem.textContent =
-                error.message + ' Check recent operations if the connection was lost.';
+                error.message + ' If the connection dropped, check this page before trying again.';
               control.disabled = false;
             }
           }

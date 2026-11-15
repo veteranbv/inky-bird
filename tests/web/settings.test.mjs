@@ -169,7 +169,7 @@ test('Bird Buddy state that cannot load still leaves the source switch', async (
   );
   assert.deepEqual(alerts(main), ['Bird Buddy state could not be read.']);
   assert.ok(
-    walk(main).some((node) => node.textContent === 'Include Bird Buddy in scheduled discovery'),
+    walk(main).some((node) => node.textContent === 'Check Bird Buddy for new birds'),
     'the switch to turn Bird Buddy off is still there',
   );
 });

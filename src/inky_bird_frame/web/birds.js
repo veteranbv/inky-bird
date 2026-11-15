@@ -347,7 +347,7 @@ export async function renderBird(context) {
   if (bird.saved || bird.plate_ready)
     notes.append(
       savedAction(
-        bird.saved ? 'Review removal from Saved birds' : 'Review adding to Saved birds',
+        bird.saved ? 'Take this bird off my frame' : 'Put this bird on my frame',
         bird.saved ? 'remove' : 'add',
         bird.taxon_id,
         bird.plate_ready,

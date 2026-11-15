@@ -1049,7 +1049,7 @@ class JournalService:
             )
             if preview["preview_hash"] != preview_hash:
                 raise JournalConflictError(
-                    "Plate work changed. Review missing-plate requests again."
+                    "In the works changed. Ask for the missing plates again."
                 )
             return queue_owner_selection_locked(cast(AppConfig, self.app_config), species)
 
@@ -1325,8 +1325,8 @@ class JournalService:
                 management = {"available": False, "reason": "unreadable"}
                 degrade(
                     "plate-work",
-                    "Plate work could not be read. Manage shows it again "
-                    "once its files are readable.",
+                    "In the works could not be read. Manage shows it again "
+                    "once its files can be read.",
                     error,
                     lists_birds=False,
                 )
@@ -1443,10 +1443,12 @@ class JournalService:
                 records: list[SpeciesSummary]
                 if source == "ebird-archive":
                     records = read_ebird_archive_summary(self.config.state_dir)
-                    description = "Complete retained archive; checklist dates, not event instants"
+                    description = "Your whole checklist history, by checklist date"
                 elif source == "birdnet-analyzer":
                     records, undated = read_birdnet_analyzer_summary(self.config.state_dir)
-                    description = f"Retained imports; {undated} undated segments"
+                    description = "Your imported recordings" + (
+                        f"; {undated} without a date" if undated else ""
+                    )
                 else:
                     records, description = read_birdbuddy_history_summary(
                         self.config.state_dir,
@@ -1527,8 +1529,8 @@ class JournalService:
                     {
                         "source": source,
                         "status": "unavailable",
-                        "coverage": "Retained history needs attention. "
-                        "Inspect this source before importing or restoring.",
+                        "coverage": "Your saved history from this source cannot be read. "
+                        "Check it before importing or restoring.",
                     }
                 )
         if strict:

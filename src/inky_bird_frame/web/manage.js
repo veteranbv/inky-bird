@@ -499,8 +499,8 @@ export async function renderStatus(context) {
               'Plates in the works could not be read.',
           ])
         : empty(
-            'Full configuration unavailable',
-            'Start Inky through its documented serve command to include controller settings.',
+            'Settings are not available here',
+            'Start Inky with its usual serve command to see this page.',
           ),
     );
     return;

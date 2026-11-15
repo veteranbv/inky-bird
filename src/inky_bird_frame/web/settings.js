@@ -149,7 +149,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     );
     checkbox(
       group,
-      'Include ' + sourceNames[source][0] + ' in scheduled discovery',
+      'Check ' + sourceNames[source][0] + ' for new birds',
       fields.sources.includes(source),
       (checked) => {
         // Sources this page does not know, such as one from a newer release, stay.
@@ -187,12 +187,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       );
     if (source === 'birdbuddy') {
       const group = section(
-        'Manual records',
-        'Bird Buddy manual sightings can be account-wide and may not belong to your selected feeder. They are separate from automatic feeder detections.',
+        'Birds added by hand',
+        'Birds added by hand in Bird Buddy can come from your whole account, not just this feeder. They are separate from the postcards your feeder sends.',
       );
       checkbox(
         group,
-        'Include manually entered sightings',
+        'Include birds added by hand',
         fields.birdbuddy_include_manual_sightings,
         (checked) => {
           changes.discovery.birdbuddy_include_manual_sightings = checked;
@@ -425,9 +425,9 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       const summary = [];
       if (source)
         summary.push(
-          (changes.discovery.sources.includes(source) ? 'Use ' : 'Do not use ') +
+          (changes.discovery.sources.includes(source) ? 'Check ' : 'Do not check ') +
             sourceNames[source][0] +
-            ' in scheduled discovery.',
+            ' for new birds.',
         );
       else
         summary.push(
@@ -617,7 +617,7 @@ async function birdBuddyAccount(ui, main, note) {
       note(
         'Role: ' +
           state.feeder.role +
-          '. Saved credentials are present; this is not a live token check. Use Refresh observations on Sources to check the enabled provider.',
+          '. Its sign-in is saved; that alone does not show it still works. Use Check sources now on Sources to try it.',
       ),
     );
     if (!state.least_privilege_guest)
@@ -631,16 +631,14 @@ async function birdBuddyAccount(ui, main, note) {
     if (state.history) {
       section.append(
         note(
-          'Last successful synchronization: ' +
+          'Last check that worked: ' +
             new Date(state.history.last_successful_sync_at).toLocaleString(),
         ),
         note(
-          'Retained postcards: ' +
+          'Postcards in your journal: ' +
             state.history.retained_postcards +
-            '. Manual sightings: ' +
-            (state.history.manual_sightings_included
-              ? 'included by your explicit setting'
-              : 'excluded') +
+            '. Birds added by hand: ' +
+            (state.history.manual_sightings_included ? 'included' : 'left out') +
             '.',
         ),
       );
@@ -649,7 +647,7 @@ async function birdBuddyAccount(ui, main, note) {
       button('Remove local Bird Buddy login', async (event) => {
         if (
           !confirm(
-            'Remove this installation’s Bird Buddy login and permission attestation? Retained detections and plates stay. This does not revoke the token at Bird Buddy.',
+            'Remove this Inky’s Bird Buddy login and your permission note? Birds already noted and your plates stay. This does not sign Inky out at Bird Buddy itself.',
           )
         )
           return;
@@ -669,8 +667,8 @@ async function birdBuddyAccount(ui, main, note) {
     section.append(
       note(
         state.history_present
-          ? 'No saved login. Earlier private detection history is retained.'
-          : 'Not signed in. No private detection history is available yet.',
+          ? 'No saved login. Birds noted earlier stay in your journal.'
+          : 'Not signed in. Nothing from Bird Buddy is in your journal yet.',
       ),
     );
   if (!response.secure_bootstrap) {
