@@ -112,9 +112,8 @@ plate yet.
 | **Favorite** | A bird you saved with **Add to Favorites** on its page. |
 | **Collections** | Named groups of birds, such as a trip. |
 | **Sources** | Where birds come from: nearby sightings, a station, a feeder or an import. |
-| **Frame** | The full-screen plate view in your browser. It does not change the wall panel. |
-| **Play** | Starts a slideshow in Frame. |
-| **Wall panel** | The optional color e-paper display on your wall. |
+| **Play** | A full-screen slideshow of your plates in the browser. It does not change the wall frame. |
+| **Wall frame** | The optional color e-paper display on your wall. |
 
 The shared plates are AI-generated illustrations checked against references
 and reviewed separately before approval. You can reuse the public catalog

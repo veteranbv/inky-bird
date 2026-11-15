@@ -754,7 +754,7 @@ test('a refused rejection is sent again with current settings and reason', async
   await candidatePage.renderCandidate(context);
   const reason = main.querySelector('textarea');
   reason.value = 'First reason';
-  const reject = findButton(main, 'Confirm rejection');
+  const reject = findButton(main, 'Send this plate back');
   reject.fire('click', { currentTarget: reject });
   await flush();
   assert(texts(main).includes('Settings changed. Reload and review again.'));

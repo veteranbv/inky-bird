@@ -98,15 +98,17 @@ async function candidates(t) {
   await page
     .getByRole('link', { name: 'Look at Synthetic QA candidate 9999991', exact: true })
     .click();
-  await heading('Review candidate');
+  await heading('A new page for your journal');
+  await page.getByText('Checks passed', { exact: true }).waitFor();
+  await page.getByText('No place details in the image', { exact: true }).waitFor();
   await page.locator('.detail-art').evaluate((image) => image.decode());
   await page
     .getByRole('checkbox', {
-      name: 'I inspected the full plate, its text, anatomy and cited review. Make this artwork approved locally and eligible for existing publication.',
+      name: 'I looked at the whole plate: the bird, its lettering and the references.',
       exact: true,
     })
     .check();
-  await page.getByRole('button', { name: 'Confirm local approval', exact: true }).click();
+  await page.getByRole('button', { name: 'Keep this plate', exact: true }).click();
   for (let n = 0; n < 20; n++) {
     if (await page.getByText('The plate is in your journal.', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
@@ -122,11 +124,14 @@ async function candidates(t) {
   );
   t.phase = 'candidate-rejection';
   await page.goto(origin + '/app?page=candidate&bird=9999992');
-  await heading('Review candidate');
+  await heading('A new page for your journal');
   await page
-    .getByLabel('Why reject this candidate?', { exact: true })
+    .getByText('This note is sent to the image service to guide the next attempt.', { exact: true })
+    .waitFor();
+  await page
+    .getByLabel('Why send it back?', { exact: true })
     .fill('Synthetic QA rejection, retain the fixture privately.');
-  await page.getByRole('button', { name: 'Confirm rejection', exact: true }).click();
+  await page.getByRole('button', { name: 'Send this plate back', exact: true }).click();
   for (let n = 0; n < 20; n++) {
     if (await page.getByText('The plate was sent back.', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
@@ -143,11 +148,11 @@ async function candidates(t) {
       ),
     ),
   );
-  t.phase = 'recovery-hold-banner';
+  t.phase = 'needs-a-hand';
+  // Home greets new plates only; a plate that needs a hand lives in Manage.
   await page.goto(origin + '/app');
   await heading('Your field journal');
-  await page.getByRole('link', { name: '1 plate held for recovery', exact: true }).waitFor();
-  assert.equal(await page.getByText(/ready for your review/).count(), 0);
+  assert.equal(await page.getByText(/held for recovery|needs? a hand|ready to look at/i).count(), 0);
   // Manage counts the plate that needs a hand and links to it.
   await page.goto(origin + '/app?page=manage');
   await heading('Manage');

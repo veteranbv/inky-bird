@@ -291,8 +291,8 @@ test('a new plate arrives as a new page for the journal', async (t) => {
   for (const raw of ['passed', 'location free', 'true', 'species accuracy', 'Generated art'])
     assert(!texts(main).includes(raw) && !main.textContent.includes(raw + ' '), raw);
   assert(!main.textContent.includes('Server notice.'), 'a ready plate needs no server caveat');
-  assert(findButton(main, 'Confirm local approval'));
-  assert(findButton(main, 'Confirm rejection'));
+  assert(findButton(main, 'Keep this plate'));
+  assert(findButton(main, 'Send this plate back'));
   assert(has(main, 'This note is sent to the image service to guide the next attempt.'));
   const plate = images(main)[0];
   const heading = main.querySelector('h2');
@@ -316,7 +316,7 @@ test('a plate that did not pass says so and keeps the server reason', async (t) 
   assert(has(main, 'Checks did not pass'));
   assert(has(main, 'The image may show place details'));
   assert(has(main, 'This candidate does not meet ordinary publication checks.'));
-  assert.equal(findButton(main, 'Confirm local approval'), null);
-  assert(findButton(main, 'Confirm rejection'));
+  assert.equal(findButton(main, 'Keep this plate'), null);
+  assert(findButton(main, 'Send this plate back'));
   await flush();
 });
