@@ -224,19 +224,26 @@ test('a change the controller refused does not flip the toggle', async (t) => {
   assert.equal(findButton(section, 'Undo'), null);
 });
 
-test('a lost connection says to check Saved birds', async (t) => {
-  const { context, main } = page(t, (path) => {
-    if (path === '/v1/owner/settings') return { revision: 'r' };
-    throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+for (const [failing, hint] of [
+  ['/v1/owner/saved/preview', false],
+  ['/v1/owner/saved/change', true],
+])
+  test(`a lost connection at ${failing.split('/').pop()} ${hint ? 'says' : 'does not say'} to check Saved birds`, async (t) => {
+    // Only a change that was sent can have been applied without an answer.
+    const server = savedServer();
+    const { context, main } = page(t, (path, body) => {
+      if (path === failing)
+        throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+      return server.respond(path, body);
+    });
+    const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+    main.append(section);
+    findButton(section, 'Add to Saved birds').click();
+    await settle(t);
+    const hinted = 'Inky cannot be reached. Check Saved birds if the connection was lost.';
+    assert(texts(section).includes(hint ? hinted : 'Inky cannot be reached.'));
+    assert.equal(texts(section).includes(hinted), hint);
   });
-  const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
-  main.append(section);
-  findButton(section, 'Add to Saved birds').click();
-  await settle(t);
-  assert(
-    texts(section).includes('Inky cannot be reached. Check Saved birds if the connection was lost.'),
-  );
-});
 
 test('bulk Saved birds changes keep their review step', async (t) => {
   const server = savedServer({ added_count: 3 });

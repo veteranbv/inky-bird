@@ -637,11 +637,12 @@ function savedSummary(preview) {
   );
 }
 
-// The server's own refusals are complete; only a lost connection leaves the outcome open.
-function savedProblem(error) {
+// The server's own refusals are complete; only a change lost after it was sent
+// leaves the outcome open.
+function savedProblem(error, sent = true) {
   return (
     error.message +
-    (['offline', 'invalid_response'].includes(error.code)
+    (sent && ['offline', 'invalid_response'].includes(error.code)
       ? ' Check Saved birds if the connection was lost.'
       : '')
   );
@@ -716,7 +717,8 @@ export function savedToggle(context, bird) {
   status.setAttribute('role', 'status');
   problem.setAttribute('role', 'alert');
   let saved = Boolean(bird.saved),
-    undo = null;
+    undo = null,
+    sent = false;
   const control = button('', () => change(saved ? 'remove' : 'add', true));
   const label = () => {
     control.textContent = saved ? 'Remove from Saved birds' : 'Add to Saved birds';
@@ -727,6 +729,7 @@ export function savedToggle(context, bird) {
     undo?.remove();
     undo = null;
     problem.textContent = '';
+    sent = false;
     status.textContent = 'Updating Saved birds…';
     try {
       const [body, preview] = await savedPreview(api, action, bird.taxon_id);
@@ -745,6 +748,7 @@ export function savedToggle(context, bird) {
         confirmSaved(context, section, problem, body, preview);
         return;
       }
+      sent = true;
       const receipt = await waitForOperation(
         api,
         await api('/v1/owner/saved/change', {
@@ -771,7 +775,7 @@ export function savedToggle(context, bird) {
         ui.showProblem(error);
         return;
       }
-      problem.textContent = savedProblem(error);
+      problem.textContent = savedProblem(error, sent);
     } finally {
       control.disabled = false;
     }
