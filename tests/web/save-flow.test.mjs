@@ -664,3 +664,87 @@ test('an interrupted change says to check Saved birds', async (t) => {
   await settle(t);
   assert(texts(section).includes(message + ' Check Saved birds if the connection was lost.'));
 });
+
+const candidatePage = await import(moduleURL(await inline("export * from '/app/candidate.js';")));
+
+test('a refused rejection is sent again with current settings and reason', async (t) => {
+  let revision = 'old';
+  const decisions = [];
+  const { context, main } = page(t, (path, body) => {
+    if (path.startsWith('/v1/owner/candidates/7/')) {
+      decisions.push(body);
+      if (decisions.length === 1)
+        throw Object.assign(new Error('Settings changed. Reload and review again.'), {
+          code: 'journal_changed',
+        });
+      if (decisions.length === 2)
+        throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+      return { operation_id: 'op1' };
+    }
+    if (path.startsWith('/v1/owner/candidates/')) {
+      return {
+        taxon_id: 7,
+        common_name: 'Example Wren',
+        scientific_name: 'Exempli wren',
+        notice: '',
+        portrait_url: '/candidate.png',
+        quality_review: {},
+        verification_sources: [],
+        candidate_revision: 'c'.repeat(64),
+        can_approve: false,
+      };
+    }
+    if (path === '/v1/owner/settings') return { revision };
+    throw new Error('unexpected ' + path);
+  });
+  context.query = new URLSearchParams({ bird: '7' });
+  await candidatePage.renderCandidate(context);
+  const reason = main.querySelector('textarea');
+  reason.value = 'First reason';
+  const reject = findButton(main, 'Confirm rejection');
+  reject.fire('click', { currentTarget: reject });
+  await flush();
+  assert(texts(main).includes('Settings changed. Reload and review again.'));
+  revision = 'new';
+  reason.value = 'Second reason';
+  reject.fire('click', { currentTarget: reject });
+  await flush();
+  // A lost answer keeps the same request, so a retry cannot decide twice.
+  reject.fire('click', { currentTarget: reject });
+  await flush();
+  assert.equal(decisions.length, 3);
+  assert.equal(decisions[0].configuration_revision, 'old');
+  assert.equal(decisions[1].configuration_revision, 'new');
+  assert.equal(decisions[1].reason, 'Second reason');
+  assert.notEqual(decisions[1].key, decisions[0].key);
+  assert.deepEqual(decisions[2], decisions[1]);
+});
+
+test('a community collection that cannot be saved keeps its preview on the page', async (t) => {
+  const { context, main, problems } = page(t, (path) => {
+    if (path === '/v1/owner/community')
+      return {
+        status: 'ready',
+        preview_hash: 'p'.repeat(64),
+        notice: 'Community reports are not your sightings.',
+        collection: {
+          label: 'Synthetic search',
+          start_date: '2001-03-01',
+          end_date: '2001-03-02',
+          members: [{ common_name: 'Example Wren', scientific_name: 'Exempli wren' }],
+        },
+      };
+    if (path === '/v1/owner/community/save')
+      throw Object.assign(new Error('This community preview changed or expired. Search again.'), {
+        code: 'journal_changed',
+      });
+    throw new Error('unexpected ' + path);
+  });
+  await collections.renderCommunity(context);
+  findButton(main, 'Save community collection').click();
+  await flush();
+  assert.deepEqual(problems, []);
+  const shown = texts(main);
+  assert(shown.includes('This community preview changed or expired. Search again.'));
+  assert(shown.includes('Example Wren · Exempli wren'));
+});

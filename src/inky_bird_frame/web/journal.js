@@ -2,7 +2,7 @@
 import { renderSettings } from '/app/settings.js';
 import { renderImports } from '/app/imports.js';
 import { renderPresentation } from '/app/presentation.js';
-import { icon } from '/app/ui.js';
+import { icon, inlineProblem, clearProblem } from '/app/ui.js';
 import { randomHex } from '/app/keys.js';
 import { renderHome } from '/app/home.js';
 import { renderBirds, renderBird } from '/app/birds.js';
@@ -266,6 +266,7 @@ export async function openJournal(ui, message = '') {
       problem.setAttribute('role', 'alert');
       let revision, key;
       const targets = typeof taxonId === 'function' ? taxonId() : taxonId;
+      clearProblem(section);
       try {
         if (Array.isArray(targets) && (!targets.length || targets.length > 32))
           throw new Error('Select between 1 and 32 birds.');
@@ -275,7 +276,7 @@ export async function openJournal(ui, message = '') {
         key = randomHex(24);
       } catch (error) {
         preview = null;
-        ui.showProblem(error);
+        inlineProblem(ui, section, error);
         return;
       }
       preview.append(

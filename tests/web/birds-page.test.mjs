@@ -286,3 +286,58 @@ for (const [plateReady, oneTap] of [
     assert.equal(Boolean(findButton(main, 'Undo')), oneTap);
     assert.deepEqual(assigned, []);
   });
+
+test('a favorite that cannot be saved says so beside the bird', async (t) => {
+  const { main, problems } = await open(t, { page: 'bird', bird: '2' }, {
+    recordProblems: true,
+    respond(path) {
+      if (path === '/v1/owner/journal/collections/favorite')
+        throw Object.assign(new Error('The journal changed. Reload and try again.'), {
+          code: 'journal_changed',
+        });
+      throw new Error('unexpected ' + path);
+    },
+  });
+  const favorite = findButton(main, 'Add to Favorites');
+  favorite.fire('click', { currentTarget: favorite });
+  await flush();
+  assert.deepEqual(problems, []);
+  assert(nodes(main).some((node) => node.textContent === 'The journal changed. Reload and try again.'));
+  assert(findButton(main, 'Add to Saved birds'), 'the rest of the page stays');
+  assert.equal(favorite.disabled, false);
+});
+
+test('an action that cannot start says so in its own section', async (t) => {
+  const source = { name: 'inaturalist', enabled: true, status: 'ok', activity: {} };
+  const { main, problems } = await open(t, { page: 'sources' }, {
+    recordProblems: true,
+    state: withState({
+      management: {
+        available: true,
+        window: 'last-30-days',
+        refresh_minutes: 15,
+        sources: [source],
+        work: { complete: true, discovery_status: 'ok' },
+        activity: { entries: {} },
+        recent_detections: [],
+      },
+    }),
+    respond(path) {
+      if (path === '/v1/owner/settings') return { revision: null };
+      if (path === '/v1/owner/operations') return { operations: [] };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  findButton(main, 'Refresh observations').click();
+  await flush();
+  assert.deepEqual(problems, []);
+  assert.equal(main.querySelector('h1').textContent, 'Sources');
+  const message = 'This service has no authoritative configuration file.';
+  assert(nodes(main).some((node) => node.textContent === message));
+  findButton(main, 'Refresh observations').click();
+  await flush();
+  assert.equal(
+    nodes(main).filter((node) => node.tagName === 'P' && node.textContent === message).length,
+    1,
+  );
+});

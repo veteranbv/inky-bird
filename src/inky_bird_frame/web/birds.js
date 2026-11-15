@@ -1,3 +1,4 @@
+import { inlineProblem } from '/app/ui.js';
 // The list's search, sort and filter live in the address, so Back, the bird
 // page and its previous and next links all see the same list.
 function lastNoted(bird) {
@@ -339,7 +340,7 @@ export async function renderBird(context) {
         location.reload();
       } catch (error) {
         control.disabled = false;
-        ui.showProblem(error);
+        inlineProblem(ui, notes, error);
       }
     }),
     note(

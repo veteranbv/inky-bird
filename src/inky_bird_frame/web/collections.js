@@ -1,5 +1,6 @@
 import { randomHex } from '/app/keys.js';
 import { plural, waitForOperation } from '/app/manage.js';
+import { inlineProblem } from '/app/ui.js';
 
 export function renderCollections(context) {
   const { el, main, data, link, note, art, members, viewLabel, base, playLink } = context;
@@ -78,7 +79,7 @@ export async function renderCommunity(context) {
           });
           location.assign(href('operation', { operation: receipt.operation_id }));
         } catch (error) {
-          ui.showProblem(error);
+          inlineProblem(ui, main, error);
         }
       }),
     );
@@ -453,7 +454,7 @@ export function renderCollection(context) {
           anchor.click();
           setTimeout(() => URL.revokeObjectURL(url), 1000);
         } catch (error) {
-          ui.showProblem(error);
+          inlineProblem(ui, tools, error);
         }
       }),
     );
@@ -581,7 +582,7 @@ export function renderCollection(context) {
           });
           location.assign(href('collections'));
         } catch (error) {
-          ui.showProblem(error);
+          inlineProblem(ui, tools, error);
         }
       }),
     );
