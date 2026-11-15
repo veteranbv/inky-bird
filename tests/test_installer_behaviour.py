@@ -649,8 +649,8 @@ def macos_host(tmp_path: Path, *agents: str) -> Host:
     return host
 
 
-def run_macos(host: Host, **extra: str) -> subprocess.CompletedProcess[str]:
-    return host.run("install-controller.sh", shell=MACOS_BASH, **extra)
+def run_macos(host: Host, agents: str = "serve refresh") -> subprocess.CompletedProcess[str]:
+    return host.run("install-controller.sh", shell=MACOS_BASH, FAKE_AGENTS=agents)
 
 
 def test_macos_upgrade_stops_agents_only_between_plates(tmp_path: Path) -> None:
@@ -692,7 +692,7 @@ def test_macos_rejected_configuration_leaves_running_agents_alone(tmp_path: Path
 def test_macos_failed_publisher_check_restores_only_the_publisher(tmp_path: Path) -> None:
     host = macos_host(tmp_path, "serve", "refresh", "catalog-publish")
     host.fail("new:catalog-publish")
-    result = run_macos(host, FAKE_AGENTS="serve refresh catalog-publish")
+    result = run_macos(host, "serve refresh catalog-publish")
     assert result.returncode == 1
     assert [call[2] for call in bootouts(host)] == [f"com.{host.family}.catalog-publish"]
     agents = host.loaded_agents()
