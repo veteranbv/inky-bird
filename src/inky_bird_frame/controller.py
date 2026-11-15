@@ -99,7 +99,7 @@ from .errors import (
 from .geo import DiscoveryLocation, resolve_discovery_location
 from .http import read_private_json, write_json_atomic
 from .images import prepare_generated_plate
-from .installation import CODEX_CALL_TIMEOUT_SECONDS
+from .installation import generation_species_timeout_seconds
 from .models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from .notifications import safe_notify, safe_record_degradation, safe_record_recovery
 from .prompts import PROMPT_VERSION
@@ -3373,12 +3373,6 @@ def _sweep_abandoned_generation_work(config: AppConfig) -> None:
             shutil.rmtree(candidate)
 
 
-def generation_species_seconds(config: AppConfig) -> int:
-    """The longest one bird can take: profile, one refresh, and per attempt two calls."""
-    calls = 2 + 2 * config.controller.max_generation_attempts
-    return calls * CODEX_CALL_TIMEOUT_SECONDS
-
-
 def _retry_or_stop(
     config: AppConfig,
     retry_store: RetryStore,
@@ -3548,7 +3542,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         failures: list[dict[str, object]] = list(held_candidates)
         attempted_count = 0
         stopped_for_time = False
-        species_seconds = generation_species_seconds(config)
+        species_seconds = generation_species_timeout_seconds(config)
         cycle_seconds = species_seconds * config.controller.max_species_attempts_per_cycle
         for species in eligible:
             if len(generated) >= config.controller.generations_per_cycle:

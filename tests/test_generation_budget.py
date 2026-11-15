@@ -26,7 +26,6 @@ from inky_bird_frame.controller import (
     ProviderStatus,
     exclusive_cycle_lock,
     generate_candidate,
-    generation_species_seconds,
     load_or_create_profile,
     read_generation_work,
     run_generation_cycle,
@@ -43,6 +42,7 @@ from inky_bird_frame.errors import (
 from inky_bird_frame.installation import (
     GENERATION_UNIT_MARGIN_SECONDS,
     generation_cycle_timeout_seconds,
+    generation_species_timeout_seconds,
 )
 from inky_bird_frame.journal import JournalService, terminal_failure
 from inky_bird_frame.models import ProfileConflict, QualityReview, SpeciesProfileData
@@ -207,9 +207,26 @@ class GenerationBudgetTests(unittest.TestCase):
             self.second_retry = retries(config).get(SECOND.taxon_id)
         return attempted, result
 
+    def unit_budget(self) -> tuple[int, int]:
+        """The cycle and per-bird time the installed service timeout allows."""
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+        cycle = generation_cycle_timeout_seconds(config) - GENERATION_UNIT_MARGIN_SECONDS
+        return cycle, cycle // config.controller.max_species_attempts_per_cycle
+
+    def test_cycle_starts_a_bird_exactly_while_the_service_timeout_still_covers_it(self) -> None:
+        cycle, per_bird = self.unit_budget()
+        attempted, result = self.run_two_birds(cycle - per_bird)
+        self.assertEqual(attempted, [FIRST.taxon_id, SECOND.taxon_id])
+        self.assertIs(result["stopped_for_time"], False)
+
+        attempted, result = self.run_two_birds(cycle - per_bird + 1)
+        self.assertEqual(attempted, [FIRST.taxon_id])
+        self.assertIs(result["stopped_for_time"], True)
+
     def test_next_bird_is_not_started_when_it_could_overrun_the_cycle(self) -> None:
         with TemporaryDirectory() as temporary:
-            species_seconds = generation_species_seconds(load(temporary))
+            species_seconds = generation_species_timeout_seconds(load(temporary))
         cycle_seconds = species_seconds * 5
         attempted, result = self.run_two_birds(cycle_seconds - species_seconds + 1)
 
@@ -221,7 +238,7 @@ class GenerationBudgetTests(unittest.TestCase):
 
     def test_next_bird_starts_while_its_longest_run_still_fits(self) -> None:
         with TemporaryDirectory() as temporary:
-            species_seconds = generation_species_seconds(load(temporary))
+            species_seconds = generation_species_timeout_seconds(load(temporary))
         attempted, result = self.run_two_birds(3 * species_seconds)
 
         self.assertEqual(attempted, [FIRST.taxon_id, SECOND.taxon_id])
@@ -240,7 +257,7 @@ class GenerationBudgetTests(unittest.TestCase):
             config = load_config(path)
             config.controller.workspace_dir.mkdir()
             refresh(config, [FIRST])
-            species_seconds = generation_species_seconds(config)
+            species_seconds = generation_species_timeout_seconds(config)
 
             def slow_sweep(_config: object) -> None:
                 clock.now += species_seconds
@@ -264,7 +281,7 @@ class GenerationBudgetTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = load(temporary)
             refresh(config, [FIRST, SECOND])
-            species_seconds = generation_species_seconds(config)
+            species_seconds = generation_species_timeout_seconds(config)
 
             def slow_sweep(_config: object) -> None:
                 clock.now += 4.5 * species_seconds
@@ -294,7 +311,7 @@ class GenerationBudgetTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = load(temporary)
         # Three attempts: profile, one refresh, and a generation plus review each.
-        self.assertEqual(generation_species_seconds(config), 8 * 1200)
+        self.assertEqual(generation_species_timeout_seconds(config), 8 * 1200)
 
     def test_service_timeout_is_the_cycle_budget_plus_its_margin(self) -> None:
         for attempts, birds in ((1, 1), (3, 5), (4, 2)):
@@ -310,7 +327,8 @@ class GenerationBudgetTests(unittest.TestCase):
                 config = load_config(path)
                 self.assertEqual(
                     generation_cycle_timeout_seconds(config),
-                    birds * generation_species_seconds(config) + GENERATION_UNIT_MARGIN_SECONDS,
+                    birds * generation_species_timeout_seconds(config)
+                    + GENERATION_UNIT_MARGIN_SECONDS,
                 )
 
 
