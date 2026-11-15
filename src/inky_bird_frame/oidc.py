@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 
@@ -23,13 +25,24 @@ from authlib.oidc.core import CodeIDToken
 from joserfc import jwt
 from joserfc.jwk import KeySet, KeySetSerialization
 
-from .access import RECENT_AUTH_SECONDS, AccessError, OIDCTransaction
+from .access import CLOCK_SKEW_SECONDS, RECENT_AUTH_SECONDS, AccessError, OIDCTransaction
 from .config import OIDCConfig
 
 # Metadata, key sets and tokens are small documents, not media or history.
 MAX_OIDC_RESPONSE_BYTES = 256 * 1024
 OIDC_TIMEOUT_SECONDS = 10
 ALGORITHMS = ("RS256", "ES256")
+# Discovery documents change rarely. The access page shows provider readiness on
+# every load, so it must not wait on the provider each time: a good document is
+# reused, refreshed in the background once old, and a failure is retried only
+# after a short pause.
+METADATA_FRESH_SECONDS = 15 * 60
+METADATA_STALE_SECONDS = 24 * 60 * 60
+METADATA_FAILURE_SECONDS = 30
+METADATA_UNEXPECTED_FAILURE = (
+    "Sign-in provider metadata could not be read; check the controller log for details"
+)
+_LOG = logging.getLogger(__name__)
 
 
 class OIDCError(AccessError):
@@ -48,6 +61,19 @@ class ProviderMetadata:
 class VerifiedIdentity:
     subject: str = field(repr=False)
     authenticated_at: float
+
+
+@dataclass
+class _CachedMetadata:
+    value: ProviderMetadata | None = None
+    fetched_at: float = 0.0
+    failure: str | None = None
+    failed_at: float = 0.0
+    refresh: asyncio.Task[ProviderMetadata] | None = None
+
+
+# Keyed by issuer: the discovery URL and its checks depend on nothing else.
+_metadata_cache: dict[str, _CachedMetadata] = {}
 
 
 class OAuthClient(Protocol):
@@ -168,6 +194,58 @@ async def _get_json(url: str) -> dict[str, object]:
 
 
 async def metadata(config: OIDCConfig) -> ProviderMetadata:
+    entry = _metadata_cache.setdefault(config.issuer, _CachedMetadata())
+    now = monotonic()
+    failed_recently = entry.failure is not None and (
+        now - entry.failed_at < METADATA_FAILURE_SECONDS
+    )
+    if entry.value is not None:
+        age = now - entry.fetched_at
+        if age < METADATA_FRESH_SECONDS:
+            return entry.value
+        if age < METADATA_STALE_SECONDS:
+            if not failed_recently:
+                _refresh_metadata(config, entry)
+            return entry.value
+    if failed_recently and entry.failure is not None:
+        raise OIDCError(entry.failure)
+    # Shield the shared fetch so one cancelled request does not abort it for others.
+    return await asyncio.shield(_refresh_metadata(config, entry))
+
+
+def _refresh_metadata(config: OIDCConfig, entry: _CachedMetadata) -> asyncio.Task[ProviderMetadata]:
+    loop = asyncio.get_running_loop()
+    task = entry.refresh
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(_fetch_into(config, entry))
+        task.add_done_callback(_consume_result)
+        entry.refresh = task
+    return task
+
+
+def _consume_result(task: asyncio.Task[ProviderMetadata]) -> None:
+    # A background refresh records its own failure; mark it retrieved.
+    if not task.cancelled():
+        task.exception()
+
+
+async def _fetch_into(config: OIDCConfig, entry: _CachedMetadata) -> ProviderMetadata:
+    try:
+        value = await _fetch_metadata(config)
+    except OIDCError as exc:
+        entry.failure, entry.failed_at = str(exc), monotonic()
+        raise
+    except Exception:
+        # Record a fixed failure so the retry pause applies; the detail goes
+        # to the log once instead of to every request or the browser.
+        _LOG.exception("Sign-in provider metadata refresh failed unexpectedly")
+        entry.failure, entry.failed_at = METADATA_UNEXPECTED_FAILURE, monotonic()
+        raise OIDCError(METADATA_UNEXPECTED_FAILURE) from None
+    entry.value, entry.fetched_at, entry.failure = value, monotonic(), None
+    return value
+
+
+async def _fetch_metadata(config: OIDCConfig) -> ProviderMetadata:
     try:
         async with asyncio.timeout(OIDC_TIMEOUT_SECONDS):
             value = await _get_json(config.issuer.rstrip("/") + "/.well-known/openid-configuration")
@@ -257,12 +335,12 @@ async def verified_identity(config: OIDCConfig, tx: OIDCTransaction, code: str) 
                     "max_age": RECENT_AUTH_SECONDS,
                 },
             )
-            claims.validate(leeway=0)
+            claims.validate(leeway=CLOCK_SKEW_SECONDS)
             authenticated_at = decoded.claims.get("auth_time")
             if (
                 isinstance(authenticated_at, bool)
                 or not isinstance(authenticated_at, (int, float))
-                or not 0 <= time.time() - authenticated_at < RECENT_AUTH_SECONDS
+                or not -CLOCK_SKEW_SECONDS <= time.time() - authenticated_at < RECENT_AUTH_SECONDS
             ):
                 raise OIDCError(
                     "Sign-in provider did not confirm recent authentication; sign in again"

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import stat
+import tracemalloc
 import unittest
 import zipfile
 from datetime import UTC, date, datetime
@@ -15,11 +17,17 @@ from ebird_fixtures import EXPORT_COLUMNS
 from inky_bird_frame.birds import DateRange, EbirdArchiveSpecies, ObservationWindow
 from inky_bird_frame.ebird_archive import (
     CSV_FILENAME,
+    MAX_COLUMNS,
+    MAX_LINE_CHARACTERS,
     MAX_NAME_LENGTH,
+    MAX_ROWS,
+    MAX_UNCOMPRESSED_BYTES,
     MAX_ZIP_METADATA_BYTES,
     REQUIRED_COLUMNS,
+    _parse_archive,
     import_ebird_archive,
     read_ebird_archive_history,
+    read_ebird_checklists,
 )
 from inky_bird_frame.errors import DataSourceError
 
@@ -419,7 +427,7 @@ class EbirdArchiveImportTests(unittest.TestCase):
             cut = body.rindex(b"Bluebird")
             late.write_bytes(body[:cut] + b"\xff" + body[cut:])
             cases = {
-                truncated: "not an eBird export",
+                truncated: "^This eBird export is damaged; download it again$",
                 corrupted: "^This eBird export is damaged; download it again$",
                 checksum: "damaged near row [0-9]+; download it again",
                 short: "not an eBird export: it is not UTF-8 text",
@@ -497,6 +505,170 @@ class EbirdArchiveImportTests(unittest.TestCase):
             row = _row("S1", "B" * MAX_NAME_LENGTH, "Sialia sialis", "2026-08-08")
             _write_csv(csv_path, [row])
             self.assertEqual(import_ebird_archive(csv_path, root / "state").species, 1)
+
+
+class EbirdArchiveBoundsTests(unittest.TestCase):
+    """A hostile export within the byte limit must not exhaust a small controller."""
+
+    def _rows(self, count: int, *, checklists: int, species: int) -> list[dict[str, str]]:
+        return [
+            _row(
+                f"S{index % checklists}",
+                f"Fixture bird {index % species}",
+                f"Fixturus avis{index % species}",
+                "2026-08-08",
+            )
+            for index in range(count)
+        ]
+
+    def test_rows_and_species_are_capped(self) -> None:
+        cases = (
+            ("MAX_ROWS", self._rows(5, checklists=5, species=5), "more than 4 rows; check"),
+            ("MAX_SPECIES", self._rows(5, checklists=1, species=5), "more than 4 species; check"),
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            for limit, rows, message in cases:
+                with self.subTest(limit=limit):
+                    _write_csv(csv_path, rows)
+                    with (
+                        patch(f"inky_bird_frame.ebird_archive.{limit}", 4),
+                        self.assertRaisesRegex(DataSourceError, message),
+                    ):
+                        import_ebird_archive(csv_path, root / "state", dry_run=True)
+                    with patch(f"inky_bird_frame.ebird_archive.{limit}", 5):
+                        import_ebird_archive(csv_path, root / "state", dry_run=True)
+            self.assertFalse((root / "state/ebird-archive-observations.json").exists())
+
+    def test_row_limit_admits_every_official_export_within_the_byte_limit(self) -> None:
+        # The shortest plausible official row: every export column present,
+        # optional ones empty, required ones as short as real values get.
+        shortest = {
+            **dict.fromkeys(EXPORT_COLUMNS, ""),
+            "Submission ID": "S1000000",
+            "Common Name": "Ruff",
+            "Scientific Name": "Pica pica",
+            "Taxonomic Order": "1",
+            "Count": "X",
+            "State/Province": "US-NY",
+            "Location ID": "L1",
+            "Location": "A",
+            "Latitude": "1.0",
+            "Longitude": "2.0",
+            "Date": "2026-08-08",
+            "Protocol": "Incidental",
+            "All Obs Reported": "0",
+        }
+        buffer = io.StringIO()
+        csv.DictWriter(buffer, fieldnames=EXPORT_COLUMNS).writerow(shortest)
+        row_bytes = len(buffer.getvalue().encode())
+        self.assertGreaterEqual(MAX_ROWS * row_bytes, MAX_UNCOMPRESSED_BYTES)
+
+    def test_an_account_of_many_single_species_checklists_is_accepted(self) -> None:
+        # More checklists than any count limit main never had: the byte limit
+        # admitted this export, so a count limit must not refuse it.
+        checklists = 150_001
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "MyEBirdData.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(REQUIRED_COLUMNS)
+                writer.writerows(
+                    (f"S{index}", "Ruff", "Calidris pugnax", "2026-08-08", "A")
+                    for index in range(checklists)
+                )
+            parsed, rows, _, _, _ = _parse_archive(path)
+        self.assertEqual((len(parsed), rows), (checklists, checklists))
+
+    def _peak_parse_bytes(self, path: Path) -> int:
+        tracemalloc.start()
+        try:
+            _parse_archive(path)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_names_repeated_across_checklists_are_held_once(self) -> None:
+        # Each stored observation may cost a dictionary slot, but not its own
+        # copy of a name that other checklists already hold.
+        checklists = 3000
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            single, repeated = root / "single.csv", root / "repeated.csv"
+            _write_csv(single, self._rows(checklists, checklists=checklists, species=50))
+            _write_csv(
+                repeated,
+                [
+                    _row(
+                        f"S{index // 6}",
+                        f"Fixture bird {index % 50}",
+                        f"Fixturus avis{index % 50}",
+                        "2026-08-08",
+                    )
+                    for index in range(checklists * 6)
+                ],
+            )
+            extra_pairs = checklists * 5
+            growth = self._peak_parse_bytes(repeated) - self._peak_parse_bytes(single)
+            self.assertLess(growth / extra_pairs, 50)
+
+    def test_stored_history_shares_species_between_checklists(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            _write_csv(
+                csv_path,
+                [
+                    _row("S1", "Eastern Bluebird", "Sialia sialis", "2026-08-08"),
+                    _row("S2", "Eastern Bluebird", "Sialia sialis", "2026-08-09"),
+                ],
+            )
+            import_ebird_archive(csv_path, root / "state")
+            _, (first, second) = read_ebird_checklists(root / "state")
+            self.assertEqual(first.species, second.species)
+            self.assertIs(first.species[0], second.species[0])
+            self.assertIs(first.species[0].scientific_name, second.species[0].scientific_name)
+
+    def test_header_column_count_is_capped(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            row = _row("S1", "Eastern Bluebird", "Sialia sialis", "2026-08-08")
+            extra = [f"Extra {index}" for index in range(MAX_COLUMNS - len(EXPORT_COLUMNS) + 1)]
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[*EXPORT_COLUMNS, *extra], restval="")
+                writer.writeheader()
+                writer.writerow(row)
+            with self.assertRaisesRegex(DataSourceError, f"more than {MAX_COLUMNS} columns"):
+                import_ebird_archive(csv_path, root / "state")
+            _write_csv(csv_path, [row])
+            self.assertEqual(import_ebird_archive(csv_path, root / "state").rows, 1)
+
+    def test_a_line_longer_than_the_limit_is_refused_even_when_each_field_fits(self) -> None:
+        # Each field stays under the CSV module's own per-field limit.
+        field = "x" * (MAX_LINE_CHARACTERS // 3 + 1)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "MyEBirdData.csv"
+            first = _row("S1", "Northern Cardinal", "Cardinalis cardinalis", "2026-08-08")
+            long = _row("S2", "Eastern Bluebird", "Sialia sialis", "2026-08-08")
+            long.update({"Observation Details": field, "Checklist Comments": field, "Time": field})
+            for path, writer in (
+                (csv_path, _write_csv),
+                (root / "MyEBirdData.zip", _write_zip),
+            ):
+                with self.subTest(path=path.suffix):
+                    writer(path, [first, long])
+                    with self.assertRaisesRegex(
+                        DataSourceError, "^eBird archive line 3 is too long$"
+                    ) as raised:
+                        import_ebird_archive(path, root / "state")
+                    self.assertNotIn("xxxx", str(raised.exception))
+            # A long quoted value split over several lines is still one row.
+            first["Checklist Comments"] = "\n".join(["y" * 1000] * 50)
+            _write_csv(csv_path, [first])
+            self.assertEqual(import_ebird_archive(csv_path, root / "state").rows, 1)
 
 
 if __name__ == "__main__":

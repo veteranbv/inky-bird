@@ -384,6 +384,9 @@ class HistoryImports:
         self._verify_file(value)
         if value["kind"] == "ebird-archive":
             history_revision, old = read_ebird_checklists(config.controller.state_dir)
+            # Release the retained history before the upload is parsed twice.
+            old_names = _live_names(old, config)
+            del old
             stats = import_ebird_archive(
                 self.path,
                 config.controller.state_dir,
@@ -392,7 +395,7 @@ class HistoryImports:
                 expected_revision=history_revision,
             ).as_dict()
             incoming = preview_ebird_checklists(self.path)
-            old_names, new_names = _live_names(old, config), _live_names(incoming, config)
+            new_names = _live_names(incoming, config)
             incoming_links = {
                 (record.checklist_hash, species.scientific_name): record.observed_on
                 for record in incoming
@@ -705,7 +708,8 @@ class HistoryImports:
         )
         with catalog_state_lock(self.config.controller.state_dir):
             journal = read_journal(self.config.controller.state_dir)
-        # Same encoding as the journal's own write, so saving cannot fail on size.
+        # Same encoding as the journal's own write. A collection saved after this
+        # check can still fill the journal; saving then refuses with this message.
         projected = JournalState(journal.revision + 1, (*journal.collections, group)).as_dict()
         if len((json.dumps(projected, indent=2, sort_keys=True) + "\n").encode()) > (
             MAX_JOURNAL_BYTES
