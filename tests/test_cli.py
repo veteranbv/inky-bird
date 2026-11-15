@@ -122,7 +122,9 @@ def controller_config(state_dir: Path, catalog_dir: Path | None = None) -> Simpl
                 "audubon.org",
                 "birds.example",
                 "field.example",
-            )
+            ),
+            max_searches_per_day=5,
+            max_searches_per_species=2,
         ),
     )
 
