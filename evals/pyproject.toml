@@ -1,0 +1,24 @@
+# The plate prompt evaluation harness: a development tool, never part of the
+# inky-bird distribution. Run it from the repository root with
+#   uv run --with-editable ./evals inky-plate-eval --help
+[project]
+name = "inky-plate-eval"
+version = "0.1.0"
+description = "Blind evaluation and tuning of the Inky Bird plate and review prompts"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    # Verified offline against the 0.0.7 source; the optimiser is isolated in
+    # plate_tuning/gepa_integration.py.
+    "gepa>=0.0.7,<0.2",
+]
+
+[project.scripts]
+inky-plate-eval = "plate_tuning.cli:main"
+
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["plate_tuning"]

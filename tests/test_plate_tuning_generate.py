@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import json
+import shlex
+from pathlib import Path
+
+import pytest
+from PIL import Image
+from plate_tuning.config import HarnessError
+from plate_tuning.generate import (
+    CodexGenerator,
+    GenerationRequest,
+    completed_sample,
+    generate_samples,
+    missing_samples,
+    parse_arm,
+    register_arm,
+    sample_dir,
+)
+from plate_tuning.panel import frozen_references
+from plate_tuning.rundir import Budget, Ledger
+from plate_tuning_fixtures import ColourGenerator, make_run
+
+from inky_bird_frame.errors import GenerationError
+from inky_bird_frame.images import PORTRAIT_SIZE
+from inky_bird_frame.prompts import PLATE_INSTRUCTIONS, PROMPT_VERSION
+
+ARMS_DIR = Path(__file__).resolve().parents[1] / "evals" / "plate_tuning" / "arms"
+
+
+def test_arm_parsing_names_and_text(tmp_path: Path) -> None:
+    default = parse_arm("current=default", base=tmp_path)
+    assert default.instructions == PLATE_INSTRUCTIONS
+    assert default.label == PROMPT_VERSION
+    assert default.is_default
+
+    v8 = parse_arm(f"v8={ARMS_DIR / 'v8.txt'}", base=tmp_path)
+    assert not v8.is_default
+    assert "natural perched posture" in v8.instructions
+    assert v8.label.startswith("v8-")
+
+    for spec in ("noequals", "Bad_Name=default", "blind=default", "x="):
+        with pytest.raises(HarnessError):
+            parse_arm(spec, base=tmp_path)
+
+
+def test_checked_in_v8_arm_is_a_valid_instruction_template(tmp_path: Path) -> None:
+    run, _panel, _downloader = make_run(tmp_path)
+    register_arm(run, parse_arm(f"v8={ARMS_DIR / 'v8.txt'}", base=tmp_path))
+
+
+def test_an_arm_name_keeps_its_wording_for_the_run(tmp_path: Path) -> None:
+    run, _panel, _downloader = make_run(tmp_path)
+    custom = tmp_path / "custom.txt"
+    custom.write_text(PLATE_INSTRUCTIONS.replace("warm aged cream", "pale grey") + "\n")
+    register_arm(run, parse_arm("base=default", base=tmp_path))
+    register_arm(run, parse_arm("base=default", base=tmp_path))
+
+    with pytest.raises(HarnessError, match="other wording"):
+        register_arm(run, parse_arm(f"base={custom}", base=tmp_path))
+
+
+def test_unusable_instructions_are_refused_before_any_generation(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    broken = tmp_path / "broken.txt"
+    broken.write_text("Draw the bird. {data_block}")
+    generator = ColourGenerator()
+
+    with pytest.raises(HarnessError, match="not usable"):
+        generate_samples(
+            run,
+            generator,
+            [parse_arm(f"broken={broken}", base=tmp_path)],
+            [(panel[0], frozen_references(run, panel[0]))],
+            1,
+            budget=Budget(10),
+        )
+    assert generator.calls == []
+
+
+def test_generation_is_capped_resumable_and_skips_finished_samples(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arms = [parse_arm("base=default", base=tmp_path), parse_arm("cand-y=default", base=tmp_path)]
+    species = [(entry, frozen_references(run, entry)) for entry in panel[:2]]
+    generator = ColourGenerator()
+
+    done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(3), parallel=2)
+
+    assert len(generator.calls) == 3
+    assert report.generated == 3
+    assert report.skipped_for_cap == 5
+    assert len(done) == 3
+    assert missing_samples(run, arms, [entry for entry, _ in species], 2) == 5
+
+    done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(10))
+    assert len(generator.calls) == 8
+    assert report.completed == 3
+    assert report.generated == 5
+    assert len(done) == 8
+    ledger = Ledger(run.path("generations.jsonl"))
+    assert ledger.count("generation-started") == 8
+    assert ledger.count("generation-finished") == 8
+
+    sample = done[("base", panel[0].taxon_id, 1)]
+    with Image.open(sample.portrait) as portrait:
+        assert portrait.size == PORTRAIT_SIZE
+    record = json.loads((sample.portrait.parent / "sample.json").read_text())
+    assert record["label"] == PROMPT_VERSION
+
+    _done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(0))
+    assert report.completed == 8
+    assert len(generator.calls) == 8
+
+
+def test_a_plate_left_by_a_crash_is_prepared_without_paying_again(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    directory = sample_dir(run, arm, panel[0], 1)
+    directory.mkdir(parents=True)
+    Image.new("RGB", (30, 40), (1, 2, 3)).save(directory / "generated.png")
+    generator = ColourGenerator()
+
+    done, report = generate_samples(
+        run, generator, [arm], [(panel[0], frozen_references(run, panel[0]))], 1, budget=Budget(0)
+    )
+
+    assert generator.calls == []
+    assert report.reprepared == 1
+    assert completed_sample(run, arm, panel[0], 1) == done[("base", panel[0].taxon_id, 1)]
+
+
+def test_a_failed_generation_is_recorded_and_retried_later(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+
+    class Failing:
+        def generate(self, request: GenerationRequest) -> None:
+            raise GenerationError("Codex exited with status 1")
+
+    _done, report = generate_samples(run, Failing(), [arm], species, 1, budget=Budget(5))
+    failure = sample_dir(run, arm, panel[0], 1) / "failure.json"
+    assert report.failed == 1
+    assert json.loads(failure.read_text())["error"] == "Codex exited with status 1"
+    assert Ledger(run.path("generations.jsonl")).count("generation-failed") == 1
+
+    done, report = generate_samples(run, ColourGenerator(), [arm], species, 1, budget=Budget(5))
+    assert report.generated == 1
+    assert not failure.exists()
+    assert ("base", panel[0].taxon_id, 1) in done
+
+
+def test_a_tampered_portrait_is_detected(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    done, _ = generate_samples(
+        run,
+        ColourGenerator(),
+        [arm],
+        [(panel[0], frozen_references(run, panel[0]))],
+        1,
+        budget=Budget(1),
+    )
+    Image.new("RGB", (5, 5)).save(done[("base", panel[0].taxon_id, 1)].portrait)
+
+    with pytest.raises(HarnessError, match="altered"):
+        completed_sample(run, arm, panel[0], 1)
+
+
+def test_codex_generator_sends_the_arm_wording_and_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-value")
+    run, panel, _downloader = make_run(tmp_path)
+    captured = tmp_path / "captured"
+    captured.mkdir()
+    stub = tmp_path / "codex"
+    # Record the arguments, working directory and prompt; write the plate it names.
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {shlex.quote(str(captured / 'args'))}\n"
+        f"pwd > {shlex.quote(str(captured / 'cwd'))}\n"
+        f"cat > {shlex.quote(str(captured / 'prompt'))}\n"
+        f"env > {shlex.quote(str(captured / 'env'))}\n"
+        f"cp {shlex.quote(str(panel[0].portrait_path))} generated.png\n"
+    )
+    stub.chmod(0o755)
+    custom = tmp_path / "custom.txt"
+    custom.write_text(PLATE_INSTRUCTIONS.replace("warm aged cream", "pale grey"))
+    arm = parse_arm(f"grey={custom}", base=tmp_path)
+    references = frozen_references(run, panel[0])
+    generator = CodexGenerator(stub, timeout_seconds=30, model="image-model")
+
+    done, report = generate_samples(
+        run, generator, [arm], [(panel[0], references)], 1, budget=Budget(1)
+    )
+
+    assert report.generated == 1, report
+    directory = sample_dir(run, arm, panel[0], 1)
+    prompt = (captured / "prompt").read_text()
+    assert "pale grey naturalist-notebook paper" in prompt
+    assert "warm aged cream" not in prompt
+    assert prompt == (directory / "prompt.txt").read_text()
+    assert prompt.split("inside the current workspace:\n", 1)[1].startswith("generated.png\n")
+    args = (captured / "args").read_text().splitlines()
+    assert args[:2] == ["exec", "--ephemeral"]
+    assert args[args.index("--model") : args.index("--model") + 2] == ["--model", "image-model"]
+    assert [args[i + 1] for i, a in enumerate(args) if a == "--image"] == [
+        str(path.resolve()) for path in references.paths
+    ]
+    assert Path((captured / "cwd").read_text().strip()).resolve() == directory.resolve()
+    assert ("grey", panel[0].taxon_id, 1) in done
+    assert "synthetic-key-value" not in (captured / "env").read_text()
