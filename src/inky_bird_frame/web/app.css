@@ -117,6 +117,11 @@ main {
   padding: 28px max(20px, env(safe-area-inset-right)) max(40px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
   margin: auto;
 }
+/* No script can report a start-up that never happens (an old browser, a module
+   that failed to load, a request that hangs), so CSS reveals this after a wait.
+   The app replaces the whole message when it starts. */
+.start-stalled { display: block; margin-top: 0.5rem; visibility: hidden; animation: start-stalled 0s 20s forwards; }
+@keyframes start-stalled { to { visibility: visible; } }
 h1, h2, h3, legend, .collection-title { font-family: var(--serif); line-height: 1.2; letter-spacing: 0.005em; }
 h1 { margin: 0 0 14px; font-size: clamp(1.7059rem, 7.5vw, 2.2353rem); font-weight: 700; }
 h2 { font-size: 1.3529rem; }

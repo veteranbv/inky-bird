@@ -78,8 +78,39 @@ async function artDelivery(t) {
       new URL(route.request().url()).origin === origin ? route.continue() : route.abort(),
     );
   }
+  await startUp(t);
   await listReturn(t);
   await layout(t);
+}
+
+// Every file the owner page names loads, and a start that never comes says so.
+async function startUp(t) {
+  const { page, origin, heading } = t;
+  t.phase = 'owner-page-start';
+  const failed = [];
+  const own = (url) => new URL(url).pathname.startsWith('/app');
+  const answered = (response) => {
+    if (response.status() >= 400 && own(response.url())) failed.push(response.status() + ' ' + response.url());
+  };
+  const lost = (request) => {
+    if (own(request.url())) failed.push('failed ' + request.url());
+  };
+  page.on('response', answered);
+  page.on('requestfailed', lost);
+  await page.goto(origin + '/app');
+  await heading('Your field journal');
+  page.off('response', answered);
+  page.off('requestfailed', lost);
+  assert.deepEqual(failed, []);
+  assert.equal(await page.locator('.start-stalled').count(), 0, 'the started app replaces the message');
+  // A module that never loads stands in for an old browser or a lost connection.
+  await page.route('**/app/app.js', (route) => route.abort());
+  await page.goto(origin + '/app');
+  const stalled = page.locator('.start-stalled');
+  assert.equal(await stalled.isVisible(), false, 'no message while the page may still start');
+  await page.evaluate(() => document.getAnimations().forEach((animation) => animation.finish()));
+  await stalled.waitFor({ state: 'visible' });
+  await page.unroute('**/app/app.js');
 }
 
 // Every control a tap can reach, with its box, for the layout checks below.
