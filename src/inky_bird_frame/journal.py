@@ -52,13 +52,11 @@ COLLECTION_ID = re.compile(r"[0-9a-f]{32}\Z")
 STOPPED_GUIDANCE = {
     "retry_limit": (
         "retry_limit",
-        "Automatic retries have stopped after repeated failed tries. "
-        "Choose this bird for retry to try again.",
+        "Automatic retries have stopped after repeated failed tries.",
     ),
     "research_limit": (
         "research_limit",
-        "This bird used its research allowance. Automatic retries have stopped; "
-        "choose it for retry to try again.",
+        "This bird used its research allowance. Automatic retries have stopped.",
     ),
 }
 

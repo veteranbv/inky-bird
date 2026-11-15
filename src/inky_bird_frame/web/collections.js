@@ -435,7 +435,7 @@ export function renderCollection(context) {
       button('Export collection', async () => {
         if (
           !confirm(
-            'The file holds this collection’s name, dates and birds, and nothing else. Share it only if you are happy to share those.',
+            'The file holds this collection’s name, dates and birds, and where each bird came from. Share it only if you are happy to share those.',
           )
         )
           return;
@@ -638,12 +638,21 @@ function savedSummary(preview) {
 // The server's own refusals are complete; only a change lost after it was sent
 // leaves the outcome open.
 function savedProblem(error, sent = true) {
+  if (sent && error.code === 'interrupted')
+    return 'Inky could not confirm whether your frame changed. Check On my frame before trying again.';
   return (
     error.message +
-    (sent && ['offline', 'invalid_response', 'interrupted'].includes(error.code)
+    (sent && ['offline', 'invalid_response'].includes(error.code)
       ? ' Check On my frame to see whether it changed.'
       : '')
   );
+}
+
+// The wall frame follows On my frame only while it shows it; otherwise the
+// name of what it shows. Null when that is On my frame or cannot be read.
+function wallElsewhere(wall) {
+  if (!wall || ['current', 'saved'].includes(wall)) return null;
+  return wall === 'favorites' ? 'Favorites' : wall === 'all' ? 'All plates' : 'another collection';
 }
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
@@ -670,7 +679,11 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
     el('h2', 'Change what is on your frame?'),
     note(savedSummary(preview)),
     ...(reason ? [note(reason)] : []),
-    note('Your frame changes from its next refresh.'),
+    note(
+      wallElsewhere(preview.wall)
+        ? 'Your wall frame shows ' + wallElsewhere(preview.wall) + ' for now, so it does not change.'
+        : 'Your frame changes from its next refresh.',
+    ),
     confirm,
     button('Cancel', () => location.reload()),
   );
@@ -678,10 +691,16 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
 }
 
 async function savedPreview(api, action, taxonId) {
-  const settings = await api('/v1/owner/settings');
+  const [settings, wall] = await Promise.all([
+    api('/v1/owner/settings'),
+    api('/v1/owner/presentation').then(
+      (state) => state?.wall_view,
+      () => null,
+    ),
+  ]);
   const body = { action, configuration_revision: settings.revision };
   if (taxonId) body.taxon_id = taxonId;
-  return [body, await api('/v1/owner/saved/preview', body)];
+  return [body, { ...(await api('/v1/owner/saved/preview', body)), wall }];
 }
 
 // Changes to many birds keep their review, confirmation and outcome page.
@@ -785,9 +804,16 @@ export function savedToggle(context, bird) {
       saved = action === 'add';
       if (saved) plateReady = true;
       label();
-      status.textContent = saved
-        ? name + ' will show on your frame from the next refresh.'
-        : name + ' will leave your frame at the next refresh.';
+      const elsewhere = wallElsewhere(preview.wall);
+      status.textContent = elsewhere
+        ? name +
+          (saved ? ' is on' : ' is off') +
+          ' your frame list; your wall frame shows ' +
+          elsewhere +
+          ' for now.'
+        : saved
+          ? name + ' will show on your frame from the next refresh.'
+          : name + ' will leave your frame at the next refresh.';
       if (offerUndo) {
         undo = button('Undo', () => change(saved ? 'remove' : 'add', false));
         status.after(undo);

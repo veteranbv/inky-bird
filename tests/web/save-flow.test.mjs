@@ -260,6 +260,7 @@ test('changes to many birds keep their review step', async (t) => {
   await settle(t);
   assert.equal(server.changes.length, 0);
   assert(texts(section).includes('Adding 3 birds.'));
+  assert(texts(section).includes('Your frame changes from its next refresh.'));
 });
 
 test('an outcome shows plain words, never identifiers or hashes', async () => {
@@ -665,15 +666,56 @@ test('a bird page with approved art removes it in one tap', async (t) => {
   assert(findButton(section, 'Undo'));
 });
 
-test('an interrupted change says to check On my frame', async (t) => {
-  const message = 'Inky could not confirm how this ended.';
+test('an interrupted change says to check On my frame before trying again', async (t) => {
+  const message = 'Inky could not confirm how this ended. Check what changed before trying again.';
   const server = savedServer({}, 'interrupted', { message });
   const { context, main } = page(t, server.respond);
   const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
   main.append(section);
   findButton(section, 'Add to my frame').click();
   await settle(t);
-  assert(texts(section).includes(message + ' Check On my frame to see whether it changed.'));
+  assert.deepEqual(
+    texts(section).filter((text) => text.includes('confirm')),
+    ['Inky could not confirm whether your frame changed. Check On my frame before trying again.'],
+  );
+});
+
+// What the wall frame shows is its own choice: a change to On my frame reaches
+// it only while it shows On my frame.
+for (const [wall, added, removed] of [
+  ['current', 'Brown Creeper will show on your frame from the next refresh.', 'Brown Creeper will leave your frame at the next refresh.'],
+  ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Brown Creeper will leave your frame at the next refresh.'],
+  ['favorites', 'Brown Creeper is on your frame list; your wall frame shows Favorites for now.', 'Brown Creeper is off your frame list; your wall frame shows Favorites for now.'],
+  ['all', 'Brown Creeper is on your frame list; your wall frame shows All plates for now.', 'Brown Creeper is off your frame list; your wall frame shows All plates for now.'],
+  ['a'.repeat(32), 'Brown Creeper is on your frame list; your wall frame shows another collection for now.', 'Brown Creeper is off your frame list; your wall frame shows another collection for now.'],
+])
+  test('adding and removing a bird while the wall frame shows ' + (wall.length === 32 ? 'a collection' : wall), async (t) => {
+    const server = savedServer();
+    const { context, main } = page(t, (path, body) =>
+      path === '/v1/owner/presentation' ? { wall_view: wall } : server.respond(path, body),
+    );
+    context.byId.set(7, { taxon_id: 7, common_name: 'Brown Creeper' });
+    const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+    main.append(section);
+    findButton(section, 'Add to my frame').click();
+    await settle(t);
+    assert(texts(section).includes(added), texts(section).join(' | '));
+    findButton(section, 'Undo').click();
+    await settle(t);
+    assert(texts(section).includes(removed), texts(section).join(' | '));
+  });
+
+test('a review of many birds says whether the wall frame follows', async (t) => {
+  const server = savedServer({ added_count: 3 });
+  const { context, main } = page(t, (path, body) =>
+    path === '/v1/owner/presentation' ? { wall_view: 'favorites' } : server.respond(path, body),
+  );
+  const section = collections.savedChange(context, 'Add every bird with a plate', 'import-approved');
+  main.append(section);
+  findButton(section, 'Add every bird with a plate').click();
+  await settle(t);
+  assert(texts(section).includes('Your wall frame shows Favorites for now, so it does not change.'));
+  assert(!texts(section).includes('Your frame changes from its next refresh.'));
 });
 
 const candidatePage = await import(moduleURL(await inline("export * from '/app/candidate.js';")));
@@ -875,15 +917,108 @@ test('Manage counts a new plate as ready and an unfinished one as needing a hand
 });
 
 test('Manage and In the works agree on what needs a hand', () => {
-  // The new-plate list is unreadable, so a waiting plate shows only as pending.
+  // A waiting plate the new-plate list shows is good news.
   const management = workWith({
-    in_review: { status: 'unavailable', candidates: [] },
+    in_review: { status: 'ok', candidates: [{ taxon_id: 5, inspect_available: true }] },
     needs_attention: [5],
     terminal_details: [{ taxon_id: 5, state: 'pending' }],
   });
-  assert.deepEqual(manage.manageNotes(management), []);
+  assert.deepEqual(manage.manageNotes(management).map(([text]) => text), [
+    '1 new plate is ready to look at.',
+  ]);
   assert.equal(manage.needsHand(management.work).size, 0);
+  // When that list cannot be read, the waiting plate is listed under Needs a hand.
+  management.work.in_review = { status: 'unavailable', candidates: [] };
+  assert.deepEqual(manage.manageNotes(management).map(([text]) => text), ['1 plate needs a hand']);
+  assert.deepEqual([...manage.needsHand(management.work)], [5]);
   management.work.terminal_details = [{ taxon_id: 5, state: 'failed' }];
   assert.deepEqual(manage.manageNotes(management).map(([text]) => text), ['1 plate needs a hand']);
   assert.deepEqual([...manage.needsHand(management.work)], [5]);
+});
+
+// The Needs a hand list on In the works, for one set of plate-work details.
+async function needsHandShown(t, work) {
+  const action = (label) => {
+    const section = new Element('section');
+    section.append(Object.assign(new Element('button'), { textContent: label }));
+    return section;
+  };
+  const management = {
+    available: true,
+    generation_enabled: true,
+    retry_wake_available: false,
+    activity: { entries: {} },
+    work: {
+      complete: true,
+      queue: [],
+      can_run: [],
+      waiting: [],
+      needs_attention: [],
+      retry_details: [],
+      terminal_details: [],
+      in_review: { status: 'ok', candidates: [] },
+      retry_requests: [],
+      ...work,
+    },
+  };
+  const { context, main } = page(t, (path) => {
+    if (path === '/v1/owner/operations') return { operations: [] };
+    if (path === '/v1/owner/management') return management;
+    throw new Error('unexpected ' + path);
+  });
+  Object.assign(context, {
+    area: 'work',
+    query: new URLSearchParams(),
+    data: {},
+    management,
+    unreadable: () => new Element('div'),
+    empty: () => new Element('section'),
+    operationAction: action,
+    currentRun: () => 0,
+  });
+  await manage.renderStatus(context);
+  const section = main.children.find(
+    (node) => node.children[0]?.textContent === 'Needs a hand',
+  );
+  return texts(section);
+}
+
+test('a waiting plate stays under Needs a hand when the new-plate list cannot be read', async (t) => {
+  const shown = await needsHandShown(t, {
+    in_review: { status: 'unavailable', candidates: [] },
+    needs_attention: [5],
+    terminal_details: [{ taxon_id: 5, common_name: 'Brown Creeper', state: 'pending' }],
+  });
+  assert(shown.includes('Brown Creeper'), shown.join(' | '));
+  assert(!shown.includes('Nothing needs a hand.'));
+});
+
+test('a waiting plate the new-plate list shows is not listed again', async (t) => {
+  const shown = await needsHandShown(t, {
+    in_review: {
+      status: 'ok',
+      candidates: [{ taxon_id: 5, common_name: 'Brown Creeper', inspect_available: true }],
+    },
+    needs_attention: [5],
+    terminal_details: [{ taxon_id: 5, common_name: 'Brown Creeper', state: 'pending' }],
+  });
+  assert(!shown.includes('Brown Creeper'), shown.join(' | '));
+  assert(shown.includes('Nothing needs a hand.'));
+});
+
+test('an unfinished new plate does not ask to be chosen again', async (t) => {
+  const shown = await needsHandShown(t, {
+    needs_attention: [5],
+    terminal_details: [{ taxon_id: 5, common_name: 'Brown Creeper', state: 'incomplete_pending' }],
+  });
+  assert(shown.includes('Its new plate is unfinished and needs a hand.'), shown.join(' | '));
+  assert(!shown.includes('Choose it above to try again.'));
+});
+
+test('a stopped bird still says how to try again', async (t) => {
+  const shown = await needsHandShown(t, {
+    needs_attention: [5],
+    terminal_details: [{ taxon_id: 5, common_name: 'Brown Creeper', state: 'failed' }],
+  });
+  assert(shown.includes('Choose it above to try again.'), shown.join(' | '));
 });

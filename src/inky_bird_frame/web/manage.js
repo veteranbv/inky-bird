@@ -301,9 +301,12 @@ export async function renderGuides(context) {
 
 // What In the works lists under "Needs a hand": unfinished new plates, birds
 // waiting for the owner to try again, and stopped ones. A new plate waiting for
-// a look is good news, not one of them.
+// a look is good news, not one of them, while the new-plate list shows it.
 function handGroups(work) {
-  const terminal = (work?.terminal_details || []).filter((detail) => detail.state !== 'pending');
+  const listed = work?.in_review?.status === 'ok';
+  const terminal = (work?.terminal_details || []).filter(
+    (detail) => detail.state !== 'pending' || !listed,
+  );
   const unfinished = (work?.in_review?.candidates || []).filter(
     (candidate) =>
       !candidate.inspect_available &&
@@ -493,7 +496,7 @@ export async function renderStatus(context) {
       management.reason === 'unreadable'
         ? unreadable([
             (data.notices || []).find((notice) => notice.part === 'plate-work')?.message ||
-              'Plate work could not be read.',
+              'Plates in the works could not be read.',
           ])
         : empty(
             'Full configuration unavailable',
@@ -657,7 +660,7 @@ export async function renderStatus(context) {
         runtime.append(el('p', (generation.common_name || 'A plate') + ' · ' + (stageWords[generation.stage] || 'Working') +
           (generation.attempt ? ' · try ' + generation.attempt : '')), stamp('Started', generation.started_at));
       else runtime.append(note(unavailable ? 'Not known right now.' : generation.status === 'unknown' ? 'Inky has not reported lately, so it may or may not be drawing.' : 'Nothing is being drawn right now.'),
-        stamp('Last plate work finished', generation.finished_at));
+        stamp('Last plate finished', generation.finished_at));
       if (!work.complete) runtime.append(note('Sources need a good check before the next plate is made.'));
       if (!unavailable) for (const [key, label] of [['job-refresh', 'Checking sources now'], ['job-catalog-publish', 'Publishing your plates now'], ['job-notifications', 'Sending notifications now']])
         if (activity[key]?.status === 'running') runtime.append(note(label));
@@ -717,7 +720,7 @@ export async function renderStatus(context) {
           stamp('Last try', detail.last_failed_at), stamp('Last started', detail.last_attempt_at),
           note((typeof detail.recorded_attempts === 'number' ? plural(detail.recorded_attempts, 'try', 'tries') + ' · ' : '') + 'each check needs 4 out of 5 or better'),
           ...Object.entries(detail.review_scores || {}).map(([axis, score]) => note((axisWords[axis] || axis.replaceAll('_', ' ')) + ': ' + score + ' out of 5')),
-          note('Choose it above to try again.'));
+          ...(detail.state === 'incomplete_pending' ? [] : [note('Choose it above to try again.')]));
       }
       if (!needsHand(work).size) holds.append(note('Nothing needs a hand.'));
       retrying.hidden = !soon;

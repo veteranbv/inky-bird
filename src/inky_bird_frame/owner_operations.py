@@ -312,7 +312,10 @@ class OwnerOperations:
                                 else "interrupted",
                                 updated_at=_stamp(),
                                 result=recovered.get(row.operation_id)
-                                or {"message": "Inky could not confirm how this ended."},
+                                or {
+                                    "message": "Inky could not confirm how this ended. "
+                                    "Check what changed before trying again."
+                                },
                             )
                             if row.status in {"pending", "running"}
                             else row

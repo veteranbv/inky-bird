@@ -30,3 +30,14 @@ def test_failure_guidance_is_plain(error_type: str | None) -> None:
     message = failure_guidance(error_type)["failure_message"]
     assert not MACHINERY.search(message), message
     assert message.endswith(".")
+
+
+@pytest.mark.parametrize("stop_reason", ["retry_limit", "research_limit"])
+def test_stopped_guidance_says_what_happened_once(stop_reason: str) -> None:
+    # In the works follows this with how to try again, so it is not repeated here.
+    guidance = failure_guidance("GenerationError", stop_reason)
+    message = guidance["failure_message"]
+    assert guidance["failure_kind"] == stop_reason
+    assert not MACHINERY.search(message), message
+    assert not re.search(r"\bfor retry\b|\bchoose\b", message, re.IGNORECASE), message
+    assert message.endswith(".")

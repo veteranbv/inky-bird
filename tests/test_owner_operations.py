@@ -146,7 +146,10 @@ def test_restart_marks_unknown_work_interrupted_without_replay(tmp_path: Path) -
     try:
         interrupted = restarted.status(str(receipt["operation_id"]))
         assert interrupted["status"] == "interrupted"
-        assert interrupted["result"] == {"message": "Inky could not confirm how this ended."}
+        assert interrupted["result"] == {
+            "message": "Inky could not confirm how this ended. "
+            "Check what changed before trying again."
+        }
         with patch("inky_bird_frame.owner_operations._stamp"):
             duplicate = restarted.submit(
                 "retry",

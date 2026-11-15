@@ -113,11 +113,18 @@ async function historyAndCollections(t) {
   assert.equal(trip.members[0].taxon_id, cardinal.taxon_id);
   assert(!fs.existsSync(path.join(fixture, 'var/controller/owner-import/upload.bin')));
   t.phase = 'portable-export';
-  page.once('dialog', (dialog) => dialog.accept());
+  let warning = '';
+  page.once('dialog', (dialog) => {
+    warning = dialog.message();
+    dialog.accept();
+  });
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export collection', exact: true }).click();
   const download = await downloadPromise;
   const exported = fs.readFileSync(await download.path(), 'utf8');
+  // The warning names everything the file holds, including where each bird came from.
+  assert(exported.includes('"origin"'));
+  assert(warning.includes('where each bird came from'), warning);
   assert(!exported.includes('checklist_hash'));
   assert(!exported.includes('Fixture garden'));
   const portablePath = path.join(fixture, 'portable.json');

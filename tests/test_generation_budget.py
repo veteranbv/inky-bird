@@ -600,7 +600,7 @@ class RetryCeilingTests(unittest.TestCase):
                 self.assertIs(first_failure(result)["terminal"], True)
                 self.assertEqual(shown["failure_kind"], "retry_limit")
                 self.assertIn("Automatic retries have stopped", shown["failure_message"])
-                self.assertIn("Choose this bird for retry", shown["failure_message"])
+                self.assertNotIn("for retry", shown["failure_message"])
                 self.assertNotIn("backoff", shown["failure_message"])
 
     def test_owner_is_told_a_bird_out_of_research_has_stopped(self) -> None:
