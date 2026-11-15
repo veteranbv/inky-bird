@@ -336,7 +336,7 @@ def test_expired_provider_metadata_is_served_while_it_refreshes() -> None:
     with _with_provider(provider):
         first = asyncio.run(metadata(CONFIG))
         provider.mode = "down"
-        later = time.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
+        later = oidc.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
 
         async def stale_read() -> object:
             value = await metadata(CONFIG)
@@ -346,7 +346,7 @@ def test_expired_provider_metadata_is_served_while_it_refreshes() -> None:
             await asyncio.sleep(0)
             return value
 
-        with patch("inky_bird_frame.oidc.time.monotonic", return_value=later):
+        with patch("inky_bird_frame.oidc.monotonic", return_value=later):
             assert asyncio.run(stale_read()) == first
             assert provider.requests == 2
             # A failed refresh keeps the last good document and is not retried
@@ -365,8 +365,8 @@ def test_a_provider_failure_is_remembered_briefly_and_then_retried() -> None:
             assert "private-provider-detail" not in str(raised.value)
         assert provider.requests == 1
         provider.mode = "ok"
-        retry = time.monotonic() + oidc.METADATA_FAILURE_SECONDS + 1
-        with patch("inky_bird_frame.oidc.time.monotonic", return_value=retry):
+        retry = oidc.monotonic() + oidc.METADATA_FAILURE_SECONDS + 1
+        with patch("inky_bird_frame.oidc.monotonic", return_value=retry):
             assert asyncio.run(metadata(CONFIG)).token_endpoint == "https://id.example.test/token"
         assert provider.requests == 2
 
@@ -379,3 +379,56 @@ def test_metadata_for_a_different_issuer_is_not_reused() -> None:
         with pytest.raises(OIDCError, match="does not match"):
             asyncio.run(metadata(other))
     assert provider.requests == 2
+
+
+def test_an_unexpected_background_refresh_failure_is_logged_once_and_paused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _Provider()
+    with _with_provider(provider):
+        first = asyncio.run(metadata(CONFIG))
+    attempts = 0
+
+    async def broken(config: OIDCConfig) -> oidc.ProviderMetadata:
+        nonlocal attempts
+        attempts += 1
+        raise KeyError("synthetic-missing-field")
+
+    async def reads() -> list[oidc.ProviderMetadata]:
+        values = []
+        for _ in range(5):
+            values.append(await metadata(CONFIG))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        return values
+
+    later = oidc.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
+    with (
+        patch("inky_bird_frame.oidc._fetch_metadata", broken),
+        patch("inky_bird_frame.oidc.monotonic", return_value=later),
+        caplog.at_level("ERROR", logger="inky_bird_frame.oidc"),
+    ):
+        assert asyncio.run(reads()) == [first] * 5
+    assert attempts == 1
+    assert oidc._metadata_cache[CONFIG.issuer].failure is not None
+    logged = [record for record in caplog.records if record.name == "inky_bird_frame.oidc"]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+    assert logged[0].exc_info[0] is KeyError
+
+
+def test_an_unexpected_first_fetch_failure_is_a_safe_sign_in_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def broken(config: OIDCConfig) -> oidc.ProviderMetadata:
+        raise KeyError("synthetic-missing-field")
+
+    with (
+        patch("inky_bird_frame.oidc._fetch_metadata", broken),
+        caplog.at_level("ERROR", logger="inky_bird_frame.oidc"),
+    ):
+        for _ in range(2):
+            with pytest.raises(OIDCError) as raised:
+                asyncio.run(metadata(CONFIG))
+            assert "synthetic-missing-field" not in str(raised.value)
+    assert len([r for r in caplog.records if r.name == "inky_bird_frame.oidc"]) == 1

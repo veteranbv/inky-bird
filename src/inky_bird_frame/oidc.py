@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 
@@ -37,6 +39,10 @@ ALGORITHMS = ("RS256", "ES256")
 METADATA_FRESH_SECONDS = 15 * 60
 METADATA_STALE_SECONDS = 24 * 60 * 60
 METADATA_FAILURE_SECONDS = 30
+METADATA_UNEXPECTED_FAILURE = (
+    "Sign-in provider metadata could not be read; check the controller log for details"
+)
+_LOG = logging.getLogger(__name__)
 
 
 class OIDCError(AccessError):
@@ -189,7 +195,7 @@ async def _get_json(url: str) -> dict[str, object]:
 
 async def metadata(config: OIDCConfig) -> ProviderMetadata:
     entry = _metadata_cache.setdefault(config.issuer, _CachedMetadata())
-    now = time.monotonic()
+    now = monotonic()
     failed_recently = entry.failure is not None and (
         now - entry.failed_at < METADATA_FAILURE_SECONDS
     )
@@ -227,9 +233,15 @@ async def _fetch_into(config: OIDCConfig, entry: _CachedMetadata) -> ProviderMet
     try:
         value = await _fetch_metadata(config)
     except OIDCError as exc:
-        entry.failure, entry.failed_at = str(exc), time.monotonic()
+        entry.failure, entry.failed_at = str(exc), monotonic()
         raise
-    entry.value, entry.fetched_at, entry.failure = value, time.monotonic(), None
+    except Exception:
+        # Record a fixed failure so the retry pause applies; the detail goes
+        # to the log once instead of to every request or the browser.
+        _LOG.exception("Sign-in provider metadata refresh failed unexpectedly")
+        entry.failure, entry.failed_at = METADATA_UNEXPECTED_FAILURE, monotonic()
+        raise OIDCError(METADATA_UNEXPECTED_FAILURE) from None
+    entry.value, entry.fetched_at, entry.failure = value, monotonic(), None
     return value
 
 
