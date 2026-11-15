@@ -3019,6 +3019,35 @@ def _remove_unused_kept_runs(state_dir: Path, retry_store: RetryStore, taxon_id:
         )
 
 
+def _forget_approved_bird_retries(state_dir: Path, retry_store: RetryStore, taxon_id: int) -> None:
+    """Drop what an approved bird kept for another try; it is never generated again."""
+    retry_store.clear(taxon_id)
+    retry_store.clear_quality_guidance(taxon_id)
+    _remove_unused_kept_runs(state_dir, retry_store, taxon_id)
+
+
+def _forget_approved_birds_retries(
+    state_dir: Path, retry_store: RetryStore, approved: set[int]
+) -> None:
+    """Catch up birds approved outside the cycle, such as by the owner's approval.
+
+    Callers hold the catalog lock, so a replacement that withdraws a bird's plate
+    and sets its guidance is never seen half done.
+    """
+    archive = state_dir / "archive"
+    runs = archive.glob("*-interrupted*") if archive.is_dir() else ()
+    prefixes = {run.name.partition("-")[0] for run in runs}
+    kept = {int(prefix) for prefix in prefixes if prefix.isascii() and prefix.isdigit()}
+    retrying = {record.taxon_id for record in retry_store.records()}
+    for taxon_id in sorted(approved):
+        if (
+            taxon_id in kept
+            or taxon_id in retrying
+            or retry_store.quality_guidance(taxon_id) is not None
+        ):
+            _forget_approved_bird_retries(state_dir, retry_store, taxon_id)
+
+
 def _retry_source_plate(state_dir: Path, relative_path: str | None) -> Path | None:
     if relative_path is None:
         return None
@@ -3312,6 +3341,7 @@ def approve_passing_candidates(
     """Approve reviewed pending candidates; a candidate that fails stays pending."""
     published: list[dict[str, object]] = []
     clear_catalog_staging(config.controller.catalog_dir)
+    retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
     pending_root = config.controller.state_dir / "pending"
     for manifest_path in sorted(pending_root.glob("*/manifest.json")):
         directory = manifest_path.parent
@@ -3343,6 +3373,7 @@ def approve_passing_candidates(
                     _held_candidate_failure(directory, taxon_id, manifest.get("common_name"))
                 )
             continue
+        _forget_approved_bird_retries(config.controller.state_dir, retry_store, taxon_id)
         published.append(entry.as_dict())
     return published
 
@@ -3479,13 +3510,19 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 )
             held_candidates: list[dict[str, object]] = []
             published = approve_passing_candidates(config, held=held_candidates)
+            approved = approved_taxon_ids(config.controller.catalog_dir)
+            _forget_approved_birds_retries(
+                config.controller.state_dir,
+                RetryStore(config.controller.state_dir / "generation-retries.json"),
+                approved,
+            )
         snapshot = _read_discovery_snapshot(config)
         species_list = snapshot.species
         retry_store = RetryStore(config.controller.state_dir / "generation-retries.json")
         work = calculate_generation_work(
             snapshot=snapshot,
             queued_species=queued_species,
-            approved=approved_taxon_ids(config.controller.catalog_dir),
+            approved=approved,
             terminal_states=_generation_terminal_states(
                 config.controller.state_dir,
                 species_list,
@@ -3641,9 +3678,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         "published": entry.as_dict(),
                     }
                 )
-                retry_store.clear(species.taxon_id)
-                retry_store.clear_quality_guidance(species.taxon_id)
-                _remove_unused_kept_runs(config.controller.state_dir, retry_store, species.taxon_id)
+                _forget_approved_bird_retries(
+                    config.controller.state_dir, retry_store, species.taxon_id
+                )
             except InsufficientReferencesError as exc:
                 retry = retry_store.record_failure(
                     species.taxon_id,
@@ -3697,9 +3734,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     )
             except GenerationStopRequested:
                 if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
-                    retry_store.clear(species.taxon_id)
-                    retry_store.clear_quality_guidance(species.taxon_id)
-                    _remove_unused_kept_runs(
+                    _forget_approved_bird_retries(
                         config.controller.state_dir, retry_store, species.taxon_id
                     )
                 else:

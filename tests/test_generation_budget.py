@@ -23,6 +23,7 @@ from inky_bird_frame.controller import (
     DiscoveryResult,
     GenerationStopRequested,
     ProviderStatus,
+    approve_passing_candidates,
     exclusive_cycle_lock,
     generate_candidate,
     load_or_create_profile,
@@ -1130,6 +1131,78 @@ class KeptRunCleanupTests(unittest.TestCase):
 
         self.assertIs(first_failure(result)["terminal"], True)
         self.assertEqual(runs, [self.OTHER])
+
+    def test_a_held_candidate_approved_later_removes_its_kept_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_kept_run(config, self.LATEST, resume=True)
+            (config.controller.state_dir / "archive" / self.OTHER).mkdir()
+            with (
+                generation([Path(temporary) / "candidate"]),
+                patch(
+                    "inky_bird_frame.controller.approve_candidate",
+                    side_effect=CandidateApprovalError("catalog busy"),
+                ),
+            ):
+                run_generation_cycle(config)
+            held_runs = kept_runs(config, FIRST.taxon_id)
+            pending = config.controller.state_dir / "pending" / "1-first-bird"
+            pending.mkdir(parents=True)
+            (pending / "manifest.json").write_text(json.dumps({"common_name": "First Bird"}))
+            with (
+                patch("inky_bird_frame.controller.has_passing_sourced_review", return_value=True),
+                patch("inky_bird_frame.controller.is_bounded_generation", return_value=True),
+                patch("inky_bird_frame.controller.approve_candidate", return_value=MagicMock()),
+            ):
+                published = approve_passing_candidates(config)
+            runs = kept_runs(config, FIRST.taxon_id)
+            guidance = retries(config).quality_guidance(FIRST.taxon_id)
+
+        self.assertEqual(held_runs, [self.OTHER, self.LATEST])
+        self.assertEqual(len(published), 1)
+        self.assertIsNone(guidance)
+        self.assertEqual(runs, [self.OTHER])
+
+    def test_a_bird_approved_outside_the_cycle_loses_its_retry_leftovers(self) -> None:
+        second_run = "2-20260101T000000Z-interrupted"
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST, SECOND])
+            seed_kept_run(config, self.LATEST, resume=True)
+            seed_failures(config, FIRST.taxon_id, 1)
+            portrait = (
+                config.controller.state_dir / "archive" / second_run / "attempt-01" / "portrait.png"
+            )
+            write_png(portrait, color=(40, 40, 200))
+            retries(config).set_quality_guidance(
+                SECOND.taxon_id,
+                ("Bill is too long",),
+                source_plate=portrait.relative_to(config.controller.state_dir).as_posix(),
+            )
+            # The owner approved the first bird's plate by hand since the last cycle.
+            with (
+                patch(
+                    "inky_bird_frame.controller.approved_taxon_ids",
+                    return_value={FIRST.taxon_id},
+                ),
+                generation(DataSourceError("source down")) as call,
+            ):
+                run_generation_cycle(config)
+            store = retries(config)
+            first_runs = kept_runs(config, FIRST.taxon_id)
+            second_runs = kept_runs(config, SECOND.taxon_id)
+            first_guidance = store.quality_guidance(FIRST.taxon_id)
+            first_retry = store.get(FIRST.taxon_id)
+            second_guidance = store.quality_guidance(SECOND.taxon_id)
+
+        self.assertEqual([args[1] for args, _ in call.call_args_list], [SECOND])
+        self.assertEqual(first_runs, [])
+        self.assertIsNone(first_guidance)
+        self.assertIsNone(first_retry)
+        # The bird still waiting for a plate keeps the run its retry resumes from.
+        self.assertEqual(second_runs, [second_run])
+        self.assertIsNotNone(second_guidance)
 
 
 def live_names(common_name: str) -> TaxonContext:
