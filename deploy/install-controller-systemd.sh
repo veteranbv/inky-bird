@@ -279,7 +279,12 @@ restore_units() {
     if [ -f "${unit}" ] && [ ! -e "${unit_backup_dir}/${name}" ] && [ -e "${unit_root}/${name}" ]; then
       changed=true
       if systemctl is-active --quiet "${name}" || systemctl is-enabled --quiet "${name}"; then
-        sudo systemctl disable --now "${name}" || restored=false
+        if ! sudo systemctl disable --now "${name}"; then
+          restored=false
+          keep_runtime_if_running "${name}"
+          # Keep its file so a rerun or the uninstaller can still find and stop it.
+          continue
+        fi
       fi
       keep_runtime_if_running "${name}"
       sudo rm -f "${unit_root}/${name}" || restored=false
@@ -349,7 +354,9 @@ cleanup() {
       fi
     fi
     for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
-      sudo systemctl start "${unit}" || not_restarted+=("${unit}")
+      if ! sudo systemctl start "${unit}" && ! systemctl is-active --quiet "${unit}"; then
+        not_restarted+=("${unit}")
+      fi
     done
     if [ -n "${new_runtime}" ] && [ "${runtime_restored}" = true ]; then
       rm -rf "${new_runtime}"
@@ -511,7 +518,24 @@ for name, content in units.items():
     (unit_dir / name).write_text(content)
 PY
 
-if ! "${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}"; then
+# Only an unreachable bird source may wait for the scheduled refresh; any other
+# failure means the new version does not work here.
+refresh_status=0
+refresh_output=$("${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
+  refresh_status=$?
+printf '%s\n' "${refresh_output}"
+if [ "${refresh_status}" -ne 0 ]; then
+  if ! python3 -I -c '
+import json, sys
+try:
+    envelope = json.loads(sys.argv[1])
+    sys.exit(0 if envelope["ok"] is False and envelope["error"]["type"] == "data_source" else 1)
+except (ValueError, KeyError, TypeError):
+    sys.exit(1)
+' "${refresh_output}"; then
+    echo "The new version could not refresh bird observations; see the error above." >&2
+    exit 1
+  fi
   echo "Could not fetch bird observations yet. The scheduled refresh will try again." >&2
 fi
 

@@ -454,9 +454,16 @@ def venv_python(executable: str, arguments: list[str]) -> int:
 def inky_bird(executable: str, arguments: list[str]) -> int:
     tag = runtime_tag(executable)
     _log("inky-bird", tag, *arguments)
-    if f"{tag}:{arguments[0]}" in _rules():
+    rules = _rules()
+    # ``tag:command`` fails as a configuration error; ``tag:command:type`` names the type.
+    kinds = [rule.rpartition(":")[2] for rule in rules if rule.startswith(f"{tag}:{arguments[0]}:")]
+    if f"{tag}:{arguments[0]}" in rules or kinds:
+        if "unreadable" in kinds:
+            print("Traceback (most recent call last):")
+            return 1
         # The real CLI reports failures as a JSON envelope on stdout.
-        error = {"type": "configuration", "message": f"synthetic {arguments[0]} failure"}
+        kind = kinds[0] if kinds else "configuration"
+        error = {"type": kind, "message": f"synthetic {arguments[0]} failure"}
         print(json.dumps({"ok": False, "error": error, "schema_version": 1}, indent=2))
         return 1
     return 0

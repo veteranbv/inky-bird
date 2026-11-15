@@ -320,8 +320,13 @@ cleanup() {
       rm -rf "${new_runtime}"
     fi
     if [ "${#still_running[@]}" -gt 0 ]; then
-      echo "The upgrade failed and these agents could not be stopped, so they may still be running the new version: ${still_running[*]}." >&2
-      echo "Its runtime is kept in ${new_runtime}. Stop each with: launchctl bootout gui/${uid}/<agent>" >&2
+      echo "The upgrade failed and these agents could not be stopped: ${still_running[*]}." >&2
+      if [ "${runtime_restored}" = true ] && [ -n "${previous_runtime}" ]; then
+        echo "A copy already running uses the new version, kept in ${new_runtime}; when it starts again it uses the previous version." >&2
+      else
+        echo "A copy already running uses the new version, kept in ${new_runtime}." >&2
+      fi
+      echo "Stop each with: launchctl bootout gui/${uid}/<agent>" >&2
     fi
     if [ "${#unrestored[@]}" -gt 0 ]; then
       echo "The upgrade failed and these agents are not running: ${unrestored[*]}." >&2

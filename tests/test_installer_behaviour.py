@@ -482,8 +482,29 @@ def test_macos_rollback_keeps_the_runtime_of_an_agent_it_could_not_stop(tmp_path
     assert (runtimes[0] / ".venv/tag").read_text() == "new\n"
     assert (runtimes[0] / "src/runtime-tag").read_text() == "new\n"
     assert f"com.{host.family}.serve" in result.stderr
-    assert "may still be running" in result.stderr
+    assert "could not be stopped" in result.stderr
+    assert "already running uses the new version" in result.stderr
+    assert "previous version" not in result.stderr
+    assert "may still be running" not in result.stderr
     assert "are not running" not in result.stderr
+
+
+def test_macos_rollback_says_a_stuck_agent_restarts_on_the_previous_version(
+    tmp_path: Path,
+) -> None:
+    host = Host(tmp_path, "Darwin")
+    host.install_old_runtime("legacy")
+    host.load_agents("refresh")
+    host.fail("bootstrap-new:refresh", f"bootout:com.{host.family}.serve")
+
+    result = host.run("install-controller.sh", shell=MACOS_BASH)
+
+    assert result.returncode != 0
+    assert host.active_runtime() == "old"
+    assert host.loaded_agents()["serve"]["runtime"] == "new"
+    assert "already running uses the new version" in result.stderr
+    assert "when it starts again it uses the previous version" in result.stderr
+    assert "may still be running" not in result.stderr
 
 
 def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
@@ -676,14 +697,58 @@ def test_linux_expired_sudo_after_controller_restart_keeps_its_runtime(tmp_path:
     assert "running again" not in result.stderr
 
 
-def test_linux_first_refresh_failure_does_not_block_install(tmp_path: Path) -> None:
+def test_linux_failed_rollback_lists_only_services_that_are_really_stopped(
+    tmp_path: Path,
+) -> None:
     host = linux_host(tmp_path)
-    host.fail("new:refresh")
+    host.install_units(
+        controller_service="active",
+        scheduler_service="active",
+        refresh_service="inactive",
+        refresh_timer="active",
+        generate_service="inactive",
+        generate_timer="active",
+    )
+    host.fail(f"sudo-expires-at:systemctl:restart:{host.family}-generate.timer")
+
+    result = run_linux(host, f"{TIMER_UNITS} scheduler.service")
+
+    assert result.returncode != 0
+    assert host.unit_state("scheduler.service")["active"] is True
+    assert host.unit_state("generate.timer")["active"] is False
+    stopped = [line for line in result.stderr.splitlines() if "are stopped" in line]
+    assert len(stopped) == 1
+    assert f"{host.family}-generate.timer" in stopped[0]
+    assert f"{host.family}-scheduler.service" not in stopped[0]
+    assert f"{host.family}-refresh.timer" not in stopped[0]
+
+
+def test_linux_unreachable_bird_source_does_not_block_install(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("new:refresh:data_source")
     result = run_linux(host)
     assert result.returncode == 0, result.stderr
     assert "will try again" in result.stderr
     assert host.active_runtime() == "new"
     assert host.unit_state("refresh.timer") == {"active": True, "enabled": True}
+
+
+@pytest.mark.parametrize(
+    "failure", ["new:refresh", "new:refresh:storage", "new:refresh:unreadable"]
+)
+def test_linux_other_refresh_failures_abort_and_keep_the_old_runtime(
+    tmp_path: Path, failure: str
+) -> None:
+    host = linux_host(tmp_path)
+    host.fail(failure)
+    result = run_linux(host)
+    assert result.returncode == 1
+    assert "will try again" not in result.stderr
+    assert host.active_runtime() == "old"
+    assert "# old" in host.unit_text("controller.service")
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit)["active"] is True
+    assert host.runtime_dirs() == []
 
 
 def unit_install_calls(host: Host) -> list[int]:
@@ -781,6 +846,8 @@ def test_linux_rollback_keeps_the_runtime_of_a_service_it_could_not_stop(tmp_pat
     assert (Path(str(process["directory"])) / ".venv/tag").read_text() == "new\n"
     assert scheduler in result.stderr and "may still" in result.stderr
     assert "previous version is running again" not in result.stderr
+    # Its unit file stays so a rerun or the uninstaller can still find and stop it.
+    assert (host.units / scheduler).exists()
 
 
 def test_linux_failure_after_install_says_the_new_version_is_running(tmp_path: Path) -> None:
@@ -926,6 +993,17 @@ def test_display_failed_fresh_install_leaves_no_enabled_timer(tmp_path: Path) ->
     assert result.returncode == 1
     assert not (host.units / f"{host.family}-display.timer").exists()
     assert host.unit_state("display.timer") == {"active": False, "enabled": False}
+
+
+def test_display_failed_fresh_install_keeps_a_timer_it_could_not_disable(tmp_path: Path) -> None:
+    host = display_host(tmp_path, None)
+    timer = f"{host.family}-display.timer"
+    host.fail(f"systemctl:restart:{timer}", f"systemctl:disable:{timer}")
+    result = host.run("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    assert result.returncode == 1
+    assert host.unit_state("display.timer")["enabled"] is True
+    assert (host.units / timer).exists()
+    assert "Could not put back" in result.stderr
 
 
 def test_display_rejected_configuration_changes_nothing(tmp_path: Path) -> None:
@@ -1088,6 +1166,52 @@ def test_linux_uninstaller_reports_a_unit_it_could_not_remove(tmp_path: Path) ->
     assert f"{host.family}-refresh.timer" in result.stderr
     assert "Controller services uninstalled." not in result.stdout
     assert host.unit_state("controller.service")["active"] is False
+
+
+def test_linux_uninstaller_keeps_a_unit_it_could_not_stop_until_a_rerun_stops_it(
+    tmp_path: Path,
+) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_units(
+        controller_service="active", refresh_service="inactive", refresh_timer="active"
+    )
+    timer = f"{host.family}-refresh.timer"
+    host.fail(f"systemctl:disable:{timer}")
+    for _ in range(2):
+        result = host.run("uninstall-controller-systemd.sh")
+        assert result.returncode == 1, result.stdout
+        assert timer in result.stderr
+        assert "Controller services uninstalled." not in result.stdout
+        assert (host.units / timer).exists()
+        assert host.unit_state("refresh.timer")["active"] is True
+    assert not (host.units / f"{host.family}-controller.service").exists()
+
+    host.fail()
+    result = host.run("uninstall-controller-systemd.sh")
+    assert result.returncode == 0, result.stderr
+    assert not (host.units / timer).exists()
+    assert host.unit_state("refresh.timer")["active"] is False
+
+
+def test_display_uninstaller_keeps_a_unit_it_could_not_stop_until_a_rerun_stops_it(
+    tmp_path: Path,
+) -> None:
+    host = Host(tmp_path, "Linux")
+    host.install_units(display_service="inactive", display_timer="active")
+    timer = f"{host.family}-display.timer"
+    host.fail(f"systemctl:disable:{timer}")
+    for _ in range(2):
+        result = host.run("uninstall-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+        assert result.returncode == 1, result.stdout
+        assert timer in result.stderr
+        assert "Display node services uninstalled." not in result.stdout
+        assert (host.units / timer).exists()
+        assert host.unit_state("display.timer")["active"] is True
+
+    host.fail()
+    result = host.run("uninstall-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+    assert result.returncode == 0, result.stderr
+    assert not (host.units / timer).exists()
 
 
 def test_linux_uninstaller_succeeds_when_units_are_absent(tmp_path: Path) -> None:
