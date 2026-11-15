@@ -118,6 +118,7 @@ async function open(t, routes, { source } = {}) {
       return structuredClone(answer);
     },
     showProblem: (error) => problems.push(error),
+    localPasswordAllowed: true,
   };
   const helpers = {
     base(title, intro) {
@@ -250,4 +251,65 @@ test('a source or event this page does not know survives a save', async (t) => {
   await flush();
   const phone = full.calls.at(-1).body.changes.notifications.destinations.find((item) => item.name === 'Phone');
   assert.deepEqual(phone.events, ['discovery', 'future_event']);
+});
+
+test('a save that needs a recent sign-in asks for the password and saves the same choices', async (t) => {
+  let confirmed = false;
+  const { main, calls, problems } = await open(t, {
+    '/v1/owner/settings': (body) =>
+      body && !confirmed
+        ? Object.assign(new Error('Confirm your sign-in before saving keys or delivery addresses'), {
+            code: 'confirmation_required',
+          })
+        : body
+          ? {}
+          : settings(),
+    '/v1/owner/confirm-password': (body) => {
+      if (body.passphrase !== 'synthetic passphrase')
+        return Object.assign(new Error('That password is not correct.'), {
+          code: 'password_confirmation_failed',
+        });
+      confirmed = true;
+      return {};
+    },
+  }, { source: 'ebird' });
+  field(main, 'ebird_api_key').value = 'replacement';
+  submit(main);
+  findButton(main, 'Save settings').fire('click');
+  await flush();
+  assert.deepEqual(problems, []);
+  const password = walk(main).find((node) => node.id === 'settings-confirm-password');
+  assert.ok(password, 'the page asks for the password in place');
+  password.value = 'wrong';
+  findButton(main, 'Confirm and save').fire('click');
+  await flush();
+  assert.deepEqual(alerts(main), ['That password is not correct.']);
+  password.value = 'synthetic passphrase';
+  findButton(main, 'Confirm and save').fire('click');
+  await flush();
+  const saves = calls.filter(({ path, body }) => path === '/v1/owner/settings' && body);
+  assert.equal(saves.length, 2);
+  assert.deepEqual(saves[1].body, saves[0].body);
+  assert.equal(saves[1].body.changes.discovery.ebird_api_key, 'replacement');
+  assert.equal(password.value, '');
+});
+
+test('destination fields have visible labels and say when a secret is saved', async (t) => {
+  const { main } = await open(t, { '/v1/owner/settings': settings() });
+  const labels = walk(main).filter((node) => node.tagName === 'LABEL');
+  const named = (text) => labels.filter((node) => node.textContent === text);
+  // Two saved destinations, each with both labels tied to their inputs.
+  for (const text of ['Destination name', 'Private notification URL']) {
+    assert.equal(named(text).length, 2);
+    for (const label of named(text))
+      assert.ok(walk(main).some((node) => node.tagName === 'INPUT' && node.id === label.htmlFor));
+  }
+  const shown = walk(main).map((node) => node.textContent);
+  assert.equal(shown.filter((text) => text === 'A URL is saved. Leave this empty to keep it.').length, 2);
+  // The Geoapify key on this page is not saved; the eBird key on its own page is.
+  const saved = (root) =>
+    walk(root).filter((node) => node.textContent === 'Saved. Leave this empty to keep it.').length;
+  assert.equal(saved(main), 0);
+  const ebird = await open(t, { '/v1/owner/settings': settings() }, { source: 'ebird' });
+  assert.equal(saved(ebird.main), 1);
 });

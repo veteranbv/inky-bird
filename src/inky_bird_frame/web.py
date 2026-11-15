@@ -75,6 +75,7 @@ from .plate_variants import PlateThumbnails
 from .presentation import GRANT_DAYS, PresentationAccess
 from .server import HEAD_REQUEST, CatalogService, dead_letter_count, log_request
 from .settings import (
+    PRIVATE_FIELDS,
     SettingsConflictError,
     SettingsError,
     confirmed_config,
@@ -263,6 +264,35 @@ def _secure_access(request: Request, config: ControllerConfig) -> bool:
         except ValueError:
             return False
     return host == "localhost" and _loopback(server[0]) and peer.is_loopback
+
+
+def _adds_outbound_access(current: dict[str, object], changes: object) -> bool:
+    """Whether a settings save sets a key or a new address Inky would send to."""
+    if not isinstance(changes, dict):
+        return False
+    discovery = changes.get("discovery")
+    if isinstance(discovery, dict):
+        if any(discovery.get(key) is not None for key in PRIVATE_FIELDS):
+            return True
+        saved = cast(dict[str, object], current.get("discovery", {}))
+        address = discovery.get("birdnet_go_url")
+        if address is not None and address != saved.get("birdnet_go_url"):
+            return True
+    notifications = changes.get("notifications")
+    destinations = notifications.get("destinations") if isinstance(notifications, dict) else None
+    if isinstance(destinations, list):
+        known = {
+            item["name"]
+            for item in cast(
+                list[dict[str, object]],
+                cast(dict[str, object], current.get("notifications", {})).get("destinations", []),
+            )
+        }
+        return any(
+            isinstance(item, dict) and ("url" in item or item.get("name") not in known)
+            for item in destinations
+        )
+    return False
 
 
 def _cookie_name(request: Request) -> str:
@@ -806,7 +836,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _result(await run_in_threadpool(journal.management_snapshot))
 
     async def application_settings(request: Request) -> JSONResponse:
-        await authorized(request)
+        secret = await authorized(request)
         if app_config is None:
             raise SettingsError("Start Inky with its configuration file to manage settings")
         if request.method == "GET":
@@ -823,6 +853,18 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         consent = body.get("confirm_generation", False)
         if type(consent) is not bool:
             raise SettingsError("Generation confirmation must be true or false")
+        current = await run_in_threadpool(settings_status, app_config)
+        # The save itself refuses any other revision, so this check always
+        # judges the exact file the save would change.
+        if current["revision"] != body["revision"]:
+            raise SettingsConflictError("Settings changed in another tab. Reload before saving.")
+        if _adds_outbound_access(current, body["changes"]):
+            try:
+                await run_in_threadpool(store.require_recent, secret)
+            except AccessConfirmationRequiredError as exc:
+                raise AccessConfirmationRequiredError(
+                    "Confirm your sign-in before saving keys or delivery addresses"
+                ) from exc
         return _result(
             await run_in_threadpool(
                 save_settings,

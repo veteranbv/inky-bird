@@ -120,6 +120,9 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         ? 'Already set. Leave empty to keep it.'
         : 'Not set';
     parent.append(caption, field);
+    // A placeholder disappears once typing starts, so say it in text too.
+    if (secret && !external && settings.credentials[key]?.configured)
+      parent.append(note('Saved. Leave this empty to keep it.'));
     if (hint) parent.append(note(hint));
     read.push(() => {
       if (external || (secret && !field.value)) return;
@@ -311,20 +314,26 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     notifications.append(destinationRows);
     const external = settings.notifications.destinations.some((item) => item.external);
     const destinationReaders = [];
+    let destinationCount = 0;
     function destination(saved = {}) {
       const row = el('fieldset');
       row.append(el('legend', 'Destination'));
       const name = el('input');
       name.value = saved.name || '';
-      name.setAttribute('aria-label', 'Destination name');
+      name.id = 'destination-name-' + ++destinationCount;
+      const nameLabel = el('label', 'Destination name');
+      nameLabel.htmlFor = name.id;
       const url = el('input');
       url.type = 'password';
       url.autocomplete = 'new-password';
-      url.setAttribute('aria-label', 'Private notification URL');
+      url.id = 'destination-url-' + destinationCount;
+      const urlLabel = el('label', 'Private notification URL');
+      urlLabel.htmlFor = url.id;
       url.placeholder = saved.name
         ? 'Already set. Leave empty to keep.'
         : 'Apprise notification URL';
-      row.append(name, url);
+      row.append(nameLabel, name, urlLabel, url);
+      if (saved.name) row.append(note('A URL is saved. Leave this empty to keep it.'));
       const known = [
         'discovery',
         'generation_approved',
@@ -433,7 +442,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         button('Save settings', async (event) => {
           const control = event.currentTarget;
           control.disabled = true;
-          try {
+          const save = async () => {
             await api('/v1/owner/settings', {
               revision: settings.revision,
               changes,
@@ -441,9 +450,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             });
             for (const field of form.querySelectorAll('input[type="password"]')) field.value = '';
             location.reload();
+          };
+          try {
+            await save();
           } catch (error) {
             control.disabled = false;
             if (error.code === 'sign_in_required') ui.showProblem(error);
+            else if (error.code === 'confirmation_required') confirmIdentity(ui, review, save);
             else problem.textContent = error.message;
           }
         }),
@@ -458,6 +471,62 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       problem.textContent = error.message;
     }
   });
+}
+
+// Keys and delivery addresses need a recent sign-in. The choices stay on the
+// page while the owner confirms, then the same save runs again.
+function confirmIdentity(ui, place, retry) {
+  const { element: el, button, api } = ui;
+  place.querySelector('.confirm-identity')?.remove();
+  const notice = el('section', '', 'notice confirm-identity');
+  notice.append(
+    el('p', 'Confirm it is you before saving keys or delivery addresses. Your choices stay on this page.'),
+  );
+  if (ui.localPasswordAllowed) {
+    const label = el('label', 'Your Inky password'),
+      password = el('input');
+    password.type = 'password';
+    password.id = 'settings-confirm-password';
+    password.autocomplete = 'current-password';
+    label.htmlFor = password.id;
+    notice.append(
+      label,
+      password,
+      button('Confirm and save', async () => {
+        try {
+          await api('/v1/owner/confirm-password', { passphrase: password.value });
+        } catch (failure) {
+          inlineProblem(ui, notice, failure);
+          return;
+        } finally {
+          password.value = '';
+        }
+        notice.remove();
+        try {
+          await retry();
+        } catch (failure) {
+          inlineProblem(ui, place, failure);
+        }
+      }),
+    );
+    password.focus();
+  }
+  if (ui.singleSignOnReady)
+    notice.append(
+      button('Confirm with single sign-on', async () => {
+        try {
+          await ui.confirmWithSSO();
+        } catch (failure) {
+          inlineProblem(ui, notice, failure);
+        }
+      }),
+      el(
+        'p',
+        'Sign-in returns to Account and access. Come back here and save again; unsaved entries will clear.',
+      ),
+    );
+  notice.append(button('Cancel confirmation', () => notice.remove()));
+  place.append(notice);
 }
 
 // What a save changes beyond the fixed summary: location, limits, secrets and

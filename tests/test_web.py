@@ -1307,3 +1307,63 @@ def test_a_trusted_proxy_keeps_each_screen_on_its_own_pairing_pause(tmp_path: Pa
         )
     ]
     assert statuses == [200, 200, 429]
+
+
+def test_saving_keys_or_delivery_addresses_needs_a_recent_sign_in(tmp_path: Path) -> None:
+    from test_config import CONFIG
+
+    origin = "https://inky.example.test"
+    path = tmp_path / "config.toml"
+    path.write_text(
+        CONFIG.replace(
+            "[controller]\n",
+            '[controller]\nconfiguration_ownership = "app"\n'
+            f'owner_allowed_origins = ["{origin}"]\n',
+        )
+    )
+    path.chmod(0o600)
+    config = load_config(path, load_secrets=False)
+    store = AccessStore(config.controller.state_dir)
+    store.setup_owner("fixture-owner", PASSPHRASE)
+    with TestClient(create_app(config.controller, app_config=config), base_url=origin) as client:
+        signed = client.post(
+            "/v1/owner/login",
+            json={"username": "fixture-owner", "passphrase": PASSPHRASE},
+            headers={"Origin": origin},
+        )
+        headers = {"Origin": origin, "X-Inky-CSRF": signed.json()["data"]["csrf"]}
+        raw = json.loads(store.path.read_text())
+        raw["sessions"][0]["authenticated_at"] -= 601
+        store.path.write_text(json.dumps(raw))
+
+        def save(changes: dict[str, object]) -> tuple[int, str]:
+            revision = client.get("/v1/owner/settings").json()["data"]["revision"]
+            response = client.post(
+                "/v1/owner/settings",
+                json={"revision": revision, "changes": changes},
+                headers=headers,
+            )
+            return response.status_code, response.json().get("error", {}).get("code", "")
+
+        before = path.read_bytes()
+        sensitive: list[dict[str, object]] = [
+            {"discovery": {"ebird_api_key": "synthetic-key"}},
+            {
+                "notifications": {
+                    "destinations": [{"name": "Phone", "url": "json://example.test/hook"}]
+                }
+            },
+        ]
+        for changes in sensitive:
+            assert save(changes) == (403, "confirmation_required")
+            assert path.read_bytes() == before
+        # Everything else saves as before, so an older page keeps working.
+        assert save({"discovery": {"radius_km": 9}}) == (200, "")
+        stale = client.post(
+            "/v1/owner/settings",
+            json={"revision": "0" * 64, "changes": {"discovery": {"radius_km": 8}}},
+            headers=headers,
+        )
+        assert (stale.status_code, stale.json()["error"]["code"]) == (409, "journal_changed")
+        client.post("/v1/owner/confirm-password", json={"passphrase": PASSPHRASE}, headers=headers)
+        assert save({"discovery": {"ebird_api_key": "synthetic-key"}}) == (200, "")
