@@ -1,7 +1,7 @@
 # Plate prompt evaluation and tuning
 
 A development tool that decides, without the owner in the loop, whether a
-change to the plate prompt (or the review prompt) makes better plates. It is
+change to the plate prompt makes better plates. It is
 not part of the `inky-bird` package, the app never imports it, and CI only runs
 its offline tests.
 
@@ -75,11 +75,7 @@ uv run --with-editable ./evals inky-plate-eval compare \
 uv run --with-editable ./evals inky-plate-eval compare \
   --run-dir "$RUN" --max-generations 120 --parallel 2 v9=default "v8=ref:$V8"
 
-# 5. Tune the review prompt on plates the calibrated panel has already judged.
-uv run --with-editable ./evals inky-plate-eval tune-review \
-  --run-dir "$RUN" --labels-from "$RUN" --budget 60 --max-reviews 160 --dry-run
-
-# 6. Tune the plate prompt in a fresh run directory, then test the best
+# 5. Tune the plate prompt in a fresh run directory, then test the best
 #    candidate on held-out species. It reuses the first run's calibration.
 TUNE=/Users/Shared/plate-eval/2026-11-tune
 uv run --with-editable ./evals inky-plate-eval cache-references --run-dir "$TUNE"
@@ -87,7 +83,7 @@ uv run --with-editable ./evals inky-plate-eval tune \
   --run-dir "$TUNE" --calibration "$RUN/calibration/summary.json" \
   --budget 150 --max-generations 220 --dry-run
 
-# 7. Tables, contact sheets and token totals.
+# 6. Tables, contact sheets and token totals.
 uv run --with-editable ./evals inky-plate-eval report --run-dir "$RUN"
 ```
 
@@ -117,12 +113,12 @@ lacks a plate (a failed generation) is not judged and is listed under
 The comparison in step 4 decides on the 8 held-out species only (24 pairs at
 3 samples), so it has little power to separate close prompts. Looking at
 held-out results before tuning also weakens their standing as an untouched
-test for a later `tune`; use a fresh run directory for tuning, as step 6 does.
+test for a later `tune`; use a fresh run directory for tuning, as step 5 does.
 
 Options common to every command: `--config FILE` (TOML, see below),
 `--catalog` (default `catalog`), `--panel`, `--parallel N` (concurrent paid
-calls, default 1) and `--seed` (only when creating a run directory). `compare`,
-`tune` and `tune-review` also take `--calibration FILE` (another run's
+calls, default 1) and `--seed` (only when creating a run directory). `compare`
+and `tune` also take `--calibration FILE` (another run's
 `calibration/summary.json`) and `--allow-uncalibrated` (see Calibration).
 
 ## What costs money
@@ -134,9 +130,8 @@ calls, default 1) and `--seed` (only when creating a run directory). `compare`,
 | `calibrate` | none | (3 per species + anchors) x 2 orders x judges | |
 | `compare` | missing plates, at most `--max-generations` | pairs x judges | |
 | `tune` | at most `--max-generations` | per new pair x judges | one reflection call per proposal |
-| `tune-review` | none | none | Codex reviews, at most `--max-reviews` |
 
-`--max-generations` (and `--max-reviews`) has no default: a paid command does
+`--max-generations` has no default: a paid command does
 not start without it. The cap is for the whole run directory: every generation
 the ledger shows started, by this command or an earlier one, failed attempts
 included, counts against it, and no new call starts once it is reached. Giving
@@ -149,17 +144,13 @@ cap is below the optimiser's planned share plus that reserve. The optimiser
 cannot spend the reserve, even when GEPA finishes an iteration past
 `max_metric_calls`: it stops before a batch it cannot pay for in full, and
 the best candidate scored on every dev species goes to the held-out test. Every paid call is
-logged in `generations.jsonl`, `judgments.jsonl`, `reviews.jsonl` or
-`reflections.jsonl`. Judge calls have no cap; the dry runs count them.
+logged in `generations.jsonl`, `judgments.jsonl` or `reflections.jsonl`. Judge calls have no cap; the dry runs count them.
 
 For the orchestrated first run (3 judges): `judge-smoke` makes 3 judge calls.
 `calibrate` with 6 planted species and A anchor plates makes (18 + A) x 2
 pairs, so (36 + 2A) x 3 judge calls, and no generations. `compare` of v9
 against v8 on all 20 species at 3 samples needs 120 generations
-(`--max-generations 120`) and 60 pairs, 180 judge calls. `tune-review` with
-`--budget 60` makes at most 60 + 2 x the held-out labelled plates reviews (up
-to 48 held-out plates from that comparison: 156), no generations and no judge
-calls, plus one reflection per proposal. `tune --budget 150` needs at most 150
+(`--max-generations 120`) and 60 pairs, 180 judge calls. `tune --budget 150` needs at most 150
 + 12 dev baselines + 48 reserved (24 candidate and 24 baseline held-out
 plates) = 210 generations, at most one judged pair (3 judge calls) per
 candidate plate, 72 judge calls for the held-out test, and one reflection per
@@ -171,7 +162,7 @@ cost; the Codex CLI prints a total after "tokens used". `report` adds them up
 per kind of call and per judge ("Paid calls"); a call whose tool printed no
 count is counted as a call without usage, so a total is then a lower bound.
 
-Generations and reviews use the local `codex` login; judges and reflection use
+Generations use the local `codex` login; judges and reflection use
 the local `claude` and `codex` logins. No API keys are read or passed: child
 processes get the application's environment allowlist.
 
@@ -199,11 +190,6 @@ from looking more independent than they are. Every summary also reports
 pairwise judge agreement, Fleiss' kappa and each judge's share of choices that
 went to side A (`position_bias`; sides are random per pair and judge, so a
 judge far from 0.5 is choosing by position).
-
-For the review prompt the score per labelled plate is half for agreeing with
-the panel's pass/fail and half for the overlap of defect categories; the tuned
-review is accepted only when the interval of its held-out score gain lies above
-zero.
 
 The owner remains the final authority: a passing result is the case for a
 prompt change, not the change itself. Adopting a winner means a normal pull
@@ -242,7 +228,7 @@ judge cannot pass. `calibration/summary.json` records the rubric digest, the
 judging prompt and schema digest, the thresholds, each judge's kind and model,
 its scores and its share of side A choices.
 
-`compare`, `tune` and `tune-review` read that record (or the one given with
+`compare` and `tune` read that record (or the one given with
 `--calibration FILE`) before deciding anything. Only judges whose name, kind
 and model match the record and who passed count; a change to the rubric, the
 judging prompt or a threshold makes the record stale for everyone. A decision
@@ -250,13 +236,12 @@ needs at least `min_calibrated_judges` (2) such judges and, with
 `require_each_provider` (on by default), at least one of each configured kind,
 so a Claude-only majority cannot decide when a Codex judge is configured.
 Without that, `compare` still generates, judges and reports every number but
-writes `decision: null` with the reason; `tune` and `tune-review` refuse to
-start. `--allow-uncalibrated` lets all three run for exploration only: the
+writes `decision: null` with the reason; `tune` refuses to start.
+`--allow-uncalibrated` lets both run for exploration only: the
 output says `exploratory: true`, `decision` stays null and what the rule would
 have said is under `exploratory_decision`. Judges that failed are still asked
 in `compare` (their numbers are reported) but never decide; `tune` asks only
-the calibrated judges, and `tune-review` labels plates only with their votes
-from comparisons judged under the same rubric, prompt and models.
+the calibrated judges.
 
 Each verdict also records the rubric's digest, the judging contract's digest
 and the judge's kind and model; after a change to any of them, the next
@@ -284,6 +269,10 @@ the prompt-safety invariants (one data block no value escapes, no photo
 attribution, intact reference numbering, unchanged tool request and output
 path). A rejected candidate scores zero and costs nothing. GEPA keeps its own
 state in `gepa/` and resumes from it.
+
+## Not included
+
+Tuning the review instructions is not part of this tool yet.
 
 ## Configuration
 
@@ -385,7 +374,7 @@ verdicts/<pair>/<judge>.json   stamped with the rubric and judging-prompt digest
 compare/<first>-vs-<second>/summary.json and pairs.json (unblinded, run-relative paths)
 .lock                     held by the command using the run directory
 smoke/                    judge-smoke logs and summary
-calibration/, tune/, tune-review/, gepa/, reviews/, report/
+calibration/, tune/, gepa/, report/
 ```
 
 A sample is finished only when `sample.json` is written, after the portrait.

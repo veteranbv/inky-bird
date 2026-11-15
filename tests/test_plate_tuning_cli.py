@@ -15,7 +15,7 @@ from plate_tuning.judges import Judge
 from plate_tuning.panel import load_panel
 from plate_tuning.report import usage_totals
 from plate_tuning.rundir import Ledger, Run
-from plate_tuning.tune import Optimizer, ReflectionLM, ReviewEvaluator
+from plate_tuning.tune import Optimizer, ReflectionLM
 from plate_tuning_fixtures import (
     ColourGenerator,
     FakeDownloader,
@@ -46,15 +46,11 @@ class Offline(Tools):
         def unused_optimizer() -> Optimizer:
             raise AssertionError("no optimiser expected")
 
-        def unused_reviewer(config: EvalConfig) -> ReviewEvaluator:
-            raise AssertionError("no review expected")
-
         super().__init__(
             generator=generator,
             judges=judges,
             reflector=unused_reflector,
             optimizer=unused_optimizer,
-            review_evaluator=unused_reviewer,
             downloader=self.fetcher,
         )
 
@@ -117,10 +113,6 @@ def test_paid_commands_refuse_to_start_without_a_cap(
     assert "--max-generations is required" in str(out["error"])
     code, out = _invoke(["tune", *common, "--budget", "5"], tools, capsys)
     assert code == 1 and "--max-generations" in str(out["error"])
-    code, out = _invoke(
-        ["tune-review", *common, "--budget", "5", "--labels-from", str(tmp_path)], tools, capsys
-    )
-    assert code == 1 and "--max-reviews" in str(out["error"])
     assert tools.colour.calls == []
     assert main(["compare"], tools=tools) == 2
 
@@ -292,21 +284,10 @@ def test_without_calibration_compare_decides_nothing_and_tuning_refuses(
     assert _at(out, "data", "decision") is None
     assert _at(out, "data", "exploratory_decision", "accept") is True
 
-    for command in (
-        ["tune", *common, "--max-generations", "100", "--budget", "4"],
-        [
-            "tune-review",
-            *common,
-            "--max-reviews",
-            "100",
-            "--budget",
-            "4",
-            "--labels-from",
-            str(tmp_path / "run"),
-        ],
-    ):
-        code, out = _invoke(command, tools, capsys)
-        assert code == 1 and "--allow-uncalibrated" in str(out["error"]), command
+    code, out = _invoke(
+        ["tune", *common, "--max-generations", "100", "--budget", "4"], tools, capsys
+    )
+    assert code == 1 and "--allow-uncalibrated" in str(out["error"])
     assert len(tools.colour.calls) == 8
 
 
@@ -425,4 +406,4 @@ def test_usage_totals_add_up_what_each_call_reported(tmp_path: Path) -> None:
         "cost_usd": 0.5,
         "mean_total_tokens": 200.0,
     }
-    assert totals["reviews"] == {"calls": 0, "calls_with_usage": 0}
+    assert totals["reflections"] == {"calls": 0, "calls_with_usage": 0}

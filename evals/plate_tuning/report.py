@@ -26,7 +26,6 @@ PAID_CALLS: Final = {
     "generations": ("generations.jsonl", "generation-finished"),
     "judgments": ("judgments.jsonl", "judgment-finished"),
     "reflections": ("reflections.jsonl", "reflection-finished"),
-    "reviews": ("reviews.jsonl", "review-finished"),
 }
 
 
@@ -349,11 +348,10 @@ def write_report(run: Run) -> dict[str, object]:
             sheets.append(str(sheet.relative_to(run.root)))
             lines.append(f"- [{taxon}](sheets/{scope}/{name}/{taxon}.png)")
         lines.append("")
-    for tuned in ("tune", "tune-review"):
-        path = run.path(tuned, "summary.json")
-        if path.exists():
-            lines.extend([f"## {tuned} result", "", "```json", path.read_text().strip(), "```", ""])
-            produced[tuned] = read_object(path)
+    path = run.path("tune", "summary.json")
+    if path.exists():
+        lines.extend(["## tune result", "", "```json", path.read_text().strip(), "```", ""])
+        produced["tune"] = read_object(path)
     usage = usage_totals(run)
     lines.extend(_usage_section(usage))
     produced["usage"] = usage

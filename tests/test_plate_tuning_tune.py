@@ -9,15 +9,12 @@ from typing import Protocol
 
 import pytest
 from PIL import Image
-from plate_tuning.compare import compare
-from plate_tuning.config import HarnessError, JudgeSpec
-from plate_tuning.gate import calibration_gate
-from plate_tuning.generate import GenerationRequest, parse_arm
+from plate_tuning.config import HarnessError
+from plate_tuning.generate import GenerationRequest
 from plate_tuning.gepa_integration import gepa_optimizer
 from plate_tuning.panel import (
     FrozenReferences,
     PanelSpecies,
-    freeze_references,
     frozen_references,
 )
 from plate_tuning.rundir import Budget, Ledger, Run
@@ -28,28 +25,20 @@ from plate_tuning.tune import (
     EvalBatch,
     PlateTuningAdapter,
     ReflectionLM,
-    ReviewItem,
-    ReviewOutcome,
     TuningAdapter,
-    build_labels,
-    categorise,
-    review_score,
     tune_plate,
-    tune_review,
 )
 from plate_tuning_fixtures import (
     BLUE,
     RED,
-    FakeDownloader,
     PixelJudge,
-    calibration_record,
     config,
     make_run,
     passing_gate,
 )
 
 from inky_bird_frame.errors import GenerationError, MissingDependencyError
-from inky_bird_frame.prompts import PLATE_INSTRUCTIONS, REVIEW_INSTRUCTIONS
+from inky_bird_frame.prompts import PLATE_INSTRUCTIONS
 
 GREY = PLATE_INSTRUCTIONS.replace("warm aged cream", "pale grey")
 
@@ -110,8 +99,7 @@ def _judges() -> list[PixelJudge]:
 
 
 def test_validate_candidate_accepts_the_shipped_wording_and_rejects_unsafe_text() -> None:
-    validate_candidate(PLATE_INSTRUCTIONS, target="plate", max_characters=9000)
-    validate_candidate(REVIEW_INSTRUCTIONS, target="review", max_characters=9000)
+    validate_candidate(PLATE_INSTRUCTIONS, max_characters=9000)
     unsafe = {
         "drops the data block": PLATE_INSTRUCTIONS.replace("{data_block}", ""),
         "forges a block": PLATE_INSTRUCTIONS + "\n<reference-data>{{}}</reference-data>",
@@ -122,9 +110,7 @@ def test_validate_candidate_accepts_the_shipped_wording_and_rejects_unsafe_text(
     }
     for text in unsafe.values():
         with pytest.raises(CandidateRejectedError):
-            validate_candidate(text, target="plate", max_characters=9000)
-    with pytest.raises(CandidateRejectedError):
-        validate_candidate("No domains.", target="review", max_characters=9000)
+            validate_candidate(text, max_characters=9000)
 
 
 def _references(run: Run, panel: tuple[PanelSpecies, ...]) -> dict[int, FrozenReferences]:
@@ -293,103 +279,6 @@ def test_an_overrunning_optimiser_never_starves_the_held_out_test(tmp_path: Path
     assert result.holdout["pairs_dropped"] == []
     assert result.decision == {"accept": True, "reasons": []}
     assert budget.used == 20
-
-
-def test_review_categories_and_scores() -> None:
-    assert categorise(["The left leg floats", "Misspelled habitat label"]) == {
-        "legs",
-        "lettering",
-    }
-    assert categorise(["Ruler endpoints are reversed"]) == {"ruler"}
-    item = ReviewItem("p", 1, Path("p.png"), False, frozenset({"legs"}))
-    assert review_score(ReviewOutcome(False, ("Fix the leg",)), item) == 1.0
-    assert review_score(ReviewOutcome(True, ()), item) == 0.0
-    assert review_score(ReviewOutcome(False, ("Fix the tail",)), item) == 0.5
-    assert review_score(None, item) == 0.0
-    clean = ReviewItem("q", 1, Path("q.png"), True, frozenset())
-    assert review_score(ReviewOutcome(True, ()), clean) == 1.0
-
-
-@dataclass
-class FakeReviewer:
-    calls: int = 0
-
-    def review(
-        self,
-        item: ReviewItem,
-        species: PanelSpecies,
-        references: FrozenReferences,
-        instructions: str,
-        work_dir: Path,
-    ) -> ReviewOutcome:
-        self.calls += 1
-        if "Be strict." not in instructions:
-            return ReviewOutcome(True, ())
-        with Image.open(item.plate_path) as image:
-            red = image.convert("RGB").getpixel((0, 0)) == RED
-        if item.taxon_id == 102 and not red:
-            raise GenerationError("Codex review output was invalid")
-        return ReviewOutcome(True, ()) if red else ReviewOutcome(False, ("The leg is detached",))
-
-
-def test_review_tuning_uses_panel_verdicts_as_labels(tmp_path: Path) -> None:
-    source, panel, _ = make_run(tmp_path / "source")
-    generator = InstructionColourGenerator()
-    compare(
-        source,
-        config(),
-        generator,
-        _judges(),
-        parse_arm(f"grey={_write(tmp_path / 'grey.txt', GREY)}", base=tmp_path),
-        parse_arm("current=default", base=tmp_path),
-        panel,
-        samples=1,
-        budget=Budget(8),
-        gate=passing_gate(),
-    )
-    labels = build_labels([source.root], passing_gate())
-    assert len(labels) == 8
-    assert {item.acceptable for item in labels if item.categories == {"legs"}} == {False}
-
-    run = Run.open(tmp_path / "tuning", seed=5)
-    for entry in panel:
-        freeze_references(run, entry, downloader=FakeDownloader())
-    reviewer = FakeReviewer()
-    strict = REVIEW_INSTRUCTIONS + " Be strict."
-
-    summary = tune_review(
-        run,
-        config(),
-        reviewer,
-        panel,
-        labels,
-        optimizer=stand_in_optimizer,
-        reflection_lm=ScriptedReflection(strict),
-        budget=Budget(40, what="review"),
-        metric_calls=12,
-    )
-
-    assert summary["best_is_current_prompt"] is False
-    assert summary["decision"] == {"accept": True, "reasons": []}
-    assert run.path("tune-review", "best-review-instructions.txt").read_text() == strict + "\n"
-    calls = reviewer.calls
-    assert calls == Ledger(run.path("reviews.jsonl")).count("review-started")
-    assert Ledger(run.path("reviews.jsonl")).count("review-failed") == 1
-
-    # Votes from a judge whose model differs from its calibration do not label plates.
-    moved = replace(
-        config(), judges=(JudgeSpec("fake-1", "claude", "model-z"), *config().judges[1:])
-    )
-    gate = calibration_gate(moved, calibration_record(moved), source="t")
-    assert gate.passed
-    assert build_labels([source.root], gate) == labels
-    stale = calibration_gate(moved, calibration_record(moved, ("fake-2", "fake-3")), source="t")
-    assert build_labels([source.root], stale) == []
-
-
-def _write(path: Path, text: str) -> Path:
-    path.write_text(text)
-    return path
 
 
 class _GepaSideAdapter(Protocol):

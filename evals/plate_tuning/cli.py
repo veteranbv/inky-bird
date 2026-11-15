@@ -42,16 +42,11 @@ from .rundir import Budget, Ledger, Run, locked, read_object
 from .smoke import judge_smoke
 from .tune import (
     BASELINE_ARM,
-    REVIEWS_LEDGER,
     ClaudeReflector,
-    CodexReviewEvaluator,
     Optimizer,
     ReflectionLM,
-    ReviewEvaluator,
-    build_labels,
     holdout_reservation,
     tune_plate,
-    tune_review,
 )
 
 EXIT_ERROR: Final = 1
@@ -78,14 +73,13 @@ class Tools:
     judges: Callable[[EvalConfig], Sequence[Judge]] = build_judges
     reflector: Callable[[Run, EvalConfig], ReflectionLM] = ClaudeReflector
     optimizer: Callable[[], Optimizer] = _real_optimizer
-    review_evaluator: Callable[[EvalConfig], ReviewEvaluator] = CodexReviewEvaluator
     downloader: Downloader = download_references
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inky-plate-eval",
-        description="Blind evaluation and tuning of the plate and review prompts.",
+        description="Blind evaluation and tuning of the plate prompt.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -149,15 +143,6 @@ def _parser() -> argparse.ArgumentParser:
     tune_command.add_argument("--dry-run", action="store_true")
     gated(tune_command)
 
-    review_command = command("tune-review", "Tune the review instructions on labelled plates")
-    review_command.add_argument(
-        "--labels-from", type=Path, action="append", required=True, help="earlier run directory"
-    )
-    review_command.add_argument("--max-reviews", type=int, help="hard review cap")
-    review_command.add_argument("--budget", type=int, required=True, help="optimiser metric calls")
-    review_command.add_argument("--dry-run", action="store_true")
-    gated(review_command)
-
     command("report", "Write the markdown report and contact sheets")
     return parser
 
@@ -184,12 +169,10 @@ def _require_cap(value: int | None, flag: str) -> int:
     return value
 
 
-def _run_budget(run: Run, cap: int, what: str) -> Budget:
+def _run_budget(run: Run, cap: int) -> Budget:
     """The cap covers the whole run directory: calls earlier commands started count too."""
-    if what == "review":
-        return Budget.for_run(cap, Ledger(run.path(REVIEWS_LEDGER)), "review-started", what=what)
     ledger = Ledger(run.path(GENERATIONS_LEDGER))
-    return Budget.for_run(cap, ledger, "generation-started", what=what)
+    return Budget.for_run(cap, ledger, "generation-started", what="generation")
 
 
 def _cap_report(budget: Budget) -> dict[str, int]:
@@ -308,7 +291,7 @@ def _compare(
     species = select(panel, split=args.split, taxa=args.species)
     samples = args.samples or config.samples_per_species
     estimate = plan(run, first, second, species, samples, len(config.judges)).as_dict()
-    budget = _run_budget(run, cap, "generation")
+    budget = _run_budget(run, cap)
     gate = _gate(args, run, config)
     exploratory = not gate.passed and args.allow_uncalibrated
     if args.dry_run:
@@ -356,7 +339,7 @@ def _tune(
         "dev_species": len(dev),
         "holdout_species": len(holdout),
     }
-    budget = _run_budget(run, cap, "generation")
+    budget = _run_budget(run, cap)
     gate = _gate(args, run, config)
     if args.dry_run:
         return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
@@ -393,49 +376,6 @@ def _tune(
     }
 
 
-def _tune_review(
-    args: argparse.Namespace,
-    run: Run,
-    config: EvalConfig,
-    panel: Sequence[PanelSpecies],
-    tools: Tools,
-) -> dict[str, object]:
-    cap = _require_cap(args.max_reviews, "--max-reviews")
-    if args.budget < 1:
-        raise HarnessError("--budget must be at least 1")
-    gate = _gate(args, run, config)
-    exploratory = not gate.passed and args.allow_uncalibrated
-    sources = [path.resolve() for path in args.labels_from]
-    labels = build_labels(sources, None if exploratory else gate)
-    splits = {entry.taxon_id: entry.split for entry in panel}
-    held_out = sum(1 for item in labels if splits.get(item.taxon_id) == "holdout")
-    needed = args.budget + 2 * held_out
-    estimate = {"labelled_plates": len(labels), "reviews_at_most": needed}
-    budget = _run_budget(run, cap, "review")
-    if args.dry_run:
-        return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
-    _require_gate(args, gate)
-    if budget.remaining < needed:
-        raise HarnessError(
-            f"--max-reviews {cap} leaves {budget.remaining} for this run, below the"
-            f" {needed} this tuning may need; raise the cap or lower --budget"
-        )
-    summary = tune_review(
-        run,
-        config,
-        tools.review_evaluator(config),
-        panel,
-        labels,
-        optimizer=tools.optimizer(),
-        reflection_lm=tools.reflector(run, config),
-        budget=budget,
-        metric_calls=args.budget,
-        exploratory=exploratory,
-        parallel=args.parallel,
-    )
-    return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict(), **summary}
-
-
 def _run(args: argparse.Namespace, tools: Tools) -> dict[str, object]:
     config = load_config(args.config)
     if args.parallel < 1:
@@ -452,7 +392,6 @@ def _run(args: argparse.Namespace, tools: Tools) -> dict[str, object]:
             "judge-smoke": _judge_smoke,
             "compare": _compare,
             "tune": _tune,
-            "tune-review": _tune_review,
         }
         return commands[args.command](args, run, config, panel, tools)
 

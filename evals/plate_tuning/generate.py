@@ -19,15 +19,14 @@ from types import ModuleType
 from typing import Final, Protocol
 
 from inky_bird_frame.birds import BirdSpecies
-from inky_bird_frame.codex_runner import REVIEW_SCHEMA, CodexRunner, _parse_review
+from inky_bird_frame.codex_runner import CodexRunner
 from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.images import prepare_generated_plate
-from inky_bird_frame.models import QualityReview, ReferencePhoto, SpeciesProfileData
+from inky_bird_frame.models import ReferencePhoto, SpeciesProfileData
 from inky_bird_frame.prompts import (
     PLATE_INSTRUCTIONS,
     PROMPT_VERSION,
     plate_prompt,
-    review_prompt,
 )
 
 from .config import (
@@ -234,7 +233,7 @@ def register_arm(
     """
     if arm.release is None:
         try:
-            validate_candidate(arm.instructions, target="plate", max_characters=max_characters)
+            validate_candidate(arm.instructions, max_characters=max_characters)
         except CandidateRejectedError as exc:
             raise HarnessError(f"Arm {arm.name} instructions are not usable: {exc}") from exc
     elif run.root.is_relative_to(Path.home().resolve()):
@@ -290,8 +289,8 @@ class Generator(Protocol):
 class InstructedCodexRunner(CodexRunner):
     """The application's Codex runner with an instruction override for evaluation.
 
-    These mirror generate_plate and review_plate for a first attempt; the
-    application's methods take no instruction argument.
+    This mirrors generate_plate for a first attempt; the application's method
+    takes no instruction argument.
     """
 
     def generate_with_instructions(
@@ -315,33 +314,6 @@ class InstructedCodexRunner(CodexRunner):
         if not output.is_file() or output.stat().st_size == 0:
             raise GenerationError(f"Codex did not create the requested plate: {output.name}")
         return codex_usage(f"{finished.stdout}\n{finished.stderr}")
-
-    def review_with_instructions(
-        self,
-        species: PanelSpecies,
-        references: FrozenReferences,
-        plate_path: Path,
-        output_path: Path,
-        log_path: Path,
-        *,
-        allowed_domains: tuple[str, ...],
-        instructions: str,
-    ) -> QualityReview:
-        raw = self._structured(
-            review_prompt(
-                species.bird(),
-                species.profile,
-                list(references.photos),
-                allowed_domains,
-                instructions=instructions,
-            ),
-            REVIEW_SCHEMA,
-            [plate_path, *references.paths],
-            output_path,
-            log_path,
-            search=True,
-        )
-        return _parse_review(raw, species.profile, allowed_domains)
 
 
 class CodexGenerator:

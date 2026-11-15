@@ -1,4 +1,4 @@
-"""Reflective tuning of the plate prompt (with generation) and the review prompt (without).
+"""Reflective tuning of the plate prompt.
 
 The optimiser is reached through the Optimizer protocol; the real one is GEPA,
 isolated in gepa_integration.py. The adapters here follow GEPA's adapter
@@ -8,22 +8,13 @@ plus the judges' feedback text for reflection.
 
 from __future__ import annotations
 
-import functools
 import threading
-from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
 
-from inky_bird_frame.errors import GenerationError
-from inky_bird_frame.prompts import (
-    PLATE_INSTRUCTION_FIELDS,
-    PLATE_INSTRUCTIONS,
-    PROMPT_VERSION,
-    REVIEW_INSTRUCTION_FIELDS,
-    REVIEW_INSTRUCTIONS,
-)
+from inky_bird_frame.prompts import PLATE_INSTRUCTION_FIELDS, PLATE_INSTRUCTIONS, PROMPT_VERSION
 
 from .blind import JudgedPair, Vote, judge_pairs
 from .compare import compare, pair_specs
@@ -32,20 +23,16 @@ from .gate import CalibrationGate
 from .generate import (
     Arm,
     Generator,
-    InstructedCodexRunner,
     Sample,
     generate_samples,
     missing_samples,
 )
 from .judges import (
-    CATEGORIES,
     CLAUDE_ISOLATION,
     Judge,
     JudgeError,
-    Usage,
     claude_envelope,
     claude_usage,
-    codex_usage,
     find_executable,
     run_bounded,
     scratch_folder,
@@ -55,29 +42,22 @@ from .rundir import (
     Budget,
     Ledger,
     Run,
-    read_json,
     read_object,
-    resolve_recorded,
-    run_tasks,
-    sha256_file,
     sha256_text,
     write_json,
     write_text,
 )
-from .safety import CandidateRejectedError, Target, validate_candidate
-from .stats import decide_improvement, majority_flag, pair_outcome, win_score
+from .safety import CandidateRejectedError, validate_candidate
+from .stats import pair_outcome, win_score
 
 PLATE_COMPONENT: Final = "plate_instructions"
-REVIEW_COMPONENT: Final = "review_instructions"
 BASELINE_ARM: Final = "baseline"
-REVIEWS_LEDGER: Final = "reviews.jsonl"
 
 ReflectionLM = Callable[[str], str]
 
 
-def constraints(target: Target, max_characters: int) -> str:
-    fields = PLATE_INSTRUCTION_FIELDS if target == "plate" else REVIEW_INSTRUCTION_FIELDS
-    names = ", ".join("{" + name + "}" for name in sorted(fields))
+def constraints(max_characters: int) -> str:
+    names = ", ".join("{" + name + "}" for name in sorted(PLATE_INSTRUCTION_FIELDS))
     return (
         "Rules for any rewrite: the text is a Python format template. Keep each of these"
         f" placeholders exactly once: {names}. Write any other brace doubled. Stay under"
@@ -308,9 +288,7 @@ class PlateTuningAdapter:
         species = [_species(item) for item in batch]
         text = candidate.get(self.component, "")
         try:
-            validate_candidate(
-                text, target="plate", max_characters=self.config.max_candidate_characters
-            )
+            validate_candidate(text, max_characters=self.config.max_candidate_characters)
         except CandidateRejectedError as exc:
             return _rejected(batch, str(exc), capture_traces)
         digest = sha256_text(text)[:12]
@@ -394,7 +372,7 @@ class PlateTuningAdapter:
         self, candidate: dict[str, str], eval_batch: EvalBatch, components_to_update: list[str]
     ) -> dict[str, list[dict[str, object]]]:
         return _reflective(
-            self.component, eval_batch, constraints("plate", self.config.max_candidate_characters)
+            self.component, eval_batch, constraints(self.config.max_candidate_characters)
         )
 
 
@@ -510,7 +488,7 @@ def tune_plate(
             best_text, best_score = adapter.scores.best(
                 [entry.key for entry in dev], PLATE_INSTRUCTIONS
             )
-    validate_candidate(best_text, target="plate", max_characters=config.max_candidate_characters)
+    validate_candidate(best_text, max_characters=config.max_candidate_characters)
     write_text(run.path("tune", "best-plate-instructions.txt"), best_text + "\n")
     holdout_result: dict[str, object] | None = None
     decision: dict[str, object] | None = None
@@ -544,424 +522,3 @@ def tune_plate(
     )
     write_json(run.path("tune", "summary.json"), outcome.as_dict())
     return outcome
-
-
-# ---- review prompt tuning -------------------------------------------------
-
-CATEGORY_KEYWORDS: Final[dict[str, tuple[str, ...]]] = {
-    "legs": ("leg", "foot", "feet", "toe", "tarsus", "talon", "claw"),
-    "wings": ("wing", "primar", "secondar", "covert", "tertial"),
-    "head_bill": ("head", "bill", "beak", "mandible", "eye", "iris", "pupil", "neck", "gape"),
-    "tail": ("tail", "rectri"),
-    "proportions": ("proportion", "posture", "silhouette", "stretch", "body shape", "duplicat"),
-    "plumage": ("plumage", "colour", "color", "feather", "pattern", "streak"),
-    "lettering": ("text", "label", "spell", "letter", "typo", "misprint", "wingspan", "weight"),
-    "ruler": ("ruler", "tick", "schematic", "endpoint"),
-}
-
-
-def categorise(findings: Sequence[str]) -> frozenset[str]:
-    """Map free-text review corrections to the judges' defect categories by keyword."""
-    found: set[str] = set()
-    for finding in findings:
-        text = finding.casefold()
-        for category, words in CATEGORY_KEYWORDS.items():
-            if any(word in text for word in words):
-                found.add(category)
-    return frozenset(found)
-
-
-@dataclass(frozen=True)
-class ReviewItem:
-    """An existing plate with the judge panel's verdict on it as its label."""
-
-    plate_id: str
-    taxon_id: int
-    plate_path: Path
-    acceptable: bool
-    categories: frozenset[str]
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "plate_id": self.plate_id,
-            "taxon_id": self.taxon_id,
-            "plate_path": str(self.plate_path),
-            "acceptable": self.acceptable,
-            "categories": sorted(self.categories),
-        }
-
-
-def label_judges(summary: dict[str, object], gate: CalibrationGate | None) -> set[str] | None:
-    """The judges whose votes in one earlier comparison may label plates.
-
-    With a gate, only calibrated judges count, and only where that comparison
-    used the same rubric, judging contract, kind and model; None means every
-    judge (an exploratory run).
-    """
-    if gate is None:
-        return None
-    judged = summary.get("judged_with")
-    if not isinstance(judged, dict):
-        return set()
-    if judged.get("rubric_sha256") != gate.rubric_sha256:
-        return set()
-    if judged.get("judge_contract_sha256") != gate.judge_contract_sha256:
-        return set()
-    listed = judged.get("judges")
-    allowed: set[str] = set()
-    for entry in listed if isinstance(listed, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("name"))
-        if gate.specs.get(name) == (entry.get("kind"), entry.get("model")):
-            allowed.add(name)
-    return allowed
-
-
-def build_labels(sources: Sequence[Path], gate: CalibrationGate | None = None) -> list[ReviewItem]:
-    """Label every plate judged in earlier runs' comparisons with the panel majority.
-
-    Only votes label_judges admits count; a plate without one is unlabelled.
-    """
-    items: dict[str, ReviewItem] = {}
-    for source in sources:
-        for records_path in sorted(source.glob("*/*/pairs.json")):
-            summary_path = records_path.parent / "summary.json"
-            summary = read_object(summary_path) if summary_path.exists() else {}
-            allowed = label_judges(summary, gate)
-            records = read_object_list(records_path)
-            for record in records:
-                for role in ("first", "second"):
-                    item = _label(source, record, role, allowed)
-                    if item is not None:
-                        items.setdefault(item.plate_id, item)
-    return sorted(items.values(), key=lambda item: (item.taxon_id, item.plate_id))
-
-
-def read_object_list(path: Path) -> list[dict[str, object]]:
-    value = read_json(path)
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
-        raise HarnessError(f"{path.name} must hold a list of pair records")
-    return [item for item in value if isinstance(item, dict)]
-
-
-def _label(
-    source: Path, record: dict[str, object], role: str, allowed: set[str] | None
-) -> ReviewItem | None:
-    plate, votes, taxon = record.get(role), record.get("votes"), record.get("taxon_id")
-    if not isinstance(plate, dict) or not isinstance(votes, list) or not isinstance(taxon, int):
-        return None
-    recorded = plate.get("path")
-    if not isinstance(recorded, str):
-        return None
-    path = resolve_recorded(source, recorded)
-    if not path.is_file():
-        return None
-    assessments = [
-        vote.get(role)
-        for vote in votes
-        if isinstance(vote, dict) and (allowed is None or vote.get("judge") in allowed)
-    ]
-    usable = [item for item in assessments if isinstance(item, dict)]
-    if not usable:
-        return None
-    acceptable = majority_flag([item.get("acceptable") is True for item in usable])
-    counts: dict[str, int] = defaultdict(int)
-    for item in usable:
-        defects = item.get("defects")
-        seen = {
-            defect.get("category")
-            for defect in (defects if isinstance(defects, list) else [])
-            if isinstance(defect, dict)
-        }
-        for category in seen:
-            if category in CATEGORIES:
-                counts[str(category)] += 1
-    return ReviewItem(
-        plate_id=f"{taxon}-{sha256_file(path)[:16]}",
-        taxon_id=taxon,
-        plate_path=path,
-        acceptable=bool(acceptable),
-        categories=frozenset(name for name, count in counts.items() if 2 * count > len(usable)),
-    )
-
-
-@dataclass(frozen=True)
-class ReviewOutcome:
-    passed: bool
-    corrections: tuple[str, ...]
-    usage: Usage | None = field(default=None, compare=False)
-
-    @property
-    def categories(self) -> frozenset[str]:
-        return categorise(self.corrections)
-
-
-class ReviewEvaluator(Protocol):
-    def review(
-        self,
-        item: ReviewItem,
-        species: PanelSpecies,
-        references: FrozenReferences,
-        instructions: str,
-        work_dir: Path,
-    ) -> ReviewOutcome:
-        """Run the pipeline review with these instructions, or raise GenerationError."""
-
-
-class CodexReviewEvaluator:
-    def __init__(self, config: EvalConfig) -> None:
-        self.executable = find_executable(config.codex_executable)
-        self.timeout = config.review_timeout_seconds
-        self.model = config.generation_model
-        self.domains = config.allowed_domains
-
-    def review(
-        self,
-        item: ReviewItem,
-        species: PanelSpecies,
-        references: FrozenReferences,
-        instructions: str,
-        work_dir: Path,
-    ) -> ReviewOutcome:
-        work_dir.mkdir(parents=True, exist_ok=True)
-        runner = InstructedCodexRunner(self.executable, work_dir, self.timeout, model=self.model)
-        log = work_dir / "review.log"
-        review = runner.review_with_instructions(
-            species,
-            references,
-            item.plate_path,
-            work_dir / "review.json",
-            log,
-            allowed_domains=self.domains,
-            instructions=instructions,
-        )
-        try:
-            usage = codex_usage(log.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            usage = None
-        return ReviewOutcome(review.passed, review.correction_findings, usage)
-
-
-def review_score(outcome: ReviewOutcome | None, item: ReviewItem) -> float:
-    """Half for agreeing on pass/fail, half for the overlap of defect categories."""
-    if outcome is None:
-        return 0.0
-    agreement = float(outcome.passed == item.acceptable)
-    found, expected = outcome.categories, item.categories
-    union = found | expected
-    overlap = 1.0 if not union else len(found & expected) / len(union)
-    return 0.5 * agreement + 0.5 * overlap
-
-
-def review_feedback(item: ReviewItem, outcome: ReviewOutcome | None, error: str | None) -> str:
-    label = (
-        f"The judge panel found this plate {'acceptable' if item.acceptable else 'not acceptable'}"
-        f" with defects in: {', '.join(sorted(item.categories)) or 'none'}."
-    )
-    if outcome is None:
-        return f"{label}\nThe review did not produce a usable result: {error}"
-    missed = sorted(item.categories - outcome.categories)
-    extra = sorted(outcome.categories - item.categories)
-    corrections = "\n".join(f"- {line}" for line in outcome.corrections) or "- none"
-    return (
-        f"{label}\nThe review {'passed' if outcome.passed else 'failed'} it and asked for:\n"
-        f"{corrections}\nCategories the review missed: {', '.join(missed) or 'none'}."
-        f" Categories the panel did not see: {', '.join(extra) or 'none'}."
-    )
-
-
-class ReviewTuningAdapter:
-    component = REVIEW_COMPONENT
-
-    def __init__(
-        self,
-        run: Run,
-        config: EvalConfig,
-        evaluator: ReviewEvaluator,
-        panel: dict[int, PanelSpecies],
-        references: dict[int, FrozenReferences],
-        *,
-        budget: Budget,
-        parallel: int,
-    ) -> None:
-        self.run = run
-        self.config = config
-        self.evaluator = evaluator
-        self.panel = panel
-        self.references = references
-        self.budget = budget
-        self.parallel = parallel
-        self.ledger = Ledger(run.path(REVIEWS_LEDGER))
-        self.scores = _Scores(run.path("tune-review", "candidates"))
-
-    def outcome(self, item: ReviewItem, text: str) -> tuple[ReviewOutcome | None, str | None]:
-        cache = self.run.path("reviews", sha256_text(text)[:16], f"{item.plate_id}.json")
-        if cache.exists():
-            stored = read_object(cache)
-            if isinstance(stored.get("error"), str):
-                return None, str(stored["error"])
-            corrections = stored.get("corrections")
-            if not isinstance(corrections, list):
-                raise HarnessError(f"Cached review {cache.name} is malformed")
-            return ReviewOutcome(stored.get("passed") is True, tuple(map(str, corrections))), None
-        self.budget.reserve()
-        self.ledger.record("review-started", plate=item.plate_id)
-        try:
-            outcome = self.evaluator.review(
-                item,
-                self.panel[item.taxon_id],
-                self.references[item.taxon_id],
-                text,
-                cache.parent / f"{item.plate_id}-work",
-            )
-        except GenerationError as exc:
-            self.ledger.record("review-failed", plate=item.plate_id, error=str(exc))
-            write_json(cache, {"error": str(exc)})
-            return None, str(exc)
-        usage = None if outcome.usage is None else dict(outcome.usage)
-        self.ledger.record("review-finished", plate=item.plate_id, usage=usage)
-        write_json(cache, {"passed": outcome.passed, "corrections": list(outcome.corrections)})
-        return outcome, None
-
-    def evaluate(
-        self, batch: list[object], candidate: dict[str, str], capture_traces: bool = False
-    ) -> EvalBatch:
-        items = [_review_item(item) for item in batch]
-        text = candidate.get(self.component, "")
-        try:
-            validate_candidate(
-                text, target="review", max_characters=self.config.max_candidate_characters
-            )
-        except CandidateRejectedError as exc:
-            return _rejected(batch, str(exc), capture_traces)
-        results = run_tasks(
-            [functools.partial(self.outcome, item, text) for item in items], self.parallel
-        )
-        scores = [
-            review_score(outcome, item) for item, (outcome, _e) in zip(items, results, strict=True)
-        ]
-        for item, score in zip(items, scores, strict=True):
-            self.scores.record(text, item.plate_id, score)
-        trajectories: list[dict[str, object]] = [
-            {"item": f"plate {item.plate_id}", "feedback": review_feedback(item, outcome, error)}
-            for item, (outcome, error) in zip(items, results, strict=True)
-        ]
-        outputs: list[dict[str, object]] = [
-            {"plate_id": item.plate_id, "score": score}
-            for item, score in zip(items, scores, strict=True)
-        ]
-        return EvalBatch(outputs, scores, trajectories if capture_traces else None)
-
-    def make_reflective_dataset(
-        self, candidate: dict[str, str], eval_batch: EvalBatch, components_to_update: list[str]
-    ) -> dict[str, list[dict[str, object]]]:
-        return _reflective(
-            self.component, eval_batch, constraints("review", self.config.max_candidate_characters)
-        )
-
-
-def _review_item(item: object) -> ReviewItem:
-    if not isinstance(item, ReviewItem):
-        raise HarnessError("The review tuner evaluates labelled plates")
-    return item
-
-
-def tune_review(
-    run: Run,
-    config: EvalConfig,
-    evaluator: ReviewEvaluator,
-    panel: Sequence[PanelSpecies],
-    labels: Sequence[ReviewItem],
-    *,
-    optimizer: Optimizer,
-    reflection_lm: ReflectionLM,
-    budget: Budget,
-    metric_calls: int,
-    exploratory: bool = False,
-    parallel: int = 1,
-) -> dict[str, object]:
-    """Tune the review instructions on labelled plates, then test on held-out species.
-
-    The labels must come from calibrated judges (see build_labels); an
-    exploratory run reports what the rule would say but makes no decision.
-    """
-    by_taxon = {entry.taxon_id: entry for entry in panel}
-    usable = [item for item in labels if item.taxon_id in by_taxon]
-    dev = [item for item in usable if by_taxon[item.taxon_id].split == "dev"]
-    holdout = [item for item in usable if by_taxon[item.taxon_id].split == "holdout"]
-    if not dev or not holdout:
-        raise HarnessError("Review tuning needs labelled plates of both dev and held-out species")
-    references = {
-        taxon: frozen_references(run, by_taxon[taxon])
-        for taxon in {item.taxon_id for item in usable}
-    }
-    write_json(run.path("tune-review", "labels.json"), [item.as_dict() for item in usable])
-    adapter = ReviewTuningAdapter(
-        run, config, evaluator, by_taxon, references, budget=budget, parallel=parallel
-    )
-    stopped: str | None = None
-    try:
-        best = optimizer(
-            seed_candidate={REVIEW_COMPONENT: REVIEW_INSTRUCTIONS},
-            trainset=list(dev),
-            valset=list(dev),
-            adapter=adapter,
-            reflection_lm=reflection_lm,
-            max_metric_calls=metric_calls,
-            minibatch_size=config.tune_minibatch_size,
-            run_dir=run.path("gepa-review"),
-            seed=run.derived("gepa-review") % 2**31,
-        )
-        best_text = best.get(REVIEW_COMPONENT, REVIEW_INSTRUCTIONS)
-    except BudgetExhaustedError as exc:
-        stopped = str(exc)
-        best_text = adapter.scores.best([item.plate_id for item in dev], REVIEW_INSTRUCTIONS)[0]
-    validate_candidate(best_text, target="review", max_characters=config.max_candidate_characters)
-    write_text(run.path("tune-review", "best-review-instructions.txt"), best_text + "\n")
-    summary: dict[str, object] = {
-        "best_is_current_prompt": best_text == REVIEW_INSTRUCTIONS,
-        "best_sha256": sha256_text(best_text),
-        "stopped_early": stopped,
-        "labelled_plates": {"dev": len(dev), "holdout": len(holdout)},
-        "exploratory": exploratory,
-    }
-    if best_text == REVIEW_INSTRUCTIONS:
-        note = "tuning found nothing better than the current review prompt"
-        summary["decision"] = None if exploratory else {"accept": False, "reasons": [note]}
-        summary["decision_note"] = note
-    else:
-        differences: dict[int, list[float]] = defaultdict(list)
-        incomplete = 0
-        for item in holdout:
-            try:
-                baseline, _ = adapter.outcome(item, REVIEW_INSTRUCTIONS)
-                candidate, _ = adapter.outcome(item, best_text)
-            except BudgetExhaustedError:
-                incomplete += 1
-                continue
-            differences[item.taxon_id].append(
-                review_score(candidate, item) - review_score(baseline, item)
-            )
-        rate, decision = decide_improvement(
-            differences,
-            iterations=config.bootstrap_iterations,
-            seed=run.derived("bootstrap|tune-review"),
-            confidence=config.confidence,
-        )
-        reasons = list(decision.reasons)
-        if incomplete:
-            reasons.append(f"{incomplete} held-out plates were not reviewed within the cap")
-        summary["holdout_score_difference"] = rate.as_dict()
-        verdict = {"accept": decision.accept and not incomplete, "reasons": reasons}
-        if exploratory:
-            summary["decision"] = None
-            summary["exploratory_decision"] = verdict
-            summary["decision_note"] = (
-                "exploratory run without a passing calibration; no decision is made"
-            )
-        else:
-            summary["decision"] = verdict
-            summary["decision_note"] = None
-    write_json(run.path("tune-review", "summary.json"), summary)
-    return summary

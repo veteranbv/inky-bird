@@ -10,22 +10,19 @@ the fixed tool request and output-path lines.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final
 
 from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.models import ReferencePhoto, SpeciesProfileData
 from inky_bird_frame.prompts import (
     PLATE_INSTRUCTION_FIELDS,
-    REVIEW_INSTRUCTION_FIELDS,
     plate_prompt,
-    review_prompt,
     validate_instructions,
 )
 
 from .config import HarnessError
 
-Target = Literal["plate", "review"]
 OPEN: Final = "<reference-data>\n"
 CLOSE: Final = "\n</reference-data>"
 HOSTILE: Final = (
@@ -45,7 +42,6 @@ OUTPUT_LINE: Final = "this exact path inside the current workspace:\n"
 VERIFY_LINE: Final = (
     "Verify that the file exists before finishing. Do not merely describe the image.\n"
 )
-DOMAINS: Final = ("birds.example", "field.example")
 
 
 class CandidateRejectedError(HarnessError):
@@ -89,24 +85,9 @@ def _references() -> list[ReferencePhoto]:
     ]
 
 
-def _renderings(text: str, target: Target) -> dict[str, tuple[str, int]]:
+def _renderings(text: str) -> dict[str, tuple[str, int]]:
     """Each rendered prompt branch, with the number of its first reference image."""
     profile, references = _profile(), _references()
-    if target == "review":
-        species = BirdSpecies(1, "Test Bird", "Avis test", 1, "safety")
-        return {
-            "review": (
-                review_prompt(
-                    species,
-                    profile,
-                    references,
-                    DOMAINS,
-                    prior_corrections=(HOSTILE,),
-                    instructions=text,
-                ),
-                2,
-            )
-        }
     rendered: dict[str, tuple[str, int]] = {}
     for scientific in ("Avis test", "Rynchops niger"):
         species = BirdSpecies(1, "Test Bird", scientific, 1, "safety")
@@ -131,7 +112,7 @@ def _renderings(text: str, target: Target) -> dict[str, tuple[str, int]]:
     return rendered
 
 
-def _check(name: str, prompt: str, first_reference: int, target: Target) -> None:
+def _check(name: str, prompt: str, first_reference: int) -> None:
     if prompt.count("<reference-data>") != 1 or prompt.count("</reference-data>") != 1:
         raise CandidateRejectedError(f"{name}: the prompt must hold exactly one data block")
     before, rest = prompt.split(OPEN, 1)
@@ -153,15 +134,14 @@ def _check(name: str, prompt: str, first_reference: int, target: Target) -> None
     ]
     if numbered != [f"Image {index}" for index in range(first_reference, first_reference + 3)]:
         raise CandidateRejectedError(f"{name}: the reference images are not numbered once each")
-    if target == "plate":
-        if not prompt.startswith("$imagegen\n\n") or prompt.count("$imagegen") != 1:
-            raise CandidateRejectedError(f"{name}: the tool request line changed")
-        tail = prompt.split(OUTPUT_LINE, 1)
-        if len(tail) != 2 or tail[1] != f"candidate.png\n\n{VERIFY_LINE}":
-            raise CandidateRejectedError(f"{name}: the output path lines changed")
+    if not prompt.startswith("$imagegen\n\n") or prompt.count("$imagegen") != 1:
+        raise CandidateRejectedError(f"{name}: the tool request line changed")
+    tail = prompt.split(OUTPUT_LINE, 1)
+    if len(tail) != 2 or tail[1] != f"candidate.png\n\n{VERIFY_LINE}":
+        raise CandidateRejectedError(f"{name}: the output path lines changed")
 
 
-def validate_candidate(text: str, *, target: Target, max_characters: int) -> None:
+def validate_candidate(text: str, *, max_characters: int) -> None:
     """Raise CandidateRejectedError unless the candidate is safe to send."""
     if len(text) > max_characters:
         raise CandidateRejectedError(
@@ -169,11 +149,10 @@ def validate_candidate(text: str, *, target: Target, max_characters: int) -> Non
         )
     if "://" in text:
         raise CandidateRejectedError("The candidate must not contain a URL")
-    fields = PLATE_INSTRUCTION_FIELDS if target == "plate" else REVIEW_INSTRUCTION_FIELDS
     try:
-        validate_instructions(text, fields)
-        renderings = _renderings(text, target)
+        validate_instructions(text, PLATE_INSTRUCTION_FIELDS)
+        renderings = _renderings(text)
     except GenerationError as exc:
         raise CandidateRejectedError(str(exc)) from exc
     for name, (prompt, first_reference) in renderings.items():
-        _check(name, prompt, first_reference, target)
+        _check(name, prompt, first_reference)

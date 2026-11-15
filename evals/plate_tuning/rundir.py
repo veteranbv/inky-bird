@@ -34,11 +34,8 @@ RESERVED_NAMES: Final = frozenset(
         "keys",
         "references",
         "report",
-        "review-labels",
-        "reviews",
         "smoke",
         "tune",
-        "tune-review",
         "unblinding",
         "verdicts",
     }

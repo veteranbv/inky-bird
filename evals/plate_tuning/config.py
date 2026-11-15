@@ -7,7 +7,6 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Final, Literal
 
-from inky_bird_frame.config import ResearchConfig
 from inky_bird_frame.errors import InkyBirdFrameError
 
 JudgeKind = Literal["claude", "codex"]
@@ -24,7 +23,7 @@ class HarnessError(InkyBirdFrameError):
 
 
 class BudgetExhaustedError(HarnessError):
-    """The generation or review cap for this command has been reached."""
+    """The generation cap for this command has been reached."""
 
 
 @dataclass(frozen=True)
@@ -49,13 +48,12 @@ class EvalConfig:
     judges: tuple[JudgeSpec, ...] = field(default_factory=_default_judges)
     claude_executable: str = "claude"
     codex_executable: str = "codex"
-    # None uses the Codex CLI's configured model for plate generation and review.
+    # None uses the Codex CLI's configured model for plate generation.
     generation_model: str | None = None
     reflection_model: str = DEFAULT_CLAUDE_MODEL
     generation_timeout_seconds: int = 1200
     judge_timeout_seconds: int = 900
     reflection_timeout_seconds: int = 600
-    review_timeout_seconds: int = 1200
     judge_attempts: int = 2
     generation_attempts: int = 2
     samples_per_species: int = 3
@@ -78,7 +76,6 @@ class EvalConfig:
     anatomy_weight: float = 0.5
     lettering_weight: float = 0.3
     acceptable_weight: float = 0.2
-    allowed_domains: tuple[str, ...] = ResearchConfig().allowed_domains
 
     def rubric(self) -> str:
         path = Path(self.rubric_path) if self.rubric_path else PACKAGE_DIR / "rubric.md"
@@ -102,7 +99,6 @@ class EvalConfig:
             "generation_timeout_seconds",
             "judge_timeout_seconds",
             "reflection_timeout_seconds",
-            "review_timeout_seconds",
             "judge_attempts",
             "generation_attempts",
             "samples_per_species",
@@ -129,8 +125,6 @@ class EvalConfig:
         weights = (self.anatomy_weight, self.lettering_weight, self.acceptable_weight)
         if min(weights) < 0 or abs(sum(weights) - 1) > 1e-9:
             raise HarnessError("The tuning score weights must be non-negative and sum to 1")
-        if len(set(self.allowed_domains)) < 2:
-            raise HarnessError("allowed_domains must contain at least two domains")
         return self
 
 
@@ -206,12 +200,6 @@ def load_config(path: Path | None) -> EvalConfig:
         if not isinstance(listed, list):
             raise HarnessError("judges must be an array of tables")
         judges = tuple(_judge(item) for item in listed)
-    domains = defaults.allowed_domains
-    if "allowed_domains" in raw:
-        listed = raw["allowed_domains"]
-        if not isinstance(listed, list) or not all(isinstance(item, str) for item in listed):
-            raise HarnessError("allowed_domains must be a list of strings")
-        domains = tuple(str(item) for item in listed)
     d = defaults
     return EvalConfig(
         judges=judges,
@@ -226,7 +214,6 @@ def load_config(path: Path | None) -> EvalConfig:
         reflection_timeout_seconds=_int(
             raw, "reflection_timeout_seconds", d.reflection_timeout_seconds
         ),
-        review_timeout_seconds=_int(raw, "review_timeout_seconds", d.review_timeout_seconds),
         judge_attempts=_int(raw, "judge_attempts", d.judge_attempts),
         generation_attempts=_int(raw, "generation_attempts", d.generation_attempts),
         samples_per_species=_int(raw, "samples_per_species", d.samples_per_species),
@@ -254,5 +241,4 @@ def load_config(path: Path | None) -> EvalConfig:
         anatomy_weight=_float(raw, "anatomy_weight", d.anatomy_weight),
         lettering_weight=_float(raw, "lettering_weight", d.lettering_weight),
         acceptable_weight=_float(raw, "acceptable_weight", d.acceptable_weight),
-        allowed_domains=domains,
     ).validate()
