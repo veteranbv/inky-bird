@@ -1111,9 +1111,15 @@ def signed_token(expires_at: datetime, label: str = "access") -> str:
 
 
 class _Reply:
+    """A complete Content-Length response, read the way http.client reads one."""
+
+    chunked = False
+
     def __init__(self, payload: object) -> None:
         self.body = json.dumps(payload).encode()
         self.headers = Message()
+        self.headers["Content-Length"] = str(len(self.body))
+        self.length: int | None = len(self.body)
 
     def __enter__(self) -> _Reply:
         return self
@@ -1122,7 +1128,10 @@ class _Reply:
         return None
 
     def read(self, limit: int) -> bytes:
-        return self.body[:limit]
+        chunk = self.body[:limit]
+        self.body = self.body[len(chunk) :]
+        self.length = len(self.body)
+        return chunk
 
 
 class ScriptedTransport:
