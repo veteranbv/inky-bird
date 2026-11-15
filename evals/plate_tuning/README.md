@@ -155,6 +155,8 @@ against v8 on all 20 species at 3 samples needs 120 generations
 plates) = 210 generations, at most one judged pair (3 judge calls) per
 candidate plate, 72 judge calls for the held-out test, and one reflection per
 proposal.
+A resumed `tune` subtracts the candidate plates earlier attempts already made
+on the dev species, which count as used, so resuming never needs a higher cap.
 
 Every finished call records the tokens its tool reported in its ledger entry
 (`usage`): Claude's JSON result gives input, output and cache tokens and a
@@ -378,6 +380,8 @@ calibration/, tune/, gepa/, report/
 ```
 
 A sample is finished only when `sample.json` is written, after the portrait.
+It records the `generation_model`; a sample made with another model is refused
+rather than reused, so use a new run directory after changing it.
 A plate is prepared again without paying only when the ledger shows its
 generation finished; a plate from a failed, timed-out or possibly unfinished
 generation is deleted and generated again, so it is never judged. If the

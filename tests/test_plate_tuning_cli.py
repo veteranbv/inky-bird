@@ -12,10 +12,16 @@ from plate_tuning.cli import Tools, main, spread
 from plate_tuning.config import EvalConfig, load_config
 from plate_tuning.generate import Generator
 from plate_tuning.judges import Judge
-from plate_tuning.panel import load_panel
+from plate_tuning.panel import frozen_references, load_panel
 from plate_tuning.report import usage_totals
-from plate_tuning.rundir import Ledger, Run
-from plate_tuning.tune import Optimizer, ReflectionLM
+from plate_tuning.rundir import Budget, Ledger, Run
+from plate_tuning.tune import (
+    PLATE_COMPONENT,
+    Optimizer,
+    PlateTuningAdapter,
+    ReflectionLM,
+    TuningAdapter,
+)
 from plate_tuning_fixtures import (
     ColourGenerator,
     FakeDownloader,
@@ -198,6 +204,61 @@ def test_tune_refuses_a_cap_that_cannot_finish_the_holdout_test(
         ["tune", *common, "--max-generations", "20", "--budget", "10"], tools, capsys
     )
     assert code == 1 and "below the 24" in str(out["error"])
+
+
+def _seed_only(
+    *,
+    seed_candidate: dict[str, str],
+    trainset: list[object],
+    valset: list[object],
+    adapter: TuningAdapter,
+    reflection_lm: ReflectionLM,
+    max_metric_calls: int,
+    minibatch_size: int,
+    run_dir: Path,
+    seed: int,
+) -> dict[str, str]:
+    """An optimiser resumed from saved state that has nothing better than the seed."""
+    return dict(seed_candidate)
+
+
+def test_a_resumed_tune_counts_the_candidate_plates_already_made(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = _common(tmp_path)
+    tools = Offline()
+    tools.optimizer = lambda: _seed_only
+    tools.reflector = lambda run, config: str
+    assert _invoke(["cache-references", *common], tools, capsys)[0] == 0
+    _calibrated(tmp_path)
+    tune = ["tune", *common, "--budget", "10"]
+    code, out = _invoke([*tune, "--max-generations", "24", "--dry-run"], tools, capsys)
+    assert code == 0 and _at(out, "data", "plan", "generations_at_most") == 24
+
+    # An interrupted first attempt: the seed scored on both dev species, paying
+    # for two dev baselines and two of the ten metric calls' candidate plates.
+    run = Run.open(tmp_path / "run")
+    panel = load_panel(Path(common[3]), Path(common[5]))
+    adapter = PlateTuningAdapter(
+        run,
+        load_config(tmp_path / "eval.toml"),
+        tools.colour,
+        [PixelJudge(name) for name in ("fake-1", "fake-2", "fake-3")],
+        {entry.taxon_id: frozen_references(run, entry) for entry in panel},
+        budget=Budget(100),
+        parallel=1,
+    )
+    adapter.evaluate(
+        [entry for entry in panel if entry.split == "dev"], {PLATE_COMPONENT: PLATE_INSTRUCTIONS}
+    )
+    assert len(tools.colour.calls) == 4
+
+    # 8 metric calls left + 12 held-out plates: one short of that is still refused.
+    code, out = _invoke([*tune, "--max-generations", "23"], tools, capsys)
+    assert code == 1 and "below the 20" in str(out["error"])
+    code, out = _invoke([*tune, "--max-generations", "24"], tools, capsys)
+    assert code == 0, out
+    assert _at(out, "data", "plan", "generations_at_most") == 20
 
 
 def test_spread_takes_one_species_per_body_plan_first(tmp_path: Path) -> None:

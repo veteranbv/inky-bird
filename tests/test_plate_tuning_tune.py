@@ -475,3 +475,45 @@ def test_a_baseline_that_cannot_be_generated_stops_tuning_instead_of_scoring_zer
 
     with pytest.raises(HarnessError, match="baseline plate"):
         adapter.evaluate(list(panel[:1]), {PLATE_COMPONENT: GREY})
+
+
+def test_a_candidate_whose_plate_cannot_be_made_keeps_its_completed_scores(
+    tmp_path: Path,
+) -> None:
+    run, panel, _ = make_run(tmp_path)
+    dev = panel[:2]
+    lost = dev[1].taxon_id
+
+    class CandidateFailsOnce:
+        """The candidate's plate for one species fails every attempt; the rest are red."""
+
+        def generate(self, request: GenerationRequest) -> None:
+            if request.arm.name.startswith("cand") and request.species.taxon_id == lost:
+                raise GenerationError("Codex exited with status 1")
+            colour = RED if "pale grey" in request.arm.instructions else BLUE
+            Image.new("RGB", (30, 40), colour).save(request.output_path)
+
+    adapter = PlateTuningAdapter(
+        run,
+        config(),
+        CandidateFailsOnce(),
+        _judges(),
+        _references(run, panel),
+        budget=Budget(20),
+        parallel=1,
+    )
+
+    batch = adapter.evaluate(list(dev), {PLATE_COMPONENT: GREY})
+
+    assert batch.scores == [pytest.approx(1.0), 0.0]
+    # The zero is persisted, so the evaluation counts as complete for selection.
+    assert adapter.scores.mean(GREY, [entry.key for entry in dev]) == pytest.approx(0.5)
+    # Eleven wins and one lost plate beat a seed that ties everywhere at 0.6.
+    items = [entry.key for entry in dev] + [f"extra-{number}" for number in range(10)]
+    for item in items[2:]:
+        adapter.scores.record(GREY, item, 1.0)
+    for item in items:
+        adapter.scores.record(PLATE_INSTRUCTIONS, item, 0.6)
+    best, mean = adapter.scores.best(items, PLATE_INSTRUCTIONS)
+    assert best == GREY
+    assert mean == pytest.approx(11 / 12)

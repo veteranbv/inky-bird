@@ -336,6 +336,16 @@ class CodexGenerator:
         )
 
 
+def generation_model(generator: Generator) -> str | None:
+    """The model a generator draws with, recorded with each of its samples.
+
+    CodexGenerator carries the configured generation_model; None is Codex's own
+    default, and a generator with no model (a test stand-in) records None too.
+    """
+    model = getattr(generator, "model", None)
+    return model if isinstance(model, str) else None
+
+
 @dataclass(frozen=True)
 class Sample:
     arm: str
@@ -373,6 +383,16 @@ def completed_sample(run: Run, arm: Arm, species: PanelSpecies, index: int) -> S
     return Sample(arm.name, species.taxon_id, index, portrait)
 
 
+def _require_model(sample: Sample, species: PanelSpecies, model: str | None) -> None:
+    record = read_object(sample.portrait.parent / SAMPLE_RECORD)
+    # Records written before the generation model was recorded carry none.
+    if "generation_model" in record and record["generation_model"] != model:
+        raise HarnessError(
+            f"Sample {sample.arm}/{species.key}/{sample.index} was made with another"
+            " generation model; use a new run directory"
+        )
+
+
 @dataclass
 class GenerationReport:
     completed: int = 0
@@ -400,7 +420,9 @@ def _prepare(directory: Path) -> None:
     prepare_generated_plate(directory / GENERATED, directory / PORTRAIT, directory / DISPLAY)
 
 
-def _finish(run: Run, request: GenerationRequest, index: int, usage: Usage | None) -> Sample:
+def _finish(
+    run: Run, request: GenerationRequest, index: int, usage: Usage | None, model: str | None
+) -> Sample:
     directory = request.sample_dir
     write_json(
         directory / SAMPLE_RECORD,
@@ -411,6 +433,7 @@ def _finish(run: Run, request: GenerationRequest, index: int, usage: Usage | Non
             "taxon_id": request.species.taxon_id,
             "index": index,
             "profile_sha256": profile_sha256(request.species),
+            "generation_model": model,
             "portrait_sha256": sha256_file(directory / PORTRAIT),
             "usage": None if usage is None else dict(usage),
         },
@@ -450,7 +473,7 @@ def _one(
             (directory / GENERATED).unlink(missing_ok=True)
         else:
             report.add("reprepared")
-            return _finish(run, request, index, None)
+            return _finish(run, request, index, None, generation_model(generator))
     if not reserved:
         try:
             budget.reserve()
@@ -475,7 +498,7 @@ def _one(
     recorded = None if usage is None else dict(usage)
     ledger.record("generation-finished", usage=recorded, **identity)
     report.add("generated")
-    return _finish(run, request, index, usage)
+    return _finish(run, request, index, usage, generation_model(generator))
 
 
 def generation_order(
@@ -523,6 +546,7 @@ def generate_samples(
     by_taxon = {entry.taxon_id: (entry, references) for entry, references in species}
     ledger = Ledger(run.path(GENERATIONS_LEDGER))
     latest = ledger.latest("arm", "taxon_id", "index")
+    model = generation_model(generator)
     keys = [(entry.taxon_id, index) for entry, _ in species for index in range(1, samples + 1)]
     tasks: list[tuple[GenerationRequest, int, Callable[[], Sample | None]]] = []
     for (taxon, index), ordered in generation_order(run, arms, keys):
@@ -531,6 +555,7 @@ def generate_samples(
         for arm in ordered:
             existing = completed_sample(run, arm, entry, index)
             if existing is not None:
+                _require_model(existing, entry, model)
                 done[(arm.name, taxon, index)] = existing
                 report.completed += 1
                 continue

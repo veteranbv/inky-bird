@@ -321,6 +321,8 @@ def test_codex_generator_sends_the_arm_wording_and_references(
     assert Path((captured / "cwd").read_text().strip()).resolve() == directory.resolve()
     assert ("grey", panel[0].taxon_id, 1) in done
     assert "synthetic-key-value" not in (captured / "env").read_text()
+    record = json.loads((directory / "sample.json").read_text())
+    assert record["generation_model"] == "image-model"
 
 
 def test_a_sample_made_from_other_species_facts_is_not_reused(tmp_path: Path) -> None:
@@ -352,3 +354,38 @@ def test_a_record_after_a_cut_off_line_is_still_read(tmp_path: Path) -> None:
     ledger.record("generation-started", sample="b")
 
     assert ledger.count("generation-started") == 2
+
+
+def test_a_sample_made_with_another_generation_model_is_not_reused(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+
+    class ModelColour(ColourGenerator):
+        def __init__(self, model: str | None) -> None:
+            super().__init__()
+            self.model = model
+
+    done, _report = generate_samples(
+        run, ModelColour("image-a"), [arm], species, 1, budget=Budget(1)
+    )
+    record_path = done[("base", panel[0].taxon_id, 1)].portrait.parent / "sample.json"
+    record = json.loads(record_path.read_text())
+    assert record["generation_model"] == "image-a"
+
+    _done, report = generate_samples(
+        run, ModelColour("image-a"), [arm], species, 1, budget=Budget(0)
+    )
+    assert report.completed == 1
+    with pytest.raises(HarnessError, match="other generation model"):
+        generate_samples(run, ModelColour("image-b"), [arm], species, 1, budget=Budget(1))
+    with pytest.raises(HarnessError, match="other generation model"):
+        generate_samples(run, ModelColour(None), [arm], species, 1, budget=Budget(1))
+
+    # Records written before the model was recorded carry none and are still used.
+    del record["generation_model"]
+    record_path.write_text(json.dumps(record))
+    _done, report = generate_samples(
+        run, ModelColour("image-b"), [arm], species, 1, budget=Budget(0)
+    )
+    assert report.completed == 1

@@ -8,6 +8,7 @@ plus the judges' feedback text for reflection.
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from .compare import compare, pair_specs
 from .config import BudgetExhaustedError, EvalConfig, HarnessError
 from .gate import CalibrationGate
 from .generate import (
+    GENERATIONS_LEDGER,
     Arm,
     Generator,
     Sample,
@@ -51,6 +53,7 @@ from .safety import CandidateRejectedError, validate_candidate
 from .stats import pair_outcome, win_score
 
 PLATE_COMPONENT: Final = "plate_instructions"
+_CANDIDATE_ARM: Final = re.compile(r"cand-[0-9a-f]{12}")
 BASELINE_ARM: Final = "baseline"
 
 ReflectionLM = Callable[[str], str]
@@ -291,8 +294,7 @@ class PlateTuningAdapter:
             validate_candidate(text, max_characters=self.config.max_candidate_characters)
         except CandidateRejectedError as exc:
             return _rejected(batch, str(exc), capture_traces)
-        digest = sha256_text(text)[:12]
-        arm = Arm(f"cand-{digest}", text, f"candidate-{digest}")
+        arm = candidate_arm(text)
         with_references = [(entry, self.references[entry.taxon_id]) for entry in species]
         done = self._generate(arm, with_references)
         specs = pair_specs("tune", arm, self.baseline, with_references, done, 1)
@@ -308,7 +310,9 @@ class PlateTuningAdapter:
         for entry in species:
             pair = judged.get(entry.taxon_id)
             if pair is None:
-                # The candidate's plate failed every attempt; it scores nothing.
+                # The candidate's plate failed every attempt; it scores nothing,
+                # recorded so the completed evaluation stays eligible for selection.
+                self.scores.record(text, entry.key, 0.0)
                 outputs.append({"taxon_id": entry.taxon_id, "generated": False})
                 scores.append(0.0)
                 trajectories.append(
@@ -421,6 +425,28 @@ class TuneResult:
         }
 
 
+def candidate_arm(text: str) -> Arm:
+    digest = sha256_text(text)[:12]
+    return Arm(f"cand-{digest}", text, f"candidate-{digest}")
+
+
+def candidate_generations(run: Run, dev: Sequence[PanelSpecies]) -> int:
+    """Candidate plates earlier tune commands in this run started on the dev species.
+
+    Each is part of the optimiser's metric-call share and already counts as used
+    against the cap, so a resumed tune must not plan for it again.
+    """
+    taxa = {entry.taxon_id for entry in dev}
+    return sum(
+        1
+        for entry in Ledger(run.path(GENERATIONS_LEDGER)).entries()
+        if entry.get("event") == "generation-started"
+        and entry.get("taxon_id") in taxa
+        and isinstance(entry.get("arm"), str)
+        and _CANDIDATE_ARM.fullmatch(str(entry["arm"])) is not None
+    )
+
+
 def holdout_reservation(
     run: Run, baseline: Arm, holdout: Sequence[PanelSpecies], samples: int
 ) -> int:
@@ -498,13 +524,12 @@ def tune_plate(
         if not exploratory:
             decision = {"accept": False, "reasons": [note]}
     else:
-        digest = sha256_text(best_text)[:12]
         result = compare(
             run,
             config,
             generator,
             judges,
-            Arm(f"cand-{digest}", best_text, f"candidate-{digest}"),
+            candidate_arm(best_text),
             adapter.baseline,
             holdout,
             samples=holdout_samples,

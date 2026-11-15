@@ -45,6 +45,7 @@ from .tune import (
     ClaudeReflector,
     Optimizer,
     ReflectionLM,
+    candidate_generations,
     holdout_reservation,
     tune_plate,
 )
@@ -330,12 +331,15 @@ def _tune(
     baseline = Arm(BASELINE_ARM, PLATE_INSTRUCTIONS, PROMPT_VERSION)
     # The held-out test's plates are set aside first; the optimiser gets the rest.
     # Its share is planned as one plate per metric call plus the dev baselines.
+    # A resumed tune already paid for its earlier candidate plates; they count as used.
     reserved = holdout_reservation(run, baseline, holdout, holdout_samples)
-    needed = args.budget + missing_samples(run, [baseline], dev, 1) + reserved
+    done = min(candidate_generations(run, dev), args.budget)
+    needed = args.budget - done + missing_samples(run, [baseline], dev, 1) + reserved
     estimate = {
         "generations_at_most": needed,
         "holdout_generations_reserved": reserved,
         "metric_calls": args.budget,
+        "candidate_generations_done": done,
         "dev_species": len(dev),
         "holdout_species": len(holdout),
     }
