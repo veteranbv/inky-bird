@@ -628,6 +628,11 @@ class AccessStore:
         provider_id: str | None = None,
         authenticated_at: float | None = None,
     ) -> SessionCredentials:
+        suspended = [s for s in state.sessions if not _usable(s, now)]
+        if len(state.sessions) >= MAX_OWNER_SESSIONS and suspended:
+            # A new sign-in replaces a session this clock cannot use; an older
+            # release deleted all of them instead.
+            state.sessions.remove(min(suspended, key=lambda s: s.last_active_at))
         if len(state.sessions) >= MAX_OWNER_SESSIONS:
             raise AccessError(
                 "Too many owner sessions; sign out on another device or use access recover locally"

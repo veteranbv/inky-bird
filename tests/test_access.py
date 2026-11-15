@@ -750,6 +750,26 @@ def test_a_stale_boot_clock_suspends_sessions_without_deleting_them(
     )
 
 
+def test_signing_in_on_a_stale_clock_is_not_refused_by_suspended_sessions(
+    tmp_path: Path,
+) -> None:
+    store = AccessStore(tmp_path)
+    store.setup_owner("birder", PASSPHRASE)
+    older = store.login(PASSPHRASE, username="birder", now=NOW - timedelta(minutes=5))
+    kept = [
+        store.login(PASSPHRASE, username="birder", now=NOW) for _ in range(MAX_OWNER_SESSIONS - 1)
+    ]
+    stale = NOW - timedelta(days=400)
+    fresh = store.login(PASSPHRASE, username="birder", now=stale)
+    store.authenticate(fresh.secret, now=stale)
+    # Only the least recently used suspended session gave way.
+    corrected = NOW + timedelta(minutes=1)
+    for credentials in kept:
+        AccessStore(tmp_path).authenticate(credentials.secret, now=corrected)
+    with pytest.raises(AccessDeniedError):
+        AccessStore(tmp_path).authenticate(older.secret, now=corrected)
+
+
 def test_small_clock_skew_is_tolerated(tmp_path: Path) -> None:
     store = AccessStore(tmp_path)
     secret, csrf = _establish(store)
