@@ -298,6 +298,7 @@ restore_units() {
         if { systemctl is-active --quiet "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
             ! sudo systemctl disable --now "${unit}"; then
           # Keep its file so a rerun or the uninstaller can still find and stop it.
+          stuck_units+=("${unit}")
           continue
         fi
         sudo rm -f "${unit_root}/${unit}" || true
@@ -320,7 +321,11 @@ restore_units() {
           ;;
       esac
     done
-    if ! restore_venv; then
+    # A fresh install has no previous version for a unit it could not stop or
+    # disable; leave that unit its runtime rather than a missing one.
+    if [ "${venv_before}" = absent ] && [ "${#stuck_units[@]}" -gt 0 ]; then
+      venv_restored=false
+    elif ! restore_venv; then
       venv_restored=false
       echo "Could not switch back to the previous version; the new one stays active, kept in ${new_runtime}." >&2
     fi
@@ -381,7 +386,7 @@ report_restore() {
     echo "Stop them with: sudo systemctl stop ${running[*]}" >&2
   fi
   if [ "${#stuck_units[@]}" -gt 0 ]; then
-    echo "These services could not be stopped and may still run the new version, kept in ${new_runtime}: ${stuck_units[*]}." >&2
+    echo "These services could not be stopped or disabled and may still run the new version, kept in ${new_runtime}: ${stuck_units[*]}." >&2
   fi
   if [ "${#stopped[@]}" -gt 0 ]; then
     echo "The upgrade failed and these services are stopped: ${stopped[*]}." >&2

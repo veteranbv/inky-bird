@@ -140,6 +140,7 @@ units_recorded=false
 package_installed=false
 old_package_removed=false
 units_replaced=false
+units_stuck=false
 installation_complete=false
 new_runtime_in_use=false
 
@@ -195,10 +196,13 @@ restore_package() {
       "${venv}/bin/python" -m pip uninstall --disable-pip-version-check -y inky-bird
       ;;
     inky-bird-frame)
-      # Until the renamed distribution is removed, removing the new one leaves
-      # the previous version exactly as it was.
-      [ "${old_package_removed}" != true ] && \
-        "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird inky-bird-frame
+      # While the renamed distribution is still what Python imports, removing
+      # the new one leaves the previous version exactly as it was.
+      if [ "${old_package_removed}" = true ] && [ "$("${venv}/bin/python" -I -c \
+          "${installed_source_program}" 2>/dev/null || true)" = "${new_runtime}" ]; then
+        return 1
+      fi
+      "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird inky-bird-frame
       ;;
     inky-bird)
       [ -n "${installed_source}" ] && \
@@ -223,6 +227,7 @@ restore_units() {
         if { systemctl is-active --quiet "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
             ! "${sudo_command[@]}" systemctl disable --now "${unit}"; then
           # Keep its file so a rerun or the uninstaller can still find and stop it.
+          units_stuck=true
           continue
         fi
         "${sudo_command[@]}" rm -f "${unit_root}/${unit}" || true
@@ -297,7 +302,11 @@ cleanup() {
   trap 'cleanup_stop=143' TERM
   if [ "${installation_complete}" != true ]; then
     restore_units
-    if [ "${package_installed}" = true ] && ! restore_package; then
+    # A fresh install's unit that could not be stopped or disabled keeps the
+    # new package to run, not a missing one.
+    if [ "${package_installed}" = true ] && [ -z "${installed}" ] && [ "${units_stuck}" = true ]; then
+      new_runtime_in_use=true
+    elif [ "${package_installed}" = true ] && ! restore_package; then
       new_runtime_in_use=true
     fi
     units_restored=true

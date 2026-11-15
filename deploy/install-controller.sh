@@ -342,7 +342,12 @@ cleanup() {
         stop_agent_for_restore "${label}"
       done
     fi
-    if [ "${runtime_activated}" = true ] && ! restore_venv; then
+    # A fresh install has no previous version for an agent it could not stop;
+    # leave that agent its runtime rather than a missing one.
+    if [ "${runtime_activated}" = true ] && [ "${venv_before}" = absent ] && \
+        [ "${#still_running[@]}" -gt 0 ]; then
+      runtime_restored=false
+    elif [ "${runtime_activated}" = true ] && ! restore_venv; then
       runtime_restored=false
       echo "Could not switch back to the previous version; the new one is kept in ${new_runtime}." >&2
     fi

@@ -84,8 +84,9 @@ disable_unit "${service_prefix}-scheduler.service"
 
 for name in controller scheduler refresh generate catalog-publish notifications; do
   for unit in "${service_prefix}-${name}.service" "${service_prefix}-${name}.timer"; do
-    # Keep the file of a unit that may still run so a rerun finds and stops it.
-    if not_stopped "${unit}"; then
+    # Keep the file of a unit that may still run so a rerun finds and stops it,
+    # and the service of a timer that may still start it.
+    if not_stopped "${unit}" || not_stopped "${unit%.service}.timer"; then
       continue
     fi
     if [ -f "/etc/systemd/system/${unit}" ]; then
