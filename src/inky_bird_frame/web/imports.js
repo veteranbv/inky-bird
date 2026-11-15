@@ -586,7 +586,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
         note(
           'Not matched: ' +
             (member.scientific_name || member.common_name) +
-            '. It will not be drawn.',
+            '. It cannot get a plate yet.',
         ),
       );
     // The controller refuses to save while any name is still waiting.

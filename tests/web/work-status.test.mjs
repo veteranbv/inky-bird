@@ -24,7 +24,7 @@ test('scheduler times are checks, not promises, and overdue is explicitly unknow
 test('preparation success is not confused with a later held or deferred plate', () => {
   const request = { taxon_id: 42, status: 'eligible' };
   assert.match(requestState(request, { needs_attention: [42] }), /waiting for you to ask again/);
-  assert.match(requestState(request, { waiting: [42] }), /after a short wait/);
+  assert.match(requestState(request, { waiting: [42] }), /waiting a while before it tries again/);
   assert.match(requestState({ status: 'blocked', outcome: 'interrupted' }, {}), /not started again/);
   assert.equal(requestState({ status: 'approved' }, {}), 'Already has a plate');
 });

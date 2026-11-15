@@ -654,6 +654,34 @@ function wallElsewhere(wall) {
   if (!wall || ['current', 'saved'].includes(wall)) return null;
   return wall === 'favorites' ? 'Favorites' : wall === 'all' ? 'All plates' : 'another collection';
 }
+const wallKnown = (wall) => typeof wall === 'string' && wall !== '';
+
+// The default wall view also keeps birds that are still being noted, so a
+// removed bird leaves it only when the controller's list no longer has it.
+// Null when that list cannot be read.
+async function stillShown(api, taxonId) {
+  try {
+    const journal = await api('/v1/owner/journal');
+    return Array.isArray(journal?.active_taxon_ids)
+      ? journal.active_taxon_ids.includes(taxonId)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// What the inline result can say for certain after one bird was added or removed.
+function toggleResult(name, saved, wall, stays) {
+  const done = saved ? 'Added to On my frame.' : 'Removed from On my frame.';
+  if (!wallKnown(wall)) return done;
+  const elsewhere = wallElsewhere(wall);
+  if (elsewhere) return done + ' Your wall frame shows ' + elsewhere + ' for now.';
+  if (saved) return name + ' will show on your frame from the next refresh.';
+  if (wall === 'current' && stays === true)
+    return done + ' ' + name + ' stays on your wall frame while it is still being noted.';
+  if (wall === 'current' && stays !== false) return done;
+  return name + ' will leave your frame at the next refresh.';
+}
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
 function confirmSaved(context, section, problem, body, preview, reason = '') {
@@ -679,11 +707,15 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
     el('h2', 'Change what is on your frame?'),
     note(savedSummary(preview)),
     ...(reason ? [note(reason)] : []),
-    note(
-      wallElsewhere(preview.wall)
-        ? 'Your wall frame shows ' + wallElsewhere(preview.wall) + ' for now, so it does not change.'
-        : 'Your frame changes from its next refresh.',
-    ),
+    ...(wallKnown(preview.wall)
+      ? [
+          note(
+            wallElsewhere(preview.wall)
+              ? 'Your wall frame shows ' + wallElsewhere(preview.wall) + ' for now, so it does not change.'
+              : 'Your wall frame uses the new list from its next refresh.',
+          ),
+        ]
+      : []),
     confirm,
     button('Cancel', () => location.reload()),
   );
@@ -804,16 +836,9 @@ export function savedToggle(context, bird) {
       saved = action === 'add';
       if (saved) plateReady = true;
       label();
-      const elsewhere = wallElsewhere(preview.wall);
-      status.textContent = elsewhere
-        ? name +
-          (saved ? ' is on' : ' is off') +
-          ' your frame list; your wall frame shows ' +
-          elsewhere +
-          ' for now.'
-        : saved
-          ? name + ' will show on your frame from the next refresh.'
-          : name + ' will leave your frame at the next refresh.';
+      const stays =
+        !saved && preview.wall === 'current' ? await stillShown(api, bird.taxon_id) : null;
+      status.textContent = toggleResult(name, saved, preview.wall, stays);
       if (offerUndo) {
         undo = button('Undo', () => change(saved ? 'remove' : 'add', false));
         status.after(undo);

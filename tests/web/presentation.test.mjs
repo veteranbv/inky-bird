@@ -276,3 +276,13 @@ test('a screen says until when it shows birds', async (t) => {
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^Shows birds until \d{1,2} [A-Z][a-z]{2} \d{4}$/);
 });
+
+test('a status sensor whose end date cannot be read shows no dangling until', async (t) => {
+  const { main } = await open(t, 'integrations', () => {
+    const value = state();
+    delete value.grants[1].expires_at;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => /until/.test(text || ''));
+  assert.deepEqual(lines.filter((text) => /until\s*$/.test(text)), []);
+});

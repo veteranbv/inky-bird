@@ -25,17 +25,17 @@ const shortStatus = {
 
 // What each request is called, and what happened once it was done.
 const outcomes = {
-  'saved-collection': ['Change to your frame', 'Your frame was changed. It updates at its next refresh.'],
+  'saved-collection': ['Change to your frame', 'On my frame was changed.'],
   refresh: ['Source check', 'Your sources were checked.'],
   retry: ['Trying plates again', 'These birds are back in the works.'],
-  'retry-now': ['Trying plates again', 'These birds will be tried next.'],
+  'retry-now': ['Trying plates again', 'These birds will be tried as soon as Inky can.'],
   'notification-test': ['Test notification', 'Inky tried each destination.'],
   'notification-retry': ['Sending again', 'Inky tried the undelivered messages again.'],
   'import-preview': ['History file check', 'The file was checked. Nothing has changed yet.'],
   'import-commit': ['History update', 'Your history was updated.'],
   'trip-preview': ['Trip check', 'The trip was checked. Nothing is saved yet.'],
   'trip-save': ['Saving a trip', 'The trip was saved.'],
-  'queue-plates': ['Asking for plates', 'The missing plates are in the works.'],
+  'queue-plates': ['Asking for plates', 'The missing plates were asked for.'],
   'approve-candidate': ['Keeping a new plate', 'The plate is in your journal.'],
   'reject-candidate': ['Sending a plate back', 'The plate was sent back.'],
   'community-preview': ['Community search', 'The search finished. Nothing is saved yet.'],

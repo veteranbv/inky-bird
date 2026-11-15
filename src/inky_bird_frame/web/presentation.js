@@ -360,7 +360,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   for (const grant of state.grants.filter((grant) => grant.kind === 'status'))
     status.append(
       el('h3', grant.name),
-      note(label(grant.view) + ' · until ' + when(grant.expires_at * 1000)),
+      note(label(grant.view) + (when(grant.expires_at * 1000) ? ' · until ' + when(grant.expires_at * 1000) : '')),
       revoke(
         status,
         grant.id,

@@ -41,6 +41,6 @@ export function requestState(request, work) {
   if (work.needs_attention?.includes(request.taxon_id))
     return 'Ready, but waiting for you to ask again. See why above.';
   if (work.waiting?.includes(request.taxon_id))
-    return 'Ready. It will be tried again after a short wait.';
+    return 'Ready. Inky is waiting a while before it tries again.';
   return 'Ready to be tried again';
 }

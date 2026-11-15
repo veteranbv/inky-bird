@@ -152,14 +152,15 @@ test('one bird is saved with one tap, an inline result and Undo', async (t) => {
   assert.equal(server.changes[0].taxon_id, 7);
   assert.equal(server.changes[0].confirm, true);
   assert.equal(server.changes[0].collection_revision, 'c'.repeat(64));
-  assert(texts(section).includes('Brown Creeper will show on your frame from the next refresh.'));
+  // Without the wall frame's view the result promises nothing about it.
+  assert(texts(section).includes('Added to On my frame.'));
   assert(findButton(section, 'Remove from my frame'));
   findButton(section, 'Undo').click();
   await settle(t);
   assert.equal(server.changes.length, 2);
   assert.equal(server.changes[1].action, 'remove');
   assert.notEqual(server.changes[1].key, server.changes[0].key);
-  assert(texts(section).includes('Brown Creeper will leave your frame at the next refresh.'));
+  assert(texts(section).includes('Removed from On my frame.'));
   assert(findButton(section, 'Add to my frame'));
   assert.equal(findButton(section, 'Undo'), null);
   assert.equal(texts(section).some((text) => /[0-9a-f]{32}/.test(text)), false);
@@ -249,7 +250,9 @@ for (const [failing, hint] of [
 
 test('changes to many birds keep their review step', async (t) => {
   const server = savedServer({ added_count: 3 });
-  const { context, main } = page(t, server.respond);
+  const { context, main } = page(t, (path, body) =>
+    path === '/v1/owner/presentation' ? { wall_view: 'current' } : server.respond(path, body),
+  );
   const section = collections.savedChange(
     context,
     'Add every bird with a plate',
@@ -260,7 +263,7 @@ test('changes to many birds keep their review step', async (t) => {
   await settle(t);
   assert.equal(server.changes.length, 0);
   assert(texts(section).includes('Adding 3 birds.'));
-  assert(texts(section).includes('Your frame changes from its next refresh.'));
+  assert(texts(section).includes('Your wall frame uses the new list from its next refresh.'));
 });
 
 test('an outcome shows plain words, never identifiers or hashes', async () => {
@@ -335,7 +338,7 @@ test('the outcome page says what happened to the frame, without raw keys', async
   await manage.renderOperation(context);
   const shown = texts(main);
   assert.equal(main.querySelector('h1').textContent, 'Change to your frame');
-  assert(shown.includes('Your frame was changed. It updates at its next refresh.'));
+  assert(shown.includes('On my frame was changed.'));
   assert(!shown.some((text) => /Operation|Owner operation|Finished/.test(text)));
   assert(shown.includes('1 bird added'));
   assert(!shown.some((text) => text.includes('succeeded') || text.includes('71bc32')));
@@ -662,7 +665,7 @@ test('a bird page with approved art removes it in one tap', async (t) => {
   findButton(section, 'Remove from my frame').click();
   await settle(t);
   assert.deepEqual([...members], []);
-  assert(texts(section).includes('This bird will leave your frame at the next refresh.'));
+  assert(texts(section).includes('Removed from On my frame.'));
   assert(findButton(section, 'Undo'));
 });
 
@@ -683,11 +686,10 @@ test('an interrupted change says to check On my frame before trying again', asyn
 // What the wall frame shows is its own choice: a change to On my frame reaches
 // it only while it shows On my frame.
 for (const [wall, added, removed] of [
-  ['current', 'Brown Creeper will show on your frame from the next refresh.', 'Brown Creeper will leave your frame at the next refresh.'],
   ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Brown Creeper will leave your frame at the next refresh.'],
-  ['favorites', 'Brown Creeper is on your frame list; your wall frame shows Favorites for now.', 'Brown Creeper is off your frame list; your wall frame shows Favorites for now.'],
-  ['all', 'Brown Creeper is on your frame list; your wall frame shows All plates for now.', 'Brown Creeper is off your frame list; your wall frame shows All plates for now.'],
-  ['a'.repeat(32), 'Brown Creeper is on your frame list; your wall frame shows another collection for now.', 'Brown Creeper is off your frame list; your wall frame shows another collection for now.'],
+  ['favorites', 'Added to On my frame. Your wall frame shows Favorites for now.', 'Removed from On my frame. Your wall frame shows Favorites for now.'],
+  ['all', 'Added to On my frame. Your wall frame shows All plates for now.', 'Removed from On my frame. Your wall frame shows All plates for now.'],
+  ['a'.repeat(32), 'Added to On my frame. Your wall frame shows another collection for now.', 'Removed from On my frame. Your wall frame shows another collection for now.'],
 ])
   test('adding and removing a bird while the wall frame shows ' + (wall.length === 32 ? 'a collection' : wall), async (t) => {
     const server = savedServer();
@@ -705,6 +707,38 @@ for (const [wall, added, removed] of [
     assert(texts(section).includes(removed), texts(section).join(' | '));
   });
 
+// The default wall view is the birds being noted plus On my frame, so a removed
+// bird leaves it only when the controller's list no longer holds it.
+for (const [label, journal, removed] of [
+  ['no longer listed', { active_taxon_ids: [8] }, 'Brown Creeper will leave your frame at the next refresh.'],
+  ['still being noted', { active_taxon_ids: [7, 8] }, 'Removed from On my frame. Brown Creeper stays on your wall frame while it is still being noted.'],
+  ['unreadable', null, 'Removed from On my frame.'],
+])
+  test('removing a bird from the default wall view when it is ' + label, async (t) => {
+    const server = savedServer();
+    const { context, main, requests } = page(t, (path, body) => {
+      if (path === '/v1/owner/presentation') return { wall_view: 'current' };
+      if (path === '/v1/owner/journal') {
+        if (!journal) throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+        return journal;
+      }
+      return server.respond(path, body);
+    });
+    context.byId.set(7, { taxon_id: 7, common_name: 'Brown Creeper' });
+    const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+    main.append(section);
+    findButton(section, 'Add to my frame').click();
+    await settle(t);
+    assert(texts(section).includes('Brown Creeper will show on your frame from the next refresh.'));
+    // Adding needs no second look: a bird on the list is on the default view.
+    assert.equal(requests.filter((request) => request.path === '/v1/owner/journal').length, 0);
+    findButton(section, 'Undo').click();
+    await settle(t);
+    const shown = texts(section);
+    assert(shown.includes(removed), shown.join(' | '));
+    assert(!shown.some((text) => text.includes('will leave') && removed !== text), shown.join(' | '));
+  });
+
 test('a review of many birds says whether the wall frame follows', async (t) => {
   const server = savedServer({ added_count: 3 });
   const { context, main } = page(t, (path, body) =>
@@ -715,7 +749,18 @@ test('a review of many birds says whether the wall frame follows', async (t) => 
   findButton(section, 'Add every bird with a plate').click();
   await settle(t);
   assert(texts(section).includes('Your wall frame shows Favorites for now, so it does not change.'));
-  assert(!texts(section).includes('Your frame changes from its next refresh.'));
+  assert(!texts(section).includes('Your wall frame uses the new list from its next refresh.'));
+});
+
+test('a review of many birds makes no promise about the wall frame when its view cannot be read', async (t) => {
+  const server = savedServer({ added_count: 3 });
+  const { context, main } = page(t, server.respond);
+  const section = collections.savedChange(context, 'Add every bird with a plate', 'import-approved');
+  main.append(section);
+  findButton(section, 'Add every bird with a plate').click();
+  await settle(t);
+  assert(findButton(section, 'Change my frame'));
+  assert(!texts(section).some((text) => /wall frame|next refresh/.test(text)), texts(section).join(' | '));
 });
 
 const candidatePage = await import(moduleURL(await inline("export * from '/app/candidate.js';")));

@@ -173,7 +173,7 @@ async function historyAndCollections(t) {
   await heading('Draw the missing plates?');
   assert(!fs.existsSync(path.join(fixture, 'var/controller/generation-queue.json')));
   await page.getByRole('button', { name: 'Ask for these plates', exact: true }).click();
-  await shown(page, 'The missing plates are in the works.');
+  await shown(page, 'The missing plates were asked for.');
   await heading('Asking for plates');
   // Every count the request returns stays on the outcome.
   await shown(page, '1 plate asked for');
