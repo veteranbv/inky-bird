@@ -64,7 +64,7 @@ async function flush() {
   for (let n = 0; n < 10; n++) await setImmediate();
 }
 
-async function open(t, routes, { source } = {}) {
+async function open(t, routes, { source, localPasswordAllowed = true } = {}) {
   const names = ['document', 'location'];
   const saved = Object.fromEntries(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const doc = fakeDocument();
@@ -118,7 +118,7 @@ async function open(t, routes, { source } = {}) {
       return structuredClone(answer);
     },
     showProblem: (error) => problems.push(error),
-    localPasswordAllowed: true,
+    localPasswordAllowed,
   };
   const helpers = {
     base(title, intro) {
@@ -292,6 +292,33 @@ test('a save that needs a recent sign-in asks for the password and saves the sam
   assert.deepEqual(saves[1].body, saves[0].body);
   assert.equal(saves[1].body.changes.discovery.ebird_api_key, 'replacement');
   assert.equal(password.value, '');
+});
+
+test('a confirmation with no way to confirm says so instead of only offering Cancel', async (t) => {
+  const { main } = await open(
+    t,
+    {
+      '/v1/owner/settings': (body) =>
+        body
+          ? Object.assign(new Error('Confirm your sign-in before saving keys or delivery addresses'), {
+              code: 'confirmation_required',
+            })
+          : settings(),
+    },
+    { source: 'ebird', localPasswordAllowed: false },
+  );
+  field(main, 'ebird_api_key').value = 'replacement';
+  submit(main);
+  findButton(main, 'Save settings').fire('click');
+  await flush();
+  const notice = walk(main).find((node) => node.classes.has('confirm-identity'));
+  assert.ok(notice);
+  assert.ok(
+    walk(notice).some(
+      (node) => node.textContent === 'Confirming a sign-in is not available right now. Try again later.',
+    ),
+  );
+  assert.ok(findButton(notice, 'Cancel confirmation'));
 });
 
 test('destination fields have visible labels and say when a secret is saved', async (t) => {

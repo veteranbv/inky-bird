@@ -525,6 +525,8 @@ function confirmIdentity(ui, place, retry) {
         'Sign-in returns to Account and access. Come back here and save again; unsaved entries will clear.',
       ),
     );
+  if (!ui.localPasswordAllowed && !ui.singleSignOnReady)
+    notice.append(el('p', 'Confirming a sign-in is not available right now. Try again later.'));
   notice.append(button('Cancel confirmation', () => notice.remove()));
   place.append(notice);
 }
