@@ -36,7 +36,7 @@ async function flush() {
   for (let n = 0; n < 30; n++) await setImmediate();
 }
 
-async function open(t, journal, { offline = false } = {}) {
+async function open(t, journal, { offline = false, accessState = access, signedOut = false } = {}) {
   const names = ['document', 'window', 'location', 'history', 'fetch', 'requestAnimationFrame'];
   const saved = Object.fromEntries(
     names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
@@ -70,8 +70,11 @@ async function open(t, journal, { offline = false } = {}) {
       return new Promise((_resolve, reject) =>
         options.signal.addEventListener('abort', () => reject(new DOMException('', 'AbortError'))),
       );
-    if (path === '/v1/access') return json(access);
-    if (path === '/v1/owner/session') return json({ csrf: 'token', single_sign_on: false });
+    if (path === '/v1/access') return json(accessState);
+    if (path === '/v1/owner/session')
+      return signedOut
+        ? json({ code: 'sign_in_required', message: 'Sign in.' }, 401)
+        : json({ csrf: 'token', single_sign_on: false });
     if (path === '/v1/owner/logout') return json({});
     if (path === '/v1/owner/broken') return json({ code: 'internal', message: 'Inky hit a problem.' }, 500);
     return json({ code: 'not_found', message: 'Not found' }, 404);
@@ -156,4 +159,32 @@ test('a refusal carries its HTTP status', async (t) => {
   const error = await pending;
   assert.equal(error.code, 'internal');
   assert.equal(error.status, 500);
+});
+
+// On a phone the account form must not sit below a wall of warning text: a
+// short note leads, the form follows, and the full facts stay one tap away.
+test('first setup over a home-network connection puts the form before the long warning', async (t) => {
+  const { main } = await open(t, async () => {}, {
+    signedOut: true,
+    accessState: { ...access, setup_required: true, registration_allowed: true, setup_code: { state: 'missing' } },
+  });
+  assert.equal(main.querySelector('h1').textContent, 'Make Inky yours');
+  const order = [];
+  (function walk(node) {
+    if (node.tagName === 'FORM') order.push('form');
+    else if (node.tagName === 'DETAILS' && node.children[0]?.textContent === 'About this home-network connection')
+      order.push('details');
+    else if (node.textContent === 'This connection is not encrypted. Use a unique password and keep Inky on your home network.')
+      order.push('note');
+    for (const child of node.children || []) walk(child);
+  })(main);
+  assert.deepEqual(order, ['note', 'form', 'details']);
+  const text = main.textContent;
+  // Every fact the long warning carried is still on the page.
+  for (const fact of [
+    'Do not expose Inky to the internet.',
+    'A different port does not keep sign-in cookies separate.',
+    'HTTPS encrypts that traffic.',
+  ])
+    assert(text.includes(fact), fact);
 });

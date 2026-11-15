@@ -56,6 +56,10 @@ async function ownerSetup(t) {
   for (const width of [320, 390]) {
     await page.setViewportSize({ width, height: 844 });
     await noSideways(page, 'Registration at ' + width + ' px');
+    // The account form leads; the longer connection facts follow it.
+    const form = await page.getByLabel('Username', { exact: true }).boundingBox();
+    const more = await page.getByText('About this home-network connection', { exact: true }).boundingBox();
+    assert(form && more && form.y < more.y, 'the account form comes before the connection details at ' + width + ' px');
   }
   fs.writeFileSync(fixture + '/sign-in-phone.png', await page.screenshot({ fullPage: true }), {
     mode: 0o600,
