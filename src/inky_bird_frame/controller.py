@@ -2784,6 +2784,13 @@ def generate_candidate(
                 ]
                 history.append(history_entry)
                 _write_attempt_history(logs, work, history)
+                # Ready before the profile refresh, so a failure there keeps this review.
+                correction_findings = _deduplicate_findings(
+                    review.correction_findings,
+                    (PROFILE_REFRESH_CORRECTION,) if review.profile_conflicts else (),
+                ) or (REVIEW_FAILURE_FALLBACK,)
+                correction_source = portrait_path
+                corrections_ready = True
                 if review.passed:
                     passed = True
                     shutil.copy2(profile_path, attempt_dir / "profile.json")
@@ -2879,12 +2886,6 @@ def generate_candidate(
                     history_entry["profile_refresh"] = "completed"
                     history_entry["profile_changed"] = before_refresh != profile
                     _write_attempt_history(logs, work, history)
-                correction_findings = _deduplicate_findings(
-                    review.correction_findings,
-                    (PROFILE_REFRESH_CORRECTION,) if review.profile_conflicts else (),
-                ) or (REVIEW_FAILURE_FALLBACK,)
-                correction_source = portrait_path
-                corrections_ready = True
         except BaseException:
             if corrections_ready and not passed and correction_source is not None:
                 _keep_interrupted_attempts(
@@ -2933,14 +2934,24 @@ def _keep_interrupted_attempts(
     Never raises: the failure that stopped generation is the one to report.
     """
     try:
+        attempt = source.relative_to(work).parts[0]
+        # Stage inside the run, which is removed if this is interrupted, so the
+        # archive only ever holds complete kept runs.
+        staged = work / "kept-run"
+        staged.mkdir()
+        for name in ("profile.json", "attempt-history.json"):
+            if (work / name).is_file():
+                shutil.copy2(work / name, staged / name)
+        (work / attempt).rename(staged / attempt)
+        fsync_tree(staged)
         destination = state_dir / "archive" / f"{species.taxon_id}-{_timestamp()}-interrupted"
         counter = 1
         while destination.exists():
             destination = destination.with_name(f"{destination.name}-{counter}")
             counter += 1
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(work, destination)
-        fsync_tree(destination)
+        staged.rename(destination)
+        fsync_directory(destination.parent)
         retry_store.set_quality_guidance(
             species.taxon_id,
             findings,
@@ -3314,6 +3325,7 @@ def _retry_or_stop(
     retry_at: datetime | None = None,
     message: str | None = None,
     counts_toward_limit: bool = True,
+    may_stop_for_owner: bool = True,
 ) -> dict[str, object]:
     """Schedule a bird's next try, or stop it for the owner after too many."""
     now = datetime.now(UTC)
@@ -3328,7 +3340,11 @@ def _retry_or_stop(
         message=message,
         counts_toward_limit=counts_toward_limit,
     )
-    if not counts_toward_limit or retry.counted_failures < MAX_AUTOMATIC_GENERATION_TRIES:
+    if (
+        not counts_toward_limit
+        or not may_stop_for_owner
+        or retry.counted_failures < MAX_AUTOMATIC_GENERATION_TRIES
+    ):
         return {
             "taxon_id": species.taxon_id,
             "common_name": species.common_name,
@@ -3372,6 +3388,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
     # Disabled mode must not approve, migrate, dequeue or start a model process.
     if not config.controller.generation_enabled:
         return {"generation_enabled": False, "generated": [], "published": []}
+    # The service timeout is this cycle's budget plus a margin, so every
+    # moment of the run counts, including waiting for the lock and preparation.
+    cycle_started = monotonic()
     with (
         exclusive_cycle_lock(config.controller.state_dir),
         activity_run(config.controller.state_dir, "generation"),
@@ -3460,8 +3479,6 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         stopped_for_time = False
         species_seconds = generation_species_seconds(config)
         cycle_seconds = species_seconds * config.controller.max_species_attempts_per_cycle
-        # Time before the first bird is covered by the service timeout's margin.
-        loop_started = monotonic()
         for species in eligible:
             if len(generated) >= config.controller.generations_per_cycle:
                 break
@@ -3471,7 +3488,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 continue
             # Start a later bird only when its longest possible run still fits,
             # so a service timeout sized from the same budget never cuts one off.
-            if attempted_count and monotonic() - loop_started + species_seconds > cycle_seconds:
+            if attempted_count and monotonic() - cycle_started + species_seconds > cycle_seconds:
                 stopped_for_time = True
                 break
             attempted_count += 1
@@ -3594,7 +3611,10 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                             retry_store,
                             species,
                             ResearchLimitError(
-                                f"{exc}; retry this bird to try again.", retry_at=exc.retry_at
+                                "This bird used its research limit of "
+                                f"{config.research.max_searches_per_species} searches; "
+                                "retry this bird to try again.",
+                                retry_at=exc.retry_at,
                             ),
                         )
                     )
@@ -3611,14 +3631,20 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         )
                     )
             except GenerationStopRequested:
-                failures.append(
-                    _retry_or_stop(
-                        config,
-                        retry_store,
-                        species,
-                        GenerationError(STOPPED_GENERATION_ERROR),
+                if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
+                    retry_store.clear(species.taxon_id)
+                    retry_store.clear_quality_guidance(species.taxon_id)
+                else:
+                    failures.append(
+                        _retry_or_stop(
+                            config,
+                            retry_store,
+                            species,
+                            GenerationError(STOPPED_GENERATION_ERROR),
+                            # A stop is not the bird's fault; a later real failure decides.
+                            may_stop_for_owner=False,
+                        )
                     )
-                )
                 raise
             except QualityReviewError as exc:
                 with catalog_state_lock(config.controller.state_dir):

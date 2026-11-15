@@ -18,6 +18,7 @@ from inky_bird_frame.birds import BirdSpecies, TaxonContext
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
     MAX_AUTOMATIC_GENERATION_TRIES,
+    PROFILE_REFRESH_CORRECTION,
     STOPPED_GENERATION_ERROR,
     DiscoveryResult,
     GenerationStopRequested,
@@ -37,8 +38,12 @@ from inky_bird_frame.errors import (
     ResearchLimitError,
     SpeciesStateError,
 )
+from inky_bird_frame.installation import (
+    GENERATION_UNIT_MARGIN_SECONDS,
+    generation_cycle_timeout_seconds,
+)
 from inky_bird_frame.journal import terminal_failure
-from inky_bird_frame.models import QualityReview, SpeciesProfileData
+from inky_bird_frame.models import ProfileConflict, QualityReview, SpeciesProfileData
 from inky_bird_frame.research import ResearchBudget
 from inky_bird_frame.retry import RetryStore
 
@@ -84,6 +89,16 @@ PROFILE = SpeciesProfileData(
         {"title": "Audubon", "url": "https://www.audubon.org/two"},
     ],
 )
+
+CONFLICT: ProfileConflict = {
+    "field": "habitat",
+    "profile_value": "Woodland edges",
+    "observed_value": "Desert",
+    "sources": [
+        {"title": "Cornell", "url": "https://www.allaboutbirds.org/x"},
+        {"title": "Audubon", "url": "https://www.audubon.org/y"},
+    ],
+}
 
 FAILED_REVIEW = QualityReview(
     False,
@@ -231,7 +246,7 @@ class GenerationBudgetTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertIs(result["stopped_for_time"], False)
 
-    def test_time_before_the_first_bird_does_not_use_a_later_slot(self) -> None:
+    def test_time_before_the_first_bird_counts_toward_the_cycle(self) -> None:
         clock = Clock()
         attempted: list[int] = []
         with TemporaryDirectory() as temporary:
@@ -259,14 +274,32 @@ class GenerationBudgetTests(unittest.TestCase):
             ):
                 result = run_generation_cycle(config)
 
-        self.assertEqual(attempted, [FIRST.taxon_id, SECOND.taxon_id])
-        self.assertIs(result["stopped_for_time"], False)
+        # The first bird always starts; a later one must fit what is left after preparation.
+        self.assertEqual(attempted, [FIRST.taxon_id])
+        self.assertIs(result["stopped_for_time"], True)
 
     def test_species_budget_counts_profile_refresh_and_two_calls_per_attempt(self) -> None:
         with TemporaryDirectory() as temporary:
             config = load(temporary)
         # Three attempts: profile, one refresh, and a generation plus review each.
         self.assertEqual(generation_species_seconds(config), 8 * 1200)
+
+    def test_service_timeout_is_the_cycle_budget_plus_its_margin(self) -> None:
+        for attempts, birds in ((1, 1), (3, 5), (4, 2)):
+            with self.subTest(attempts=attempts, birds=birds), TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(
+                    CONFIG.replace(
+                        "max_generation_attempts = 3",
+                        f"max_generation_attempts = {attempts}\n"
+                        f"max_species_attempts_per_cycle = {birds}",
+                    )
+                )
+                config = load_config(path)
+                self.assertEqual(
+                    generation_cycle_timeout_seconds(config),
+                    birds * generation_species_seconds(config) + GENERATION_UNIT_MARGIN_SECONDS,
+                )
 
 
 class GenerationStopTests(unittest.TestCase):
@@ -295,6 +328,56 @@ class GenerationStopTests(unittest.TestCase):
             self.assertEqual(record.attempts, 1)
             self.assertGreater(record.next_attempt_at, datetime.now(UTC))
         self.assertIsNone(second)
+
+    def test_stop_after_the_bird_was_approved_records_no_failure(self) -> None:
+        approved: set[int] = set()
+
+        def approve(_state: Path, _catalog: Path, taxon_id: int) -> object:
+            approved.add(taxon_id)
+            raise GenerationStopRequested(signal.SIGTERM)
+
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 1)
+            with (
+                generation([Path(temporary) / "candidate"]),
+                patch("inky_bird_frame.controller.approve_candidate", side_effect=approve),
+                patch(
+                    "inky_bird_frame.controller.approved_taxon_ids",
+                    side_effect=lambda _catalog: set(approved),
+                ),
+                self.assertRaises(GenerationStopRequested),
+            ):
+                run_generation_cycle(config)
+            record = retries(config).get(FIRST.taxon_id)
+
+        self.assertEqual(approved, {FIRST.taxon_id})
+        self.assertIsNone(record)
+
+    def test_a_stop_never_makes_the_try_that_stops_the_bird(self) -> None:
+        stop = GenerationStopRequested(signal.SIGTERM)
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+            with generation(stop), self.assertRaises(GenerationStopRequested):
+                run_generation_cycle(config)
+            stopped = retries(config).get(FIRST.taxon_id)
+            saved_after_stop = list((config.controller.state_dir / "failed").glob("1-*"))
+            path = retries(config).path
+            raw = json.loads(path.read_text())
+            raw["records"][0]["next_attempt_at"] = "2000-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(raw))
+            with generation(DataSourceError("source down")):
+                result = run_generation_cycle(config)
+
+        self.assertIsNotNone(stopped)
+        if stopped is not None:
+            self.assertEqual(stopped.error, STOPPED_GENERATION_ERROR)
+        self.assertEqual(saved_after_stop, [])
+        # The next real failure decides.
+        self.assertIs(first_failure(result)["terminal"], True)
 
 
 class RetryCeilingTests(unittest.TestCase):
@@ -452,6 +535,32 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIsNone(record)
         self.assertEqual(guidance["failure_kind"], "research_limit")
 
+    def test_a_bird_out_of_research_is_told_so_when_the_daily_limit_was_hit_too(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 1)
+            budget = ResearchBudget(
+                config.controller.state_dir / "research-budget.json",
+                daily_limit=config.research.max_searches_per_day,
+                species_limit=config.research.max_searches_per_species,
+            )
+            for _ in range(config.research.max_searches_per_species):
+                budget.consume(FIRST.taxon_id)
+            daily = ResearchLimitError(
+                "Daily research limit of 9 searches has been reached",
+                retry_at=datetime.now(UTC) + timedelta(hours=3),
+            )
+            with generation(daily):
+                result = run_generation_cycle(config)
+            failure = first_failure(result)
+
+        self.assertIs(failure["terminal"], True)
+        self.assertNotIn("Daily", str(failure["error"]))
+        self.assertIn(
+            f"research limit of {config.research.max_searches_per_species}", str(failure["error"])
+        )
+
     def test_ceiling_after_source_outages_keeps_the_source_guidance(self) -> None:
         config, result = self.cycle_with(
             DataSourceError("source down"), MAX_AUTOMATIC_GENERATION_TRIES - 1
@@ -579,6 +688,99 @@ class KeptAttemptTests(unittest.TestCase):
             call.call_args.kwargs["initial_correction_findings"], ("Crest is too short",)
         )
         self.assertEqual(call.call_args.kwargs["initial_correction_source"], source)
+
+    def conflict_review(self, finding: str) -> QualityReview:
+        return QualityReview(
+            False,
+            3,
+            4,
+            5,
+            5,
+            True,
+            (finding,),
+            correction_findings=(finding,),
+            profile_conflicts=(CONFLICT,),
+        )
+
+    def test_profile_refresh_outage_after_a_conflict_keeps_the_reviewed_attempt(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [CARDINAL])
+            with (
+                fake_codex([None], [self.conflict_review("Habitat is wrong")]),
+                patch(
+                    "inky_bird_frame.controller._refresh_profile_after_conflict",
+                    side_effect=DataSourceError("iNaturalist timed out"),
+                ),
+            ):
+                result = run_generation_cycle(config)
+            guidance = retries(config).quality_guidance(CARDINAL.taxon_id)
+
+        self.assertIs(first_failure(result)["terminal"], False)
+        self.assertIsNotNone(guidance)
+        if guidance is not None:
+            self.assertEqual(guidance.findings, ("Habitat is wrong", PROFILE_REFRESH_CORRECTION))
+            self.assertEqual(guidance.profile_conflicts, (CONFLICT,))
+            self.assertIsNotNone(guidance.source_plate)
+            self.assertTrue(str(guidance.source_plate).endswith("/attempt-01/portrait.png"))
+
+    def test_profile_refresh_outage_on_a_later_attempt_keeps_that_attempt(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                fake_codex([None, None], [FAILED_REVIEW, self.conflict_review("Bill is pale")]),
+                patch(
+                    "inky_bird_frame.controller._refresh_profile_after_conflict",
+                    side_effect=ResearchLimitError(
+                        "Daily research limit", retry_at=datetime.now(UTC)
+                    ),
+                ),
+                self.assertRaises(ResearchLimitError),
+            ):
+                generate_candidate(config, CARDINAL, config.controller.workspace_dir)
+            guidance = retries(config).quality_guidance(CARDINAL.taxon_id)
+
+        self.assertIsNotNone(guidance)
+        if guidance is not None:
+            self.assertEqual(guidance.findings, ("Bill is pale", PROFILE_REFRESH_CORRECTION))
+            self.assertEqual(guidance.profile_conflicts, (CONFLICT,))
+            self.assertTrue(str(guidance.source_plate).endswith("/attempt-02/portrait.png"))
+
+    def test_kept_run_holds_only_the_attempt_it_resumes_from(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                fake_codex(
+                    [None, None, GenerationError("image tool failed")],
+                    [FAILED_REVIEW, FAILED_REVIEW],
+                ),
+                self.assertRaises(GenerationError),
+            ):
+                generate_candidate(config, CARDINAL, config.controller.workspace_dir)
+            kept = sorted((config.controller.state_dir / "archive").glob("9083-*-interrupted"))
+            contents = sorted(path.name for path in kept[0].iterdir()) if kept else []
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(contents, ["attempt-02", "attempt-history.json", "profile.json"])
+
+    def test_a_stop_while_keeping_the_attempt_leaves_no_partial_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                fake_codex([None, GenerationError("image tool failed")], [FAILED_REVIEW]),
+                patch(
+                    "inky_bird_frame.controller.fsync_tree",
+                    side_effect=GenerationStopRequested(signal.SIGTERM),
+                ),
+                self.assertRaises(GenerationStopRequested),
+            ):
+                generate_candidate(config, CARDINAL, config.controller.workspace_dir)
+            archive = config.controller.state_dir / "archive"
+            kept = list(archive.glob("9083-*")) if archive.exists() else []
+            guidance = retries(config).quality_guidance(CARDINAL.taxon_id)
+
+        self.assertEqual(kept, [])
+        self.assertIsNone(guidance)
 
     def test_stop_during_a_later_attempt_keeps_the_reviewed_attempt(self) -> None:
         with TemporaryDirectory() as temporary:
