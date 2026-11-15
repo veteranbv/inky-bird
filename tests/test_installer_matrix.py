@@ -600,7 +600,8 @@ def check_install(
     if case.mode in ("fail", "expire", "kill") and outcome.returncode == 0:
         # The new version runs; only owner setup, or a leftover the output names, remains.
         tolerated = (case.tool == "inky-bird" and "owner setup is incomplete" in output) or (
-            case.tool == "rm" and "by hand: " in output
+            case.tool in ("rm", "ssh")
+            and ("by hand: " in output or "after reconnecting: " in output)
         )
         if case.mode == "kill" or not tolerated:
             report.append("I8: the run reported success although it was failed or stopped")
@@ -623,7 +624,7 @@ def check_install(
         return
     if claims_new(outcome):
         # A late step failed after the new version was installed and started.
-        check_final_units(machine, scenario, after, report)
+        check_final_units(machine, scenario, after, report, output)
     # I4: every unit is back as it was, or named.
     for unit, state in before.role.units.items() if not claims_new(outcome) else ():
         now = after.units[unit]
@@ -709,9 +710,18 @@ def check_success(
 
 
 def check_final_units(
+    machine: Machine, scenario: Scenario, after: RoleView, report: list[str], named: str = ""
+) -> None:
+    """I4 once the new version is installed: every unit as the new version wants it,
+    except a unit a failed run names as not set up."""
+    found: list[str] = []
+    check_intended_units(machine, scenario, after, found)
+    report.extend(item for item in found if not named or item.split()[3] not in named)
+
+
+def check_intended_units(
     machine: Machine, scenario: Scenario, after: RoleView, report: list[str]
 ) -> None:
-    """I4 once the new version is installed: every unit as the new version wants it."""
     if machine.system == "Darwin":
         wanted = {f"com.{machine.family}.{label}" for label in AGENTS.split()}
         for unit, (loaded, _) in after.units.items():

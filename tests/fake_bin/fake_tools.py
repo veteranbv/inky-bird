@@ -141,16 +141,21 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
     helper = subprocess.Popen(command, env=environment)
 
     def finish(signum: int, frame: object) -> None:
-        helper.terminate()
-        helper.wait()
+        # Only unwind here; waiting inside a handler can deadlock on Popen's lock.
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, finish)
-    deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
-    while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.01)
-    kill_installer()
-    return helper.wait()
+    try:
+        deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
+        while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        kill_installer()
+        return helper.wait()
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if helper.poll() is None:
+            helper.terminate()
+        helper.wait()
 
 
 def _cycle_lock_held() -> bool:
