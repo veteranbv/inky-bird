@@ -79,6 +79,44 @@ const captionClearSmall = async (target) => {
   }
   await target.setViewportSize({ width: 390, height: 844 });
 };
+// On a short landscape screen the plate fills the left column at full
+// height, beside the name, notes, notice and controls, and nothing overlaps.
+const landscapeShort = (width, height) => width > height && height <= 640;
+const plateBeside = async (target, where) => {
+  const size = await target.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  const found = await boxes({
+    plate: target.locator('.frame-viewport'),
+    name: target.locator('.frame-caption'),
+    bar: target.locator('.frame-controls'),
+  });
+  await layout(
+    target,
+    found.plate && found.plate.height >= 0.7 * size.height && found.plate.y >= 0 &&
+      found.plate.y + found.plate.height <= size.height + 0.5,
+    where + ': the plate is under 70% of the window height',
+    found,
+  );
+  for (const key of ['name', 'bar'])
+    await layout(
+      target,
+      found[key] && found[key].x >= found.plate.x + found.plate.width - 0.5,
+      where + ': the ' + key + ' is not beside the plate',
+      found,
+    );
+  await noSideways(target, where);
+};
+const screenSizes = async (target) => {
+  for (const [width, height] of [
+    [844, 390],
+    [1024, 600],
+    [1280, 800],
+  ]) {
+    await target.setViewportSize({ width, height });
+    await captionClear(target);
+    if (landscapeShort(width, height)) await plateBeside(target, 'Screen at ' + width + 'x' + height);
+    else await noSideways(target, 'Screen at ' + width + 'x' + height);
+  }
+};
 // Another system's fonts: a wider fallback face and taller lines. No Frame
 // layout may depend on how tall its text is.
 const STRESSED_TEXT =
@@ -134,6 +172,7 @@ async function noticeClear(t, stressed) {
     [375, 667],
     [375, 812],
     [844, 390],
+    [1024, 600],
     [1280, 800],
   ]) {
     const size = width + 'x' + height;
@@ -186,6 +225,24 @@ async function noticeClear(t, stressed) {
           where + 'the bar covers the ' + (key === 'name' ? 'bird name' : 'note'),
           found,
         );
+      if (landscapeShort(width, height)) await plateBeside(page, where.slice(0, -2));
+      // A notice shows two lines; the rest is one tap away and always in the
+      // status text for assistive technology.
+      const more = page.locator('.notice-more');
+      await layout(page, (await more.isVisible()) === lines > 2, where + 'More is wrong for this notice', found);
+      if (lines > 2) {
+        const full = await notice.textContent();
+        await page.getByRole('button', { name: 'More of this notice', exact: true }).click();
+        await layout(
+          page,
+          (await notice.evaluate((node) => node.scrollHeight <= node.clientHeight + 1)) &&
+            (await notice.textContent()) === full &&
+            (await more.getAttribute('aria-expanded')) === 'true',
+          where + 'More does not show the whole notice',
+          found,
+        );
+        await page.getByRole('button', { name: 'Less of this notice', exact: true }).click();
+      }
     }
     await page.unroute(plateRoute);
   }
@@ -232,7 +289,7 @@ async function pairedScreen(t) {
   await page.reload();
   await page.getByRole('heading', { name: 'Screen waiting to pair · ' + pairCode, exact: true }).waitFor();
   await page.getByLabel('Screen name', { exact: true }).fill('Synthetic tablet');
-  await page.getByLabel('Permitted view', { exact: true }).first().selectOption(trip.collection_id);
+  await page.getByLabel('Birds to show', { exact: true }).first().selectOption(trip.collection_id);
   await page
     .getByLabel('I matched this code on the screen I want to pair', { exact: true })
     .check();
@@ -247,8 +304,7 @@ async function pairedScreen(t) {
   await captionClearSmall(screen);
   await zoomEnlarges(screen);
   await screen.keyboard.press('Escape');
-  await screen.setViewportSize({ width: 844, height: 390 });
-  await captionClear(screen);
+  await screenSizes(screen);
   await screen.setViewportSize({ width: 390, height: 844 });
   assert.equal((await screenContext.request.get(origin + '/v1/owner/journal')).status(), 401);
   const screenView = (await (await screenContext.request.get(origin + '/v1/screen/view')).json())

@@ -61,7 +61,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     return input;
   }
   function choice(section, selected = 'current') {
-    const name = el('label', 'Permitted view'),
+    const name = el('label', 'Birds to show'),
       input = el('select');
     input.id = 'view-' + ++serial;
     name.htmlFor = input.id;

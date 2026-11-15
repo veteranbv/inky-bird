@@ -154,7 +154,7 @@ async function integrations(t) {
   await page.goto(origin + '/app?page=integrations');
   await heading('Integrations');
   await page
-    .getByLabel('Permitted view', { exact: true })
+    .getByLabel('Birds to show', { exact: true })
     .first()
     .selectOption(imported.collection_id);
   await page
