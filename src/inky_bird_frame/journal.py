@@ -497,14 +497,25 @@ def save_collection(
     taxon_ids: object,
     collection_id: object = None,
     member_names: Mapping[int, tuple[str, str]] | None = None,
+    unresolved: object = None,
 ) -> JournalState:
+    """Save a named selection.
+
+    ``unresolved`` lists the collection's unresolved members to keep, in the
+    owner projection's shape; ``None`` keeps them all. A dropped member whose
+    scientific name matches a newly chosen bird resolves to it and keeps its
+    origin and checklist links.
+    """
     expected = _revision(revision)
     name = _label(label)
     taxa = _taxa(taxon_ids)
+    keep = _unresolved_choice(unresolved)
     if collection_id is not None and (
         not isinstance(collection_id, str) or not COLLECTION_ID.fullmatch(collection_id)
     ):
         raise JournalError("Choose an existing collection")
+    if collection_id is None and keep:
+        raise JournalError("A new collection has no unresolved species to keep")
     with catalog_state_lock(state_dir):
         state = read_journal(state_dir)
         if state.revision != expected:
@@ -540,6 +551,30 @@ def save_collection(
             retained = {
                 member.taxon_id: member for member in current.members if member.taxon_id is not None
             }
+            pending = [member for member in current.members if member.taxon_id is None]
+            if keep is not None:
+                names = {(member.common_name, member.scientific_name) for member in pending}
+                if not keep <= names:
+                    raise JournalError("Choose unresolved species from this collection")
+                dropped = {
+                    member.scientific_name.casefold(): member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) not in keep
+                    and member.scientific_name
+                }
+                pending = [
+                    member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) in keep
+                ]
+                for taxon_id, member in zip(taxa, members, strict=True):
+                    if taxon_id in retained:
+                        continue
+                    match = dropped.pop(member.scientific_name.casefold(), None)
+                    if match is not None:
+                        retained[taxon_id] = replace(
+                            member, origin=match.origin, evidence=match.evidence
+                        )
             groups[found] = replace(
                 current,
                 label=name,
@@ -547,11 +582,27 @@ def save_collection(
                 members=tuple(
                     retained.get(cast(int, member.taxon_id), member) for member in members
                 )
-                + tuple(member for member in current.members if member.taxon_id is None),
+                + tuple(pending),
             )
         result = JournalState(state.revision + 1, tuple(groups))
         _write_journal(state_dir, result)
         return result
+
+
+def _unresolved_choice(value: object) -> set[tuple[str, str]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise JournalError("Choose which unresolved species to keep")
+    chosen: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"common_name", "scientific_name"}:
+            raise JournalError("Choose which unresolved species to keep")
+        pair = (_visible_text(item["common_name"]), _visible_text(item["scientific_name"]))
+        if pair in chosen:
+            raise JournalError("A collection cannot contain a species twice")
+        chosen.add(pair)
+    return chosen
 
 
 def remove_collection(state_dir: Path, *, revision: object, collection_id: object) -> JournalState:
@@ -860,6 +911,7 @@ class JournalService:
         label: object,
         taxon_ids: object,
         collection_id: object = None,
+        unresolved: object = None,
     ) -> JournalState:
         taxa = _taxa(taxon_ids)
         identities = {
@@ -878,6 +930,7 @@ class JournalService:
             taxon_ids=list(taxa),
             collection_id=collection_id,
             member_names=identities,
+            unresolved=unresolved,
         )
 
     def _listed_birds(self, taxa: list[int]) -> dict[int, dict[str, object]]:
