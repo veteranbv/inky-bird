@@ -242,6 +242,7 @@ function run(body) {
             engine,
             phase: t.phase,
             type: error.name,
+            message: String(error.message).slice(0, 4000),
             actual: Array.isArray(error.actual) ? error.actual : undefined,
           },
           null,
@@ -250,6 +251,8 @@ function run(body) {
         { mode: 0o600 },
       );
       console.error('History browser failed at ' + t.phase + ': ' + error.name);
+      // Journey messages are synthetic; layout failures carry their measured boxes.
+      console.error('  ' + String(error.message).slice(0, 4000));
       // Recorded problems are synthetic and often happened in an earlier phase.
       for (const entry of Array.isArray(error.actual) ? error.actual : [])
         if (entry && typeof entry === 'object' && 'phase' in entry)

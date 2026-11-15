@@ -279,39 +279,25 @@ export function renderFrame(context) {
       }
     }
   }, 60000);
-  let noticeRoom = null;
   setStopScreen(() => {
     clearInterval(timer);
     clearInterval(check);
     loading?.abort();
     if (objectURL) URL.revokeObjectURL(objectURL);
     stopTools();
-    if (noticeRoom) {
-      noticeRoom.disconnect();
-      main.style.removeProperty('--frame-notice-room');
-    }
   });
   setFrameSignOut(signedOut);
   const dock = el('div', '', 'frame-dock');
   dock.append(status, controls);
-  // A notice can take several lines above the bar; keep the bird name and
-  // note clear of it. The More menu still opens over the page.
-  if (typeof ResizeObserver === 'function') {
-    noticeRoom = new ResizeObserver(() =>
-      main.style.setProperty(
-        '--frame-notice-room',
-        (status.offsetHeight ? status.offsetHeight + 8 : 0) + 'px',
-      ),
-    );
-    noticeRoom.observe(status);
-  }
   main.append(
     viewport,
     caption,
-    dock,
     note('Plates change once a minute while playing. This does not refresh the wall panel.'),
   );
   if (!window.isSecureContext)
     main.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
+  // Last in the column, so a notice of any length takes its own room above
+  // the bar instead of covering the bird name or the notes.
+  main.append(dock);
   show();
 }
