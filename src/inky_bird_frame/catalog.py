@@ -6,18 +6,22 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from time import monotonic, sleep, time_ns
+from typing import BinaryIO, cast
 
 from .birds import BirdSpecies
-from .errors import CatalogError, MissingDependencyError
-from .http import write_json_atomic
+from .errors import BusyError, CatalogError, MissingDependencyError
+from .http import write_bytes_atomic, write_json_atomic
 from .images import slugify
 from .models import QualityReview, ReferencePhoto, SpeciesProfileData
 from .timeutil import parse_utc_timestamp
@@ -34,6 +38,8 @@ SPECIES_FILENAMES = frozenset(
         "quality-review.json",
     }
 )
+# Finder writes this when the owner browses a folder; it is never copied into the catalog.
+FINDER_METADATA = ".DS_Store"
 
 
 class CandidateApprovalError(CatalogError):
@@ -66,11 +72,37 @@ class CollectionState:
     legacy_seed_queue_migrated_at: str | None
 
 
+class CatalogBusyError(CatalogError, BusyError):
+    """Raised when the catalog state lock stays held past a caller's time limit."""
+
+
+def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
+    deadline = monotonic() + timeout
+    delay = 0.01
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CatalogBusyError("The catalog is busy; try again in a moment") from exc
+            sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.25)
+
+
 @contextmanager
-def catalog_state_lock(state_dir: Path) -> Iterator[None]:
+def catalog_state_lock(
+    state_dir: Path, *, shared: bool = False, timeout: float | None = None
+) -> Iterator[None]:
+    """Hold the catalog state lock; ``shared`` is for pure reads, ``timeout`` bounds the wait."""
     state_dir.mkdir(parents=True, exist_ok=True)
+    operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     with (state_dir / "catalog-state.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(handle.fileno(), operation)
+        else:
+            _flock_within(handle.fileno(), operation, timeout)
         try:
             yield
         finally:
@@ -231,12 +263,48 @@ def remove_collection_taxa(
     return remaining, removed
 
 
-def sha256_file(path: Path) -> str:
+def _sha256_handle(handle: BinaryIO) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return _sha256_handle(handle)
+
+
+# Readers validate every plate on each call; remember a plate's checksum while its file
+# is unchanged. Files changed within the window are hashed again, because coarse
+# filesystem timestamps cannot tell two writes in the same tick apart.
+_CHECKSUM_CACHE_LIMIT = 4096
+_CHECKSUM_SETTLED_NS = 2_000_000_000
+_checksum_cache: dict[tuple[int, int, int, int, int], str] = {}
+_checksum_cache_lock = threading.Lock()
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _asset_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        identity = _file_identity(before)
+        with _checksum_cache_lock:
+            cached = _checksum_cache.get(identity)
+        if cached is not None:
+            return cached
+        checksum = _sha256_handle(handle)
+        unchanged = _file_identity(os.fstat(handle.fileno())) == identity
+    settled = time_ns() - max(before.st_mtime_ns, before.st_ctime_ns) > _CHECKSUM_SETTLED_NS
+    if unchanged and settled:
+        with _checksum_cache_lock:
+            if len(_checksum_cache) >= _CHECKSUM_CACHE_LIMIT:
+                _checksum_cache.clear()
+            _checksum_cache[identity] = checksum
+    return checksum
 
 
 def read_json(path: Path) -> object:
@@ -383,7 +451,7 @@ def _verify_asset_checksums(
 ) -> None:
     for filename, checksum in checksums.items():
         try:
-            matches = sha256_file(directory / filename) == checksum
+            matches = _asset_sha256(directory / filename) == checksum
         except OSError as exc:
             raise CatalogError(f"Catalog asset is missing or unreadable: {manifest_path}") from exc
         if not matches:
@@ -428,9 +496,18 @@ def _manifest_entry(manifest_path: Path, catalog_dir: Path) -> CatalogEntry:
 
 def read_catalog_entries(catalog_dir: Path) -> list[CatalogEntry]:
     species_dir = catalog_dir / "species"
-    entries = [
-        _manifest_entry(path, catalog_dir) for path in sorted(species_dir.glob("*/manifest.json"))
-    ]
+    entries: list[CatalogEntry] = []
+    directories: dict[int, str] = {}
+    for path in sorted(species_dir.glob("*/manifest.json")):
+        entry = _manifest_entry(path, catalog_dir)
+        # Displays refuse an index that lists one bird twice.
+        if entry.taxon_id in directories:
+            raise CatalogError(
+                f"Catalog has more than one entry for taxon {entry.taxon_id}: "
+                f"{directories[entry.taxon_id]} and {path.parent.name}"
+            )
+        directories[entry.taxon_id] = path.parent.name
+        entries.append(entry)
     entries.sort(key=lambda item: (item.common_name.casefold(), item.taxon_id))
     return entries
 
@@ -443,12 +520,25 @@ def catalog_index_data(entries: list[CatalogEntry]) -> dict[str, object]:
     }
 
 
+def _holds_bytes(path: Path, content: bytes) -> bool:
+    try:
+        # Non-blocking, so a FIFO planted in its place cannot stall the rebuild.
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            return handle.read(len(content) + 1) == content
+    except OSError:
+        return False
+
+
 def rebuild_catalog_index(catalog_dir: Path) -> list[CatalogEntry]:
     entries = read_catalog_entries(catalog_dir)
-    write_json_atomic(
-        catalog_dir / "index.json",
-        catalog_index_data(entries),
-    )
+    path = catalog_dir / "index.json"
+    content = (json.dumps(catalog_index_data(entries), indent=2, sort_keys=True) + "\n").encode()
+    # Refreshes rebuild the index constantly; an identical file is kept, so its metadata
+    # still identifies an unchanged catalog and the storage is not rewritten.
+    if not _holds_bytes(path, content):
+        write_bytes_atomic(path, content)
     return entries
 
 
@@ -599,7 +689,7 @@ def _refresh_index_after_removal(catalog_dir: Path, taxon_id: int) -> None:
 def _copy_tree_durably(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copytree(source, destination)
+        shutil.copytree(source, destination, ignore=shutil.ignore_patterns(FINDER_METADATA))
         fsync_tree(destination)
     except Exception:
         if destination.exists():
@@ -688,6 +778,8 @@ def _validate_pending_candidate_files(
     # Publication accepts only these regular files, and copying follows
     # symlinks, so anything else would leak into or block the catalog.
     for path in source.iterdir():
+        if path.name == FINDER_METADATA:
+            continue
         if path.name not in SPECIES_FILENAMES or path.is_symlink() or not path.is_file():
             raise CandidateApprovalError(f"Candidate {source.name} has an unexpected file")
     if (
@@ -710,6 +802,35 @@ def _validate_pending_candidate_files(
     _verify_candidate_images(source)
 
 
+def mentions_private_text(value: object, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    """Whether any string inside a JSON value matches a casefolded privacy pattern."""
+    if isinstance(value, dict):
+        return any(mentions_private_text(child, patterns) for child in value.values())
+    if isinstance(value, list):
+        return any(mentions_private_text(child, patterns) for child in value)
+    if isinstance(value, str):
+        folded = value.casefold()
+        return any(pattern.search(folded) is not None for pattern in patterns)
+    return False
+
+
+def _refuse_private_text(source: Path, patterns: tuple[re.Pattern[str], ...]) -> None:
+    if not patterns:
+        return
+    for filename in sorted(SPECIES_FILENAMES - set(ASSET_FILENAMES.values())):
+        path = source / filename
+        if not path.is_file():
+            continue
+        try:
+            payload = read_json(path)
+        except CatalogError as exc:
+            raise CandidateApprovalError(f"Candidate {source.name} has unreadable JSON") from exc
+        if mentions_private_text(payload, patterns):
+            raise CandidateApprovalError(
+                f"Candidate {source.name} mentions this controller's location or a local path"
+            )
+
+
 def _discard_pending(source: Path) -> None:
     # Drop the manifest first: an interrupted removal then leaves an incomplete
     # directory that no reader treats as a candidate to approve.
@@ -718,7 +839,28 @@ def _discard_pending(source: Path) -> None:
     fsync_directory(source.parent)
 
 
-def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> CatalogEntry:
+def _directory_claiming_taxon(species_root: Path, taxon_id: int, other_than: Path) -> Path | None:
+    for manifest_path in sorted(species_root.glob("*/manifest.json")):
+        if manifest_path.parent == other_than:
+            continue
+        try:
+            manifest = read_json(manifest_path)
+        except CatalogError:
+            continue
+        claimed = manifest.get("taxon_id") if isinstance(manifest, dict) else None
+        if type(claimed) is int and claimed == taxon_id:
+            return manifest_path.parent
+    return None
+
+
+def approve_candidate(
+    state_dir: Path,
+    catalog_dir: Path,
+    taxon_id: int,
+    *,
+    private_patterns: tuple[re.Pattern[str], ...] = (),
+) -> CatalogEntry:
+    """Approve one pending plate; ``private_patterns`` are publication's privacy terms."""
     source = find_taxon_directory(state_dir / "pending", taxon_id)
     if source is None:
         raise CatalogError(f"No pending candidate exists for taxon {taxon_id}")
@@ -738,6 +880,12 @@ def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> Cata
         raise CandidateApprovalError("Candidate manifest has no slug")
     destination = catalog_dir / "species" / f"{taxon_id}-{slug}"
     existing_approval = find_taxon_directory(catalog_dir / "species", taxon_id)
+    if existing_approval is None or existing_approval == destination:
+        # A directory named for another bird can still hold this one's manifest; a second
+        # entry would make every catalog reader refuse the catalog.
+        existing_approval = _directory_claiming_taxon(
+            catalog_dir / "species", taxon_id, destination
+        )
     if existing_approval is not None and existing_approval != destination:
         raise CandidateApprovalError(
             f"Taxon {taxon_id} already has a catalog entry; run retry for this bird first"
@@ -761,6 +909,7 @@ def approve_candidate(state_dir: Path, catalog_dir: Path, taxon_id: int) -> Cata
     # Verify the candidate before anything is staged: an unverified copy would
     # replace the only retained plate with an entry that blocks every reader.
     _validate_pending_candidate_files(source, manifest, taxon_id)
+    _refuse_private_text(source, private_patterns)
     if destination.exists():
         # Debris from an interrupted legacy copy, or the same candidate copied
         # incompletely: never a valid approval, so approve again.

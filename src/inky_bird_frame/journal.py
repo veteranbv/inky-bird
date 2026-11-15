@@ -21,7 +21,7 @@ from typing import cast
 from uuid import uuid4
 
 from .activity import read_activity
-from .birds import BirdSpecies, ObservationWindow, cached_species_identities
+from .birds import BirdSpecies, cached_species_identities
 from .catalog import catalog_state_lock, read_collection, read_json
 from .codex_runner import parse_species_profile
 from .config import AppConfig, ControllerConfig, DiscoveryProvider
@@ -47,50 +47,66 @@ MAX_LABEL_CHARACTERS = 128
 COLLECTION_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
-def failure_guidance(error_type: object) -> dict[str, str]:
+# Why automatic work stopped for the owner, as saved in failure.json; the
+# error type alone describes a failure that would still be retried.
+STOPPED_GUIDANCE = {
+    "retry_limit": (
+        "retry_limit",
+        "Automatic retries have stopped after repeated failed tries.",
+    ),
+    "research_limit": (
+        "research_limit",
+        "This bird used its research allowance. Automatic retries have stopped.",
+    ),
+}
+
+
+def failure_guidance(error_type: object, stop_reason: object = None) -> dict[str, str]:
     """Stable, useful categories; never echo an upstream exception or type name."""
+    if isinstance(stop_reason, str) and stop_reason in STOPPED_GUIDANCE:
+        code, message = STOPPED_GUIDANCE[stop_reason]
+        return {"failure_kind": code, "failure_message": message}
     messages = {
         "QualityReviewError": (
             "quality_review",
-            "The plate exhausted its review rounds without passing. Retry preserves "
-            "correction guidance; inspect a pending candidate before approving.",
+            "The plate did not pass its checks after every try. Trying again keeps "
+            "the notes from the earlier tries.",
         ),
         "InsufficientReferencesError": (
             "references",
-            "Not enough usable reference photos. Wait for source coverage to improve, "
-            "or review the source before retrying.",
+            "Inky could not find enough good reference photos. Try again once "
+            "your sources have more of this bird.",
         ),
         "ResearchLimitError": (
             "research_limit",
-            "Research allowance is temporarily unavailable. Automatic work waits until "
-            "its next eligibility time.",
+            "Inky has used its research allowance for now. It tries again on its own later.",
         ),
         "DataSourceError": (
             "source",
-            "A source or research request could not complete. Check Sources; "
-            "automatic retry uses backoff.",
+            "A source or a research lookup did not answer. Inky tries again on its "
+            "own, waiting longer each time; Sources shows which one.",
         ),
         "GenerationError": (
             "generation",
-            "The model or generated artifact could not complete validation. Retry is "
-            "serialized behind active work; inspect private operator evidence if it repeats.",
+            "The drawing could not be finished. Inky tries again after other plates; "
+            "if this keeps happening, the controller log has the details.",
         ),
         "SpeciesStateError": (
             "retained_state",
-            "Retained identity or correction evidence needs inspection. Retrying cannot "
-            "bypass provenance or review checks.",
+            "This bird's saved work needs a look from whoever runs Inky before it "
+            "can be tried again. Its checks still apply.",
         ),
         "MissingDependencyError": (
             "dependency",
-            "A controller dependency is unavailable. An operator must repair it before retrying.",
+            "Part of Inky's setup is missing. Whoever runs Inky needs to repair it "
+            "before this can be tried again.",
         ),
     }
     code, message = messages.get(
         str(error_type),
         (
             "unknown",
-            "Details are unavailable in this saved record. Inspect retained operator "
-            "evidence before repeating the attempt.",
+            "Inky has no details for this. Check the controller log before trying again.",
         ),
     )
     return {"failure_kind": code, "failure_message": message}
@@ -107,7 +123,9 @@ def terminal_failure(paths: tuple[Path, ...], taxon_id: int) -> dict[str, object
         rounds = attempts if isinstance(attempts, list) and len(attempts) <= 100 else []
         last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
         outcome = last.get("outcome")
-        error_type = failure.get("error_type") if failure.get("taxon_id") == taxon_id else None
+        own = failure.get("taxon_id") == taxon_id
+        error_type = failure.get("error_type") if own else None
+        stop_reason = failure.get("stop_reason") if own else None
         if error_type is None and outcome in {"correction_required", "profile_conflict"}:
             error_type = "QualityReviewError"
         if error_type is None and outcome in {"generation_error", "review_error"}:
@@ -116,7 +134,7 @@ def terminal_failure(paths: tuple[Path, ...], taxon_id: int) -> dict[str, object
             review = last.get("quality_review")
             axes = {"species_accuracy", "anatomy_accuracy", "text_accuracy", "composition_quality"}
             return {
-                **failure_guidance(error_type),
+                **failure_guidance(error_type, stop_reason),
                 "recorded_attempts": len(rounds),
                 "last_attempt_at": last.get("started_at")
                 if parse_utc_timestamp(last.get("started_at"))
@@ -145,6 +163,10 @@ class JournalConflictError(JournalError):
 
 class JournalViewRemovedError(JournalError):
     """A selected view was authoritatively removed, not temporarily unavailable."""
+
+
+class JournalUnavailableError(JournalError):
+    """The saved journal is damaged, unreadable or too new; not a request mistake."""
 
 
 @dataclass(frozen=True)
@@ -224,7 +246,7 @@ class JournalState:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": JOURNAL_SCHEMA,
             "revision": self.revision,
             "collections": [asdict(group) for group in self.collections],
         }
@@ -369,7 +391,25 @@ def _revision(value: object) -> int:
     return value
 
 
+JOURNAL_SCHEMA = 2
+PORTABLE_SCHEMA = 1
+
+
+def _newer_schema(value: object, supported: int) -> bool:
+    return type(value) is int and value > supported
+
+
 def read_journal(state_dir: Path) -> JournalState:
+    try:
+        return _read_journal(state_dir)
+    except JournalUnavailableError:
+        raise
+    except JournalError as exc:
+        # Every refusal here is about the saved file, whatever helper raised it.
+        raise JournalUnavailableError(str(exc)) from exc
+
+
+def _read_journal(state_dir: Path) -> JournalState:
     path = state_dir / "journal.json"
     try:
         info = path.lstat()
@@ -383,6 +423,9 @@ def read_journal(state_dir: Path) -> JournalState:
         if len(encoded) > MAX_JOURNAL_BYTES:
             raise JournalError("Journal state exceeds the supported size")
         raw = json.loads(encoded)
+        # A newer release may add fields; never call its valid file damaged.
+        if isinstance(raw, dict) and _newer_schema(raw.get("schema_version"), JOURNAL_SCHEMA):
+            raise JournalError("This journal needs a newer Inky version")
         if not isinstance(raw, dict) or set(raw) != {"schema_version", "revision", "collections"}:
             raise JournalError("Journal state is invalid; restore its matching backup")
         if type(raw["schema_version"]) is not int or raw["schema_version"] not in {1, 2}:
@@ -465,14 +508,24 @@ def save_collection(
     taxon_ids: object,
     collection_id: object = None,
     member_names: Mapping[int, tuple[str, str]] | None = None,
+    remove_unresolved: object = None,
 ) -> JournalState:
+    """Save a named selection.
+
+    ``remove_unresolved`` names unresolved members to take out, in the owner
+    projection's shape. A removed member whose scientific name matches a newly
+    chosen bird resolves to it and keeps its origin and checklist links.
+    """
     expected = _revision(revision)
     name = _label(label)
     taxa = _taxa(taxon_ids)
+    drop = _unresolved_choice(remove_unresolved)
     if collection_id is not None and (
         not isinstance(collection_id, str) or not COLLECTION_ID.fullmatch(collection_id)
     ):
         raise JournalError("Choose an existing collection")
+    if collection_id is None and drop:
+        raise JournalError("A new collection has no unresolved species to remove")
     with catalog_state_lock(state_dir):
         state = read_journal(state_dir)
         if state.revision != expected:
@@ -508,6 +561,30 @@ def save_collection(
             retained = {
                 member.taxon_id: member for member in current.members if member.taxon_id is not None
             }
+            pending = [member for member in current.members if member.taxon_id is None]
+            if drop:
+                names = {(member.common_name, member.scientific_name) for member in pending}
+                if not drop <= names:
+                    raise JournalError("Choose unresolved species from this collection")
+                dropped = {
+                    member.scientific_name.casefold(): member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) in drop
+                    and member.scientific_name
+                }
+                pending = [
+                    member
+                    for member in pending
+                    if (member.common_name, member.scientific_name) not in drop
+                ]
+                for taxon_id, member in zip(taxa, members, strict=True):
+                    if taxon_id in retained:
+                        continue
+                    match = dropped.pop(member.scientific_name.casefold(), None)
+                    if match is not None:
+                        retained[taxon_id] = replace(
+                            member, origin=match.origin, evidence=match.evidence
+                        )
             groups[found] = replace(
                 current,
                 label=name,
@@ -515,11 +592,27 @@ def save_collection(
                 members=tuple(
                     retained.get(cast(int, member.taxon_id), member) for member in members
                 )
-                + tuple(member for member in current.members if member.taxon_id is None),
+                + tuple(pending),
             )
         result = JournalState(state.revision + 1, tuple(groups))
         _write_journal(state_dir, result)
         return result
+
+
+def _unresolved_choice(value: object) -> set[tuple[str, str]]:
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise JournalError("Choose which unresolved species to remove")
+    chosen: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"common_name", "scientific_name"}:
+            raise JournalError("Choose which unresolved species to remove")
+        pair = (_visible_text(item["common_name"]), _visible_text(item["scientific_name"]))
+        if pair in chosen:
+            raise JournalError("A collection cannot contain a species twice")
+        chosen.add(pair)
+    return chosen
 
 
 def remove_collection(state_dir: Path, *, revision: object, collection_id: object) -> JournalState:
@@ -660,6 +753,9 @@ class JournalService:
     def __init__(self, config: ControllerConfig, *, app_config: AppConfig | None = None) -> None:
         self.config = config
         self.app_config = app_config
+        # Trip evidence status, keyed by the eBird history file's identity and
+        # the journal content, so page loads do not re-parse the whole archive.
+        self._evidence_cache: tuple[object, list[list[dict[str, object]]]] | None = None
 
     def catalog(self) -> list[dict[str, object]]:
         path = self.config.catalog_dir / "index.json"
@@ -745,73 +841,70 @@ class JournalService:
             free = shutil.disk_usage(self.config.state_dir).free
         checks: list[dict[str, str]] = [
             {
-                "name": "Approved catalog index",
+                "name": "Your plates",
                 "status": "ok",
-                "detail": f"{len(entries)} approved entries parsed. "
-                "Each served image is checked against its approved hash.",
+                "detail": f"{len(entries)} {'plate' if len(entries) == 1 else 'plates'} read. "
+                "Each one shown is checked against its saved fingerprint.",
             },
             {
-                "name": "Private storage",
+                "name": "Storage",
                 "status": "info",
                 "detail": f"{free / (1024**3):.1f} GiB free. "
-                "History uploads require at least 2 GiB before admission.",
+                "A history upload needs at least 2 GiB free.",
             },
         ]
         if management.get("available"):
             work = cast(dict[str, object], management["work"])
             providers = cast(list[dict[str, object]], management["sources"])
             notifications = cast(dict[str, object], management["notifications"])
+            pending = cast(int, notifications["pending"])
+            undelivered = cast(int, notifications["dead_letters"])
             checks.extend(
                 [
                     {
-                        "name": "Discovery",
+                        "name": "Finding new birds",
                         "status": "ok" if work["complete"] else "attention",
-                        "detail": "Saved discovery state: " + cast(str, work["discovery_status"]),
+                        "detail": "The last check for new birds finished."
+                        if work["complete"]
+                        else "The last check for new birds did not finish.",
                     },
                     {
-                        "name": "Configured sources",
+                        "name": "Sources",
                         "status": "attention"
                         if any(item["enabled"] and item["status"] != "ok" for item in providers)
                         else "ok",
-                        "detail": "Inspect enabled source checks in Sources. "
+                        "detail": "Sources shows how each check went. "
                         "Imported history is not a live feed.",
                     },
                     {
-                        "name": "Notification delivery",
-                        "status": "attention" if notifications["dead_letters"] else "ok",
-                        "detail": f"{notifications['pending']} pending; "
-                        f"{notifications['dead_letters']} dead letters.",
+                        "name": "Notifications",
+                        "status": "attention" if undelivered else "ok",
+                        "detail": f"{pending} {'message' if pending == 1 else 'messages'} "
+                        f"waiting; {undelivered} could not be delivered.",
                     },
                     {
-                        "name": "Generation policy",
+                        "name": "Plate making",
                         "status": "info",
-                        "detail": "Enabled; AI allowance and review rules apply."
+                        "detail": "On, with your own image-generation account. "
+                        "Every new plate must pass its checks before it joins your journal."
                         if management["generation_enabled"]
-                        else "Off by choice. No new model work starts.",
+                        else "Off. No new plates are drawn.",
                     },
                 ]
             )
         return {
             "version": __version__,
             "checks": checks,
-            "notice": "These are read-only application checks, not privileged host "
-            "or service validation. Run the controller doctor for installed services, "
-            "executables and network diagnostics. "
-            "No raw logs or secret configuration are returned.",
+            "notice": "These checks only read Inky's own files. For installed services "
+            "and the network, run the controller doctor. Logs and secret settings "
+            "are not shown here.",
         }
 
     def favorite(self, *, revision: object, taxon_id: object, favorite: object) -> JournalState:
         if type(favorite) is not bool:
             raise JournalError("Choose whether to keep this bookmark")
         _taxa([taxon_id])
-        bird = next(
-            (
-                bird
-                for bird in cast(list[dict[str, object]], self.snapshot()["birds"])
-                if bird["taxon_id"] == taxon_id
-            ),
-            None,
-        )
+        bird = self._listed_birds([cast(int, taxon_id)]).get(cast(int, taxon_id))
         if bird is None:
             raise JournalError("Choose a bird from your journal or available artwork")
         return set_favorite(
@@ -832,6 +925,7 @@ class JournalService:
         label: object,
         taxon_ids: object,
         collection_id: object = None,
+        remove_unresolved: object = None,
     ) -> JournalState:
         taxa = _taxa(taxon_ids)
         identities = {
@@ -839,7 +933,7 @@ class JournalService:
                 cast(str, bird["common_name"]),
                 cast(str, bird["scientific_name"]),
             )
-            for bird in cast(list[dict[str, object]], self.snapshot()["birds"])
+            for bird in self._listed_birds(list(taxa)).values()
         }
         if any(taxon not in identities for taxon in taxa):
             raise JournalError("Choose birds from your journal or available artwork")
@@ -850,7 +944,28 @@ class JournalService:
             taxon_ids=list(taxa),
             collection_id=collection_id,
             member_names=identities,
+            remove_unresolved=remove_unresolved,
         )
+
+    def _listed_birds(self, taxa: list[int]) -> dict[int, dict[str, object]]:
+        """The journal's birds by taxon, for changes that name only these birds.
+
+        A requested bird missing while a part that lists birds is unreadable
+        may be in that part, so its message is the answer instead.
+        """
+        snapshot = self.snapshot()
+        birds = {
+            cast(int, bird["taxon_id"]): bird
+            for bird in cast(list[dict[str, object]], snapshot["birds"])
+        }
+        if any(taxon not in birds for taxon in taxa):
+            for row in cast(list[dict[str, object]], snapshot["history_coverage"]):
+                if row["status"] == "unavailable":
+                    raise JournalError(cast(str, row["coverage"]))
+            for notice in cast(list[dict[str, str]], snapshot["notices"]):
+                if notice["part"] != "plate-work":
+                    raise JournalError(notice["message"])
+        return birds
 
     def queue_preview(self, *, collection_id: str, revision: object) -> dict[str, object]:
         with catalog_state_lock(self.config.state_dir):
@@ -938,7 +1053,7 @@ class JournalService:
             )
             if preview["preview_hash"] != preview_hash:
                 raise JournalConflictError(
-                    "Plate work changed. Review missing-plate requests again."
+                    "In the works changed. Ask for the missing plates again."
                 )
             return queue_owner_selection_locked(cast(AppConfig, self.app_config), species)
 
@@ -971,7 +1086,7 @@ class JournalService:
             )
         return {
             "format": "inky-collection",
-            "schema_version": 1,
+            "schema_version": PORTABLE_SCHEMA,
             "label": group.label,
             "start_date": group.start_date,
             "end_date": group.end_date,
@@ -980,12 +1095,18 @@ class JournalService:
 
     def prepare_collection_import(self, document: object) -> tuple[JournalCollection, str]:
         if (
+            isinstance(document, dict)
+            and document.get("format") == "inky-collection"
+            and _newer_schema(document.get("schema_version"), PORTABLE_SCHEMA)
+        ):
+            raise JournalError("This collection needs a newer Inky version")
+        if (
             not isinstance(document, dict)
             or set(document)
             != {"format", "schema_version", "label", "start_date", "end_date", "members"}
             or document["format"] != "inky-collection"
             or type(document["schema_version"]) is not int
-            or document["schema_version"] != 1
+            or document["schema_version"] != PORTABLE_SCHEMA
         ):
             raise JournalError("Choose a supported Inky collection export")
         label = _label(document["label"])
@@ -993,7 +1114,7 @@ class JournalService:
         raw_members = document["members"]
         if not isinstance(raw_members, list):
             raise JournalError("The collection export has no valid member list")
-        birds = cast(list[dict[str, object]], self.snapshot()["birds"])
+        birds = cast(list[dict[str, object]], self.snapshot(strict=True)["birds"])
         by_id = {bird["taxon_id"]: bird for bird in birds}
         by_scientific: dict[str, list[dict[str, object]]] = {}
         for bird in birds:
@@ -1073,32 +1194,62 @@ class JournalService:
         )
         return save_imported_collection(self.config.state_dir, revision=expected, collection=group)
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self, *, strict: bool = False) -> dict[str, object]:
+        """Owner journal projection.
+
+        The page degrades an unreadable part to a notice. ``strict`` callers use
+        the bird list as the record of which birds exist, so they refuse when a
+        part that lists birds is unreadable.
+        """
         if self.app_config is not None:
             self.app_config = current_config(self.app_config)
-        retained, evidence, coverage, unresolved = self._retained_history()
+        retained, evidence, coverage, unresolved, recent = self._retained_history(strict=strict)
+        notices: list[dict[str, str]] = []
+
+        def degrade(part: str, message: str, error: Exception, *, lists_birds: bool = True) -> None:
+            if strict and lists_birds:
+                raise JournalError(message) from error
+            notices.append({"part": part, "message": message})
+
         with catalog_state_lock(self.config.state_dir):
             state = read_journal(self.config.state_dir)
             saved = [entry.taxon_id for entry in read_collection(self.config.state_dir)]
             active_path = self.config.state_dir / "active-catalog.json"
-            active, _ = (
-                project_catalog(read_json(active_path))
-                if active_path.exists()
-                else ({"species": []}, {})
-            )
-            active_species = cast(list[dict[str, object]], active["species"])
-            featured = featured_plate_entry(active)
+            try:
+                active, _ = (
+                    project_catalog(read_json(active_path))
+                    if active_path.exists()
+                    else ({"species": []}, {})
+                )
+                active_species = cast(list[dict[str, object]], active["species"])
+                featured = featured_plate_entry(active)
+            except (CatalogError, OSError, ValueError) as error:
+                active_species, featured = [], None
+                degrade(
+                    "current-birds",
+                    "The current wall birds could not be read. The next refresh writes them again.",
+                    error,
+                )
             active_ids = [cast(int, entry["taxon_id"]) for entry in active_species]
             observed = current_discovery_species(self.app_config) if self.app_config else []
-            queued = read_generation_queue(self.app_config) if self.app_config else []
+            try:
+                queued = read_generation_queue(self.app_config) if self.app_config else []
+            except (CatalogError, OSError, ValueError) as error:
+                queued = []
+                degrade(
+                    "plate-queue", "The list of birds waiting for plates could not be read.", error
+                )
             identities = {bird.taxon_id: bird for bird in [*retained, *queued, *observed]}
             from .recovery import pending_inventory
 
-            pending: dict[str, object] = (
-                pending_inventory(self.app_config)
-                if self.app_config
-                else {"status": "unavailable", "candidates": []}
-            )
+            unavailable: dict[str, object] = {"status": "unavailable", "candidates": []}
+            try:
+                pending: dict[str, object] = (
+                    pending_inventory(self.app_config) if self.app_config else unavailable
+                )
+            except (CatalogError, JournalError, OSError, ValueError) as error:
+                pending = unavailable
+                degrade("plates-in-review", "Plates waiting for review could not be read.", error)
             for candidate in cast(list[dict[str, object]], pending["candidates"]):
                 id = cast(int, candidate["taxon_id"])
                 if candidate["inspect_available"] and id not in identities:
@@ -1143,6 +1294,7 @@ class JournalService:
                         else [],
                         "portrait_url": f"/v1/owner/journal/birds/{taxon_id}/portrait",
                         "portrait_sha256": entry["portrait_sha256"],
+                        "approved_at": entry["approved_at"],
                     }
                 )
             approved_ids = {cast(int, bird["taxon_id"]) for bird in birds}
@@ -1171,6 +1323,17 @@ class JournalService:
                 )
             for bird in birds:
                 bird["retained_evidence"] = evidence.get(cast(int, bird["taxon_id"]), [])
+            try:
+                management = self.management(approved=approved_ids, pending=pending)
+            except (CatalogError, JournalError, OSError, ValueError) as error:
+                management = {"available": False, "reason": "unreadable"}
+                degrade(
+                    "plate-work",
+                    "In the works could not be read. Manage shows it again "
+                    "once its files can be read.",
+                    error,
+                    lists_birds=False,
+                )
             result = {
                 "revision": state.revision,
                 "collections": state.owner_dict()["collections"],
@@ -1180,58 +1343,91 @@ class JournalService:
                 "birds": birds,
                 "history_coverage": coverage,
                 "unresolved_history": unresolved,
-                "management": self.management(approved=approved_ids, pending=pending),
+                "recent_species": recent,
+                "notices": notices,
+                "management": management,
             }
         # Do not hold the catalog lock while taking the history lock: trip saves
         # take history first, then catalog. Keep the curated membership unchanged.
         if any(member.evidence for group in state.collections for member in group.members):
-            from .ebird_archive import STATE_FILENAME, read_ebird_checklists
-
-            try:
-                _, records = read_ebird_checklists(self.config.state_dir)
-                available = (self.config.state_dir / STATE_FILENAME).is_file()
-                links = {
-                    (record.checklist_hash, species.scientific_name): record.observed_on
-                    for record in records
-                    for species in record.species
-                }
-            except DataSourceError:
-                available, links = False, {}
             projected = cast(list[dict[str, object]], result["collections"])
-            for group, projection in zip(state.collections, projected, strict=True):
-                projection["evidence"] = [
-                    {
-                        "taxon_id": member.taxon_id,
-                        "scientific_name": member.scientific_name,
-                        "status": "unavailable"
-                        if not available
-                        else "linked"
-                        if member_evidence_matches(group, member, links)
-                        else "source-changed",
-                    }
-                    for member in group.members
-                    if member.evidence
-                ]
+            for projection, rows in zip(projected, self._trip_evidence(state), strict=True):
+                projection["evidence"] = rows
         return result
 
+    def _trip_evidence(self, state: JournalState) -> list[list[dict[str, object]]]:
+        from .ebird_archive import STATE_FILENAME, read_ebird_checklists
+
+        path = self.config.state_dir / STATE_FILENAME
+        try:
+            info = path.lstat()
+            identity: object = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+        except FileNotFoundError:
+            identity = None
+        except OSError:
+            identity = object()  # Never matches: read and report below.
+        key = (
+            identity,
+            hashlib.sha256(json.dumps(state.as_dict(), sort_keys=True).encode()).hexdigest(),
+        )
+        cached = self._evidence_cache
+        if cached is not None and cached[0] == key:
+            return [[dict(row) for row in rows] for rows in cached[1]]
+        cacheable = True
+        try:
+            _, records = read_ebird_checklists(self.config.state_dir)
+            available = path.is_file()
+            links = {
+                (record.checklist_hash, species.scientific_name): record.observed_on
+                for record in records
+                for species in record.species
+            }
+        except DataSourceError:
+            available, links = False, {}
+            # A passing failure must not outlive an unchanged file.
+            cacheable = False
+        evidence: list[list[dict[str, object]]] = [
+            [
+                {
+                    "taxon_id": member.taxon_id,
+                    "scientific_name": member.scientific_name,
+                    "status": "unavailable"
+                    if not available
+                    else "linked"
+                    if member_evidence_matches(group, member, links)
+                    else "source-changed",
+                }
+                for member in group.members
+                if member.evidence
+            ]
+            for group in state.collections
+        ]
+        if cacheable:
+            self._evidence_cache = (key, evidence)
+        return [[dict(row) for row in rows] for rows in evidence]
+
     def _retained_history(
-        self,
+        self, *, strict: bool = False
     ) -> tuple[
         list[BirdSpecies],
         dict[int, list[dict[str, object]]],
         list[dict[str, object]],
         list[dict[str, object]],
+        list[dict[str, object]],
     ]:
         # History locks precede the catalog lock. Rendering never calls a provider
         # or resolves new taxonomy, and a provider limit must not truncate a library.
-        from .birdbuddy import read_birdbuddy_history_species
-        from .birdnet_analyzer import read_birdnet_analyzer_history
-        from .ebird_archive import read_ebird_archive_history
+        # Small per-species summaries stand in for the complete histories.
+        from .birdbuddy import read_birdbuddy_history_summary
+        from .birdnet_analyzer import read_birdnet_analyzer_summary
+        from .ebird_archive import read_ebird_archive_summary
+        from .history_summary import SpeciesSummary
 
         birds: list[BirdSpecies] = []
         evidence: dict[int, list[dict[str, object]]] = {}
         coverage: list[dict[str, object]] = []
         unresolved: list[dict[str, object]] = []
+        latest: dict[int, tuple[str, str]] = {}
         canonical = {
             cast(str, entry["scientific_name"]): (
                 cast(int, entry["taxon_id"]),
@@ -1248,53 +1444,51 @@ class JournalService:
             if not (self.config.state_dir / filename).exists():
                 continue
             try:
-                records: list[tuple[str, str, int]]
+                records: list[SpeciesSummary]
                 if source == "ebird-archive":
-                    archive = read_ebird_archive_history(
-                        self.config.state_dir, window=ObservationWindow.ALL_TIME, limit=None
-                    )
-                    records = [
-                        (item.common_name, item.scientific_name, item.observation_count)
-                        for item in archive.species
-                    ]
-                    description = "Complete retained archive; checklist dates, not event instants"
+                    records = read_ebird_archive_summary(self.config.state_dir)
+                    description = "Your whole checklist history, by checklist date"
                 elif source == "birdnet-analyzer":
-                    analyzer = read_birdnet_analyzer_history(
-                        self.config.state_dir, window=ObservationWindow.ALL_TIME, limit=None
-                    )
-                    records = [
-                        (item.common_name, item.scientific_name, item.detection_count)
-                        for item in analyzer.species
-                    ]
-                    description = (
-                        f"Retained imports; {analyzer.undated_detections} undated segments"
+                    records, undated = read_birdnet_analyzer_summary(self.config.state_dir)
+                    description = "Your imported recordings" + (
+                        f"; {undated} without a date" if undated else ""
                     )
                 else:
-                    feeder, description = read_birdbuddy_history_species(
+                    records, description = read_birdbuddy_history_summary(
                         self.config.state_dir,
                         include_manual_sightings=bool(
                             self.app_config
                             and self.app_config.discovery.birdbuddy_include_manual_sightings
                         ),
                     )
-                    records = [
-                        (item.common_name, item.scientific_name, item.detection_count)
-                        for item in feeder
-                    ]
-                identities = cached_species_identities(
-                    self.config.state_dir / f"{source}-taxonomy-crosswalk.json"
-                )
+                try:
+                    identities = cached_species_identities(
+                        self.config.state_dir / f"{source}-taxonomy-crosswalk.json"
+                    )
+                except (DataSourceError, OSError, ValueError):
+                    coverage.append(
+                        {
+                            "source": source,
+                            "status": "unavailable",
+                            "coverage": "Saved species matches for this history could not "
+                            "be read. Inspect the controller state before importing again.",
+                        }
+                    )
+                    continue
                 source_birds: list[BirdSpecies] = []
                 source_unresolved: list[dict[str, object]] = []
                 source_evidence: dict[int, list[dict[str, object]]] = {}
-                for common, scientific, count in records:
-                    identity = identities.get(scientific) or canonical.get(scientific)
+                for record in records:
+                    count = record.count
+                    identity = identities.get(record.scientific_name) or canonical.get(
+                        record.scientific_name
+                    )
                     if identity is None:
                         source_unresolved.append(
                             {
                                 "source": source,
-                                "common_name": _visible_text(common),
-                                "scientific_name": _visible_text(scientific),
+                                "common_name": _visible_text(record.common_name),
+                                "scientific_name": _visible_text(record.scientific_name),
                                 "count": count,
                                 "unit": unit,
                             }
@@ -1307,7 +1501,13 @@ class JournalService:
                         )
                     )
                     source_evidence.setdefault(id, []).append(
-                        {"source": source, "count": count, "unit": unit}
+                        {
+                            "source": source,
+                            "count": count,
+                            "unit": unit,
+                            "first_noted": record.first_noted,
+                            "last_noted": record.last_noted,
+                        }
                     )
                 # A malformed later identity must not leave a partly complete
                 # source marked available. Publish this source projection once.
@@ -1315,6 +1515,10 @@ class JournalService:
                 unresolved.extend(source_unresolved)
                 for id, rows in source_evidence.items():
                     evidence.setdefault(id, []).extend(rows)
+                    for row in rows:
+                        noted = row["last_noted"]
+                        if isinstance(noted, str) and (id not in latest or noted > latest[id][0]):
+                            latest[id] = (noted, source)
                 coverage.append(
                     {
                         "source": source,
@@ -1329,11 +1533,21 @@ class JournalService:
                     {
                         "source": source,
                         "status": "unavailable",
-                        "coverage": "Retained history needs attention. "
-                        "Inspect this source before importing or restoring.",
+                        "coverage": "Your saved history from this source cannot be read. "
+                        "Check it before importing or restoring.",
                     }
                 )
-        return birds, evidence, coverage, unresolved
+        if strict:
+            for row in coverage:
+                if row["status"] == "unavailable":
+                    raise JournalError(cast(str, row["coverage"]))
+        recent = [
+            {"taxon_id": id, "last_noted": noted, "source": source}
+            for id, (noted, source) in sorted(
+                latest.items(), key=lambda item: (item[1][0], -item[0]), reverse=True
+            )[:10]
+        ]
+        return birds, evidence, coverage, unresolved, recent
 
     def management_snapshot(self) -> dict[str, object]:
         """Small polling projection; never scan or join imported source histories."""

@@ -13,6 +13,14 @@ class InkyBirdFrameError(Exception):
     """Base exception for expected application failures."""
 
 
+class UsageError(InkyBirdFrameError, ValueError):
+    """Raised when command arguments or interactive input are not acceptable."""
+
+
+class BusyError(InkyBirdFrameError):
+    """Raised when another process already holds the work this command needs."""
+
+
 class DataSourceError(InkyBirdFrameError):
     """Raised when a remote data source cannot be used."""
 

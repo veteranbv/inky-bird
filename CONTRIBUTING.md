@@ -65,7 +65,13 @@ authentication material.
 
 Tests must not require network access, Codex authentication, notification
 credentials, or Inky hardware. Mock those boundaries and keep fixtures
-location-neutral.
+location-neutral. The suite enforces this: `tests/conftest.py` refuses DNS
+lookups, connections and UDP to anything but loopback, and child processes get
+a `git` limited to local repositories and a closed loopback proxy. Tools that
+ignore proxy settings, such as `ssh`, `nc` or `dig`, are not contained, so do
+not call them from tests. Free-space
+checks always see at least 64 GiB free; a test of the low-space branch patches
+`shutil.disk_usage` itself.
 
 ## Code changes
 
@@ -101,11 +107,41 @@ to 3.14. Browser interaction regressions use Node.js 20 or newer's built-in
 test runner; there is no Node service or frontend package installation in the
 user runtime.
 
+### Frontend modules
+
+The owner page's entry module is `src/inky_bird_frame/web/journal.js`: shared
+page helpers, module state and dispatch. Each area has its own module:
+`home.js`, `birds.js` (Birds list and bird page), `collections.js`
+(Collections, community search, editing, import and the collection view),
+`frame.js`, `candidate.js`, `manage.js` (Manage, outcomes, health, backups,
+Sources, plate work and notifications) and `keys.js` (idempotency keys and new
+collection IDs). Area modules receive shared state through the one context
+object built in `openJournal` and do not import `journal.js`. The other files
+in that folder serve the settings, screen and viewer pages or are shared
+helpers.
+
+A new `/app` module must be added to `STATIC_PAGES` and the route list in
+`web.py`, and get a `modulepreload` line in `index.html`.
+`test_owner_page_preloads_every_module_it_imports` follows single-line
+`import ... from '/app/...'` statements from `app.js` and checks the preload
+line and the `STATIC_PAGES` entry of each module it finds. It does not follow
+an import split over several lines, so check those modules by hand.
+`test_static_map_matches_routes_and_shipped_files` checks that `STATIC_PAGES`
+matches the routes and the shipped files. A node test that loads `journal.js` as a `data:` URL must
+inline its whole `/app` import graph; `tests/web/journal-art.test.mjs` shows
+how.
+
 ### Full browser acceptance
 
-This journey is a manual check; no CI workflow runs it.
+CI runs this journey with Chromium in the **Browser acceptance** job on every
+pull request. Run it locally before changing web assets.
 
-`tests/web/journal.e2e.cjs` starts a temporary loopback installation. It uses
+`tests/web/journal.e2e.cjs` runs the area journeys from `birds.e2e.cjs`,
+`save.e2e.cjs`, `manage.e2e.cjs` and `frame.e2e.cjs` over the shared
+`e2e-harness.cjs`, against one synthetic installation. It starts a temporary
+loopback installation on a free port it picks for each run, so several runs can
+go at once. It fails on browser console errors, on 5xx answers and on missing
+app files. It uses
 random test credentials, synthetic history and candidates, and public approved
 art. It blocks external browser requests, substitutes the community query in
 the synthetic server, and inserts a reserved-setup status for one rendering
@@ -116,8 +152,8 @@ Install the optional test tools outside the checkout:
 
 ```bash
 qa_tools=$(mktemp -d)
-npm install --prefix "$qa_tools" --ignore-scripts --no-audit --no-fund \
-  playwright@1.62.1 @axe-core/playwright@4.14.0
+npm install --prefix "$qa_tools" --ignore-scripts --no-audit --no-fund --save-exact \
+  playwright@1.62.1 playwright-core@1.62.1 axe-core@4.14.0 @axe-core/playwright@4.14.0
 "$qa_tools/node_modules/.bin/playwright" install chromium
 INKY_QA_PLAYWRIGHT="$qa_tools/node_modules/playwright" \
 INKY_QA_AXE="$qa_tools/node_modules/@axe-core/playwright" \
@@ -137,6 +173,30 @@ contain random synthetic credentials; do not publish the directory wholesale.
 CSV. Never supply personal history. These journeys complement unit tests;
 they do not prove live provider contracts, physical hardware or real-phone
 certificate trust.
+
+The test covers normal tasks, stale edits, interrupted responses, explicit
+work, scope withdrawal and revocation. Its community query is mocked, so it is
+not a live iNaturalist contract test.
+
+Chromium, Firefox and WebKit journeys and automated accessibility checks are
+separate from physical-phone, hardware and live-provider qualification. A narrow
+viewport is not proof of a particular phone. The README screenshots use two
+public approved plates and manual selections in a fresh art-only demo, not
+personal history. Refresh those images from the actual interface; never use
+private controller screenshots as convenient documentation fixtures.
+
+The following remain release gates, not automatic claims from a passing test:
+
+- complete live qualification of generation-optional installation and ownership
+  migration across native and Docker service restarts;
+- final large-file, mobile and live qualification of history import paths;
+- live qualification of source/work/notification actions, paired screens,
+  selected wall routing and scoped dashboard permissions;
+- complete new-install and upgrade journeys, final mobile/browser qualification,
+  independent security review and repository review on the final exact head.
+
+No release or production deployment is implied by these test results.
+Provider access remains subject to each service's permissions and limits.
 
 ### Refresh the README screenshots
 

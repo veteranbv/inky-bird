@@ -38,6 +38,15 @@ application commands inside the controller container instead, for example
 The command exits `0` only when no check has status `fail`. Warnings do not make
 the role unready, but should still be reviewed.
 
+If setup or uninstall stops with "Both inky-bird and inky-bird-frame
+installations exist", it lists what it found for each name. Keep the
+installation you use. For the other one, remove its services (see
+[Uninstall](installation.md#uninstall)) and move its folders aside, for example
+by renaming them, once you no longer need their data. Then run the command
+again. Leftover data alone does not block the name whose services are
+installed, or the name whose support folder holds the configuration you passed
+to setup.
+
 ## Controller
 
 ### Immediate retry is not available
@@ -86,6 +95,51 @@ Run the focused validator:
 Start from `config.example.toml`. Do not paste YAML or JSON into the TOML file.
 Keep strings quoted, array items comma-separated, and each table header unique.
 
+A valid file still reports problems worth fixing. `unknown_keys` lists every key
+and table this version does not use, for example `[notification]` instead of
+`[notifications]`, or `generation_enable` instead of `generation_enabled`. Such
+a key is ignored, so the setting you meant has no effect. `warnings` reports
+other problems, such as overlapping workspace, catalog and state directories.
+`configuration_ownership` and `generation_enabled` show what this file will do.
+Unknown keys are deprecated: they are accepted in 1.x and will be rejected in
+2.0 (see [Deprecations](operations.md#deprecations)).
+
+`config install` checks the new file before it touches the old one. If the
+installed file no longer loads, it keeps it beside the new one as
+`config.toml.invalid-<UTC time>` (mode `0600`) and installs the new file. If
+the kept file was managed in the browser, the output says so; enter those
+settings again. Delete the kept copy once the new configuration works.
+
+### Doctor warnings and job checks
+
+- `config_unknown_keys` (warn): the configuration has settings this version does
+  not use. The detail lists their names, never their values. Fix typos and
+  remove settings you no longer need.
+- `notification_dead_letters` (warn): some notifications stopped retrying and
+  were not delivered. Fix the destination, then run
+  `"$IBF" notifications retry --config "$CONFIG"`.
+- `job_refresh`, `job_generate`, `job_catalog_publish` and `job_notifications`
+  (fail), on installations with per-job timers or launchd jobs: the most
+  recent run of that scheduled job exited with an error or was stopped by a
+  signal. Read that job's log, then run doctor again after its next run. Only
+  the jobs your configuration enables are checked.
+
+### Scheduled jobs stop after a configuration edit
+
+When one scheduler process runs the jobs (Docker and app-managed native
+installations) and the configuration stops loading, the scheduler keeps its
+last good job list and logs `jobs_reload_failed` once. Scheduled jobs fail
+until the file is fixed. If notifications are on, it sends one "Inky settings
+could not be loaded" notice through the last good destinations. Run
+`"$IBF" config validate --config "$CONFIG"`, fix the file, and the jobs resume.
+
+A scheduler that starts with a broken file, for example after a reboot or a
+restart that followed a hand edit, exits `1` and is restarted with no notice:
+about every 10 seconds by systemd or launchd, and by Docker after a delay that
+starts short and doubles with each failure. Only a break while the scheduler is
+already running sends the notice above. Check the service status
+and its log, then fix the file.
+
 ### `codex_executable` fails
 
 ```bash
@@ -107,7 +161,9 @@ codex login --device-auth
 
 Authenticate as the same OS account that owns the service. Do not copy Codex
 credentials into the repository, configuration file, GitHub Actions, or the
-display node.
+display node. Inky passes Codex only a short list of environment variables, and
+API-key variables are not on it. If Codex worked only through an environment
+variable, sign in with `codex login` instead.
 
 ### `controller_health` fails
 
@@ -154,9 +210,21 @@ An eBird response can take longer than other providers, so its recent-observatio
 request has a separate 90-second limit. The eBird provider's private `details`
 reports `http_duration_ms` for both successes and request failures. If eBird
 still times out, check that duration before changing the configured radius or
-window. The notification comparison does not hold failed-provider observations
-in the active catalog; their return after recovery no longer produces a
-duplicate discovery notice.
+window. A failed provider's last birds stay in the active catalog for three
+refresh intervals (see [Multiple providers](discovery.md#multiple-providers)),
+and their return after recovery does not produce a duplicate discovery notice.
+
+Unless a caller sets its own deadline, an outbound request, redirects
+included, also ends after four times its per-read timeout: for example 40
+seconds for a default 10-second request, and 240 seconds for the display's
+60-second plate download. The trip preview's name lookups share one 60-second
+deadline. A response shorter than
+the length it declared is an error, not a truncated result.
+
+If Bird Buddy reports "Bird Buddy asked Inky to slow down; Inky will try again
+after …", Inky is waiting as Bird Buddy asked and sends no request until then.
+Wait, or see [Bird Buddy setup](discovery.md#bird-buddy-setup) for how long the
+wait lasts.
 
 ### A source shows a bird, but the frame does not change
 
@@ -284,7 +352,9 @@ journalctl -u "$FAMILY-display.service" -n 100 --no-pager
 ```
 
 When `prioritize_latest_detection` is enabled, the display shows the newest
-unconsumed detection once and then resumes normal rotation. Its successful
+unconsumed detection once and then resumes normal rotation. A bird among the
+last six shown does not jump the queue, and detections never take more than two
+updates in a row. Its successful
 cycle reports `"selection_reason": "latest_detection"`; `display_update` may
 be `unchanged` when that plate is already on the panel. A station
 classification that looks wrong must be corrected at the detector. Inky Bird

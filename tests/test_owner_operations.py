@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import threading
 import time
+import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
+from typing import Literal, cast
 from unittest.mock import patch
 
 import pytest
@@ -14,8 +19,14 @@ from starlette.testclient import TestClient
 from inky_bird_frame import settings as settings_module
 from inky_bird_frame.config import load_config
 from inky_bird_frame.controller import exclusive_cycle_lock
+from inky_bird_frame.ebird_archive import CSV_FILENAME, preview_ebird_checklists
+from inky_bird_frame.errors import DataSourceError
 from inky_bird_frame.owner_operations import (
+    MAX_RECEIPT_BYTES,
+    MAX_RECEIPTS,
     MAX_RESULT_BYTES,
+    OperationKind,
+    OperationReceipt,
     OwnerOperationBusyError,
     OwnerOperationError,
     OwnerOperations,
@@ -23,7 +34,7 @@ from inky_bird_frame.owner_operations import (
 )
 from inky_bird_frame.retry_requests import RETRY_WAKE_LISTENER, retry_requests, retry_wake_token
 from inky_bird_frame.runtime_state import state_lock
-from inky_bird_frame.settings import initialize_config, settings_status
+from inky_bird_frame.settings import SettingsConflictError, initialize_config, settings_status
 from inky_bird_frame.web import create_app
 
 
@@ -133,7 +144,12 @@ def test_restart_marks_unknown_work_interrupted_without_replay(tmp_path: Path) -
     worker.path.write_text(json.dumps(raw))
     restarted = OwnerOperations(tmp_path)
     try:
-        assert restarted.status(str(receipt["operation_id"]))["status"] == "interrupted"
+        interrupted = restarted.status(str(receipt["operation_id"]))
+        assert interrupted["status"] == "interrupted"
+        assert interrupted["result"] == {
+            "message": "Inky could not confirm how this ended. "
+            "Check what changed before trying again."
+        }
         with patch("inky_bird_frame.owner_operations._stamp"):
             duplicate = restarted.submit(
                 "retry",
@@ -213,6 +229,36 @@ def test_adapter_refresh_uses_real_zero_source_logic_and_rejects_stale_settings(
         execute_owner_operation(config, "refresh", revision="old")
 
 
+@pytest.mark.parametrize(
+    ("kind", "enabled", "ending"),
+    [
+        ("retry", False, "Plate making is off. These birds wait until you turn it on."),
+        ("retry-now", False, "Plate making is off. These birds wait until you turn it on."),
+        ("retry", True, "They are tried at the next scheduled check."),
+        ("retry-now", True, "Inky tries them as soon as it can, once the sources are checked."),
+    ],
+)
+def test_retry_message_holds_whether_plate_making_is_on(
+    tmp_path: Path, kind: Literal["retry", "retry-now"], enabled: bool, ending: str
+) -> None:
+    path = tmp_path / "config.toml"
+    initialize_config(path)
+    if enabled:
+        path.write_text(
+            path.read_text().replace('"generation_enabled" = false', '"generation_enabled" = true')
+        )
+    config = load_config(path, load_secrets=False)
+    assert config.controller.generation_enabled is enabled
+    with patch("inky_bird_frame.retry_requests.retry_wake_available", return_value=True):
+        result = execute_owner_operation(
+            config, kind, revision=str(settings_status(config)["revision"]), taxon_ids=[303]
+        )
+    message = str(result["message"])
+    assert message == (
+        "A plate you kept is never replaced. In the works shows how each one goes. " + ending
+    )
+
+
 def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     initialize_config(path)
@@ -228,7 +274,7 @@ def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_
             config, "notification-test", revision=str(settings_status(config)["revision"])
         )
     assert result["failed_count"] == result["delivered_count"] == 1
-    assert "failed" in str(result["message"])
+    assert str(result["message"]) == "The test did not reach every destination."
 
 
 def test_concurrent_save_cannot_change_confirmed_notification_destinations(tmp_path: Path) -> None:
@@ -389,3 +435,281 @@ def test_http_operation_boundary_and_no_secret_or_model_operation(
             101,
             202,
         ]
+
+
+def _finished_receipts(count: int, *, result_bytes: int, age: timedelta) -> dict[str, object]:
+    stamp = (datetime.now(UTC) - age).replace(microsecond=0).isoformat()
+    return {
+        "schema_version": 1,
+        "receipts": [
+            {
+                "operation_id": f"{index:032x}",
+                "key_hash": f"{index:064x}",
+                "input_hash": "0" * 64,
+                "kind": "saved-collection",
+                "status": "succeeded",
+                "created_at": stamp,
+                "updated_at": stamp,
+                "result": {"message": "x" * result_bytes},
+            }
+            for index in range(count)
+        ],
+    }
+
+
+def test_ordinary_use_never_fills_the_receipt_store(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    try:
+        last = ""
+        for index in range(MAX_RECEIPTS + 44):
+            receipt = worker.submit(
+                "saved-collection",
+                key=f"saved-birds-toggle-{index:04d}",
+                inputs={"taxon_id": index},
+                execute=lambda: {"message": "Saved birds updated."},
+            )
+            last = str(receipt["operation_id"])
+            assert completed(partial(worker.status, last))["status"] == "succeeded"
+        rows = json.loads(worker.path.read_text())["receipts"]
+        assert len(rows) == MAX_RECEIPTS
+        assert rows[-1]["operation_id"] == last
+    finally:
+        worker.close()
+
+
+def test_final_result_evicts_old_outcomes_instead_of_reporting_interrupted(
+    tmp_path: Path,
+) -> None:
+    # A nearly full file of recent outcomes, then a result at the size limit.
+    count = 70
+    while True:
+        seeded = json.dumps(
+            _finished_receipts(count, result_bytes=16_000, age=timedelta(hours=1)),
+            indent=2,
+            sort_keys=True,
+        )
+        if len(seeded.encode()) <= MAX_RECEIPT_BYTES - 1024:
+            break
+        count -= 1
+    assert len(seeded.encode()) + MAX_RESULT_BYTES > MAX_RECEIPT_BYTES
+    path = tmp_path / "owner-operations.json"
+    path.write_text(seeded)
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        receipt = worker.submit(
+            "refresh",
+            key="large-final-result-key",
+            inputs={},
+            execute=lambda: {"message": "y" * (MAX_RESULT_BYTES - 64)},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "succeeded"
+        assert result["result"] == {"message": "y" * (MAX_RESULT_BYTES - 64)}
+        body = path.read_bytes()
+        assert len(body) <= MAX_RECEIPT_BYTES
+        kept = [row["operation_id"] for row in json.loads(body)["receipts"]]
+        # Only the oldest outcomes went, in order.
+        assert kept[-1] == receipt["operation_id"]
+        assert len(kept) < count + 1
+        assert kept[:-1] == [f"{index:032x}" for index in range(count - len(kept) + 1, count)]
+    finally:
+        worker.close()
+
+
+def test_finished_receipt_survives_eviction_after_the_clock_moves_back(tmp_path: Path) -> None:
+    # Saved outcomes stamped later than now (the clock was corrected) sort
+    # after the receipt being finished; its own large result must not evict it.
+    count = 70
+    while True:
+        seeded = json.dumps(
+            _finished_receipts(count, result_bytes=16_000, age=-timedelta(hours=1)),
+            indent=2,
+            sort_keys=True,
+        )
+        if len(seeded.encode()) <= MAX_RECEIPT_BYTES - 1024:
+            break
+        count -= 1
+    path = tmp_path / "owner-operations.json"
+    path.write_text(seeded)
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        receipt = worker.submit(
+            "refresh",
+            key="clock-moved-back-key",
+            inputs={},
+            execute=lambda: {"message": "y" * (MAX_RESULT_BYTES - 64)},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "succeeded"
+        assert len(path.read_bytes()) <= MAX_RECEIPT_BYTES
+    finally:
+        worker.close()
+
+
+def test_status_poll_after_a_crash_never_evicts_the_polled_receipt(tmp_path: Path) -> None:
+    # A store just under the size limit with one receipt left running by a
+    # crash. Recording "Interrupted" during a status poll must not evict the
+    # finished receipt being polled, even though it is the oldest.
+    seeded = _finished_receipts(60, result_bytes=16_000, age=timedelta(hours=1))
+    rows = cast(list[dict[str, object]], seeded["receipts"])
+    rows[-1].update(status="running", result=None)
+
+    def size() -> int:
+        return len(json.dumps(seeded, indent=2, sort_keys=True).encode())
+
+    first = cast(dict[str, object], rows[0]["result"])
+    first["message"] = str(first["message"]) + "x" * (MAX_RECEIPT_BYTES - 16 - size())
+    assert MAX_RECEIPT_BYTES - 32 < size() <= MAX_RECEIPT_BYTES
+    path = tmp_path / "owner-operations.json"
+    path.write_text(json.dumps(seeded, indent=2, sort_keys=True))
+    path.chmod(0o600)
+    worker = OwnerOperations(tmp_path)
+    try:
+        polled = worker.status(str(rows[0]["operation_id"]))
+        assert polled["status"] == "succeeded"
+        saved = {row["operation_id"]: row for row in json.loads(path.read_text())["receipts"]}
+        assert saved[rows[0]["operation_id"]]["status"] == "succeeded"
+        assert saved[rows[-1]["operation_id"]]["status"] == "interrupted"
+        assert len(path.read_bytes()) <= MAX_RECEIPT_BYTES
+    finally:
+        worker.close()
+
+
+def test_eviction_keeps_unfinished_and_current_receipts(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    old = datetime.now(UTC) - timedelta(days=1)
+    rows = [
+        OperationReceipt(
+            f"{index:032x}",
+            f"{index:064x}",
+            "0" * 64,
+            "refresh",
+            "running" if index == 0 else "succeeded",
+            old.isoformat(),
+            (old + timedelta(seconds=index)).isoformat(),
+        )
+        for index in range(MAX_RECEIPTS)
+    ]
+    newest = replace(rows[-1], operation_id="f" * 32, key_hash="f" * 64, status="pending")
+    worker._write([*rows, newest], keep=frozenset({newest.operation_id}))
+    kept = {row.operation_id for row in worker._read()}
+    assert rows[0].operation_id in kept  # oldest, but still running
+    assert newest.operation_id in kept
+    assert rows[1].operation_id not in kept  # oldest finished outcome
+    assert len(kept) == MAX_RECEIPTS
+    unfinished = [replace(row, status="running") for row in rows]
+    with pytest.raises(OwnerOperationError, match="unfinished"):
+        worker._write([*unfinished, newest], keep=frozenset({newest.operation_id}))
+    worker.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "error", "shown"),
+    [
+        (
+            "import-preview",
+            DataSourceError("eBird archive is missing required columns: Date"),
+            "eBird archive is missing required columns: Date",
+        ),
+        (
+            "import-commit",
+            SettingsConflictError("Settings changed. Reload and review this action again."),
+            "Settings changed. Reload and review this action again.",
+        ),
+        (
+            "import-preview",
+            DataSourceError("Invalid taxonomy crosswalk: /private/state/crosswalk.json"),
+            None,
+        ),
+        ("refresh", DataSourceError("HTTP 500 from api.example.test"), None),
+    ],
+)
+def test_receipts_keep_safe_import_and_settings_messages(
+    tmp_path: Path, kind: OperationKind, error: Exception, shown: str | None
+) -> None:
+    worker = OwnerOperations(tmp_path)
+
+    def fail() -> dict[str, object]:
+        raise error
+
+    try:
+        receipt = worker.submit(kind, key="safe-message-synthetic", inputs={}, execute=fail)
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "failed"
+        message = cast(dict[str, object], result["result"])["message"]
+        if shown is None:
+            assert str(message).startswith("The operation did not finish.")
+            assert "private" not in worker.path.read_text()
+        else:
+            assert message == shown
+        assert cast(dict[str, object], result["result"])["error_type"] == type(error).__name__
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Could not open ~/exports/MyEBirdData.csv",
+        "Lookup failed at https://api.example.test/v2/ref",
+        "Invalid taxonomy crosswalk: C:\\state\\crosswalk.json",
+        "Invalid taxonomy crosswalk (/state/crosswalk.json)",
+    ],
+)
+def test_receipts_hide_import_messages_that_name_a_path_or_url(
+    tmp_path: Path, message: str
+) -> None:
+    worker = OwnerOperations(tmp_path)
+
+    def fail() -> dict[str, object]:
+        raise DataSourceError(message)
+
+    try:
+        receipt = worker.submit(
+            "import-preview", key="path-message-synthetic", inputs={}, execute=fail
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        shown = str(cast(dict[str, object], result["result"])["message"])
+        assert shown.startswith("The operation did not finish.")
+    finally:
+        worker.close()
+
+
+def test_receipts_show_real_missing_column_list_from_a_wrong_upload(tmp_path: Path) -> None:
+    archive = tmp_path / "upload.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(CSV_FILENAME, "Name,Value\na,b\n")
+    worker = OwnerOperations(tmp_path / "state")
+    try:
+        receipt = worker.submit(
+            "import-preview",
+            key="wrong-upload-synthetic",
+            inputs={},
+            execute=lambda: {"rows": len(preview_ebird_checklists(archive))},
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert result["status"] == "failed"
+        message = str(cast(dict[str, object], result["result"])["message"])
+        assert message.startswith("eBird archive is missing required columns: ")
+        assert "Date" in message
+    finally:
+        worker.close()
+
+
+def test_receipts_show_a_column_name_that_contains_a_slash(tmp_path: Path) -> None:
+    worker = OwnerOperations(tmp_path)
+    message = "eBird archive is missing required columns: State/Province, Date"
+
+    def fail() -> dict[str, object]:
+        raise DataSourceError(message)
+
+    try:
+        receipt = worker.submit(
+            "import-preview", key="slash-column-synthetic", inputs={}, execute=fail
+        )
+        result = completed(lambda: worker.status(str(receipt["operation_id"])))
+        assert str(cast(dict[str, object], result["result"])["message"]) == message
+    finally:
+        worker.close()

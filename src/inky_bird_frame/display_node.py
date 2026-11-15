@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 from .catalog import CatalogEntry
 from .config import DisplayNodeConfig, RotationMode
 from .display import detect_inky_display, show_on_inky
-from .errors import CatalogError, DataSourceError
+from .errors import BusyError, CatalogError, DataSourceError
 from .http import get_bytes, get_json, post_json, write_bytes_atomic, write_json_atomic
 from .selection import select_catalog_entry, select_shuffle_bag_entry
 from .timeutil import parse_utc_timestamp
@@ -48,6 +48,10 @@ class DisplayState:
     consecutive_detection_displays: int = 0
 
 
+class DisplayCycleBusyError(CatalogError, BusyError):
+    """Another display cycle holds the lock; retry later. Still a CatalogError for 1.x callers."""
+
+
 @contextmanager
 def exclusive_display_cycle_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -55,7 +59,7 @@ def exclusive_display_cycle_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise CatalogError("Another display cycle is already running") from exc
+            raise DisplayCycleBusyError("Another display cycle is already running") from exc
         try:
             yield
         finally:

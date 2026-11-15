@@ -89,8 +89,25 @@ The controller checks display staleness each time it runs `notifications
 dispatch`, so display monitoring runs only when `[notifications]` has
 `enabled = true`. With notifications off, nothing checks for a stale display.
 A stale display counts as a degradation, so the threshold and cooldown below
-also apply to it. A selected wall view that is empty pauses the panel without a
-completed update, so it is reported as stale too.
+also apply to it.
+
+An empty wall view is a pause, not a failure. When the display uses the wall
+address (`.../wall`), its latest fetch was recorded on that route within the
+stale threshold, and the selected wall view is empty, the display check reports
+`paused: true` and `stale: false` and sends no notice. Moving from stale to
+paused records neither a degradation nor a recovery, so an earlier "Display
+updates are stale" notice stays open until real updates resume. A display that
+reads `/v1/catalog`, or that stops fetching, still raises the stale notice.
+
+Right after the controller's web server starts, the display may not have
+reported to it yet. For one rotation interval plus the display's startup delay,
+its rotation jitter and five minutes, a display check that would otherwise
+report a stale display reports `resuming: true` and `stale: false` instead. It
+neither opens nor closes a stale notice. A display that is up to date, or
+paused on an empty wall view, reports as usual.
+The start time is kept in `controller-started.json` under `state_dir`. A real
+outage that begins just before a restart is therefore reported up to that much
+later.
 
 Routine successes do not notify. Transient failures notify only after
 `degradation_failure_threshold` consecutive failures or
@@ -105,12 +122,26 @@ genuinely new taxa from healthy providers can still notify. If upgrading while
 the previous refresh was degraded, the first complete refresh establishes a
 reliable comparison without a discovery notice.
 
-The first refresh of a new installation names every species it finds in one
-notice, however many there are. Later, a notice that matches one still queued
-or already delivered is not sent again; the outbox remembers the last 1,000
-delivered notices. A plate approval notifies once per species. A discovery notice is
-skipped when it names exactly the same species as an earlier one, so a species
-that returns on its own next season may not be announced again.
+Each species is announced as new at most once per calendar year (UTC). One
+notice counts every new species and names the first ten, so the first refresh
+of a new installation, or a widened observation window, sends a single notice
+with a count rather than one per species. A species that returns next year is
+announced again. Inky remembers this year's announced species in
+`new-species-notices.json` under `state_dir` (mode `0600`). Deleting it can
+repeat this year's notices. Each refresh still compares against the species
+the previous refresh found, even while notifications are off or no destination
+subscribes to `discovery`. Species found during that time are not announced
+when notifications are turned on later, unless they leave the list and return.
+
+A plate approval notifies once per approved plate, so a replacement plate for
+the same bird is announced too. A notice that matches one still queued or
+already delivered is not sent again; the outbox remembers the last 1,000
+delivered notices. A queued notice or health record that cannot be saved leaves
+a warning in the service log. A new-species record that cannot be saved leaves
+no warning; this year's notice can then repeat.
+
+A refresh failure of any kind counts toward the "Bird discovery is degraded"
+alert, except when another refresh is already running.
 
 ## Delivery reliability
 
@@ -119,10 +150,25 @@ roll back discovery, generation, publication, or display state.
 
 The controller stores a durable private outbox under `state_dir`. It records
 each destination separately. If Discord succeeds and Pushover fails, only
-Pushover is retried. After `max_delivery_attempts`, the message moves to a
-visible dead-letter count for inspection. A bounded event ledger prevents
-completed messages from being resent after a restart. A slow provider cannot
-block or overwrite application events.
+Pushover is retried. The first retry waits `delivery_retry_minutes`; each later
+wait doubles, up to 6 hours (or `delivery_retry_minutes` if that is longer).
+After `max_delivery_attempts`, the message moves to a visible dead-letter count
+for inspection. With the defaults (5 minutes, 20 attempts) that happens after
+about 82 hours of failures. A bounded event ledger prevents completed messages
+from being resent after a restart. A slow provider cannot block or overwrite
+application events.
+
+`notifications status` shows `pending`, `dead_letters`, `oldest_pending_at`,
+`next_attempt_at` and a `retry` object with `first_delay_minutes`,
+`max_delay_minutes`, `max_delivery_attempts` and `dead_letter_after_minutes`.
+`status` and the controller doctor (`notification_dead_letters`) also report
+dead letters. After fixing a destination, `notifications retry` puts dead
+letters back in the queue and tries to deliver them.
+
+`GET /health` and `GET /wall/health` include `notification_dead_letters` for
+uptime monitors: a count, `0` when nothing has stopped retrying (including an
+installation that never queued a notice), or `null` when the notification state
+cannot be read.
 
 ## Provider setup
 

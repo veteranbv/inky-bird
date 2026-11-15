@@ -50,9 +50,11 @@ birdbuddy_include_manual_sightings = false
 # To change this existing file through the browser, use the explicit adoption
 # preview in Settings, then re-run the installer and restart the service.
 # configuration_ownership = "managed"
-# Existing configurations keep generation enabled. Turn it off to use only
-# approved artwork. Re-run native setup to remove the generation timer.
-# generation_enabled = false
+# New installs show approved artwork only. Set true to create new artwork with
+# your own image-generation account; that provider's charges apply. After changing
+# it, re-run native setup, or for Docker run config-sync and restart the services.
+# Older files without this line keep generation on, unless app-managed.
+generation_enabled = false
 # Private upload previews expire after 24 hours; choose 1–168. Cleanup never
 # removes confirmed history or saved trips. Restart after changing this policy.
 # owner_import_retention_hours = 24
@@ -122,7 +124,10 @@ insufficient_references_retry_minutes = 10080
 # for one recovery. Raise it deliberately when generation_minutes is reduced or after seeding.
 enabled = true
 max_searches_per_day = 5
-# Two allows one normal profile attempt and one bounded conflict refresh for the same species.
+# A total per bird, not per day: two allow one normal profile attempt and one conflict
+# refresh. It goes back to zero when a run produces a plate, when the bird stops and
+# waits for you, and on your retry or replacement; automatic retries keep it. A search
+# that ends without an answer (timeout or failed start) is given back.
 max_searches_per_species = 2
 allowed_domains = [
     "allaboutbirds.org",
@@ -175,6 +180,8 @@ enabled = false
 degradation_failure_threshold = 3
 degradation_window_minutes = 30
 cooldown_minutes = 360
+# The first retry waits delivery_retry_minutes; later waits double,
+# up to 6 hours, or delivery_retry_minutes if that is longer.
 delivery_retry_minutes = 5
 max_delivery_attempts = 20
 

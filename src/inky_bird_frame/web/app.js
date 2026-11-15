@@ -19,9 +19,10 @@ for (const name of ['pointerdown', 'keydown'])
   });
 
 class RequestError extends Error {
-  constructor(message, code) {
+  constructor(message, code, status) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -33,29 +34,100 @@ async function api(path, body) {
   });
 }
 
-async function upload(path, file, signal) {
-  return request(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Inky-CSRF': csrf },
-    body: file,
-    signal,
+function unreachable() {
+  return new RequestError('Inky cannot be reached. Check your connection and try again.', 'offline');
+}
+
+function stoppedUpload() {
+  return new RequestError('Upload stopped. No history changed.', 'stopped');
+}
+
+// A hung request must not hold a page: every request ends by this deadline.
+// Uploads are bounded by their own progress instead.
+const REQUEST_TIMEOUT = 60000;
+
+// A write that timed out may still have been applied by Inky.
+function notAnswered(write) {
+  return new RequestError(
+    write
+      ? 'Inky did not answer in time. The change may still have been saved, so reload before trying again.'
+      : 'Inky did not answer in time. Check your connection and try again.',
+    'timeout',
+  );
+}
+
+// fetch cannot report how much of a request body has been sent.
+async function upload(path, file, signal, onProgress) {
+  const response = await new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(stoppedUpload());
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    const stop = () => xhr.abort();
+    // Leaving the page would end the transfer, so the browser asks first.
+    const stay = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    const settle = (finish) => {
+      signal?.removeEventListener('abort', stop);
+      removeEventListener('beforeunload', stay);
+      finish();
+    };
+    xhr.onload = () =>
+      settle(() =>
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          status: xhr.status,
+          json: async () => JSON.parse(xhr.responseText),
+        }),
+      );
+    xhr.onerror = xhr.ontimeout = () => settle(() => reject(unreachable()));
+    xhr.onabort = () => settle(() => reject(signal?.aborted ? stoppedUpload() : unreachable()));
+    if (onProgress)
+      xhr.upload.onprogress = (event) =>
+        onProgress(event.loaded, event.lengthComputable ? event.total : 0);
+    xhr.open('POST', path);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Inky-CSRF', csrf);
+    signal?.addEventListener('abort', stop);
+    addEventListener('beforeunload', stay);
+    xhr.send(file);
   });
+  return reply(response);
 }
 
 async function request(path, options) {
-  let response;
+  const control = new AbortController();
+  let timedOut = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    control.abort();
+  }, REQUEST_TIMEOUT);
   try {
-    response = await fetch(path, {
-      ...options,
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
-  } catch {
-    throw new RequestError(
-      'Inky cannot be reached. Check your connection and try again.',
-      'offline',
-    );
+    let response;
+    try {
+      response = await fetch(path, {
+        ...options,
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: control.signal,
+      });
+    } catch {
+      throw timedOut ? notAnswered(options.method === 'POST') : unreachable();
+    }
+    try {
+      return await reply(response);
+    } catch (error) {
+      throw timedOut ? notAnswered(options.method === 'POST') : error;
+    }
+  } finally {
+    clearTimeout(deadline);
   }
+}
+
+async function reply(response) {
   let result;
   try {
     result = await response.json();
@@ -73,6 +145,7 @@ async function request(path, options) {
     throw new RequestError(
       result.error?.message || 'Inky could not complete this request.',
       result.error?.code,
+      response.status,
     );
   return result.data;
 }
@@ -240,6 +313,8 @@ function rememberField(form, access) {
   return input;
 }
 
+// A short note leads; what follows the form keeps every fact, so on a phone
+// the account form is not pushed below a wall of text. Returns that part.
 function connectionNotice(access) {
   const hostTrust = element(
     'p',
@@ -252,23 +327,24 @@ function connectionNotice(access) {
     check.setAttribute('aria-hidden', 'true');
     notice.append(check, document.createTextNode('Encrypted connection'));
     main.append(notice, hostTrust);
-    return;
+    return null;
   }
-  const section = element('section', '', 'notice');
-  section.append(
+  main.append(
     element(
       'p',
-      'This connection is not encrypted. Use a unique password on a trusted home network. Do not expose Inky to the internet.',
+      'This connection is not encrypted. Use a unique password and do not expose Inky to the internet.',
+      'hint',
     ),
   );
-  section.append(hostTrust);
-  section.append(
+  const more = element('div', '', 'connection-more');
+  more.append(
+    hostTrust,
     help('About this home-network connection', [
       'People who can inspect your network traffic could read passwords, session credentials and private data. HTTPS encrypts that traffic. You can add it later, but Inky does not require it for trusted home-network use.',
       'Other web apps on this same hostname or IP address can receive your Inky sign-in cookie, even on a different port. If you do not trust those apps, use a separate device or an isolated address. A new HTTP hostname alone does not isolate them. See the access guide for HTTPS isolation.',
     ]),
   );
-  main.append(section);
+  return more;
 }
 
 function signIn(access, notice = '') {
@@ -276,8 +352,8 @@ function signIn(access, notice = '') {
   screen(
     setup ? 'Make Inky yours' : 'Welcome back',
     setup
-      ? 'Create the owner account for your bird journal. No email or online account is needed.'
-      : 'Sign in to your Inky bird journal.',
+      ? 'Create the owner account for your journal. No email or online account is needed.'
+      : 'Sign in to your journal.',
   );
   const mark = element('img', '', 'auth-mark');
   mark.src = '/app/icon-180.png';
@@ -286,7 +362,7 @@ function signIn(access, notice = '') {
   mark.height = 180;
   main.prepend(mark);
   if (notice) main.append(noticeMessage(notice));
-  connectionNotice(access);
+  const connectionMore = connectionNotice(access);
   if (setup)
     main.append(
       element(
@@ -374,11 +450,12 @@ function signIn(access, notice = '') {
     main.append(
       element(
         'p',
-        'Browser sign-in is unavailable. Ask the installer to restore the provider or enable local sign-in. Your data stays in place.',
+        'Browser sign-in is unavailable. Ask whoever runs Inky to restore the provider or turn on the Inky password. Your data stays in place.',
         'notice',
       ),
     );
   if (access.provider?.error) main.append(element('p', access.provider.error, 'error'));
+  if (connectionMore) main.append(connectionMore);
   if (!setup)
     main.append(
       help('Can’t sign in?', [
@@ -540,7 +617,7 @@ async function accountAccess(access, session, message = '') {
         confirmationBox.append(
           element(
             'p',
-            'Your sign-in provider is unavailable. This change needs a fresh sign-in. Ask the installer to restore the provider, or enable local login through operator recovery.',
+            'This change needs a fresh sign-in, but your sign-in provider is not answering. Try again once it is back, or ask whoever runs Inky to turn on the Inky password.',
           ),
           cancel,
         );
@@ -719,7 +796,7 @@ async function accountAccess(access, session, message = '') {
         advanced.append(
           element(
             'p',
-            p.error || 'The provider is unavailable. Ask the installer to check its settings.',
+            p.error || 'The provider is unavailable. Ask whoever runs Inky to check its settings.',
             'error',
           ),
         );
@@ -776,8 +853,17 @@ function showProblem(error) {
     return;
   }
   screen('Inky needs attention', error.message);
+  main.append(button('Try again', () => load()));
+  // A signed-in owner can always leave a page that cannot be drawn.
+  if (csrf)
+    main.append(
+      button('Go to Home', () => {
+        history.replaceState(null, '', '/app');
+        load();
+      }),
+      button('Sign out', signOut),
+    );
   main.append(
-    button('Try again', () => load()),
     help('If the problem continues', [
       'Check that Inky is running and your home network or private VPN is connected. For a private-state error, check storage and permissions. Do not delete state to hide an error.',
     ]),
@@ -856,7 +942,7 @@ window.addEventListener('popstate', () => {
 });
 await load(
   ssoResult === 'failed'
-    ? 'Single sign-on could not finish. Your existing access stays in place. Try again, or use local sign-in if available. If this continues, ask the installer to check the provider.'
+    ? 'Single sign-on could not finish. Your existing access stays in place. Try again, or use local sign-in if available. If this continues, ask whoever runs Inky to check the provider.'
     : ssoResult === 'linked'
       ? 'Single sign-on linked and verified.'
       : ssoResult === 'confirmed'

@@ -11,6 +11,30 @@ from .http import write_json_atomic
 
 
 class ResearchBudget:
+    """A shared daily search total plus a per-species total for one run of work.
+
+    A run is the automatic work toward one plate for one bird. Every event:
+
+    | Event                                    | Per-species total | Daily total    |
+    |------------------------------------------|-------------------|----------------|
+    | Research call starts (saved first)       | +1                | +1             |
+    | Call completes, usable answer or not     | kept              | kept           |
+    | Call ends without an answer (timeout,    | -1 (refund)       | -1 if the same |
+    |   agent outage, failed start)            |                   |   day, else -  |
+    | Process dies or is stopped mid-call      | kept              | kept           |
+    | Automatic retry after a failure          | kept              | kept           |
+    | Run ends with a plate (pending or held)  | reset to 0        | kept           |
+    | Stop for the owner (any terminal stop)   | reset to 0        | kept           |
+    | Owner retry, with or without fresh       | reset to 0        | kept           |
+    |   research (CLI or the web page)         |                   |                |
+    | Owner replacement of an approved plate   | reset to 0        | kept           |
+    | Owner rejection of a pending plate       | kept (already 0)  | kept           |
+    | New UTC day                              | kept              | starts at 0    |
+
+    The per-species limit is checked against the run's total; the daily limit
+    against the day's total. tests/test_research_allowance.py walks every row.
+    """
+
     def __init__(self, path: Path, *, daily_limit: int, species_limit: int) -> None:
         self.path = path
         self.daily_limit = daily_limit
@@ -18,36 +42,67 @@ class ResearchBudget:
 
     def consume(self, taxon_id: int, now: datetime | None = None) -> None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
-        day, total, species = self._read()
+        day, total, species, totals = self._read()
         if day != current.date():
             total = 0
             species = {}
-        species_count = species.get(taxon_id, 0)
         retry_at = datetime.combine(current.date() + timedelta(days=1), time.min, tzinfo=UTC)
         if total >= self.daily_limit:
             raise ResearchLimitError(
                 f"Daily research limit of {self.daily_limit} searches has been reached",
                 retry_at=retry_at,
             )
-        if species_count >= self.species_limit:
+        if totals.get(taxon_id, 0) >= self.species_limit:
             raise ResearchLimitError(
                 f"Taxon {taxon_id} reached its research limit of {self.species_limit} searches",
                 retry_at=retry_at,
             )
-        species[taxon_id] = species_count + 1
+        species[taxon_id] = species.get(taxon_id, 0) + 1
+        totals[taxon_id] = totals.get(taxon_id, 0) + 1
+        self._write(current.date(), total + 1, species, totals)
+
+    def refund(self, taxon_id: int, now: datetime | None = None) -> None:
+        """Return one search that ended without an answer."""
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        day, total, species, totals = self._read()
+        if totals.get(taxon_id, 0) <= 0:
+            return
+        totals[taxon_id] -= 1
+        if day == current.date() and species.get(taxon_id, 0) > 0:
+            species[taxon_id] -= 1
+            total = max(total - 1, 0)
+        self._write(day, total, species, totals)
+
+    def species_exhausted(self, taxon_id: int) -> bool:
+        """Whether this species has used its whole allowance, which only a reset returns."""
+        return self._read()[3].get(taxon_id, 0) >= self.species_limit
+
+    def reset_species(self, taxon_id: int) -> None:
+        if not self.path.exists():
+            return
+        day, total, species, totals = self._read()
+        if totals.pop(taxon_id, None) is None:
+            return
+        self._write(day, total, species, totals)
+
+    def _write(
+        self, day: date, total: int, species: dict[int, int], totals: dict[int, int]
+    ) -> None:
+        # date, total and species keep their earlier meaning for older readers.
         write_json_atomic(
             self.path,
             {
                 "schema_version": 1,
-                "date": current.date().isoformat(),
-                "total": total + 1,
+                "date": day.isoformat(),
+                "total": total,
                 "species": {str(key): value for key, value in sorted(species.items())},
+                "species_totals": {str(key): value for key, value in sorted(totals.items())},
             },
         )
 
-    def _read(self) -> tuple[date, int, dict[int, int]]:
+    def _read(self) -> tuple[date, int, dict[int, int], dict[int, int]]:
         if not self.path.exists():
-            return date.min, 0, {}
+            return date.min, 0, {}, {}
         try:
             raw = json.loads(self.path.read_text())
         except json.JSONDecodeError as exc:
@@ -69,13 +124,24 @@ class ResearchBudget:
             parsed_day = date.fromisoformat(day)
         except ValueError as exc:
             raise CatalogError(f"Invalid research budget date: {self.path}") from exc
-        parsed_species: dict[int, int] = {}
-        for key, value in species.items():
+        parsed_species = self._counts(species)
+        raw_totals = raw.get("species_totals")
+        if raw_totals is None:
+            # A file from an earlier release kept only one day's counts; they are
+            # the only usage on record, so they start the totals.
+            return parsed_day, total, parsed_species, dict(parsed_species)
+        if not isinstance(raw_totals, dict):
+            raise CatalogError(f"Invalid research budget: {self.path}")
+        return parsed_day, total, parsed_species, self._counts(raw_totals)
+
+    def _counts(self, raw: dict[object, object]) -> dict[int, int]:
+        parsed: dict[int, int] = {}
+        for key, value in raw.items():
             try:
-                taxon_id = int(key)
-            except (TypeError, ValueError) as exc:
+                taxon_id = int(str(key))
+            except ValueError as exc:
                 raise CatalogError(f"Invalid research budget taxon: {self.path}") from exc
             if taxon_id <= 0 or not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise CatalogError(f"Invalid research budget count: {self.path}")
-            parsed_species[taxon_id] = value
-        return parsed_day, total, parsed_species
+            parsed[taxon_id] = value
+        return parsed

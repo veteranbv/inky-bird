@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,16 @@ from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.models import ProfileConflict
 from inky_bird_frame.retry import RetryGuidance, RetryStore, parse_retry_profile_conflicts
+
+EARLIER_RECORD = {
+    "taxon_id": 42,
+    "attempts": 20,
+    "error_type": "InsufficientReferencesError",
+    "error": "not enough photos",
+    "first_failed_at": "2026-01-01T00:00:00+00:00",
+    "last_failed_at": "2026-05-01T00:00:00+00:00",
+    "next_attempt_at": "2026-05-08T00:00:00+00:00",
+}
 
 
 class RetryStoreTests(unittest.TestCase):
@@ -42,6 +53,78 @@ class RetryStoreTests(unittest.TestCase):
         if reloaded is not None:
             self.assertEqual(reloaded.common_name, "Example Bird")
             self.assertEqual(reloaded.scientific_name, "Avis exemplum")
+
+    def test_only_counted_failures_raise_the_ceiling_count(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            store = RetryStore(path)
+            for counts in (False, True, False):
+                store.record_failure(
+                    42,
+                    RuntimeError("temporary"),
+                    now=now,
+                    initial_minutes=1,
+                    maximum_minutes=1,
+                    counts_toward_limit=counts,
+                )
+            reloaded = RetryStore(path).get(42)
+
+        self.assertIsNotNone(reloaded)
+        if reloaded is not None:
+            self.assertEqual(reloaded.attempts, 3)
+            self.assertEqual(reloaded.counted_failures, 1)
+
+    def test_record_from_an_earlier_release_starts_its_count_at_zero(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            path.write_text(json.dumps({"schema_version": 1, "records": [EARLIER_RECORD]}))
+            record = RetryStore(path).get(42)
+
+        self.assertIsNotNone(record)
+        if record is not None:
+            self.assertEqual(record.attempts, 20)
+            self.assertEqual(record.counted_failures, 0)
+
+    def test_invalid_counted_failures_are_refused(self) -> None:
+        for value in (-1, 21, True, "3"):
+            with self.subTest(value=value), TemporaryDirectory() as temporary:
+                path = Path(temporary) / "retries.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "records": [{**EARLIER_RECORD, "counted_failures": value}],
+                        }
+                    )
+                )
+                with self.assertRaisesRegex(CatalogError, "Invalid retry record"):
+                    RetryStore(path)
+
+    def test_backoff_doubles_each_failure_until_the_cap(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        waits: list[timedelta] = []
+        attempts: list[int] = []
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "retries.json"
+            current = now
+            for _ in range(6):
+                record = RetryStore(path).record_failure(
+                    42,
+                    RuntimeError("temporary"),
+                    now=current,
+                    initial_minutes=10,
+                    maximum_minutes=100,
+                )
+                waits.append(record.next_attempt_at - current)
+                attempts.append(record.attempts)
+                current = record.next_attempt_at
+
+        self.assertEqual(
+            waits,
+            [timedelta(minutes=minutes) for minutes in (10, 20, 40, 80, 100, 100)],
+        )
+        self.assertEqual(attempts, [1, 2, 3, 4, 5, 6])
 
     def test_failure_without_message_is_recorded_in_a_readable_form(self) -> None:
         now = datetime(2026, 7, 10, tzinfo=UTC)

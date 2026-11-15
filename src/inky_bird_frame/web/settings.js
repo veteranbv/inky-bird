@@ -1,13 +1,21 @@
 // Settings edit the controller's authoritative file. Secrets are write-only.
+import { inlineProblem } from '/app/ui.js';
+import { windowName, eventName } from '/app/words.js';
+
+const secretNames = {
+  ebird_api_key: 'eBird API key',
+  birdweather_token: 'BirdWeather station token',
+  geoapify_api_key: 'Geoapify API key',
+};
+
 export async function renderSettings(ui, { base, link, note, sourceNames, source }) {
   const { element: el, button, api } = ui;
   const main = document.querySelector('#main');
-  const settings = await api('/v1/owner/settings');
   base(
     source ? sourceNames[source][0] : 'Settings and backups',
     source
       ? sourceNames[source][1]
-      : 'Choose how Inky runs. Installation and network settings stay with the installer.',
+      : 'Choose how Inky runs. Installation and network settings stay with whoever runs Inky.',
   );
   if (source) main.append(link('Back to Sources', 'sources'));
   main.append(link('Back to Manage', 'manage'));
@@ -18,6 +26,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   );
   if (location.protocol === 'http:') main.append(privateNotice);
   if (source === 'birdbuddy') await birdBuddyAccount(ui, main, note);
+  let settings;
+  try {
+    settings = await api('/v1/owner/settings');
+  } catch (error) {
+    inlineProblem(ui, main, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
   if (settings.restart_required) {
     main.append(
       el('h2', 'Finish switching configuration ownership'),
@@ -29,7 +44,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   }
   if (!settings.editable) {
     main.append(
-      el('h2', 'Managed by your installer'),
+      el('h2', 'Managed by whoever runs Inky'),
       note(
         'Your TOML file and environment remain authoritative. Change the file, validate it, then re-run native setup or restart Docker. This page never edits a temporary copy that startup will replace.',
       ),
@@ -43,8 +58,15 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             note(
               'Inky will back up this private file, then mark it app-managed. Your source choices, generation policy, credentials and history stay unchanged. Future browser saves update this same file. Environment credentials stay locked.',
             ),
+            ...(settings.adoption_notice ? [note(settings.adoption_notice)] : []),
             note(
-              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. To undo adoption, stop Inky and restore the matching previous file, then run setup again.',
+              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. ' +
+                // Before adoption the copy exists only when an earlier adoption made it.
+                (settings.original_backup && settings.original_backup_available === false
+                  ? 'To undo adoption, stop Inky, put ' +
+                    settings.original_backup +
+                    ' back in place of your configuration file, then run setup again.'
+                  : 'To undo adoption, stop Inky and restore the matching previous file, then run setup again.'),
             ),
             button('Confirm switch', async (event) => {
               const control = event.currentTarget;
@@ -99,12 +121,15 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (type === 'number') {
       field.step = ['latitude', 'longitude'].includes(key) ? 'any' : '1';
     }
-    if (external) field.placeholder = 'Managed by the installer environment';
+    if (external) field.placeholder = 'Set by whoever runs Inky';
     else if (secret)
       field.placeholder = settings.credentials[key]?.configured
         ? 'Already set. Leave empty to keep it.'
         : 'Not set';
     parent.append(caption, field);
+    // A placeholder disappears once typing starts, so say it in text too.
+    if (secret && !external && settings.credentials[key]?.configured)
+      parent.append(note('Saved. Leave this empty to keep it.'));
     if (hint) parent.append(note(hint));
     read.push(() => {
       if (external || (secret && !field.value)) return;
@@ -126,16 +151,20 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   if (source) {
     const group = section(
       'Use this source',
-      'Enabling a source can put newly observed birds into the live selection. It does not download media. Automatic plate work follows your generation setting.',
+      'Birds this source notes can go on your frame. Plates for them are made only if plate making is on.',
     );
     checkbox(
       group,
-      'Include ' + sourceNames[source][0] + ' in scheduled discovery',
+      'Check ' + sourceNames[source][0] + ' for new birds',
       fields.sources.includes(source),
       (checked) => {
-        changes.discovery.sources = Object.keys(sourceNames).filter((key) =>
-          key === source ? checked : fields.sources.includes(key),
-        );
+        // Sources this page does not know, such as one from a newer release, stay.
+        const others = fields.sources.filter((key) => key !== source);
+        changes.discovery.sources = checked
+          ? fields.sources.includes(source)
+            ? [...fields.sources]
+            : [...others, source]
+          : others;
       },
     );
     if (['inaturalist', 'ebird'].includes(source))
@@ -164,12 +193,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       );
     if (source === 'birdbuddy') {
       const group = section(
-        'Manual records',
-        'Bird Buddy manual sightings can be account-wide and may not belong to your selected feeder. They are separate from automatic feeder detections.',
+        'Birds added by hand',
+        'Birds added by hand in Bird Buddy can come from your whole account, not just this feeder. They are separate from the postcards your feeder sends.',
       );
       checkbox(
         group,
-        'Include manually entered sightings',
+        'Include birds added by hand',
         fields.birdbuddy_include_manual_sightings,
         (checked) => {
           changes.discovery.birdbuddy_include_manual_sightings = checked;
@@ -179,7 +208,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (['ebird-archive', 'birdnet-analyzer'].includes(source))
       form.append(
         note(
-          'An import is retained history, not a live connection. Enabling it selects records within the shared window; it does not request a new file automatically.',
+          'This is history you imported, not a live connection. Turning it on uses its records within your window; it never fetches a new file.',
         ),
       );
   } else {
@@ -239,13 +268,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         changes.discovery.geoapify_api_key = null;
     });
     const selection = section(
-      'Shared live selection',
-      'Collections keep their own fixed membership. These choices control scheduled observation refreshes. eBird nearby supports up to 30 days and 50 km.',
+      'What your regular checks look for',
+      'Collections keep their own birds. eBird nearby looks back at most 30 days and 50 km.',
     );
     const window = el('select');
     window.setAttribute('aria-label', 'Observation window');
     for (const key of ['last-day', 'last-week', 'last-30-days', 'last-year', 'all-time']) {
-      const option = el('option', key.replaceAll('-', ' '));
+      const option = el('option', windowName(key));
       option.value = key;
       window.append(option);
     }
@@ -257,15 +286,15 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     input(selection, 'radius_km', 'Radius in kilometers', fields.radius_km, { type: 'number' });
     input(selection, 'species_limit', 'Live species limit', fields.species_limit, {
       type: 'number',
-      hint: 'This limits live discovery, not the membership of a saved trip. BirdWeather supports at most 100.',
+      hint: 'The most birds your regular checks bring in. Saved trips keep all their birds. BirdWeather supports at most 100.',
     });
     const generation = section(
-      'Plate generation',
-      'Approved art is free to browse. First install and sign in to Codex through the operator setup, then run the controller doctor. Creating missing plates uses that AI account and its allowance or costs. Inky keeps sourced review and retry limits. Disabling generation leaves history and queued work intact. An attempt already running can finish.',
+      'Plate making',
+      'Browsing your plates is free. New plates are drawn with your own image-generation account, and that provider’s charges apply. Set the account up on the controller first, then run the controller doctor. Every new plate must pass its checks before it joins your journal. Turning this off keeps your history and waiting requests; a plate already being drawn can finish.',
     );
     checkbox(
       generation,
-      'Enable scheduled plate generation',
+      'Make new plates on a schedule',
       settings.generation_enabled,
       (checked) => {
         changes.controller.generation_enabled = checked;
@@ -273,13 +302,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     );
     const consent = checkbox(
       generation,
-      'I understand that enabling generation can start AI work at the next scheduled cycle.',
+      'I understand this can start using my image-generation account at the next check.',
       false,
       () => {},
     );
     read.push(() => {
       if (!settings.generation_enabled && changes.controller.generation_enabled && !consent.checked)
-        throw new Error('Confirm AI use before enabling generation.');
+        throw new Error('Tick the box to confirm before turning plate making on.');
     });
     const notifications = section(
       'Notifications',
@@ -292,21 +321,27 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     notifications.append(destinationRows);
     const external = settings.notifications.destinations.some((item) => item.external);
     const destinationReaders = [];
+    let destinationCount = 0;
     function destination(saved = {}) {
       const row = el('fieldset');
       row.append(el('legend', 'Destination'));
       const name = el('input');
       name.value = saved.name || '';
-      name.setAttribute('aria-label', 'Destination name');
+      name.id = 'destination-name-' + ++destinationCount;
+      const nameLabel = el('label', 'Destination name');
+      nameLabel.htmlFor = name.id;
       const url = el('input');
       url.type = 'password';
       url.autocomplete = 'new-password';
-      url.setAttribute('aria-label', 'Private notification URL');
+      url.id = 'destination-url-' + destinationCount;
+      const urlLabel = el('label', 'Private notification URL');
+      urlLabel.htmlFor = url.id;
       url.placeholder = saved.name
         ? 'Already set. Leave empty to keep.'
         : 'Apprise notification URL';
-      row.append(name, url);
-      const events = [
+      row.append(nameLabel, name, urlLabel, url);
+      if (saved.name) row.append(note('A URL is saved. Leave this empty to keep it.'));
+      const known = [
         'discovery',
         'generation_approved',
         'terminal_error',
@@ -317,17 +352,24 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         'display_stale',
         'display_recovered',
       ];
+      // An event this page does not list stays with its destination.
+      const events = [...known, ...(saved.events || []).filter((event) => !known.includes(event))];
       const checked = [];
       for (const event of events) {
         const label = el('label', '', 'check-label'),
           field = el('input');
         field.type = 'checkbox';
         field.checked = !saved.events || saved.events.includes(event);
-        label.append(field, document.createTextNode(event.replaceAll('_', ' ')));
+        label.append(field, document.createTextNode(eventName(event)));
         row.append(label);
         checked.push([event, field]);
       }
-      row.append(button('Remove destination', () => row.remove()));
+      row.append(
+        button('Remove destination', () => {
+          row.remove();
+          withdrawReview();
+        }),
+      );
       destinationRows.append(row);
       destinationReaders.push(() =>
         row.isConnected
@@ -342,12 +384,17 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (external)
       notifications.append(
         note(
-          'Destination credentials are managed by the environment. Change them through the installer.',
+          'Destination credentials are managed by the environment. Ask whoever runs Inky to change them.',
         ),
       );
     else {
       for (const saved of settings.notifications.destinations) destination(saved);
-      notifications.append(button('Add destination', () => destination()));
+      notifications.append(
+        button('Add destination', () => {
+          destination();
+          withdrawReview();
+        }),
+      );
       read.push(() => {
         changes.notifications.destinations = destinationReaders.map((get) => get()).filter(Boolean);
       });
@@ -360,11 +407,16 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   review.hidden = true;
   const submit = el('button', 'Review changes');
   submit.type = 'submit';
-  form.append(submit, problem, review);
-  main.append(form);
-  form.addEventListener('input', () => {
+  form.append(submit, problem);
+  // Outside the form, so typing or pressing Enter in its sign-in confirmation
+  // neither withdraws the review nor submits the form again.
+  main.append(form, review);
+  // A review describes one set of choices; any later change withdraws it.
+  function withdrawReview() {
     review.hidden = true;
-  });
+    review.replaceChildren();
+  }
+  form.addEventListener('input', withdrawReview);
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     problem.textContent = '';
@@ -379,26 +431,27 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       const summary = [];
       if (source)
         summary.push(
-          (changes.discovery.sources.includes(source) ? 'Use ' : 'Do not use ') +
+          (changes.discovery.sources.includes(source) ? 'Check ' : 'Do not check ') +
             sourceNames[source][0] +
-            ' in scheduled discovery.',
+            ' for new birds.',
         );
       else
         summary.push(
-          'Live window: ' + changes.discovery.window.replaceAll('-', ' ') + '.',
-          'Generation: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
+          'Window: ' + windowName(changes.discovery.window) + '.',
+          'Plate making: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
           'Notifications: ' + (changes.notifications.enabled ? 'on' : 'off') + '.',
         );
+      summary.push(...differences(settings, changes));
       review.append(
         el('h2', 'Save these choices?'),
         ...summary.map(note),
         note(
-          'Inky validates the whole file before saving. A private previous-file backup is kept. The scheduler reads changes on its next check. Saving a new source does not run a connection test.',
+          'Inky checks the whole file before saving and keeps a private copy of the previous one. Changes apply from the next check. Saving a source does not test its connection.',
         ),
         button('Save settings', async (event) => {
           const control = event.currentTarget;
           control.disabled = true;
-          try {
+          const save = async () => {
             await api('/v1/owner/settings', {
               revision: settings.revision,
               changes,
@@ -406,9 +459,14 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             });
             for (const field of form.querySelectorAll('input[type="password"]')) field.value = '';
             location.reload();
+          };
+          try {
+            await save();
           } catch (error) {
-            problem.textContent = error.message;
             control.disabled = false;
+            if (error.code === 'sign_in_required') ui.showProblem(error);
+            else if (error.code === 'confirmation_required') confirmIdentity(ui, review, save);
+            else problem.textContent = error.message;
           }
         }),
         button('Keep editing', () => {
@@ -424,11 +482,123 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   });
 }
 
+// Keys and delivery addresses need a recent sign-in. The choices stay on the
+// page while the owner confirms, then the same save runs again.
+function confirmIdentity(ui, place, retry) {
+  const { element: el, button, api } = ui;
+  place.querySelector('.confirm-identity')?.remove();
+  const notice = el('section', '', 'notice confirm-identity');
+  notice.append(
+    el('p', 'Confirm it is you before saving keys or delivery addresses. Your choices stay on this page.'),
+  );
+  if (ui.localPasswordAllowed) {
+    const label = el('label', 'Your Inky password'),
+      password = el('input');
+    password.type = 'password';
+    password.id = 'settings-confirm-password';
+    password.autocomplete = 'current-password';
+    label.htmlFor = password.id;
+    notice.append(
+      label,
+      password,
+      button('Confirm and save', async () => {
+        try {
+          await api('/v1/owner/confirm-password', { passphrase: password.value });
+        } catch (failure) {
+          inlineProblem(ui, notice, failure);
+          return;
+        } finally {
+          password.value = '';
+        }
+        notice.remove();
+        try {
+          await retry();
+        } catch (failure) {
+          inlineProblem(ui, place, failure);
+        }
+      }),
+    );
+    password.focus();
+  }
+  if (ui.singleSignOnReady)
+    notice.append(
+      button('Confirm with single sign-on', async () => {
+        try {
+          await ui.confirmWithSSO();
+        } catch (failure) {
+          inlineProblem(ui, notice, failure);
+        }
+      }),
+      el(
+        'p',
+        'Sign-in returns to Account and access. Come back here and save again; unsaved entries will clear.',
+      ),
+    );
+  if (!ui.localPasswordAllowed && !ui.singleSignOnReady)
+    notice.append(el('p', 'Confirming a sign-in is not available right now. Try again later.'));
+  notice.append(button('Cancel confirmation', () => notice.remove()));
+  place.append(notice);
+}
+
+// What a save changes beyond the fixed summary: location, limits, secrets and
+// destinations, so nothing is removed or replaced without being named.
+function differences(settings, changes) {
+  const fields = settings.discovery,
+    next = changes.discovery,
+    lines = [];
+  const place = (values) =>
+    values.latitude != null
+      ? 'latitude ' + values.latitude + ', longitude ' + values.longitude
+      : values.zip_code
+        ? 'US ZIP code ' + values.zip_code
+        : values.postal_code
+          ? 'postal code ' + values.postal_code + (values.country_code ? ', ' + values.country_code : '')
+          : 'no community location';
+  const keys = ['latitude', 'longitude', 'zip_code', 'postal_code', 'country_code'];
+  if (keys.some((key) => key in next)) {
+    const after = Object.fromEntries(keys.map((key) => [key, key in next ? next[key] : fields[key]]));
+    if (place(after) !== place(fields)) lines.push('Community location: ' + place(after) + '.');
+  }
+  if ('radius_km' in next && next.radius_km !== (fields.radius_km ?? null))
+    lines.push('Radius: ' + (next.radius_km ?? 'not set') + (next.radius_km == null ? '.' : ' km.'));
+  if ('species_limit' in next && next.species_limit !== (fields.species_limit ?? null))
+    lines.push('Live species limit: ' + (next.species_limit ?? 'not set') + '.');
+  if ('birdnet_go_url' in next && next.birdnet_go_url !== (fields.birdnet_go_url ?? null))
+    lines.push('BirdNET-Go base URL: ' + (next.birdnet_go_url ?? 'not set') + '.');
+  for (const [key, name] of Object.entries(secretNames)) {
+    if (!(key in next)) continue;
+    const saved = settings.credentials[key]?.configured;
+    if (next[key] === null) {
+      if (saved) lines.push('Clear the saved ' + name + '.');
+    } else lines.push((saved ? 'Replace the saved ' : 'Save a new ') + name + '.');
+  }
+  const destinations = changes.notifications.destinations;
+  if (destinations) {
+    const before = settings.notifications.destinations.map((item) => item.name);
+    const after = destinations.map((item) => item.name);
+    for (const name of before)
+      if (!after.includes(name)) lines.push('Remove notification destination: ' + name + '.');
+    for (const item of destinations)
+      if (!before.includes(item.name)) lines.push('Add notification destination: ' + item.name + '.');
+      else if (item.url) lines.push('Replace the private URL for ' + item.name + '.');
+  }
+  return lines;
+}
+
 async function birdBuddyAccount(ui, main, note) {
   const { api, element: el, button } = ui;
-  const response = await api('/v1/owner/birdbuddy'),
-    state = response.state;
   const section = el('section', '', 'journal-card');
+  let response;
+  try {
+    response = await api('/v1/owner/birdbuddy');
+  } catch (error) {
+    // The rest of the page, including the switch for this source, still works.
+    section.append(el('h2', 'Bird Buddy account'));
+    main.append(section);
+    inlineProblem(ui, section, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
+  const state = response.state;
   section.append(
     el('h2', 'Bird Buddy account'),
     note(
@@ -453,7 +623,7 @@ async function birdBuddyAccount(ui, main, note) {
       note(
         'Role: ' +
           state.feeder.role +
-          '. Saved credentials are present; this is not a live token check. Use Refresh observations on Sources to check the enabled provider.',
+          '. Its sign-in is saved; that alone does not show it still works. Use Check sources now on Sources to try it.',
       ),
     );
     if (!state.least_privilege_guest)
@@ -467,16 +637,14 @@ async function birdBuddyAccount(ui, main, note) {
     if (state.history) {
       section.append(
         note(
-          'Last successful synchronization: ' +
+          'Last check that worked: ' +
             new Date(state.history.last_successful_sync_at).toLocaleString(),
         ),
         note(
-          'Retained postcards: ' +
+          'Postcards in your journal: ' +
             state.history.retained_postcards +
-            '. Manual sightings: ' +
-            (state.history.manual_sightings_included
-              ? 'included by your explicit setting'
-              : 'excluded') +
+            '. Birds added by hand: ' +
+            (state.history.manual_sightings_included ? 'included' : 'left out') +
             '.',
         ),
       );
@@ -485,7 +653,7 @@ async function birdBuddyAccount(ui, main, note) {
       button('Remove local Bird Buddy login', async (event) => {
         if (
           !confirm(
-            'Remove this installation’s Bird Buddy login and permission attestation? Retained detections and plates stay. This does not revoke the token at Bird Buddy.',
+            'Remove this Inky’s Bird Buddy login and your permission note? Birds already noted and your plates stay. This does not sign Inky out at Bird Buddy itself.',
           )
         )
           return;
@@ -505,8 +673,8 @@ async function birdBuddyAccount(ui, main, note) {
     section.append(
       note(
         state.history_present
-          ? 'No saved login. Earlier private detection history is retained.'
-          : 'Not signed in. No private detection history is available yet.',
+          ? 'No saved login. Birds noted earlier stay in your journal.'
+          : 'Not signed in. Nothing from Bird Buddy is in your journal yet.',
       ),
     );
   if (!response.secure_bootstrap) {

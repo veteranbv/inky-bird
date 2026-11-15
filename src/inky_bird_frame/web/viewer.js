@@ -1,5 +1,6 @@
 // The read-only screen has no owner cookie handling, private history or storage.
 import { frameTools, compact, glyph, stepIndex, confirmAction } from '/app/frame-tools.js';
+import { clampedNotice } from '/app/ui.js';
 const main = document.querySelector('#main');
 // A hung request must not stop a wall screen: every request ends by this deadline.
 const REQUEST_TIMEOUT = 20000;
@@ -127,11 +128,11 @@ async function pair() {
       code,
       el(
         'p',
-        'On your signed-in device, open Manage → Displays. Match this code, name this screen and choose the view it may show.',
+        'On your signed-in device, open Manage → Wall frame. Match this code, name this screen and choose what it shows.',
       ),
       el(
         'p',
-        'Pairing permits approved artwork only. It does not sign this screen in as the owner.',
+        'A paired screen shows plates only. It does not sign in as you.',
       ),
       status,
       cancel,
@@ -229,10 +230,20 @@ function present(initial) {
     togglePlay,
     onQuiet: forgetting.reset,
   });
+  const notice = clampedNotice(status, button);
+  const stopFrame = stopTools;
+  stopTools = () => {
+    stopFrame();
+    notice.stop();
+  };
   const dock = el('div');
   dock.className = 'frame-dock';
-  dock.append(status, controls);
-  main.replaceChildren(viewport, caption, dock);
+  dock.append(status, notice.control, controls);
+  // The bird name sits beside the plate on a short landscape screen.
+  const side = el('div');
+  side.className = 'frame-side';
+  side.append(caption);
+  main.replaceChildren(viewport, side, dock);
   function withdraw() {
     sequence += 1;
     loading?.abort();
@@ -247,7 +258,7 @@ function present(initial) {
     const bird = birds[index];
     if (!bird) {
       withdraw();
-      status.textContent = 'No approved plates in the permitted view. Inky will not switch views.';
+      status.textContent = 'This view has no plates now. The screen waits here and starts again when it has some.';
       return;
     }
     position = index;
@@ -268,14 +279,13 @@ function present(initial) {
     try {
       const response = await fetch(bird.portrait_url, {
         credentials: 'same-origin',
-        cache: 'no-store',
         signal: controller.signal,
       });
       if ([401, 403].includes(response.status)) {
         unavailable('Access expired or was revoked.');
         return;
       }
-      if (!response.ok) throw new Error('The selected plate is temporarily unavailable.');
+      if (!response.ok) throw new Error('This plate is not available right now.');
       const url = URL.createObjectURL(await response.blob());
       const decoded = new Image();
       decoded.src = url;
@@ -293,15 +303,15 @@ function present(initial) {
       objectURL = url;
       image.src = url;
       image.hidden = false;
-      image.alt = 'Approved field-journal plate: ' + bird.common_name;
+      image.alt = 'Field-journal plate: ' + bird.common_name;
       caption.textContent = bird.common_name;
       rendered = key;
       status.textContent = '';
     } catch (error) {
       if ((timedOut || !controller.signal.aborted) && !stopped)
         status.textContent =
-          (timedOut ? 'The selected plate is temporarily unavailable.' : error.message) +
-          ' Keeping the last approved image.';
+          (timedOut ? 'This plate is not available right now.' : error.message) +
+          ' Keeping the last plate.';
     } finally {
       clearTimeout(deadline);
     }
@@ -337,7 +347,7 @@ function present(initial) {
         unavailable(error.message);
         return;
       }
-      status.textContent = error.message + ' Keeping the last approved image.';
+      status.textContent = error.message + ' Keeping the last plate.';
     } finally {
       if (live()) timer = setTimeout(poll, 15000);
     }
@@ -355,7 +365,7 @@ async function start() {
         'p',
         error.code === 'offline'
           ? error.message
-          : 'Pair this browser to show one approved view without owner access.',
+          : 'Pair this browser to show your plates here, without signing in.',
       ),
       button('Pair this screen', pair),
     );

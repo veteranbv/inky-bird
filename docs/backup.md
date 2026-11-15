@@ -19,16 +19,44 @@ truth:
 | `state_dir` | Observations, collections, imports, retries, notifications, owner access, run history and optional Bird Buddy refresh token | Private and credential-sensitive |
 | `workspace_dir` | Current generated work and downloaded references | Private working data |
 
+Copies kept beside `config.toml` hold the same credentials and need the same
+protection: `config.toml.previous` (the file before the latest browser save),
+`config.toml.original` (the operator's file kept at the first browser
+adoption) and any `config.toml.invalid-<UTC time>` that `config install` kept.
+
 Relative paths resolve from the directory that contains `config.toml`. Record
 the resolved source and restore paths with the backup. A source checkout,
 virtual environment, container image, and display cache can be recreated and do
 not replace a state backup.
 
-Bird Buddy authentication lives in `state_dir/birdbuddy-auth.json`. It contains
-a rotating refresh token and makes every backup that includes it
-credential-sensitive. `birdbuddy-detections.json`, eBird Archive state, BirdNET
-Analyzer state, discovery snapshots, and run records contain private species and
-time history even when they contain no account credentials or precise location.
+Bird Buddy authentication lives in `state_dir/birdbuddy-auth.json`. It holds
+two refresh tokens: the current one and the last one Bird Buddy accepted, kept
+for one retry when the current one is rejected. It can also hold the current
+access token and its expiry. All of them make every backup that includes the
+file credential-sensitive. The feeder history also records, per feeder, when
+its full confirmed history was last read (`confirmed_history_checked_at`) and
+with which manual-sightings setting. `birdbuddy-detections.json`, eBird
+Archive state, BirdNET Analyzer state, discovery snapshots, and run records
+contain private species and time history even when they contain no account
+credentials or precise location.
+
+Each history file can have a private `.previous` copy beside it (mode `0600`):
+`birdbuddy-detections.json.previous` after a sync that changes the history, and
+`ebird-archive-observations.json.previous` or
+`birdnet-analyzer-detections.json.previous` after a browser import replaces
+existing history. Back them up and remove them together with their history.
+
+Some files can be rebuilt and may be left out of a backup. Each history has a
+summary beside it (`ebird-archive-observations-summary.json`,
+`birdnet-analyzer-detections-summary.json`, `birdbuddy-detections-summary.json`)
+with species names, counts and dates, no places. A missing or out-of-date
+summary is rebuilt from its history automatically, including after you restore
+an older history file, so restore order does not change. `plate-thumbnails/`
+holds small copies of approved plates for grid views and rebuilds itself.
+`birdbuddy-backoff.json` (a wait Bird Buddy asked for),
+`catalog-publish-verified.json` (the last full publication check),
+`controller-started.json` and `new-species-notices.json` can also be left out;
+leaving out the last one can repeat this year's new-species notices.
 
 The browser also keeps private owner and session state in this directory.
 Treat a backup containing it as credential-sensitive even without Bird Buddy.
@@ -848,8 +876,8 @@ from erasing data.
   `--dry-run` remove one species from persistent local membership; they do not
   delete its reusable approved plate.
 - eBird Archive, BirdNET Analyzer, and Bird Buddy history remain in their named
-  mode-`0600` state files until the operator deliberately removes that private
-  state.
+  mode-`0600` state files, with their `.previous` copies and summaries, until
+  the operator deliberately removes that private state.
 
 There is no safe selective command for completely purging one provider. Removing
 only its named history file is **provider-owned history removal**, not complete
@@ -868,7 +896,9 @@ selects the default iNaturalist source.
 For provider-owned history removal, first disable the provider, quiesce every
 writer, and make a separately protected recovery backup if policy permits. The
 history files are `ebird-archive-observations.json`,
-`birdnet-analyzer-detections.json`, and `birdbuddy-detections.json`. Use
+`birdnet-analyzer-detections.json`, and `birdbuddy-detections.json`. Remove the
+provider's `.previous` copy and `-summary.json` file with it; both hold the
+same species history. Use
 `birdbuddy logout --yes` for Bird Buddy authentication rather than editing or
 selectively deleting fields from `birdbuddy-auth.json`. Remove the corresponding
 `*-taxonomy-crosswalk.json` file too when cached species-resolution history is in

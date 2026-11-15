@@ -24,8 +24,13 @@ from .errors import ConfigurationError, InkyBirdFrameError, InstallationError
 from .http import get_json, write_bytes_atomic
 from .images import SUPPORTED_HARDWARE_SIZES
 from .native_names import LEGACY_NAME, resolve_native_layout, service_family
+from .notifications import notification_state_path, notification_status
 
 SUDO_AUTHORIZATION_TIMEOUT_SECONDS = 300
+# CodexRunner's default per-call limit; a test keeps the two equal.
+CODEX_CALL_TIMEOUT_SECONDS = 1200
+# Discovery refresh, reference downloads and stopping the agent cleanly.
+GENERATION_UNIT_MARGIN_SECONDS = 900
 INSTALLER_TIMEOUT_SECONDS = 3600
 # One native sign-in credential, bounded below normal OS environment limits.
 MAX_NATIVE_ACCESS_BYTES = 64 * 1024
@@ -142,6 +147,12 @@ def _systemd_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _systemd_argument(value: str) -> str:
+    # ExecStart expands $NAME and ${NAME} in arguments after the executable;
+    # the executable token and other directives used here are not expanded.
+    return _systemd_quote(value).replace("$", "$$")
+
+
 def controller_executable_path(codex_path: Path, *, generation_enabled: bool = True) -> str:
     """Return a deterministic PATH for managed controller services."""
     if not codex_path.is_absolute():
@@ -156,10 +167,10 @@ def controller_executable_path(codex_path: Path, *, generation_enabled: bool = T
     return ":".join(executable_paths)
 
 
-def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, str]:
-    """Persist only the configured OIDC secret for restart-safe native serving."""
+def _native_oidc_secret(config: AppConfig, config_path: Path) -> tuple[str, str, Path] | None:
+    """Return the OIDC secret native serving would retain, without writing anything."""
     if config.controller.oidc is None:
-        return {}
+        return None
     name = config.controller.oidc.client_secret_env
     path = config_path.resolve().parent / "native-access.env"
     cached: object = None
@@ -182,6 +193,18 @@ def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, s
                 "Supply the configured OIDC client secret when running native setup; "
                 "use one nonempty printable value"
             )
+    except (OSError, UnicodeError, ValueError):
+        raise InstallationError("Native access cache is invalid or cannot be written") from None
+    return name, secret, path
+
+
+def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, str]:
+    """Persist only the configured OIDC secret for restart-safe native serving."""
+    resolved = _native_oidc_secret(config, config_path)
+    if resolved is None:
+        return {}
+    name, secret, path = resolved
+    try:
         # JSON's printable UTF-8 string form is also a systemd EnvironmentFile
         # double-quoted value. No shell is used and no expansion is performed.
         content = f"{name}={json.dumps(secret, ensure_ascii=False)}\n".encode()
@@ -252,6 +275,20 @@ def native_tls_environment(config_path: Path) -> dict[str, str]:
     return {"SSL_CERT_FILE": str(bundle)}
 
 
+def generation_species_timeout_seconds(config: AppConfig) -> int:
+    """The longest one bird can take: its agent calls at their timeout."""
+    # A profile, one profile refresh, and per attempt one generation and one review.
+    calls = 2 + 2 * config.controller.max_generation_attempts
+    return calls * CODEX_CALL_TIMEOUT_SECONDS
+
+
+def generation_cycle_timeout_seconds(config: AppConfig) -> int:
+    """Bound one generation cycle by the agent calls its configuration allows."""
+    # Deferred species still count toward the cap.
+    birds = config.controller.max_species_attempts_per_cycle
+    return birds * generation_species_timeout_seconds(config) + GENERATION_UNIT_MARGIN_SECONDS
+
+
 def controller_systemd_units(
     config: AppConfig,
     *,
@@ -286,7 +323,9 @@ def controller_systemd_units(
     )
 
     def command(*arguments: str) -> str:
-        return " ".join(_systemd_quote(argument) for argument in (str(executable), *arguments))
+        return " ".join(
+            (_systemd_quote(str(executable)), *(_systemd_argument(item) for item in arguments))
+        )
 
     serving = common + owner_environment + SYSTEMD_SERVICE_HARDENING
     units = {
@@ -331,6 +370,7 @@ WantedBy=multi-user.target
             config.notifications.enabled,
         ),
     )
+    timeouts = {"generate": f"{generation_cycle_timeout_seconds(config)}s"}
     for name, minutes, enabled in jobs:
         if not enabled:
             continue
@@ -353,7 +393,7 @@ Description=Run the Inky Bird {name} cycle
 [Service]
 Type=oneshot
 {common}ExecStart={command(*arguments)}
-TimeoutStartSec=30min
+TimeoutStartSec={timeouts.get(name, "30min")}
 """
         units[f"{service_prefix}-{name}.timer"] = f"""[Unit]
 Description=Schedule the Inky Bird {name} cycle
@@ -382,7 +422,7 @@ def display_systemd_units(
     service_prefix = service_family(service_prefix)
     exec_start = (
         f"{_systemd_quote(str(executable))} display-cycle "
-        f"--config {_systemd_quote(str(config_path))}"
+        f"--config {_systemd_argument(str(config_path))}"
     )
     tls_environment = "".join(
         f"Environment={_systemd_quote(f'{name}={value}')}\n"
@@ -479,6 +519,46 @@ def _config_permissions(path: Path) -> DiagnosticCheck:
             remediation=f"Run: chmod 600 {path}",
         )
     return _pass("config_permissions", "Private configuration permissions are restricted")
+
+
+def _unknown_keys_check(config: AppConfig) -> DiagnosticCheck:
+    # Names only: an unknown key may still hold a private value.
+    return _warn(
+        "config_unknown_keys",
+        "The configuration has settings this version does not use",
+        detail=", ".join(config.unknown_keys),
+        remediation="Check these names for typos, and remove settings you no longer need.",
+    )
+
+
+def _notification_dead_letter_check(config: AppConfig, config_path: Path) -> DiagnosticCheck:
+    check_id = "notification_dead_letters"
+    try:
+        # stat, not is_file: a denied lookup must be reported, not read as absent.
+        try:
+            recorded = stat.S_ISREG(notification_state_path(config).stat().st_mode)
+        except FileNotFoundError:
+            recorded = False
+        if not recorded:
+            return _pass(check_id, "No notifications are waiting to be retried")
+        status = notification_status(config)
+    except (InkyBirdFrameError, OSError) as exc:
+        return _warn(
+            check_id,
+            "Notification delivery state could not be read",
+            detail=str(exc),
+            remediation="Inspect the controller state directory permissions.",
+        )
+    count = status.get("dead_letters")
+    if not isinstance(count, int) or count <= 0:
+        return _pass(check_id, "No notifications are waiting to be retried")
+    return _warn(
+        check_id,
+        f"{count} notification(s) stopped retrying and were not delivered",
+        remediation=(
+            f"Fix the destination, then run: inky-bird notifications retry --config {config_path}"
+        ),
+    )
 
 
 def _birdbuddy_auth_check(config: AppConfig) -> DiagnosticCheck:
@@ -641,11 +721,72 @@ def _launchd_target(label: str, uid: int) -> tuple[str, str]:
     return f"system/{label}", "LaunchDaemon"
 
 
-def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
+LAUNCHD_PERIODIC_JOBS = {
+    "refresh": "observation refresh",
+    "generate": "generation cycle",
+    "catalog-publish": "catalog publication",
+    "notifications": "notification dispatch",
+}
+
+
+def _launchd_last_run_check(job: str, printed: str) -> DiagnosticCheck:
+    """Judge a periodic job by the exit launchd recorded for its most recent run."""
+    check_id = f"job_{job.replace('-', '_')}"
+    description = LAUNCHD_PERIODIC_JOBS[job]
+    fields: dict[str, str] = {}
+    for line in printed.splitlines():
+        key, separator, value = line.strip().partition(" = ")
+        if separator:
+            fields.setdefault(key, value.strip())
+    remediation = "Inspect the controller logs, then run doctor again after the next run."
+    signal_name = fields.get("last terminating signal")
+    if signal_name:
+        return _fail(
+            check_id,
+            f"The most recent {description} was stopped before it finished",
+            detail=f"Stopped by signal: {signal_name}",
+            remediation=remediation,
+        )
+    exit_code = fields.get("last exit code")
+    if exit_code is None or exit_code.startswith("(never exited)"):
+        return _pass(check_id, f"The {description} has not finished a run yet")
+    number = exit_code.split(":", 1)[0].strip()
+    if number == "0":
+        return _pass(check_id, f"The most recent {description} succeeded")
+    if number.isdigit():
+        return _fail(
+            check_id,
+            f"The most recent {description} failed",
+            detail=f"Last run ended with exit code {exit_code}",
+            remediation=remediation,
+        )
+    return _fail(
+        check_id,
+        f"The {description} result could not be determined",
+        detail=f"launchctl reported: {exit_code}",
+        remediation=remediation,
+    )
+
+
+def _native_family(config: AppConfig) -> str | DiagnosticCheck:
+    """Return the installed service family, or the check explaining why it is unknown."""
     try:
-        prefix = resolve_native_layout().family
+        return resolve_native_layout(config_path=config.configuration_path).family
     except ValueError as exc:
-        yield _fail("native_identity", str(exc))
+        return _fail("native_identity", str(exc))
+    except OSError as exc:
+        return _fail(
+            "native_identity",
+            "The installed services could not be identified",
+            detail=str(exc),
+            remediation="Run doctor as the service account, or check its folder permissions.",
+        )
+
+
+def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
+    prefix = _native_family(config)
+    if isinstance(prefix, DiagnosticCheck):
+        yield prefix
         return
     labels = [
         "com.inky-bird-frame.serve",
@@ -674,7 +815,10 @@ def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
             continue
         result = _run(["launchctl", "print", target])
         if result.returncode == 0:
-            yield _pass(f"service_{label.rsplit('.', 1)[-1]}", f"{kind} is loaded: {label}")
+            job = label.rsplit(".", 1)[-1]
+            yield _pass(f"service_{job}", f"{kind} is loaded: {label}")
+            if job in LAUNCHD_PERIODIC_JOBS:
+                yield _launchd_last_run_check(job, result.stdout)
         else:
             yield _fail(
                 f"service_{label.rsplit('.', 1)[-1]}",
@@ -728,10 +872,9 @@ def _systemd_last_run_check(
 
 
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
-    try:
-        prefix = resolve_native_layout().family
-    except ValueError as exc:
-        yield _fail("native_identity", str(exc))
+    prefix = _native_family(config)
+    if isinstance(prefix, DiagnosticCheck):
+        yield prefix
         return
     yield _systemd_unit_check(f"{prefix}-controller.service")
     if config.controller.configuration_ownership == "app":
@@ -831,6 +974,8 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
         return DoctorReport(role, tuple(checks))
     checks.append(_pass("config", f"Configuration is valid: {config_path}"))
     checks.append(_config_permissions(config_path))
+    if config.unknown_keys:
+        checks.append(_unknown_keys_check(config))
 
     if role is InstallationRole.CONTROLLER:
         checks.extend(
@@ -848,6 +993,8 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
             checks.append(_pass("generation", "Generation is off; Codex is not required"))
         if DiscoveryProvider.BIRDBUDDY in config.discovery.sources:
             checks.append(_birdbuddy_auth_check(config))
+        if config.notifications.enabled:
+            checks.append(_notification_dead_letter_check(config, config_path))
         if platform.system() == "Darwin":
             checks.extend(_launchd_checks(config))
         elif shutil.which("systemctl") is not None:
@@ -858,10 +1005,9 @@ def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
         checks.append(_display_boot_config_check())
         checks.append(_display_hardware_check())
         if platform.system() == "Linux" and shutil.which("systemctl") is not None:
-            try:
-                prefix = resolve_native_layout().family
-            except ValueError as exc:
-                checks.append(_fail("native_identity", str(exc)))
+            prefix = _native_family(config)
+            if isinstance(prefix, DiagnosticCheck):
+                checks.append(prefix)
             else:
                 checks.append(_systemd_unit_check(f"{prefix}-display.timer"))
                 checks.append(
@@ -901,6 +1047,42 @@ def _authorize_linux_setup() -> None:
         raise InstallationError("Administrator authorization failed; run sudo -v and try again")
 
 
+def validate_native_controller_setup(config: AppConfig, config_path: Path) -> None:
+    """Refuse, before any change, what the native controller installers would refuse."""
+    environment_credentials: list[str] = []
+    if config.discovery.geoapify_api_key_env is not None:
+        environment_credentials.append("geoapify_api_key_env")
+    if (
+        DiscoveryProvider.EBIRD in config.discovery.sources
+        and config.discovery.ebird_api_key_env is not None
+    ):
+        environment_credentials.append("ebird_api_key_env")
+    if (
+        DiscoveryProvider.BIRDWEATHER in config.discovery.sources
+        and config.discovery.birdweather_token_env is not None
+    ):
+        environment_credentials.append("birdweather_token_env")
+    if environment_credentials:
+        names = ", ".join(environment_credentials)
+        raise InstallationError(
+            f"Managed controller services cannot use {names}; store the corresponding "
+            "credential directly in the private mode-0600 configuration file"
+        )
+    environment_destinations = [
+        destination.name
+        for destination in config.notifications.destinations
+        if config.notifications.enabled and destination.url_env is not None
+    ]
+    if environment_destinations:
+        names = ", ".join(environment_destinations)
+        raise InstallationError(
+            "Managed controller services require direct notification URLs in the private "
+            f"configuration file; replace url_env for: {names}"
+        )
+    _native_oidc_secret(config, config_path)
+    native_tls_environment(config_path)
+
+
 def setup(
     role: InstallationRole,
     config_path: Path,
@@ -916,25 +1098,7 @@ def setup(
     config_path = config_path.expanduser().resolve()
     config = load_config(config_path)
     if role is InstallationRole.CONTROLLER:
-        environment_credentials: list[str] = []
-        if config.discovery.geoapify_api_key_env is not None:
-            environment_credentials.append("geoapify_api_key_env")
-        if (
-            DiscoveryProvider.EBIRD in config.discovery.sources
-            and config.discovery.ebird_api_key_env is not None
-        ):
-            environment_credentials.append("ebird_api_key_env")
-        if (
-            DiscoveryProvider.BIRDWEATHER in config.discovery.sources
-            and config.discovery.birdweather_token_env is not None
-        ):
-            environment_credentials.append("birdweather_token_env")
-        if environment_credentials:
-            names = ", ".join(environment_credentials)
-            raise InstallationError(
-                f"Managed controller services cannot use {names}; store the corresponding "
-                "credential directly in the private mode-0600 configuration file"
-            )
+        validate_native_controller_setup(config, config_path)
     script = _setup_script(role, source_dir)
     if not script.is_file():
         raise InstallationError(f"Installer is missing: {script}")
@@ -953,6 +1117,13 @@ def setup(
         "applied": False,
         "changes": changes,
     }
+    if role is InstallationRole.CONTROLLER:
+        result["generation_enabled"] = config.controller.generation_enabled
+        if not config.controller.generation_enabled:
+            result["generation"] = (
+                "New artwork is off. To turn it on, set generation_enabled = true "
+                "under [controller] in the configuration, then run setup again."
+            )
     if not apply:
         result["confirmation"] = "Repeat the same command with --yes to apply these changes."
         return result

@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
 import stat
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Final
 from urllib.error import HTTPError
 
 from .birds import BirdBuddySpecies, ObservationWindow
-from .errors import DataSourceError
-from .http import post_json, write_bytes_atomic, write_json_atomic
+from .errors import BusyError, DataSourceError
+from .history_summary import SpeciesSummary, load_summary, parse_species_rows, write_summary
+from .http import post_json, read_private_json, write_bytes_atomic, write_json_atomic
 from .timeutil import parse_utc_timestamp
 
 BIRDBUDDY_GRAPHQL_URL: Final = "https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql"
@@ -28,8 +31,20 @@ BIRDBUDDY_MAX_FEED_PAGES: Final = 100
 # add evidence but never removes what it did not see.
 BIRDBUDDY_MAX_CONFIRMED_PAGES: Final = 100
 BIRDBUDDY_HISTORY_DAYS: Final = 366
+# The feed is read every cycle; the full confirmed history only this often,
+# which keeps the request count independent of how much media an account owns.
+BIRDBUDDY_CONFIRMED_HISTORY_INTERVAL: Final = timedelta(days=1)
+# A saved access token is used until this long before it expires.
+ACCESS_TOKEN_RENEWAL_MARGIN: Final = timedelta(minutes=5)
+ACCESS_TOKEN_MAX_REUSE: Final = timedelta(hours=12)
+# Throttling without a usable Retry-After waits 15 minutes, doubling to 6 hours.
+THROTTLE_FIRST_WAIT: Final = timedelta(minutes=15)
+THROTTLE_MAX_WAIT: Final = timedelta(hours=6)
+THROTTLE_HINT_LIMIT: Final = timedelta(days=1)
+BACKOFF_SCHEMA_VERSION: Final = 1
 AUTH_SCHEMA_VERSION: Final = 1
 HISTORY_SCHEMA_VERSION: Final = 1
+SUMMARY_SOURCE: Final = "birdbuddy"
 AUTHORIZED_ACCESS_ATTESTATION: Final = (
     "I confirm that Bird Buddy has authorized automated API access for this account."
 )
@@ -218,6 +233,18 @@ class _RefreshRejectedError(DataSourceError):
     """Bird Buddy answered the token renewal with HTTP 401 or 403."""
 
 
+class _SyncBusyError(BusyError, DataSourceError):
+    """Another sync holds the lock; a source error the CLI still reports as busy."""
+
+
+class _ThrottledError(DataSourceError):
+    """Bird Buddy answered HTTP 429; ``retry_after`` is its parsed hint, if any."""
+
+    def __init__(self, retry_after: datetime | timedelta | None) -> None:
+        self.retry_after = retry_after
+        super().__init__("Bird Buddy asked Inky to slow down; try again later")
+
+
 _SESSION_INVALID: Final = "Bird Buddy session is invalid; run birdbuddy login again"
 
 
@@ -229,6 +256,10 @@ class BirdBuddyAuthState:
     # The last token Bird Buddy accepted, kept for one retry when the current
     # token gets HTTP 401 or 403. Absent in state written by earlier releases.
     previous_refresh_token: str | None = None
+    # The current access token and when Inky stops using it. Absent when the
+    # token carried no readable expiry, and in state from earlier releases.
+    access_token: str | None = None
+    access_token_expires_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +276,8 @@ class BirdBuddyPostcard:
     species: tuple[PostcardSpecies, ...]
     media_ids: tuple[str, ...] = ()
     complete: bool = True
+    # Species set from the owner's confirmed history rather than the feed.
+    owner_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,6 +322,11 @@ class FeederHistory:
     confirmed_species: dict[tuple[str, str], ConfirmedSpeciesEvidence]
     archived_postcards: dict[tuple[str, ...], ArchivedPostcardLink] = field(default_factory=dict)
     archived_unlinked_latest: dict[str, str] = field(default_factory=dict)
+    # When the full confirmed history was last read, and whether that read
+    # included manual sightings. Absent in history from earlier releases.
+    confirmed_history_checked_at: str | None = None
+    confirmed_history_manual_sightings: bool | None = None
+    confirmed_history_complete: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -309,6 +347,8 @@ class BirdBuddySyncStats:
     confirmed_records_ignored: int = 0
     confirmed_records_skipped: int = 0
     confirmed_history_complete: bool = True
+    confirmed_history_checked: bool = True
+    confirmed_history_checked_at: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -328,6 +368,8 @@ class BirdBuddySyncStats:
             "confirmed_records_ignored": self.confirmed_records_ignored,
             "confirmed_records_skipped": self.confirmed_records_skipped,
             "confirmed_history_complete": self.confirmed_history_complete,
+            "confirmed_history_checked": self.confirmed_history_checked,
+            "confirmed_history_checked_at": self.confirmed_history_checked_at,
         }
 
 
@@ -371,6 +413,10 @@ def _previous_history_path(state_dir: Path) -> Path:
     return state_dir / "birdbuddy-detections.json.previous"
 
 
+def _backoff_path(state_dir: Path) -> Path:
+    return state_dir / "birdbuddy-backoff.json"
+
+
 @contextmanager
 def _state_errors() -> Iterator[None]:
     try:
@@ -410,7 +456,7 @@ def _sync_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise DataSourceError("Another Bird Buddy detection sync is already running") from exc
+            raise _SyncBusyError("Another Bird Buddy detection sync is already running") from exc
         try:
             yield
         finally:
@@ -483,13 +529,73 @@ def _graphql_request(
     access_token: str | None = None,
 ) -> dict[str, object]:
     headers = {"Authorization": f"Bearer {access_token}"} if access_token else None
-    payload = post_json(
-        BIRDBUDDY_GRAPHQL_URL,
-        {"query": query, "variables": variables},
-        headers=headers,
-        error_label="Bird Buddy API",
-    )
+    try:
+        payload = post_json(
+            BIRDBUDDY_GRAPHQL_URL,
+            {"query": query, "variables": variables},
+            headers=headers,
+            error_label="Bird Buddy API",
+        )
+    except DataSourceError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, HTTPError) and cause.code == 429:
+            hint = cause.headers.get("Retry-After") if cause.headers is not None else None
+            raise _ThrottledError(_retry_after(hint)) from exc
+        raise
     return _graphql_data(payload, operation)
+
+
+def _retry_after(value: object) -> datetime | timedelta | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.isascii() and text.isdigit():
+        limit = int(THROTTLE_HINT_LIMIT.total_seconds())
+        return timedelta(seconds=min(int(text), limit) if len(text) <= 9 else limit)
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    return when.astimezone(UTC) if when.tzinfo is not None else None
+
+
+def _access_token_expiry(access_token: str, issued: datetime) -> datetime | None:
+    """Read the token's own expiry claim; None when it has no readable one."""
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        claims: object = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except ValueError:
+        return None
+    expiry = claims.get("exp") if isinstance(claims, dict) else None
+    if not isinstance(expiry, int | float) or isinstance(expiry, bool):
+        return None
+    try:
+        expires = datetime.fromtimestamp(expiry, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return min(expires, issued + ACCESS_TOKEN_MAX_REUSE)
+
+
+def _with_access_token(
+    state: BirdBuddyAuthState, access_token: str | None, issued: datetime
+) -> BirdBuddyAuthState:
+    expires = _access_token_expiry(access_token, issued) if access_token is not None else None
+    if access_token is None or expires is None or expires - ACCESS_TOKEN_RENEWAL_MARGIN <= issued:
+        return replace(state, access_token=None, access_token_expires_at=None)
+    return replace(
+        state,
+        access_token=access_token,
+        access_token_expires_at=expires.replace(microsecond=0).isoformat(),
+    )
+
+
+def _usable_access_token(state: BirdBuddyAuthState, current: datetime) -> str | None:
+    expires = parse_utc_timestamp(state.access_token_expires_at)
+    if state.access_token is None or expires is None:
+        return None
+    return state.access_token if current + ACCESS_TOKEN_RENEWAL_MARGIN < expires else None
 
 
 def _authenticate(email: str, password: str) -> tuple[str, str, list[BirdBuddyFeeder]]:
@@ -539,6 +645,14 @@ def _auth_payload(state: BirdBuddyAuthState) -> dict[str, object]:
             if state.previous_refresh_token is not None
             else {}
         ),
+        **(
+            {
+                "access_token": state.access_token,
+                "access_token_expires_at": state.access_token_expires_at,
+            }
+            if state.access_token is not None and state.access_token_expires_at is not None
+            else {}
+        ),
     }
 
 
@@ -574,8 +688,18 @@ def _read_auth_state(state_dir: Path) -> BirdBuddyAuthState:
         or feeder.role not in {"member", "owner"}
     ):
         raise DataSourceError("Invalid Bird Buddy authentication state")
+    # A damaged saved access token is only a lost shortcut: renew instead.
+    access_token = _nonempty_string(value.get("access_token"))
+    access_token_expires_at = _nonempty_string(value.get("access_token_expires_at"))
+    if access_token is None or parse_utc_timestamp(access_token_expires_at) is None:
+        access_token = access_token_expires_at = None
     return BirdBuddyAuthState(
-        authorization_confirmed_at, feeder, refresh_token, previous_refresh_token
+        authorization_confirmed_at,
+        feeder,
+        refresh_token,
+        previous_refresh_token,
+        access_token,
+        access_token_expires_at,
     )
 
 
@@ -592,10 +716,13 @@ def login_birdbuddy(
         raise DataSourceError("Bird Buddy authorized-access confirmation is required")
     if not email.strip() or not password:
         raise DataSourceError("Bird Buddy email and password are required")
-    _, refresh_token, feeders = _authenticate(email.strip(), password)
+    access_token, refresh_token, feeders = _authenticate(email.strip(), password)
     feeder = _select_feeder(feeders, feeder_id)
-    confirmed_at = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).isoformat()
-    state = BirdBuddyAuthState(confirmed_at, feeder, refresh_token)
+    current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    confirmed_at = current.isoformat()
+    state = _with_access_token(
+        BirdBuddyAuthState(confirmed_at, feeder, refresh_token), access_token, current
+    )
     with _state_errors(), _auth_lock(state_dir):
         write_json_atomic(_auth_path(state_dir), _auth_payload(state), mode=0o600)
     return {
@@ -676,30 +803,115 @@ def _renew_session(state: BirdBuddyAuthState) -> tuple[str, str, str]:
     return access_token, replacement, state.refresh_token
 
 
-def _refreshed_access_token(state_dir: Path) -> tuple[str, BirdBuddyFeeder]:
+def _session_access_token(
+    state_dir: Path, current: datetime, *, refused: str | None = None
+) -> tuple[str, BirdBuddyFeeder, bool]:
+    """Return an access token, the feeder and whether the token was a saved one."""
     with _auth_lock(state_dir):
         state = _read_auth_state(state_dir)
+        saved = _usable_access_token(state, current)
+        if saved is not None and saved != refused:
+            # Another sync may have renewed after this one read the refused token.
+            return saved, state.feeder, True
+        if refused is not None and state.access_token == refused:
+            # Forget a token Bird Buddy refused before renewing, so a failed
+            # renewal does not leave it to be tried again next cycle.
+            state = replace(state, access_token=None, access_token_expires_at=None)
+            write_json_atomic(_auth_path(state_dir), _auth_payload(state), mode=0o600)
         access_token, replacement, used_token = _renew_session(state)
+        renewed = _with_access_token(
+            BirdBuddyAuthState(
+                state.authorization_confirmed_at,
+                state.feeder,
+                replacement,
+                used_token,
+            ),
+            access_token,
+            current,
+        )
         try:
-            write_json_atomic(
-                _auth_path(state_dir),
-                _auth_payload(
-                    BirdBuddyAuthState(
-                        state.authorization_confirmed_at,
-                        state.feeder,
-                        replacement,
-                        used_token,
-                    )
-                ),
-                mode=0o600,
-            )
+            write_json_atomic(_auth_path(state_dir), _auth_payload(renewed), mode=0o600)
         except OSError as exc:
             raise DataSourceError(
                 "Bird Buddy renewed the sign-in, but Inky could not save it. Check the state "
                 "folder's permissions and free space; if the next sync fails, run birdbuddy "
                 "login again"
             ) from exc
-    return access_token, state.feeder
+    return access_token, state.feeder, False
+
+
+def _access_refused(exc: DataSourceError) -> bool:
+    cause = exc.__cause__
+    return isinstance(exc, _GraphQLRejectedError) or (
+        isinstance(cause, HTTPError) and cause.code in {401, 403}
+    )
+
+
+def _backoff_until(state_dir: Path, current: datetime) -> tuple[datetime | None, int]:
+    """Read the saved throttling wait; an unreadable or implausible record means no wait."""
+    path = _backoff_path(state_dir)
+    if not path.exists() and not path.is_symlink():
+        return None, 0
+    try:
+        value = read_private_json(path, maximum=4096)
+    except DataSourceError:
+        return None, 0
+    if not isinstance(value, dict) or value.get("schema_version") != BACKOFF_SCHEMA_VERSION:
+        return None, 0
+    until = parse_utc_timestamp(value.get("not_before"))
+    failures = value.get("failures")
+    if (
+        until is None
+        or until > current + THROTTLE_HINT_LIMIT
+        or not isinstance(failures, int)
+        or isinstance(failures, bool)
+    ):
+        return None, 0
+    return until, max(failures, 0)
+
+
+def _record_throttling(
+    state_dir: Path, current: datetime, hint: datetime | timedelta | None
+) -> datetime:
+    _, failures = _backoff_until(state_dir, current)
+    failures += 1
+    default = min(THROTTLE_FIRST_WAIT * 2 ** min(failures - 1, 16), THROTTLE_MAX_WAIT)
+    if isinstance(hint, timedelta):
+        until = current + max(hint, timedelta(minutes=1))
+    elif isinstance(hint, datetime):
+        until = min(max(hint, current + timedelta(minutes=1)), current + THROTTLE_HINT_LIMIT)
+    else:
+        until = current + default
+    until = until.replace(microsecond=0)
+    # A state folder that cannot take the record must not hide the throttling.
+    with suppress(OSError):
+        write_json_atomic(
+            _backoff_path(state_dir),
+            {
+                "schema_version": BACKOFF_SCHEMA_VERSION,
+                "not_before": until.isoformat(),
+                "failures": failures,
+            },
+            mode=0o600,
+        )
+    return until
+
+
+def _slow_down(until: datetime) -> DataSourceError:
+    return DataSourceError(
+        f"Bird Buddy asked Inky to slow down; Inky will try again after {until.isoformat()}"
+    )
+
+
+def _confirmed_history_due(
+    history: FeederHistory | None, current: datetime, *, include_manual_sightings: bool
+) -> bool:
+    if history is None or history.confirmed_history_manual_sightings != include_manual_sightings:
+        return True
+    checked = parse_utc_timestamp(history.confirmed_history_checked_at)
+    if checked is None:
+        return True
+    return not timedelta(0) <= current - checked < BIRDBUDDY_CONFIRMED_HISTORY_INTERVAL
 
 
 def _feeder_id(value: object) -> str | None:
@@ -1202,6 +1414,7 @@ def _parse_postcard_state(value: object) -> BirdBuddyPostcard:
         observed_at,
         tuple(species),
         media_ids=tuple(sorted(media_ids)),
+        owner_confirmed=value.get("owner_confirmed") is True,
     )
 
 
@@ -1383,6 +1596,12 @@ def _parse_feeder_history(value: object) -> FeederHistory:
         confirmed = {(item.source, item.species.species_id): item for item in confirmed_items}
         if len(confirmed) != len(confirmed_items):
             raise DataSourceError("Invalid Bird Buddy detection history")
+    # Read cadence only: an unreadable value just means history is read again.
+    checked_at = value.get("confirmed_history_checked_at")
+    checked_manual = value.get("confirmed_history_manual_sightings")
+    checked_complete = value.get("confirmed_history_complete")
+    if parse_utc_timestamp(checked_at) is None or not isinstance(checked_manual, bool):
+        checked_at = checked_manual = checked_complete = None
     return FeederHistory(
         history_started_at,
         earliest if isinstance(earliest, str) else None,
@@ -1392,6 +1611,9 @@ def _parse_feeder_history(value: object) -> FeederHistory:
         confirmed,
         archived_postcards,
         archived_unlinked_latest,
+        checked_at if isinstance(checked_at, str) else None,
+        checked_manual if isinstance(checked_manual, bool) else None,
+        checked_complete if isinstance(checked_complete, bool) else None,
     )
 
 
@@ -1430,13 +1652,20 @@ def _postcard_payload(postcard: BirdBuddyPostcard) -> dict[str, object]:
             }
             for species in postcard.species
         ],
+        **({"owner_confirmed": True} if postcard.owner_confirmed else {}),
     }
 
 
 def _history_content(histories: dict[str, FeederHistory]) -> dict[str, object]:
     return _history_payload(
         {
-            feeder_id: replace(history, last_successful_sync_at=None)
+            feeder_id: replace(
+                history,
+                last_successful_sync_at=None,
+                confirmed_history_checked_at=None,
+                confirmed_history_manual_sightings=None,
+                confirmed_history_complete=None,
+            )
             for feeder_id, history in histories.items()
         }
     )
@@ -1491,6 +1720,22 @@ def _history_payload(histories: dict[str, FeederHistory]) -> dict[str, object]:
                     }
                     for _, item in sorted(history.confirmed_species.items())
                 ],
+                **(
+                    {
+                        "confirmed_history_checked_at": history.confirmed_history_checked_at,
+                        "confirmed_history_manual_sightings": (
+                            history.confirmed_history_manual_sightings
+                        ),
+                        **(
+                            {"confirmed_history_complete": history.confirmed_history_complete}
+                            if history.confirmed_history_complete is not None
+                            else {}
+                        ),
+                    }
+                    if history.confirmed_history_checked_at is not None
+                    and history.confirmed_history_manual_sightings is not None
+                    else {}
+                ),
             }
             for feeder_id, history in sorted(histories.items())
         },
@@ -1752,6 +1997,7 @@ def _update_history(
     replace_manual_evidence: bool,
     confirmed_species_by_media: dict[str, tuple[PostcardSpecies, ...]],
     confirmed_complete: bool = True,
+    confirmed_checked: bool = True,
 ) -> _HistoryUpdate:
     current_iso = current.isoformat()
     lock = _history_lock(state_dir) if persist else nullcontext()
@@ -1775,6 +2021,16 @@ def _update_history(
             existing = history.postcards.get(postcard.postcard_id)
             if (
                 existing is not None
+                and existing.owner_confirmed
+                and not confirmed_checked
+                and existing.observed_at == postcard.observed_at
+                and existing.media_ids == postcard.media_ids
+            ):
+                # Keep the owner's correction until the next confirmed read.
+                duplicates += 1
+                continue
+            if (
+                existing is not None
                 and existing.observed_at == postcard.observed_at
                 and existing.species == postcard.species
             ):
@@ -1787,15 +2043,15 @@ def _update_history(
                 postcard.media_ids,
                 confirmed_species_by_media,
             )
-            if confirmed_species is None or confirmed_species == postcard.species:
+            if confirmed_species is None or (
+                confirmed_species == postcard.species and postcard.owner_confirmed
+            ):
                 continue
-            history.postcards[postcard_id] = BirdBuddyPostcard(
-                postcard.postcard_id,
-                postcard.observed_at,
-                confirmed_species,
-                media_ids=postcard.media_ids,
+            history.postcards[postcard_id] = replace(
+                postcard, species=confirmed_species, owner_confirmed=True
             )
-            reclassified_postcard_ids.add(postcard_id)
+            if confirmed_species != postcard.species:
+                reclassified_postcard_ids.add(postcard_id)
         archived_reclassifications = _reconcile_archived_postcards(
             history,
             confirmed_species_by_media,
@@ -1844,6 +2100,10 @@ def _update_history(
                     )
                 del history.postcards[postcard_id]
         history.last_successful_sync_at = current_iso
+        if confirmed_checked:
+            history.confirmed_history_checked_at = current_iso
+            history.confirmed_history_manual_sightings = replace_manual_evidence
+            history.confirmed_history_complete = confirmed_complete
         histories[feeder_id] = history
         if persist:
             path = _history_path(state_dir)
@@ -1855,7 +2115,24 @@ def _update_history(
                 not previous_path.exists() or _history_content(histories) != content_before
             ):
                 write_bytes_atomic(previous_path, path.read_bytes(), mode=0o600)
-            write_json_atomic(path, _history_payload(histories), mode=0o600)
+            payload = _history_payload(histories)
+            write_json_atomic(path, payload, mode=0o600)
+            feeders = payload["feeders"]
+            # Summarize what was written, in its stored order, so a rebuild from
+            # the file gives the same rows. Never fail a sync whose history is
+            # saved: the next read rebuilds a missing summary.
+            with suppress(DataSourceError):
+                if isinstance(feeders, dict):
+                    write_summary(
+                        path,
+                        SUMMARY_SOURCE,
+                        _summary_body(
+                            {
+                                feeder: _parse_feeder_history(stored)
+                                for feeder, stored in feeders.items()
+                            }
+                        ),
+                    )
     return _HistoryUpdate(
         history,
         duplicates,
@@ -1877,13 +2154,18 @@ def sync_birdbuddy_detections(
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
     sync_lock = _sync_lock(state_dir) if persist_history else nullcontext()
     with _state_errors(), sync_lock:
-        access_token, feeder = _refreshed_access_token(state_dir)
-        incoming, pages, processed, ignored = _fetch_postcards(access_token, feeder.feeder_id)
-        confirmed = _fetch_confirmed_history(
-            access_token,
-            feeder.feeder_id,
-            include_manual_sightings=include_manual_sightings,
-        )
+        waiting_until, _ = _backoff_until(state_dir, current)
+        if waiting_until is not None and current < waiting_until:
+            raise _slow_down(waiting_until)
+        try:
+            fetched = _fetch_remote(state_dir, current, include_manual_sightings)
+        except _ThrottledError as exc:
+            raise _slow_down(_record_throttling(state_dir, current, exc.retry_after)) from exc
+        # A preview holds no sync lock, so it leaves any wait a sync recorded.
+        if persist_history:
+            with suppress(OSError):
+                _backoff_path(state_dir).unlink(missing_ok=True)
+        feeder, incoming, pages, processed, ignored, confirmed, checked = fetched
         current_iso = current.isoformat()
         update = _update_history(
             state_dir,
@@ -1895,6 +2177,7 @@ def sync_birdbuddy_detections(
             replace_manual_evidence=include_manual_sightings,
             confirmed_species_by_media=confirmed.species_by_media,
             confirmed_complete=confirmed.complete,
+            confirmed_checked=checked,
         )
     species = _aggregate_species(
         update.history,
@@ -1919,9 +2202,177 @@ def sync_birdbuddy_detections(
         manual_records_accepted=confirmed.manual_records_accepted,
         confirmed_records_ignored=confirmed.records_ignored,
         confirmed_records_skipped=confirmed.records_skipped,
-        confirmed_history_complete=confirmed.complete,
+        # Between full reads, report how complete the last one was.
+        confirmed_history_complete=(
+            confirmed.complete
+            if checked
+            else update.history.confirmed_history_complete is not False
+        ),
+        confirmed_history_checked=checked,
+        confirmed_history_checked_at=update.history.confirmed_history_checked_at,
     )
     return BirdBuddySyncResult(species, stats)
+
+
+_RemoteFetch = tuple[
+    BirdBuddyFeeder, list[BirdBuddyPostcard], int, int, int, _ConfirmedHistoryFetch, bool
+]
+
+
+def _fetch_remote(
+    state_dir: Path, current: datetime, include_manual_sightings: bool
+) -> _RemoteFetch:
+    access_token, feeder, saved = _session_access_token(state_dir, current)
+    try:
+        return _fetch_with(state_dir, access_token, feeder, current, include_manual_sightings)
+    except DataSourceError as exc:
+        if not saved or isinstance(exc, _ThrottledError) or not _access_refused(exc):
+            raise
+    # The saved token was refused before its expiry: renew once (unless another
+    # sync already saved a newer token) and start over.
+    access_token, feeder, _ = _session_access_token(state_dir, current, refused=access_token)
+    return _fetch_with(state_dir, access_token, feeder, current, include_manual_sightings)
+
+
+def _fetch_with(
+    state_dir: Path,
+    access_token: str,
+    feeder: BirdBuddyFeeder,
+    current: datetime,
+    include_manual_sightings: bool,
+) -> _RemoteFetch:
+    incoming, pages, processed, ignored = _fetch_postcards(access_token, feeder.feeder_id)
+    with _history_lock(state_dir):
+        history = _read_history(state_dir).get(feeder.feeder_id)
+    checked = _confirmed_history_due(
+        history, current, include_manual_sightings=include_manual_sightings
+    )
+    confirmed = (
+        _fetch_confirmed_history(
+            access_token,
+            feeder.feeder_id,
+            include_manual_sightings=include_manual_sightings,
+        )
+        if checked
+        # Not read this cycle: a partial snapshot with no records changes nothing.
+        else _ConfirmedHistoryFetch([], 0, 0, 0, 0, 0, complete=False)
+    )
+    return feeder, incoming, pages, processed, ignored, confirmed, checked
+
+
+def _noted_on(timestamp: str) -> date:
+    observed = parse_utc_timestamp(timestamp)
+    if observed is None:
+        raise DataSourceError("Invalid Bird Buddy detection timestamp")
+    # The controller's local date when the summary is written; a time-zone
+    # change shows from the next history write.
+    return observed.astimezone().date()
+
+
+def _summary_rows(
+    history: FeederHistory, *, include_manual_sightings: bool
+) -> list[dict[str, object]]:
+    first: dict[str, date] = {}
+    last: dict[str, date] = {}
+
+    def note(species_id: str, timestamp: str) -> None:
+        noted = _noted_on(timestamp)
+        first[species_id] = min(first.get(species_id, noted), noted)
+        last[species_id] = max(last.get(species_id, noted), noted)
+
+    for postcard in history.postcards.values():
+        for species in postcard.species:
+            note(species.species_id, postcard.observed_at)
+    for evidence in history.confirmed_species.values():
+        if evidence.source != _CONFIRMED_MANUAL_SOURCE or include_manual_sightings:
+            note(evidence.species.species_id, evidence.observed_at)
+    for archived in history.archived_species.values():
+        note(archived.species_id, archived.latest_detection_at)
+    return [
+        SpeciesSummary(
+            item.common_name,
+            item.scientific_name,
+            item.detection_count,
+            # Archived postcards keep only their newest date, so the first is unknown.
+            None
+            if item.species_id in history.archived_species
+            else first[item.species_id].isoformat(),
+            last[item.species_id].isoformat(),
+        ).as_dict()
+        for item in _aggregate_species(
+            history,
+            ObservationWindow.ALL_TIME,
+            datetime.now(UTC),
+            None,
+            include_manual_sightings=include_manual_sightings,
+        )
+    ]
+
+
+def _summary_body(histories: dict[str, FeederHistory]) -> dict[str, object]:
+    return {
+        "unit": "postcards or confirmed presence",
+        "feeders": {
+            feeder_id: {
+                "automatic": _summary_rows(history, include_manual_sightings=False),
+                "with_manual": _summary_rows(history, include_manual_sightings=True),
+            }
+            for feeder_id, history in sorted(histories.items())
+        },
+    }
+
+
+def _parse_summary_feeders(
+    payload: dict[str, object],
+) -> dict[str, tuple[list[SpeciesSummary], list[SpeciesSummary]]]:
+    feeders = payload.get("feeders")
+    if not isinstance(feeders, dict):
+        raise DataSourceError("Invalid history summary")
+    parsed: dict[str, tuple[list[SpeciesSummary], list[SpeciesSummary]]] = {}
+    for feeder_id, rows in feeders.items():
+        if (
+            not isinstance(feeder_id, str)
+            or not feeder_id
+            or not isinstance(rows, dict)
+            or set(rows) != {"automatic", "with_manual"}
+        ):
+            raise DataSourceError("Invalid history summary")
+        parsed[feeder_id] = (
+            parse_species_rows(rows["automatic"]),
+            parse_species_rows(rows["with_manual"]),
+        )
+    return parsed
+
+
+def read_birdbuddy_history_summary(
+    state_dir: Path, *, include_manual_sightings: bool = False
+) -> tuple[list[SpeciesSummary], str]:
+    """Like read_birdbuddy_history_species, from the small summary; adds dates."""
+    path = _history_path(state_dir)
+    with _state_errors():
+        with _history_lock(state_dir):
+            feeders = load_summary(
+                path,
+                SUMMARY_SOURCE,
+                _parse_summary_feeders,
+                lambda: _summary_body(_read_history(state_dir)),
+            )
+        if not feeders:
+            return [], "No retained feeder history"
+        auth_present = _auth_path(state_dir).exists()
+        selected_state = _read_auth_state(state_dir) if auth_present else None
+    if selected_state is not None:
+        selected = selected_state.feeder.feeder_id
+    elif len(feeders) == 1:
+        selected = next(iter(feeders))
+    else:
+        raise DataSourceError("Select a feeder with Bird Buddy login to inspect retained history")
+    rows = feeders.get(selected)
+    if rows is None:
+        return [], "No retained history for the selected feeder"
+    return (
+        rows[1] if include_manual_sightings else rows[0]
+    ), "Since integration began; confirmed presence is not an exact visit count"
 
 
 def read_birdbuddy_history_species(

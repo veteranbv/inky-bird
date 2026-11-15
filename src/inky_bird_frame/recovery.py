@@ -7,7 +7,8 @@ import json
 import os
 import shutil
 import stat
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -30,14 +31,38 @@ from .controller import (
     ensure_generation_retry,
     exclusive_cycle_lock,
     read_generation_queue,
+    reset_research_allowance,
     retry_approved_candidate,
 )
-from .errors import CatalogError, CatalogPublishError, GenerationError, SpeciesStateError
+from .errors import (
+    BusyError,
+    CatalogError,
+    CatalogPublishError,
+    GenerationError,
+    SpeciesStateError,
+)
 from .http import MAX_ASSET_BYTES
 from .journal import MAX_JOURNAL_BYTES, JournalConflictError, JournalError
 from .models import ProfileConflict, SpeciesProfileData
-from .publisher import validate_pending_candidate
+from .publisher import publication_privacy_patterns, validate_pending_candidate
 from .retry import RetryStore, parse_retry_profile_conflicts
+
+# Plate review reads run in the web worker pool; a long catalog change must not pin a worker.
+PLATE_REVIEW_LOCK_SECONDS = 10.0
+
+
+@contextmanager
+def _plate_review_read_lock(config: AppConfig) -> Iterator[None]:
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                catalog_state_lock(
+                    config.controller.state_dir, shared=True, timeout=PLATE_REVIEW_LOCK_SECONDS
+                )
+            )
+        except BusyError as exc:
+            raise JournalError("Inky is busy with plates. Try again in a moment.") from exc
+        yield
 
 
 def _candidate_bytes(path: Path, maximum: int) -> bytes:
@@ -53,20 +78,26 @@ def _candidate_bytes(path: Path, maximum: int) -> bytes:
         return body
     except (OSError, ValueError) as exc:
         raise JournalError(
-            "This candidate asset is unavailable or unsafe. Use operator recovery."
+            "This new plate's files cannot be read safely. Ask whoever runs Inky to recover it."
         ) from exc
 
 
 def _pending_manifest(config: AppConfig, taxon_id: int) -> tuple[Path, dict[str, object], bytes]:
     pending_root = config.controller.state_dir / "pending"
     if pending_root.is_symlink():
-        raise JournalError("Pending candidate storage is unsafe. Use operator recovery.")
+        raise JournalError(
+            "New plates cannot be read safely. Ask whoever runs Inky to recover them."
+        )
     root = pending_root.resolve()
     path = find_taxon_directory(root, taxon_id)
     if path is None:
-        raise JournalConflictError("This candidate is no longer pending. Reload Plate work.")
+        raise JournalConflictError(
+            "This new plate is no longer waiting for you. Reload In the works."
+        )
     if path.resolve() != path or not path.is_dir():
-        raise JournalError("Pending candidate storage is unsafe. Use operator recovery.")
+        raise JournalError(
+            "New plates cannot be read safely. Ask whoever runs Inky to recover them."
+        )
     manifest_bytes = _candidate_bytes(path / "manifest.json", MAX_JOURNAL_BYTES)
     try:
         manifest = json.loads(manifest_bytes)
@@ -83,7 +114,9 @@ def _pending_manifest(config: AppConfig, taxon_id: int) -> tuple[Path, dict[str,
         ):
             raise ValueError("identity")
     except (ValueError, UnicodeDecodeError) as exc:
-        raise JournalError("This pending manifest is invalid. Use operator recovery.") from exc
+        raise JournalError(
+            "This new plate's record is damaged. Ask whoever runs Inky to recover it."
+        ) from exc
     return path, cast(dict[str, object], manifest), manifest_bytes
 
 
@@ -116,6 +149,8 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
     ids = set()
     unknown = False
     for directory in sorted(root.iterdir()) if root.exists() else []:
+        if directory.name == ".DS_Store":
+            continue
         prefix, separator, _ = directory.name.partition("-")
         if not separator or not prefix.isascii() or not prefix.isdigit() or int(prefix) <= 0:
             unknown = True
@@ -131,7 +166,9 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
                 not (directory / filename).is_file() or (directory / filename).is_symlink()
                 for filename in ("portrait.png", "display.png")
             ):
-                raise JournalError("Candidate assets need operator recovery")
+                raise JournalError(
+                    "This new plate's files need to be recovered by whoever runs Inky"
+                )
             candidates.append(
                 {
                     "taxon_id": taxon_id,
@@ -154,11 +191,11 @@ def pending_inventory(config: AppConfig) -> dict[str, object]:
 
 def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
     """Owner-only allowlist; generated candidates are never approved/public art."""
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         path, manifest, _, revision = _pending_candidate(config, taxon_id)
         ready = True
         try:
-            validate_pending_candidate(path)
+            validate_pending_candidate(path, private_patterns=publication_privacy_patterns(config))
         except (CatalogPublishError, CatalogError, OSError, ValueError):
             ready = False
         profile: SpeciesProfileData | None
@@ -208,21 +245,19 @@ def pending_candidate(config: AppConfig, taxon_id: int) -> dict[str, object]:
             ]
             if isinstance(sources, list)
             else [],
-            "notice": "Not approved artwork. Approve only after checking the full plate "
-            "and sourced review. Approval makes it available locally and to your "
-            "existing publication policy."
+            "notice": "Keep it only after looking at the whole plate and its references. "
+            "A kept plate joins your journal and any publishing you have set up."
             if ready
-            else "This candidate does not meet ordinary publication checks. "
-            "It cannot be approved here. Reject it or use explicit operator recovery; "
-            "do not bypass the gate.",
+            else "This plate did not pass its checks, so it cannot be kept here. "
+            "Send it back, or ask whoever runs Inky to recover it.",
         }
 
 
 def pending_portrait(config: AppConfig, taxon_id: int, *, revision: str) -> bytes:
-    with catalog_state_lock(config.controller.state_dir):
+    with _plate_review_read_lock(config):
         _, _, body, current = _pending_candidate(config, taxon_id)
         if current != revision:
-            raise JournalConflictError("This candidate changed. Reload its review before viewing.")
+            raise JournalConflictError("This new plate changed. Reload it before looking again.")
         return body
 
 
@@ -233,25 +268,42 @@ def decide_pending_candidate(
         path, _, _, current = _pending_candidate(config, taxon_id)
         if current != revision:
             raise JournalConflictError(
-                "This candidate changed. Inspect the current plate before deciding."
+                "This new plate changed. Look at the current one before deciding."
             )
         if has_valid_approved_candidate(config.controller.catalog_dir, taxon_id):
             raise JournalError(
-                "Approved art already exists. Replacement requires the explicit "
-                "operator migration workflow."
+                "This bird already has a plate. Replacing it is a separate step for "
+                "whoever runs Inky."
             )
         if approve:
+            private_patterns = publication_privacy_patterns(config)
             try:
-                validate_pending_candidate(path)
+                validate_pending_candidate(path, private_patterns=private_patterns)
             except (CatalogPublishError, CatalogError, OSError, ValueError) as exc:
+                private_only = bool(private_patterns)
+                if private_only:
+                    try:
+                        validate_pending_candidate(path)
+                    except (CatalogPublishError, CatalogError, OSError, ValueError):
+                        private_only = False
+                if private_only:
+                    raise JournalError(
+                        "This plate's text names this controller's location or a local path, "
+                        "so it cannot be published. Send it back, then try the bird again."
+                    ) from exc
                 raise JournalError(
-                    "This candidate cannot pass ordinary approval. "
-                    "Use operator recovery without bypassing review."
+                    "This plate cannot pass ordinary approval. "
+                    "Ask whoever runs Inky to recover it; its checks stay in place."
                 ) from exc
-            approve_candidate(config.controller.state_dir, config.controller.catalog_dir, taxon_id)
+            approve_candidate(
+                config.controller.state_dir,
+                config.controller.catalog_dir,
+                taxon_id,
+                private_patterns=private_patterns,
+            )
         else:
             if not reason.strip() or len(reason) > 2000:
-                raise JournalError("Give a rejection reason of 1–2000 characters")
+                raise JournalError("Say why you are sending it back, in up to 2000 characters")
             reject_candidate(config.controller.state_dir, taxon_id, reason.strip())
     return {
         "taxon_id": taxon_id,
@@ -894,6 +946,8 @@ def retry_species(
                     shutil.move(str(source), destination)
                     moved.append(str(destination))
         retry_store.clear(taxon_id)
+        # The owner's retry starts a new run with a full research allowance.
+        reset_research_allowance(config, taxon_id)
         queued_for_generation = any(
             species.taxon_id == taxon_id for species in read_generation_queue(config)
         )

@@ -11,137 +11,8 @@ For a new installation, [download the bundle](#1-download-the-deployment-bundle)
 and [create your configuration](#2-create-private-configuration). To start with
 approved art, leave generation disabled and skip Codex authentication. You can
 add a display or source later. If you already run Inky, go to [Update](#update).
-
-The image includes the project license and the pinned Codex CLI and GitHub CLI
-license material under `/usr/share/licenses/inky-bird-frame/`. See
-[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for component details.
-
-## What runs
-
-Compose starts four services from the same image:
-
-| Service | Job | Credentials |
-| --- | --- | --- |
-| `config-sync` | Validates the host `config.toml`, installs a private runtime copy, then exits | Configuration file and referenced environment values |
-| `bootstrap` | Copies the included public bird catalog into persistent storage, then exits | None |
-| `controller` | Serves the browser journal, paired screens, health and approved art on port 8793; runs explicit browser actions | Private owner hashes, configured provider/destination credentials, optional identity-service client secret |
-| `scheduler` | Refreshes observations and runs generation, notifications, and optional catalog publication | Codex and any configured service credentials |
-
-The controller and scheduler use the same commands as a native installation.
-One failed scheduled job is logged and retried later without stopping the HTTP
-service or unrelated jobs.
-
-The [browser journal](journal.md) opens at `/app`.
-Create a local username and password; no setup code is required. The optional
-`access.env` file supplies only controller access credentials such as an OIDC
-client secret. Protect it with mode `0600`. It is separate from `controller.env`,
-which supplies provider and destination credentials to both long-running
-services. Browser source and notification actions need those variables in the
-serving process as well as the scheduler. Keep only required Inky variables in
-these files. Do not give the controller a vault service token or unrelated host
-credentials. Both processes use the same private configuration and history.
-See [migration](migration-v1.md) and [history imports](history-imports.md).
-
-Docker port forwarding changes the address seen by the application. List the
-exact browser address in your host `config.toml`, including any non-default
-port. For access from the same computer:
-
-```toml
-[controller]
-owner_access_mode = "local"
-owner_allowed_origins = ["http://localhost:8793"]
-```
-
-For a phone on your home network, replace that example with the controller's
-actual LAN address. Add each address you use, rather than a wildcard. With a
-TLS reverse proxy, use its exact HTTPS address and `owner_access_mode = "https-only"`
-as described in the access guide. This explicit address check prevents an
-unrelated hostname from reaching owner forms through DNS rebinding.
-
-Trust the other web services on that hostname or IP, including other ports:
-browsers share sign-in cookies across ports. A separate HTTP hostname alone
-does not isolate an untrusted service. See the
-[host-isolation requirements](browser-access.md#sessions-and-private-files).
-
-The controller health check reads the same configuration as `doctor`. It uses
-HTTP for a plain listener and HTTPS for direct TLS. It validates certificate
-trust and the response, not just a successful TCP connection. For direct TLS,
-put the matching certificate and mode-0600 private key in the private data
-volume, readable by UID 10001. Configure their paths as described in the
-[access guide](browser-access.md#advanced-supply-a-certificate). If using a
-private CA, mount only its public trust certificate and set `SSL_CERT_FILE` for
-the controller. Include its actual listener hostname and port in
-`owner_allowed_origins`; that address must resolve inside the container too.
-Do not disable certificate validation to pass a health check. A reverse proxy
-that terminates HTTPS leaves the backend listener and health check on HTTP.
-
-For existing managed installations, the host `config.toml` is authoritative.
-An [app-managed installation](settings.md) instead preserves its private runtime
-file across restarts; the original host file is only its first-start seed.
-Compose bind-mounts the host file read-only into
-the one-shot `config-sync` service, not the long-running services. Local Docker
-Compose cannot remap the owner or mode of a file-backed config, so mounting a
-mode-0600 host file directly into the unprivileged controller is not portable.
-`config-sync` is therefore a short-lived container-root init process. It runs
-offline with a read-only root filesystem, `no-new-privileges`, every capability
-dropped except `DAC_OVERRIDE` and `CHOWN`, one read-only host bind, and the
-controller data volume. It receives the same optional `controller.env` as the
-scheduler so references such as `ebird_api_key_env` can be validated without
-putting their values in `config.toml`. With networking disabled, those values
-cannot be sent anywhere by this service. It validates and atomically installs
-a mode-0600 copy, then transfers ownership to Inky's UID/GID 10001 before any
-long-running service can start. A failure at any step blocks startup. The
-private bind relabels the source for enforcing SELinux hosts and refuses to
-create a directory when the configured file is missing. The controller and
-scheduler remain unprivileged with no added capabilities. Set
-`INKY_BIRD_CONFIG` in `.env` when the host file is not `./config.toml`.
-
-### User namespace remapping
-
-Standard Docker Engine and rootless Docker can read a mode-0600 host config:
-standard Engine uses the init service's two scoped capabilities, while
-rootless Docker maps container root to the host account that owns the file.
-[Daemon-wide `userns-remap`](https://docs.docker.com/engine/security/userns-remap/)
-instead maps container root to a subordinate host UID. Docker requires bind
-mount permissions to be arranged for that UID.
-
-If `userns-remap` is enabled, find the configured remap account and its first
-subordinate UID in `/etc/subuid`, then grant only that mapped-root UID read
-access to the private host file. For example, when the remap account is
-`dockremap`:
-
-```bash
-remap_root_uid="$(awk -F: '$1 == "dockremap" { print $2; exit }' /etc/subuid)"
-test -n "$remap_root_uid"
-sudo setfacl --modify "u:${remap_root_uid}:r" config.toml
-getfacl config.toml
-```
-
-Use the account actually configured by your daemon; `default` means
-`dockremap`. Do not make the file group- or world-readable, and do not disable
-user-namespace isolation for this container. Without the narrow ACL,
-`config-sync` fails closed with an actionable error before reading or replacing
-the runtime copy. Docker's
-[UID/GID mapping guide](https://docs.docker.com/engine/security/rootless/uid-gid-mapping/)
-explains the difference between rootless and `userns-remap` ownership.
-
-`bootstrap` runs `catalog sync --source-catalog /app/catalog --catalog
-/data/catalog --state-dir /data/var/controller`. Compose opts into reviewed
-migrations and independent local approval retention through environment
-variables instead of version-specific command-line arguments, so the current
-Compose definition can still start an older image after the matching persistent
-snapshot is restored. Bootstrap validates the bundled and persistent catalogs,
-copies missing species, and applies only replacements whose recorded approval
-hashes and complete migration ancestry match the persistent plate. A validated
-persistent descendant is reported as `retained_newer`. A valid local plate made
-before the same exact species entered the public catalog has no shared approval
-ancestry, so bootstrap preserves it and reports it as `retained_independent`.
-It never changes taxon identity or downgrades a local plate. Shared-history
-forks, malformed catalogs, and incomplete or tampered migration records still
-fail closed. The sync rebuilds the index and holds the controller state lock so
-it cannot race a running cycle. The
-[operations guide](operations.md#copy-species-between-catalogs) describes the
-command in general.
+The services Compose starts, and how their configuration and credentials are
+kept apart, are described under [What runs](#what-runs) near the end.
 
 ## Before you begin
 
@@ -398,6 +269,14 @@ docker compose run --rm --no-deps scheduler \
 copy. An invalid edit leaves the last valid runtime copy untouched and prevents
 dependent services from starting through `docker compose up`.
 
+If the runtime copy itself no longer loads, for example because a newer release
+checks a value more strictly, `config-sync` still installs a valid host file. It
+keeps the old runtime copy beside it as `/data/config.toml.invalid-<UTC time>`
+(mode `0600`) and never deletes it. If the old copy was managed in the browser,
+enter those browser settings again. Delete the kept copy once the new
+configuration works. A browser-managed runtime copy that still loads is kept
+instead, and `config-sync` reports `"preserved": true`.
+
 For a **new empty installation only**, prepare browser account creation now,
 before the first `up` or catalog bootstrap:
 
@@ -448,11 +327,15 @@ refreshes observations before generation is allowed. `bootstrap` should finish
 with exit code zero; it safely checks the catalog again whenever Compose
 recreates the project.
 
-With the `config.example.toml` path, generation is on: the scheduler starts paid
-Codex generation right after its first successful refresh, which happens as
-soon as `up` starts it. To keep it off, set `generation_enabled = false` under
-`[controller]` before `config-sync`. The `config init` seed starts with
-generation off.
+New artwork is off with both `config.example.toml` and the `config init` seed:
+the controller shows approved artwork only. To make new plates, set
+`generation_enabled = true` under `[controller]`, run `config-sync` and recreate
+the controller and scheduler (for an app-managed configuration, turn it on in
+Settings). Generation uses your own Codex sign-in or API key, and that
+provider's charges apply. The scheduler then starts generation right after its
+next successful refresh. A configuration file without a `generation_enabled`
+line keeps generation on, unless it is app-managed, so an existing installation
+keeps its current behaviour.
 
 Open `http://CONTROLLER_ADDRESS:8793/app` from an address listed in
 `owner_allowed_origins`, and create your username and password (or sign in with
@@ -492,7 +375,16 @@ contain authentication state.
 
 Compose uses `restart: unless-stopped`, so the HTTP service and scheduler return
 after Docker starts following a reboot. The scheduler requires a successful
-observation refresh before it generates anything.
+observation refresh before it generates anything. The scheduler has
+`stop_grace_period: 60s`, so `docker compose stop`, `up --detach` or a reboot
+lets a running generation stop Codex and record the attempt instead of being
+killed after Docker's default 10 seconds.
+
+Grid views use small thumbnail copies of approved plates, kept under the
+controller state directory in `plate-thumbnails/` (folder mode `0700`, files
+`0600`, a few tens of KB each). They are made the first time a grid shows a
+plate, and copies for replaced or removed plates are deleted when the next new
+one is made. The folder is safe to delete at any time; it rebuilds itself.
 
 Back up `config.toml`, `.env`, any `controller.env` and `access.env` files, and
 the `controller-data` volume. Include any alternate files selected through
@@ -618,6 +510,133 @@ docker compose -f compose.yaml -f compose.build.yaml up --detach
 The override sets `pull_policy: build`, so every service uses the locally built
 runtime. The default `compose.yaml` remains registry-only.
 
+## What runs
+
+Compose starts four services from the same image:
+
+| Service | Job | Credentials |
+| --- | --- | --- |
+| `config-sync` | Validates the host `config.toml`, installs a private runtime copy, then exits | Configuration file and referenced environment values |
+| `bootstrap` | Copies the included public bird catalog into persistent storage, then exits | None |
+| `controller` | Serves the browser journal, paired screens, health and approved art on port 8793; runs explicit browser actions | Private owner hashes, configured provider/destination credentials, optional identity-service client secret |
+| `scheduler` | Refreshes observations and runs generation, notifications, and optional catalog publication | Codex and any configured service credentials |
+
+The controller and scheduler use the same commands as a native installation.
+One failed scheduled job is logged and retried later without stopping the HTTP
+service or unrelated jobs.
+
+The [browser journal](journal.md) opens at `/app`.
+Create a local username and password; no setup code is required. The optional
+`access.env` file supplies only controller access credentials such as an OIDC
+client secret. Protect it with mode `0600`. It is separate from `controller.env`,
+which supplies provider and destination credentials to both long-running
+services. Browser source and notification actions need those variables in the
+serving process as well as the scheduler. Keep only required Inky variables in
+these files. Do not give the controller a vault service token or unrelated host
+credentials. Both processes use the same private configuration and history.
+See [migration](migration-v1.md) and [history imports](history-imports.md).
+
+Docker port forwarding changes the address seen by the application. List the
+exact browser address in your host `config.toml`, including any non-default
+port. For access from the same computer:
+
+```toml
+[controller]
+owner_access_mode = "local"
+owner_allowed_origins = ["http://localhost:8793"]
+```
+
+For a phone on your home network, replace that example with the controller's
+actual LAN address. Add each address you use, rather than a wildcard. With a
+TLS reverse proxy, use its exact HTTPS address and `owner_access_mode = "https-only"`
+as described in the access guide. This explicit address check prevents an
+unrelated hostname from reaching owner forms through DNS rebinding.
+
+Trust the other web services on that hostname or IP, including other ports:
+browsers share sign-in cookies across ports. A separate HTTP hostname alone
+does not isolate an untrusted service. See the
+[host-isolation requirements](browser-access.md#sessions-and-private-files).
+
+The controller health check reads the same configuration as `doctor`. It uses
+HTTP for a plain listener and HTTPS for direct TLS. It validates certificate
+trust and the response, not just a successful TCP connection. For direct TLS,
+put the matching certificate and mode-0600 private key in the private data
+volume, readable by UID 10001. Configure their paths as described in the
+[access guide](browser-access.md#advanced-supply-a-certificate). If using a
+private CA, mount only its public trust certificate and set `SSL_CERT_FILE` for
+the controller. Include its actual listener hostname and port in
+`owner_allowed_origins`; that address must resolve inside the container too.
+Do not disable certificate validation to pass a health check. A reverse proxy
+that terminates HTTPS leaves the backend listener and health check on HTTP.
+
+For existing managed installations, the host `config.toml` is authoritative.
+An [app-managed installation](settings.md) instead preserves its private runtime
+file across restarts; the original host file is only its first-start seed.
+Compose bind-mounts the host file read-only into
+the one-shot `config-sync` service, not the long-running services. Local Docker
+Compose cannot remap the owner or mode of a file-backed config, so mounting a
+mode-0600 host file directly into the unprivileged controller is not portable.
+`config-sync` is therefore a short-lived container-root init process. It runs
+offline with a read-only root filesystem, `no-new-privileges`, every capability
+dropped except `DAC_OVERRIDE` and `CHOWN`, one read-only host bind, and the
+controller data volume. It receives the same optional `controller.env` as the
+scheduler so references such as `ebird_api_key_env` can be validated without
+putting their values in `config.toml`. With networking disabled, those values
+cannot be sent anywhere by this service. It validates and atomically installs
+a mode-0600 copy, then transfers ownership to Inky's UID/GID 10001 before any
+long-running service can start. A failure at any step blocks startup. The
+private bind relabels the source for enforcing SELinux hosts and refuses to
+create a directory when the configured file is missing. The controller and
+scheduler remain unprivileged with no added capabilities. Set
+`INKY_BIRD_CONFIG` in `.env` when the host file is not `./config.toml`.
+
+### User namespace remapping
+
+Standard Docker Engine and rootless Docker can read a mode-0600 host config:
+standard Engine uses the init service's two scoped capabilities, while
+rootless Docker maps container root to the host account that owns the file.
+[Daemon-wide `userns-remap`](https://docs.docker.com/engine/security/userns-remap/)
+instead maps container root to a subordinate host UID. Docker requires bind
+mount permissions to be arranged for that UID.
+
+If `userns-remap` is enabled, find the configured remap account and its first
+subordinate UID in `/etc/subuid`, then grant only that mapped-root UID read
+access to the private host file. For example, when the remap account is
+`dockremap`:
+
+```bash
+remap_root_uid="$(awk -F: '$1 == "dockremap" { print $2; exit }' /etc/subuid)"
+test -n "$remap_root_uid"
+sudo setfacl --modify "u:${remap_root_uid}:r" config.toml
+getfacl config.toml
+```
+
+Use the account actually configured by your daemon; `default` means
+`dockremap`. Do not make the file group- or world-readable, and do not disable
+user-namespace isolation for this container. Without the narrow ACL,
+`config-sync` fails closed with an actionable error before reading or replacing
+the runtime copy. Docker's
+[UID/GID mapping guide](https://docs.docker.com/engine/security/rootless/uid-gid-mapping/)
+explains the difference between rootless and `userns-remap` ownership.
+
+`bootstrap` runs `catalog sync --source-catalog /app/catalog --catalog
+/data/catalog --state-dir /data/var/controller`. Compose opts into reviewed
+migrations and independent local approval retention through environment
+variables instead of version-specific command-line arguments, so the current
+Compose definition can still start an older image after the matching persistent
+snapshot is restored. Bootstrap validates the bundled and persistent catalogs,
+copies missing species, and applies only replacements whose recorded approval
+hashes and complete migration ancestry match the persistent plate. A validated
+persistent descendant is reported as `retained_newer`. A valid local plate made
+before the same exact species entered the public catalog has no shared approval
+ancestry, so bootstrap preserves it and reports it as `retained_independent`.
+It never changes taxon identity or downgrades a local plate. Shared-history
+forks, malformed catalogs, and incomplete or tampered migration records still
+fail closed. The sync rebuilds the index and holds the controller state lock so
+it cannot race a running cycle. The
+[operations guide](operations.md#copy-species-between-catalogs) describes the
+command in general.
+
 ## Troubleshooting
 
 ```bash
@@ -631,6 +650,13 @@ If Codex cannot start its sandbox on Ubuntu, confirm that the included AppArmor
 profile is installed and loaded. Do not disable AppArmor's system-wide
 unprivileged-user-namespace restriction.
 
-The image publication workflow runs only for trusted `main`, published
-releases, or an owner-started manual run. Pull requests build and test the
-container in CI but cannot publish packages or receive controller credentials.
+## Reference
+
+The image includes the project license and the pinned Codex CLI and GitHub CLI
+license material under `/usr/share/licenses/inky-bird-frame/`. See
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for component details.
+
+Images are published only from trusted `main`, published releases or an
+owner-started manual run. Pull requests build and test the container but
+cannot publish it or receive controller credentials. For HTTP errors, caching and security headers, external
+browser applications and Homepage, see the [reference page](reference.md).

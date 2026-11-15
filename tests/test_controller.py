@@ -204,18 +204,18 @@ class ControllerTests(unittest.TestCase):
         location.assert_not_called()
 
     def test_ebird_archive_source_accepts_an_explicit_date_range(self) -> None:
-        selected_range = DateRange(date(2025, 4, 29), date(2025, 5, 2))
+        selected_range = DateRange(date(2020, 1, 10), date(2020, 1, 12))
         history = EbirdArchiveHistory(
             [],
-            66,
-            330,
-            96,
+            2,
+            10,
+            5,
             0,
-            330,
-            "2026-08-09T12:00:00+00:00",
-            "2026-08-09T12:00:00+00:00",
-            "2021-03-27",
-            "2026-08-07",
+            10,
+            "2020-02-01T00:00:00+00:00",
+            "2020-02-01T00:00:00+00:00",
+            "2020-01-01",
+            "2020-01-31",
         )
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
@@ -399,7 +399,7 @@ class ControllerTests(unittest.TestCase):
             cache_path.parent.mkdir(parents=True)
             cache_path.write_text("{}")
 
-            with self.assertRaisesRegex(CatalogError, "Invalid cached species profile"):
+            with self.assertRaisesRegex(SpeciesStateError, "Invalid cached species profile"):
                 load_or_create_profile(
                     config,
                     species,
@@ -550,7 +550,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_historical_seed_uses_coordinate_override_without_mutating_config(self) -> None:
         species = BirdSpecies(2, "Trip Bird", "Avis itineris", 3, "iNaturalist")
-        date_range = DateRange(date(2026, 7, 13), date(2026, 7, 16))
+        date_range = DateRange(date(2020, 1, 10), date(2020, 1, 12))
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
             config_path.write_text(CONFIG)
@@ -565,18 +565,18 @@ class ControllerTests(unittest.TestCase):
                 result = enqueue_seed_species(
                     config,
                     date_range=date_range,
-                    latitude=33.6407,
-                    longitude=-84.4277,
+                    latitude=1.25,
+                    longitude=2.5,
                     sources=(DiscoveryProvider.INATURALIST,),
                     radius_km=11,
                     dry_run=True,
                 )
 
-        self.assertEqual(result["start_date"], "2026-07-13")
-        self.assertEqual(result["end_date"], "2026-07-16")
+        self.assertEqual(result["start_date"], "2020-01-10")
+        self.assertEqual(result["end_date"], "2020-01-12")
         self.assertIsNone(result["window"])
-        self.assertEqual(fetch.call_args.kwargs["latitude"], 33.6407)
-        self.assertEqual(fetch.call_args.kwargs["longitude"], -84.4277)
+        self.assertEqual(fetch.call_args.kwargs["latitude"], 1.25)
+        self.assertEqual(fetch.call_args.kwargs["longitude"], 2.5)
         self.assertEqual(fetch.call_args.kwargs["date_range"], date_range)
         self.assertEqual(config.discovery.zip_code, "12345")
 
@@ -687,14 +687,21 @@ class ControllerTests(unittest.TestCase):
                     "inky_bird_frame.controller.current_discovery_species",
                     return_value=[observed],
                 ),
-                patch("inky_bird_frame.controller._write_active_catalog", return_value=1),
+                patch(
+                    "inky_bird_frame.controller.rebuild_catalog_index",
+                    return_value=[approved],
+                ),
             ):
                 result = remove_collection_member(config, 1)
+            active = json.loads((config.controller.state_dir / "active-catalog.json").read_text())
 
         self.assertEqual(result["removed_count"], 1)
         self.assertEqual(result["removed_taxon_ids"], [1])
         self.assertEqual(result["collection_count"], 0)
         self.assertEqual(result["active_approved_count"], 1)
+        # The bird leaves the collection but stays active because it is observed.
+        self.assertEqual([entry["taxon_id"] for entry in active["species"]], [1])
+        self.assertEqual(active["species"][0]["observation_count"], 3)
 
     def test_approved_replacement_requeues_historical_taxon_and_updates_active_catalog(
         self,
@@ -1754,7 +1761,9 @@ class ControllerTests(unittest.TestCase):
             )
             attempted: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
@@ -1812,7 +1821,9 @@ class ControllerTests(unittest.TestCase):
             )
             attempted: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
@@ -1905,7 +1916,9 @@ class ControllerTests(unittest.TestCase):
             attempted: list[int] = []
             due_checks: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
@@ -2330,6 +2343,12 @@ class ControllerTests(unittest.TestCase):
             discovery([healthy, new_healthy, new_recovered], ebird_ok=True),
             discovery([healthy, returning, new_healthy, new_recovered], ebird_ok=True),
         ]
+        walls: list[list[int]] = []
+
+        def record_wall(_config: AppConfig, species: list[BirdSpecies]) -> int:
+            walls.append([item.taxon_id for item in species])
+            return len(species)
+
         with TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.toml"
             config_path.write_text(CONFIG)
@@ -2338,7 +2357,7 @@ class ControllerTests(unittest.TestCase):
                 patch("inky_bird_frame.controller.discover_species", side_effect=results),
                 patch(
                     "inky_bird_frame.controller._write_active_catalog",
-                    side_effect=lambda _config, species: len(species),
+                    side_effect=record_wall,
                 ),
             ):
                 refreshes = [run_refresh_cycle(config) for _ in results]
@@ -2351,8 +2370,11 @@ class ControllerTests(unittest.TestCase):
             ],
             [[1, 2], [3], [], [4], [], [2]],
         )
-        self.assertEqual(refreshes[1]["species_count"], 2)
-        self.assertEqual(refreshes[1]["active_approved_count"], 2)
+        # The failed eBird provider's bird stays on the wall while its outage is recent.
+        self.assertEqual(walls[1], [1, 3, 2])
+        self.assertEqual(walls[2], [1, 3, 2])
+        self.assertEqual(refreshes[1]["species_count"], 3)
+        self.assertEqual(walls[4], [1, 3, 4])
         self.assertEqual(snapshot["notification_baseline_taxon_ids"], [1, 2, 3, 4])
 
     def test_upgrade_from_degraded_snapshot_waits_for_reliable_baseline(self) -> None:
@@ -4631,7 +4653,7 @@ class DiscoveryProviderTests(unittest.TestCase):
         self.assertEqual(len(result.species), 1)
         self.assertEqual(result.species[0].observation_count, 9)
         self.assertEqual(result.species[0].sources, ("iNaturalist", "eBird"))
-        self.assertTrue(all(provider.status == "ok" for provider in result.providers))
+        self.assertEqual([provider.status for provider in result.providers], ["ok", "ok"])
 
     def test_combined_mode_continues_when_ebird_fails(self) -> None:
         inaturalist = BirdSpecies(12942, "Eastern Bluebird", "Sialia sialis", 9, "iNaturalist")

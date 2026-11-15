@@ -124,14 +124,25 @@ Receipts live in `state_dir/owner-operations.json` with mode `0600`, under the
 existing catalog-state lock. A separate private operation lock prevents two
 workers from running at once. Symlinks, insecure permissions and malformed state
 fail closed. Raw exceptions, server payloads, secrets and bootstrap credentials
-are not saved in receipts or shown in operation outcomes.
+are not saved in receipts or shown in operation outcomes. A failed import shows
+the importer's own message, for example "eBird archive is missing required
+columns: …", unless that message names a path or URL; then it stays generic.
+An action refused because settings changed shows "Settings changed. Reload and
+review this action again."
 
-Completed and interrupted receipts are retained for seven days. That gives time
-to inspect an interrupted task after a weekend. Storage is bounded to 256
-receipts and 1 MiB of serialized state; a single result is bounded to 16 KiB.
-Full storage refuses new actions instead of evicting active work. Cleanup removes
-only expired receipts, never source history, generation work or plates. An
-expired identifier is not a permanent exactly-once guarantee.
+Completed and interrupted receipts are retained for up to seven days. That
+gives time to inspect an interrupted task after a weekend. When the store passes
+256 receipts or 1 MiB of serialized state, the oldest finished outcomes are
+removed first; a single result is bounded to 16 KiB. Pending and running
+receipts, and the one being finished or polled, are never removed. New work is
+refused only when unfinished receipts alone fill the store: "Too many owner
+operations are unfinished. Wait for them before continuing." Cleanup removes
+only receipts, never source history, generation work or plates.
+
+So the replay guarantee is: up to 256 recent outcomes within seven days. Once an
+outcome is removed, its outcome page stops resolving, and repeating the same
+request identifier runs the work again instead of returning the stored outcome.
+An import commit is still checked against its preview and revision.
 
 Back up receipts with the rest of the stopped controller state. A receipt is
 evidence of an operation outcome, not a replacement for its source data or a
@@ -142,5 +153,7 @@ completed records can be evicted, unresolved blocked requests cannot. A new
 explicit request replaces that bird's prior outcome while retaining its hold
 until preparation completes. Activity lives in
 `state_dir/activity.json`. Both files use atomic mode-`0600` writes and private
-locks. Activity is advisory; it does not authorize work. Back up both with the
+locks. Activity is advisory; it does not authorize work. When activity is
+read, an invalid value or a field from a newer release is dropped and the rest
+of its entry is kept. Back up both with the
 rest of controller state. Removing a receipt does not cancel an accepted retry.

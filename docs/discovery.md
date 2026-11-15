@@ -191,9 +191,12 @@ could otherwise erase history. After confirming that the file is complete and
 the reduction reflects intentional eBird edits or deletions, rerun with
 `--allow-history-reduction`.
 
-Private state retains only a one-way checklist fingerprint, the checklist date,
-and common and scientific species names. It does not retain eBird account data,
-raw submission or location IDs, coordinates, place names, observer counts,
+Private state retains only an unsalted SHA-256 of each submission ID, the
+checklist date, and common and scientific species names. Submission IDs are
+short sequential identifiers ("S" followed by digits), so anyone who can read
+the file could recover them by trying
+every ID; the file is private (mode `0600`), not anonymous. It does not retain
+eBird account data, raw location IDs, coordinates, place names, observer counts,
 individual bird counts, comments, effort, or media references. One species on
 one checklist counts as one personal observation regardless of the reported
 number of individuals. `ebird archive status` reports only aggregate counts and
@@ -205,7 +208,10 @@ labels remain private unresolved diagnostics and cannot trigger generation.
 First-time taxonomy resolution is paced to iNaturalist's official guidance of
 about one API request per second; large archives can therefore take a few
 minutes to seed. Completed matches are cached atomically, so a transient error
-or rate limit preserves progress for the next run.
+or rate limit preserves progress for the next run. The cache is saved after
+every 25 new lookups, and whenever a run is interrupted, and its lock is
+released at least every 30 seconds, so an interrupted first import keeps what
+it has already matched.
 Because the export supplies calendar dates rather than event instants, archive
 observations do not claim latest-detection rotation priority. Re-export and
 reimport periodically to include newly published eBird checklists; no eBird
@@ -424,16 +430,20 @@ window. Analyzer provides no absolute time, so dated imports do not invent a
 latest-detection timestamp or take latest-detection rotation priority.
 
 Imports are atomic and idempotent. Inky identifies a recording segment from
-the CSV's `File`, `Start (s)`, and `End (s)` values, allowing a later Analyzer
-classification for that same segment to replace the earlier one. Keep the
+the CSV's `File`, `Start (s)`, and `End (s)` values. Each species listed for a
+segment is its own record, so a segment with three species keeps all three.
+Re-importing an analysis replaces the species list of every segment in that
+upload: a re-analysis can add, change or remove detections, and the preview
+counts removals. Segments not in the upload are left alone. Keep the
 Analyzer `File` values stable and unique across your corpus. Reusing one segment
 identity with two different explicit dates fails closed rather than silently
 mixing history. Use `--dry-run` to validate and preview counts without replacing
 history.
 
-The private mode-`0600` state retains only a one-way segment fingerprint,
-species names, and an optional explicit date. Source paths, segment offsets,
-confidence values, and audio are not retained. Every species still requires an
+The private mode-`0600` state retains only an unsalted SHA-256 of each
+record's CSV `File` value (often a full path), start and end times and species
+name, plus the species names and an optional explicit date. Source paths,
+segment offsets, confidence values, and audio are not retained in readable form. Every species still requires an
 exact active iNaturalist bird match; unresolved or non-bird labels cannot enter
 generation. `all-time` means all unique segments imported into this
 installation, not the complete history of the recording device.
@@ -501,15 +511,39 @@ For noninteractive secret-manager use, inject `INKY_BIRDBUDDY_EMAIL` and
 available names and IDs without saving authentication; rerun with the intended
 `--feeder-id`.
 
-Login stores only the attestation time, selected feeder, and rotating refresh
-token in mode-`0600` controller state. Access tokens remain in memory. The
-password and email are never retained. `birdbuddy logout --config
-/path/to/config.toml --yes` removes local authentication while preserving
-detection history; it does not claim to revoke the remote token.
+Login stores the attestation time, selected feeder and rotating refresh token in
+`birdbuddy-auth.json`, mode `0600`, under `state_dir`. The state also keeps the
+last refresh token Bird Buddy accepted. When the current token is rejected with
+an authentication error, Inky tries that one once before asking you to sign in
+again; throttling and server errors are reported as what they are. The same
+file keeps the current access token and its expiry, with the same protection.
+Inky reuses it for up to 12 hours, until five minutes before it expires, and
+only then exchanges the refresh token for a new one. The password and email are
+never retained. `birdbuddy logout --config /path/to/config.toml --yes` removes
+local authentication while preserving detection history; it does not claim to
+revoke the remote token.
 
-Bird Buddy rotates its refresh token once before each authenticated sync, so
-even `discover` and seed previews must atomically update authentication state.
-Preview commands do not commit detection history or taxonomy cache changes.
+Exchanging the refresh token rotates it, so even `discover` and seed previews
+must atomically update authentication state. Preview commands do not commit
+detection history or taxonomy cache changes.
+
+The new-postcard feed is read every cycle. The full confirmed history is read
+about once a day, and also on the first sync after upgrading, whenever
+`birdbuddy_include_manual_sightings` changes, and when history has no saved
+read time. A correction made in the Bird Buddy app can therefore take up to a
+day to show. On syncs that do not read the full history, the provider details
+report `confirmed_history_checked: false`, which only means it was not re-read
+this time; `confirmed_records_skipped` stays `0`. `confirmed_history_complete`
+keeps the result of the last full read, and `confirmed_history_checked_at`
+gives its time.
+
+When Bird Buddy answers HTTP 429, Inky waits for the time it asks for (at least
+a minute, at most a day). Without one it waits 15 minutes, doubling up to 6
+hours. During the wait every sync and preview fails at once with "Bird Buddy
+asked Inky to slow down; Inky will try again after <time>" and sends no
+request. The wait is kept in `birdbuddy-backoff.json` (mode `0600`, safe to
+delete) and cleared after the next successful sync; a successful preview leaves
+it in place.
 
 The provider reads high-confidence species metadata and media identifiers from
 new postcards. It also reads the species, capture time, origin, feeder ID, and
@@ -588,13 +622,25 @@ logout --yes` to remove local authentication while preserving history.
 
 eBird returns recent public sightings and an eBird species code. The controller
 searches iNaturalist for a single active bird species with an exact scientific
-name or synonym. Its iNaturalist taxon ID becomes the canonical catalog identity.
+name or synonym. When iNaturalist returns both a current exact scientific name
+and a synonym match, for example after a split, the exact current name wins.
+Two synonym-only matches stay ambiguous. Misses cached under the earlier rule
+are checked once more after upgrading, at about one request per second. Its
+iNaturalist taxon ID becomes the canonical catalog identity.
 The same lookup recognizes the [Winter Wren rename](https://doi.org/10.1093/ornithology/ukag037)
 from `Troglodytes hiemalis` to `Nannus hiemalis` (iNaturalist taxon `1720022`).
 Existing deferrals for the old name can retry on the next refresh after
 upgrading. Ambiguous, inactive, hybrid, subspecies, domestic, and unmatched
 records still defer. A seven-day negative cache prevents repeated refreshes from
 retrying the same miss.
+
+If iNaturalist marks a bird's taxon inactive, plate research stops before any
+search or generation. The status says "iNaturalist no longer uses taxon N; it
+was replaced by taxon M. Research was skipped." (or "it has no current
+replacement"). The bird is retried later with normal backoff and, like any
+other failure, stops after 12 automatic tries until you retry it. Inky does not
+follow the replacement automatically; an existing plate stays with the old
+taxon ID.
 
 iNaturalist remains the source for taxonomy and research-grade CC0/CC-BY
 reference photographs. eBird and Macaulay Library media are not copied into the
@@ -605,8 +651,12 @@ generation pipeline.
 Each provider receives the configured `species_limit`, so the merged result may
 be larger before duplicate species are removed. If one provider fails, the
 others still refresh the active catalog and the controller records which source
-failed. A refresh fails only when every configured provider fails. In that
-case, the prior active catalog stays in place.
+failed. The failed provider's birds from its last successful refresh are kept
+for three refresh intervals (45 minutes with the default 15-minute refresh, at
+most 24 hours); its status row reports `carried_species_count`. After that its
+birds leave the active catalog until it answers again. Changing the discovery
+settings ends this carry-over. A refresh fails only when every configured
+provider fails. In that case, the prior active catalog stays in place.
 
 The legacy singular values `source = "inaturalist"`, `"ebird"`, `"combined"`,
 and `"birdweather"` remain accepted. Do not set both `source` and `sources`.
@@ -635,7 +685,9 @@ evidence. `shuffle_bag` is the recommended source-neutral rotation policy.
 
 BirdWeather, BirdNET-Go, and Bird Buddy also supply each species' latest
 detection timestamp. By default, a display node shows the newest detection once
-before returning to its configured rotation. This is display priority, not a
+before returning to its configured rotation. A detected bird jumps the queue only
+when it is not among the last few birds shown, and never more than twice in a
+row. This is display priority, not a
 confidence claim or a live event stream: the timestamp advances only when the
 controller refreshes a provider. Configure
 `display_node.prioritize_latest_detection = false` to disable it. The `discover`

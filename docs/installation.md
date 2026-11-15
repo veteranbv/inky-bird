@@ -1,10 +1,5 @@
 # Installation
 
-The examples below use the names for a clean installation. Existing installs
-keep their current configuration, data roots and native service names; setup
-detects that identity instead of creating a second scheduler. Before updating
-an existing install, read the [name migration guide](repository-name.md).
-
 This guide starts with a blank controller and Raspberry Pi and ends with a frame
 that returns after a reboot. Follow the sections in order. The first panel test
 uses an included plate, so you can prove the hardware before setting up Codex or
@@ -13,19 +8,23 @@ bird observations.
 If you only want the browser journal, use [Start with approved art](settings.md#start-with-approved-art)
 or run the [Docker controller](docker.md) without a display node.
 
+## Before you begin
+
+The examples below use the names for a clean installation. Existing installs
+keep their current configuration, data roots and native service names; setup
+detects that identity instead of creating a second scheduler. Before updating
+an existing install, read the [name migration guide](repository-name.md).
+
+You do not need panel hardware, Codex authentication or a bird-service account
+for the approved-art path. The requirements below describe the complete
+observation-driven wall installation.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/installation-architecture-dark.png">
   <img src="images/installation-architecture.png" alt="Inky Bird runtime architecture showing observation and generation services; the controller; the Raspberry Pi display node and an optional trusted browser application reading the approved catalog over a private network; and the Inky Impression panel">
 </picture>
 
-Every application connection is client-initiated. The display node connects
-directly to the controller. A browser connects directly only from a trusted HTTP
-origin; otherwise, its application proxy or TLS terminator connects to the
-controller. The controller's configured port (8793 in the supplied example
-configuration) must remain on a trusted network and must not be forwarded from
-the public internet.
-
-## Choose the two computers
+### Choose the two computers
 
 The controller and display node have different jobs. A capable Linux Raspberry
 Pi can run both, but the recommended framed build puts a small Pi behind the
@@ -56,12 +55,7 @@ nodes can read the same catalog, but the controller's fetch and success
 heartbeats describe the display role as a whole rather than identifying each
 physical panel independently.
 
-## Before you begin
-
-Want the journal without building a frame? Start with [approved art and no
-generation](settings.md#start-with-approved-art). You do not need panel hardware,
-Codex authentication or a bird-service account for that path. The requirements
-below describe the complete observation-driven wall installation.
+### What you need
 
 You need:
 
@@ -78,6 +72,13 @@ The controller requires Python 3.11 or newer, `git`, `rsync`, `uv`, and Codex
 CLI. The display requires `git`, `rsync`, and Pimoroni's Python environment.
 
 ### Network requirements
+
+Every application connection is client-initiated. The display node connects
+directly to the controller. A browser connects directly only from a trusted HTTP
+origin; otherwise, its application proxy or TLS terminator connects to the
+controller. The controller's configured port (8793 in the supplied example
+configuration) must remain on a trusted network and must not be forwarded from
+the public internet.
 
 | From | To | Purpose |
 | --- | --- | --- |
@@ -112,173 +113,8 @@ listens on every interface of the controller host. On a multi-homed
 controller, set `bind_host` to the specific LAN address the display uses so
 the service is not offered on other networks.
 
-### Browser applications
-
-For Inky's own bundled journal, follow [first setup](browser-access.md) and
-[the journal guide](journal.md). For paired screens, selected wall views and
-scoped dashboard recipes, use [presentation setup](presentation.md). The
-compatible external catalog interface below remains separate from owner access.
-
-The [owner access page](browser-access.md) is separate from the read-only
-integration routes below. This section is for an operator-supplied application
-that consumes the catalog API or frames its narrow featured-plate embed.
-Both permissions are disabled by default. To let a trusted web application
-fetch the active catalog and its images directly, list its exact origin under
-`[controller]`:
-
-```toml
-[controller]
-cors_allowed_origins = ["https://frame.example.test"]
-```
-
-An origin contains only the scheme, host, and optional port. Inky rejects
-wildcards, credentials, paths, queries, and fragments. Use an ASCII hostname
-or the canonical form of an IP address. Internationalized and punycode
-hostnames are not supported. A matching origin can read `GET /v1/catalog` and
-the active catalog's portrait and display PNGs under `GET /v1/assets/`. Other
-catalog files, inactive plates, health, the featured-plate embed, and display
-telemetry do not receive cross-origin access. Requests from other origins
-receive the normal response without an `Access-Control-Allow-Origin` header.
-
-Framing is a separate permission. List each trusted parent origin explicitly:
-
-```toml
-[controller]
-embed_allowed_origins = ["https://home.example.test"]
-```
-
-The controller adds those origins to the embed's Content Security Policy
-`frame-ancestors` directive. CSP does not reliably match IP-address sources, so
-framing origins must use DNS hostnames. Underscores and trailing dots are also
-rejected. Unlisted sites cannot frame the embed. Keeping CORS and framing
-separate means an existing catalog reader does not silently gain permission to
-present controller content inside its pages.
-
-The browser catalog includes active species identity, approval time, image
-paths and checksums, and any available observation count and latest-detection
-time. It does not include provider names, raw observations, locations,
-credentials, or private provider state. Browser reads never refresh the
-physical display's health signals. The server also verifies an active image's
-catalog checksum before it sends the file.
-
-This setting does not add authentication, TLS, or public-internet safety. Keep
-the controller private. Prefer a same-origin application proxy, which needs no
-CORS permission and can authenticate the browser before making a server-side
-request to Inky. Direct public-HTTPS-to-local-network behavior varies by
-browser: the browser may block mixed content, ask for local-network permission,
-or allow only specific local address forms. A VPN does not make those browser
-rules consistent. Terminate HTTPS for the controller or use the same-origin
-proxy when you need a portable path.
-
-Direct cross-origin access through cookie, session, client-certificate, or HTTP
-Authorization proxies is not compatible with this interface. Inky does not
-permit credentialed CORS requests and does not implement CORS or Private
-Network Access preflight. Standard catalog `GET` requests use no custom request
-headers. Routine application request logs use a fixed route label, method and
-status, not source addresses, arbitrary paths, queries, cookies or credentials.
-Do not enable proxy request logging for authentication callbacks. Normal systemd
-journal or bounded private macOS log retention applies.
-
-#### Homepage dashboard
-
-[Homepage](https://gethomepage.dev/) can show Inky with its stock service
-widgets; no Homepage fork, custom JavaScript, or Inky-specific plugin is
-required. Its `customapi` widget fetches through the Homepage server, while its
-`iframe` widget loads in the browser.
-
-For a compact status card, add one `customapi` widget:
-
-```yaml
-- Birds:
-    - Inky Bird:
-        icon: mdi-bird
-        href: https://github.com/veteranbv/inky-bird
-        description: Observation-driven field-journal plates
-        siteMonitor: http://inky-controller:8793/v1/catalog
-        widget:
-          type: customapi
-          url: http://inky-controller:8793/health
-          refreshInterval: 300000
-          mappings:
-            - field: active_species
-              label: Active
-              format: number
-            - field: approved_species
-              label: Plates
-              format: number
-            - field: version
-              label: Version
-              format: text
-```
-
-For the featured-plate card, use Homepage's multiple-widget form and add the
-`iframe` after the same status widget:
-
-```yaml
-- Birds:
-    - Inky Bird:
-        icon: mdi-bird
-        href: https://github.com/veteranbv/inky-bird
-        description: Observation-driven field-journal plates
-        siteMonitor: http://inky-controller:8793/v1/catalog
-        widgets:
-          - type: customapi
-            url: http://inky-controller:8793/health
-            refreshInterval: 300000
-            mappings:
-              - field: active_species
-                label: Active
-                format: number
-              - field: approved_species
-                label: Plates
-                format: number
-              - field: version
-                label: Version
-                format: text
-          - type: iframe
-            src: https://inky.example.test/v1/embed/featured-plate
-            classes: h-60
-            allowScrolling: no
-            referrerPolicy: no-referrer
-```
-
-Replace the names and URLs with addresses reachable from the Homepage server
-and browser. `siteMonitor` uses `/v1/catalog`, not `/health`, because the
-catalog route fails closed when active catalog state is unavailable. Inky
-answers Homepage's `HEAD` readiness probe without transferring the catalog.
-`/health` answers `GET` only and returns 404 to `HEAD`, so do not point a
-`HEAD`-based monitor at it.
-The stats request is server-side and needs no CORS permission. Polling every
-five minutes avoids Homepage's much noisier default while keeping the counts
-useful.
-
-The optional image needs a browser-reachable HTTPS route for the controller. A
-true same-origin proxy beneath the Homepage origin works with the default
-`frame-ancestors 'self'` policy. For a separate controller origin, as shown
-above, add the Homepage origin to `embed_allowed_origins`. Make sure a reverse
-proxy forwards both `/v1/embed/featured-plate` and `/v1/assets/`, and does not
-replace the controller's CSP with a conflicting frame-denial header. The embed
-uses a relative asset URL so those routes can share a direct origin or the same
-proxy path prefix. Keep the route private; use authentication or a VPN before
-traffic crosses an untrusted boundary. Allowing the origin does not secure the
-controller. The iframe refreshes every 15 minutes and displays the upright
-portrait, never the rotated hardware image. The embed refreshes itself, so do
-not add Homepage's `refreshInterval` option. Homepage 2.1.2 accumulates iframe
-timers when that option is enabled. That release also drops its documented
-iframe `name` setting before rendering, so the example omits an ineffective
-setting. This is an upstream accessibility limitation: Homepage 2.1.2 renders
-the stock iframe without an accessible frame name. The embedded document itself
-still has a descriptive title, and its image has alternative text.
-
-Whenever any active entry has a valid detection time, the featured plate comes
-from that set: newest detection wins, with approval time and taxon ID breaking
-ties. Only when no active entry has a detection time does newest approval become
-the fallback. BirdWeather, BirdNET-Go, and Bird Buddy are currently the only
-sources that contribute those times, so this is not a universal
-latest-observation view and does not claim to match the plate currently on the
-frame. The embed exposes only the selected approved bird identity and image. A
-valid empty catalog shows a quiet empty state; invalid or unavailable catalog
-state returns `503`.
+To let another web application or a Homepage dashboard read the catalog, see
+the [reference page](reference.md#browser-applications).
 
 ## 1. Install the controller
 
@@ -373,16 +209,29 @@ account you use to sign in at `/app`. Cancelling leaves the controller running
 with owner controls locked; run `uv run inky-bird access setup --config "$CONFIG"`
 later in a private terminal.
 
-Paid plate generation is on with `config.example.toml`: `generation_enabled`
-defaults to true unless the file sets `configuration_ownership = "app"`. Each generation cycle uses Codex,
-through your ChatGPT plan's Codex allowance or a billed API key. On macOS, the
-first scheduled generation runs one `schedule.generation_minutes` interval
-after setup (six hours with the example value), then at that interval. To keep
-it off, set `generation_enabled = false` under `[controller]` before setup; if
-setup already ran, change it and run setup again to remove the generation job.
-With an app-managed configuration, generation is off until you turn it on; when
-it is on, the scheduler starts generation right after its first successful
-refresh.
+New artwork is off with `config.example.toml` (`generation_enabled = false`),
+so a new controller shows approved artwork only. Setup output then includes
+`"generation_enabled": false` and a `generation` line that says how to turn it
+on. To make new plates, set `generation_enabled = true` under `[controller]` and
+run setup again. Generation uses your own Codex sign-in, through your ChatGPT
+plan's Codex allowance or a billed API key, and that provider's charges apply.
+On macOS, the first scheduled generation then runs one
+`schedule.generation_minutes` interval after setup (six hours with the example
+value), then at that interval. A configuration file without a
+`generation_enabled` line keeps generation on, unless it is app-managed, so an
+existing installation keeps its current behaviour. With an app-managed
+configuration, generation is off until you turn it on in Settings; then the
+scheduler starts generation right after its next successful refresh.
+
+The setup preview refuses, before `sudo` or any installer step, what the native
+installers would refuse: provider keys read from environment variables
+(`*_api_key_env`, `birdweather_token_env`), notification destinations that use
+`url_env`, a missing OIDC client secret or an unsafe `native-access.env`, and an
+unsafe `native-tls.env`. Store provider keys and notification URLs directly in
+the private mode-`0600` configuration file. Supply the OIDC client secret in its
+named environment variable when you run setup (see
+[browser access](browser-access.md)). Keep `native-access.env` and
+`native-tls.env` as private (mode `0600`) regular files.
 
 LaunchAgents begin when this macOS user logs in. They survive application
 updates and restart after logout/login or reboot. For unattended recovery, the
@@ -461,14 +310,19 @@ and any `sudo` prompt remain visible. See the official
 As on macOS, `--yes` ends by asking for `Inky username:` and a hidden password
 when no browser owner exists yet.
 
-Paid plate generation is on with `config.example.toml`. On Linux, the generation
-timer first runs two minutes after setup, then every
-`schedule.generation_minutes`. Each cycle uses Codex, through your ChatGPT
-plan's Codex allowance or a billed API key. To keep it off, set
-`generation_enabled = false` under `[controller]` before setup; if setup already
-ran, change it and run setup again to remove the generation timer. With an
-app-managed configuration, generation is off until you turn it on; when it is
-on, the scheduler starts generation right after its first successful refresh.
+New artwork is off with `config.example.toml`, as on macOS. To make new plates,
+set `generation_enabled = true` under `[controller]` and run setup again; that
+adds the generation timer. It first runs two minutes after setup, then every
+`schedule.generation_minutes`. Generation uses your own Codex sign-in or API
+key, and that provider's charges apply. With an app-managed configuration,
+generation is off until you turn it on in Settings; then the scheduler starts
+generation right after its next successful refresh.
+
+The generation service's `TimeoutStartSec` follows the configuration:
+`max_species_attempts_per_cycle` x (2 x `max_generation_attempts` + 2) x 20
+minutes, plus 15 minutes. With the example values that is 48,900 seconds, about
+13.6 hours. Run setup again after changing either setting. The other one-shot
+services stop after 30 minutes, and the display service after 15.
 
 ### Docker controller
 
@@ -796,6 +650,26 @@ uv run inky-bird setup controller --config "$CONFIG" --yes
 uv run inky-bird doctor controller --config "$CONFIG"
 ```
 
+Before it changes anything, controller setup waits up to 30 minutes for a plate
+that is being made. If one is still being made, setup stops with "A plate is
+still being made. Run the upgrade again after it finishes. No changes made."
+(`setup` then reports "Installer exited with status 3"). If the installed version
+cannot be loaded, or cannot read your configuration (for example after you
+edited it for the new release), setup says it cannot check for a plate and
+continues without waiting; with no installed version, it continues without a
+message. Setup refuses only if the check itself fails to run, for example when
+it cannot open the lock in `state_dir`: "Could not check whether a plate is
+being made. No changes made."
+
+On a Linux controller, setup then stops the scheduler and job timers and waits
+up to 30 more minutes for a running refresh, generate, catalog-publish or
+notifications job to finish before it copies anything. If a job is still
+running then, setup stops with "Timed out waiting for `UNIT` to finish." (naming
+the job). Run setup again once the job has finished. If an upgrade fails after
+it stopped services, it starts again only the services it stopped and says so,
+or lists any it could not start with the command to start them. It does not
+undo state or catalog changes the new version already made.
+
 On the display, stop the timer and wait for a running panel update to finish
 before setup. An install that began under the old name uses
 `inky-bird-frame-display` instead of `inky-bird-display`:
@@ -899,6 +773,16 @@ After service removal, delete `~/Services/inky-bird` only if its managed
 runtime is no longer needed. Delete the private support/configuration directory
 only after saving any catalog or state you want to keep.
 
+## Browser applications
+
+Recipes for another web application that reads the catalog, for framing the
+featured plate, and for a Homepage dashboard are in the
+[reference page](reference.md#browser-applications).
+
+### Homepage dashboard
+
+See [Homepage dashboard](reference.md#homepage-dashboard) in the reference page.
+
 ## Troubleshooting
 
 Start with the role's doctor command. Its JSON output gives every check a stable
@@ -906,6 +790,9 @@ ID, status, summary, and remediation. Continue with the focused runbook in
 [`troubleshooting.md`](troubleshooting.md).
 
 ## Authoritative references
+
+- [Inky reference page](reference.md): HTTP errors, caching and security
+  headers, external browser applications and Homepage.
 
 - [OpenAI Codex CLI](https://github.com/openai/codex#installing-and-running-codex-cli)
   and [authentication](https://learn.chatgpt.com/docs/auth)

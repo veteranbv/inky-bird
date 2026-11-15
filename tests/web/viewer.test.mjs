@@ -8,10 +8,12 @@ const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const toolsURL =
   'data:text/javascript;base64,' +
   Buffer.from(await readFile(new URL('frame-tools.js', web), 'utf8')).toString('base64');
-const viewerSource = (await readFile(new URL('viewer.js', web), 'utf8')).replace(
-  "'/app/frame-tools.js'",
-  JSON.stringify(toolsURL),
-);
+const uiURL =
+  'data:text/javascript;base64,' +
+  Buffer.from(await readFile(new URL('ui.js', web), 'utf8')).toString('base64');
+const viewerSource = (await readFile(new URL('viewer.js', web), 'utf8'))
+  .replace("'/app/frame-tools.js'", JSON.stringify(toolsURL))
+  .replace("'/app/ui.js'", JSON.stringify(uiURL));
 let loads = 0;
 
 const bird = {
@@ -54,7 +56,7 @@ async function open(t, route) {
     window: { isSecureContext: false },
     location: { reload: () => reloads.push(doc.body.classList.contains('presenting')) },
     fetch: (path, options = {}) => {
-      requests.push({ path, method: options.method || 'GET' });
+      requests.push({ path, method: options.method || 'GET', cache: options.cache });
       return route(path, options);
     },
     Image: class {
@@ -197,7 +199,7 @@ test('a hung plate request times out without stopping the screen', async (t) => 
   assert.equal(views(screen.requests), 2);
   t.mock.timers.tick(20000);
   await flush();
-  assert.match(statusText(screen.main), /temporarily unavailable\. Keeping the last approved image/);
+  assert.match(statusText(screen.main), /not available right now\. Keeping the last plate/);
   t.mock.timers.tick(15000);
   await flush();
   assert.equal(views(screen.requests), 3, 'polling continues after the deadline');
@@ -216,7 +218,7 @@ test('previous and next do nothing harmful once the view empties', async (t) => 
   findButton(screen.main, 'Previous').click();
   await flush();
   assert(!screen.main.querySelector('img').src);
-  assert.match(statusText(screen.main), /No approved plates in the permitted view/);
+  assert.match(statusText(screen.main), /This view has no plates now/);
   species = [bird];
   t.mock.timers.tick(15000);
   await flush();
@@ -256,4 +258,15 @@ test('a swipe on a faded wall screen steps, and Space still pauses', async (t) =
   assert.equal(play.getAttribute('aria-pressed'), 'true');
   screen.doc.fire('keydown', { target: screen.doc.body, key: ' ' });
   assert.equal(play.getAttribute('aria-pressed'), 'false', 'Space pauses after a tap on the plate');
+});
+
+test('the screen asks for the full revisioned plate and lets the browser cache it', async (t) => {
+  const screen = await open(t, (path) =>
+    path === '/v1/screen/view' ? Promise.resolve(json({ species: [bird] })) : Promise.resolve(png()),
+  );
+  const plates = screen.requests.filter((request) => request.path.startsWith('/v1/screen/plates/'));
+  assert.deepEqual(
+    plates.map((request) => [request.path, request.cache]),
+    [[bird.portrait_url, undefined]],
+  );
 });
