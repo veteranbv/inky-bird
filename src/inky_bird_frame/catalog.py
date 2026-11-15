@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -20,7 +21,7 @@ from typing import BinaryIO, cast
 
 from .birds import BirdSpecies
 from .errors import BusyError, CatalogError, MissingDependencyError
-from .http import write_json_atomic
+from .http import write_bytes_atomic, write_json_atomic
 from .images import slugify
 from .models import QualityReview, ReferencePhoto, SpeciesProfileData
 from .timeutil import parse_utc_timestamp
@@ -515,12 +516,25 @@ def catalog_index_data(entries: list[CatalogEntry]) -> dict[str, object]:
     }
 
 
+def _holds_bytes(path: Path, content: bytes) -> bool:
+    try:
+        # Non-blocking, so a FIFO planted in its place cannot stall the rebuild.
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            return handle.read(len(content) + 1) == content
+    except OSError:
+        return False
+
+
 def rebuild_catalog_index(catalog_dir: Path) -> list[CatalogEntry]:
     entries = read_catalog_entries(catalog_dir)
-    write_json_atomic(
-        catalog_dir / "index.json",
-        catalog_index_data(entries),
-    )
+    path = catalog_dir / "index.json"
+    content = (json.dumps(catalog_index_data(entries), indent=2, sort_keys=True) + "\n").encode()
+    # Refreshes rebuild the index constantly; an identical file is kept, so its metadata
+    # still identifies an unchanged catalog and the storage is not rewritten.
+    if not _holds_bytes(path, content):
+        write_bytes_atomic(path, content)
     return entries
 
 

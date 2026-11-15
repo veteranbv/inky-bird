@@ -2219,6 +2219,22 @@ class PublicationRunTests(unittest.TestCase):
             record = config.controller.state_dir / "catalog-publish-verified.json"
             self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
 
+    def test_an_unchanged_index_rebuild_keeps_the_last_full_verification(self) -> None:
+        with TemporaryDirectory() as temporary:
+            _, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Good Bird")
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+                run_catalog_publish(config)
+                self.assertTrue(run_catalog_publish(config)["verification_reused"])
+                # Every observation refresh rebuilds the index, normally to the same bytes.
+                rebuild_catalog_index(catalog)
+                again = run_catalog_publish(config)
+
+            self.assertTrue(again["verification_reused"])
+            self.assertFalse(again["changed"])
+
     def test_a_different_image_library_validates_in_full_again(self) -> None:
         with TemporaryDirectory() as temporary:
             _, _, config, fake = self._environment(Path(temporary))

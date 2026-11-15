@@ -392,6 +392,36 @@ class CatalogTests(unittest.TestCase):
 
                 self.assertEqual(index_after, index_before)
 
+    def test_index_rebuild_leaves_an_identical_index_file_in_place(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            index = catalog / "index.json"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            before = index.lstat()
+
+            rebuild_catalog_index(catalog)
+            unchanged = index.lstat()
+            index.write_text(index.read_text().replace("Carolina Wren", "Stale Name"))
+            rebuild_catalog_index(catalog)
+            repaired = index.read_bytes()
+            index.unlink()
+            index.symlink_to(root / "elsewhere.json")
+            (root / "elsewhere.json").write_bytes(repaired)
+            rebuild_catalog_index(catalog)
+
+            self.assertEqual(
+                (unchanged.st_ino, unchanged.st_mtime_ns), (before.st_ino, before.st_mtime_ns)
+            )
+            self.assertIn(b"Carolina Wren", repaired)
+            self.assertNotIn(b"Stale Name", repaired)
+            self.assertFalse(index.is_symlink())
+            self.assertEqual(index.read_bytes(), repaired)
+
     def test_approval_refuses_a_taxon_another_directory_already_holds(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
         review = QualityReview(True, 4, 4, 4, 4, True, ())
