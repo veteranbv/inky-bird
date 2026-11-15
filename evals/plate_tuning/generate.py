@@ -16,15 +16,13 @@ from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.images import prepare_generated_plate
 from inky_bird_frame.models import QualityReview
 from inky_bird_frame.prompts import (
-    PLATE_INSTRUCTION_FIELDS,
     PLATE_INSTRUCTIONS,
     PROMPT_VERSION,
     plate_prompt,
     review_prompt,
-    validate_instructions,
 )
 
-from .config import BudgetExhaustedError, HarnessError
+from .config import DEFAULT_MAX_CANDIDATE_CHARACTERS, BudgetExhaustedError, HarnessError
 from .panel import FrozenReferences, PanelSpecies
 from .rundir import (
     RESERVED_NAMES,
@@ -38,6 +36,7 @@ from .rundir import (
     write_json,
     write_text,
 )
+from .safety import CandidateRejectedError, validate_candidate
 
 DEFAULT_ARM: Final = "default"
 _ARM_NAME: Final = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
@@ -45,6 +44,7 @@ GENERATED: Final = "generated.png"
 PORTRAIT: Final = "portrait.png"
 DISPLAY: Final = "display.png"
 SAMPLE_RECORD: Final = "sample.json"
+GENERATIONS_LEDGER: Final = "generations.jsonl"
 
 
 @dataclass(frozen=True)
@@ -92,11 +92,17 @@ def parse_arm(spec: str, *, base: Path) -> Arm:
     return Arm(name, text, f"{path.stem}-{sha256_text(text)[:12]}")
 
 
-def register_arm(run: Run, arm: Arm) -> Arm:
-    """Record the arm's exact text; a name keeps its text for the life of the run."""
+def register_arm(
+    run: Run, arm: Arm, *, max_characters: int = DEFAULT_MAX_CANDIDATE_CHARACTERS
+) -> Arm:
+    """Gate and record the arm's exact text; a name keeps its text for the life of the run.
+
+    Every arm, typed on the command line or proposed by the tuner, passes the
+    same safety gate before Codex ever sees it.
+    """
     try:
-        validate_instructions(arm.instructions, PLATE_INSTRUCTION_FIELDS)
-    except GenerationError as exc:
+        validate_candidate(arm.instructions, target="plate", max_characters=max_characters)
+    except CandidateRejectedError as exc:
         raise HarnessError(f"Arm {arm.name} instructions are not usable: {exc}") from exc
     path = run.path("arms", f"{arm.name}.json")
     if path.exists():
@@ -281,6 +287,11 @@ def _finish(run: Run, request: GenerationRequest, index: int) -> Sample:
     return Sample(request.arm.name, request.species.taxon_id, index, directory / PORTRAIT)
 
 
+def _discard_plates(directory: Path) -> None:
+    for name in (GENERATED, PORTRAIT, DISPLAY):
+        (directory / name).unlink(missing_ok=True)
+
+
 def _one(
     run: Run,
     generator: Generator,
@@ -289,14 +300,17 @@ def _one(
     request: GenerationRequest,
     index: int,
     report: GenerationReport,
+    finished: bool,
 ) -> Sample | None:
     """Produce one sample. Each crash point leaves a state the next run resumes from:
 
-    no record and no plate -> generate; a plate but no record -> prepare it again
-    without paying; a record -> done.
+    no record -> generate again; a plate and a ledger entry saying the agent
+    finished, but no record -> prepare it again without paying; a record -> done.
+    A plate whose generation failed, or whose agent may not have finished (a
+    started entry and nothing after it), is never used.
     """
     directory = request.sample_dir
-    if (directory / GENERATED).is_file():
+    if finished and (directory / GENERATED).is_file():
         try:
             _prepare(directory)
         except GenerationError:
@@ -318,6 +332,8 @@ def _one(
         generator.generate(request)
         _prepare(directory)
     except GenerationError as exc:
+        # A timed-out or failed agent can still have written a draft.
+        _discard_plates(directory)
         ledger.record("generation-failed", error=str(exc), **identity)
         write_json(directory / "failure.json", {"error": str(exc)})
         report.add("failed")
@@ -336,13 +352,14 @@ def generate_samples(
     *,
     budget: Budget,
     parallel: int = 1,
+    max_characters: int = DEFAULT_MAX_CANDIDATE_CHARACTERS,
 ) -> tuple[dict[tuple[str, int, int], Sample], GenerationReport]:
     """Make every missing (arm, species, sample) plate, within the cap."""
     report = GenerationReport()
     done: dict[tuple[str, int, int], Sample] = {}
     pending: list[tuple[GenerationRequest, int]] = []
     for arm in arms:
-        register_arm(run, arm)
+        register_arm(run, arm, max_characters=max_characters)
         for entry, references in species:
             for index in range(1, samples + 1):
                 existing = completed_sample(run, arm, entry, index)
@@ -354,10 +371,22 @@ def generate_samples(
                     arm, entry, references, sample_dir(run, arm, entry, index)
                 )
                 pending.append((request, index))
-    ledger = Ledger(run.path("generations.jsonl"))
+    ledger = Ledger(run.path(GENERATIONS_LEDGER))
+    latest = ledger.latest("arm", "taxon_id", "index")
     results = run_tasks(
         [
-            functools.partial(_one, run, generator, budget, ledger, request, index, report)
+            functools.partial(
+                _one,
+                run,
+                generator,
+                budget,
+                ledger,
+                request,
+                index,
+                report,
+                latest.get((request.arm.name, request.species.taxon_id, index))
+                == "generation-finished",
+            )
             for request, index in pending
         ],
         parallel,

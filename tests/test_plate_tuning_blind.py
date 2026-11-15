@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import replace
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, PngImagePlugin
 from plate_tuning.blind import (
+    KEYS_DIR,
     PairSpec,
     PlateRef,
     expected_text,
@@ -16,7 +18,7 @@ from plate_tuning.blind import (
     prepare_pair,
     unblind_choice,
 )
-from plate_tuning.config import HarnessError
+from plate_tuning.config import HarnessError, JudgeSpec
 from plate_tuning.panel import PanelSpecies, frozen_references
 from plate_tuning.rundir import Ledger, Run
 from plate_tuning_fixtures import BLUE, RED, FailingJudge, PixelJudge, config, make_run, profile
@@ -67,10 +69,18 @@ def test_blind_folder_holds_only_anonymous_plates_references_and_rubric(tmp_path
         assert "Comment" not in plate.info
     assert b"candidate" not in first_file.read_bytes()
     assert "candidate" not in pair_id and "test" not in pair_id
-    key = json.loads(run.path("keys", f"{pair_id}.json").read_text())
+    keys = sorted(run.path(KEYS_DIR).glob("*.json"))
+    assert len(keys) == 1
+    key = json.loads(keys[0].read_text())
+    assert key["pair_id"] == pair_id
     assert key["first_side"] == first_side
     assert key["first"]["label"] == "candidate"
-    assert not run.path("keys").is_relative_to(blind)
+    # Nothing ties the folder's name to its key's name or place.
+    assert pair_id not in keys[0].name
+    assert not run.path(KEYS_DIR).is_relative_to(blind)
+    assert not run.path("keys").exists()
+    times = {(blind / f"plate-{side}.png").stat().st_mtime for side in "AB"}
+    assert len(times) == 1
 
 
 def test_sides_are_random_per_pair_but_stable_on_resume(tmp_path: Path) -> None:
@@ -127,7 +137,7 @@ def test_judging_unblinds_correctly_whatever_side_the_plate_landed_on(tmp_path: 
         assert [vote.anatomy for vote in pair.votes] == ["first", "first", "second"]
         assert pair.votes[0].second.fatal and not pair.votes[0].first.fatal
         assert pair.votes[2].first.fatal
-    assert pending_judgments(run, specs, judges) == 0
+    assert pending_judgments(run, specs, judges, config()) == 0
 
 
 def test_judging_resumes_without_asking_again(tmp_path: Path) -> None:
@@ -173,3 +183,60 @@ def test_expected_text_names_every_printed_label() -> None:
     assert text["ruler_label"] == "BODY LENGTH: 12-14 cm"
     assert text["field_marks"] == ["red cap", "pale belly", "dark tail", "short bill"]
     assert text["color_swatch_names"] == ["red", "cream", "brown"]
+
+
+def test_a_rubric_or_judge_model_change_rebuilds_the_folder_and_judges_again(
+    tmp_path: Path,
+) -> None:
+    run, panel, _ = make_run(tmp_path)
+    specs = _specs(tmp_path, run, panel, 2)
+    judge = PixelJudge("fake-1")
+    first_rubric, second_rubric = tmp_path / "one.md", tmp_path / "two.md"
+    first_rubric.write_text("rubric one")
+    second_rubric.write_text("rubric two")
+    one = replace(config(), rubric_path=str(first_rubric))
+
+    pairs = judge_pairs(run, specs, [judge], one)
+    assert len(judge.requests) == 2
+    judge_pairs(run, specs, [judge], one)
+    assert len(judge.requests) == 2
+
+    two = replace(config(), rubric_path=str(second_rubric))
+    assert pending_judgments(run, specs, [judge], two) == 2
+    judge_pairs(run, specs, [judge], two)
+    assert len(judge.requests) == 4
+    for pair in pairs:
+        assert run.path("blind", pair.pair_id, "RUBRIC.md").read_text() == "rubric two"
+        record = json.loads(run.path("verdicts", pair.pair_id, "fake-1.json").read_text())
+        assert record["stamp"] == {
+            "rubric_sha256": hashlib.sha256(b"rubric two").hexdigest(),
+            "judge_kind": "claude",
+            "judge_model": "model-x",
+        }
+
+    other_model = replace(two, judges=(JudgeSpec("fake-1", "claude", "model-y"), *two.judges[1:]))
+    judge_pairs(run, specs, [judge], other_model)
+    assert len(judge.requests) == 6
+
+
+def test_a_stale_verdict_is_never_counted_when_judging_it_again_fails(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    specs = _specs(tmp_path, run, panel, 1)
+    judge_pairs(run, specs, [PixelJudge("fake-1")], config())
+    rubric = tmp_path / "new.md"
+    rubric.write_text("new rubric")
+
+    pairs = judge_pairs(
+        run, specs, [FailingJudge("fake-1")], replace(config(), rubric_path=str(rubric))
+    )
+
+    assert pairs[0].votes == ()
+    assert pairs[0].errors == (("fake-1", "fake judge failed"),)
+
+
+def test_a_judge_missing_from_the_configuration_is_refused(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    specs = _specs(tmp_path, run, panel, 1)
+
+    with pytest.raises(HarnessError, match="not in the configuration"):
+        judge_pairs(run, specs, [PixelJudge("stranger")], config())

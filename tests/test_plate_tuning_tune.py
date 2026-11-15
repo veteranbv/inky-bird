@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
 import pytest
 from PIL import Image
 from plate_tuning.compare import compare
+from plate_tuning.config import HarnessError
 from plate_tuning.generate import GenerationRequest, parse_arm
 from plate_tuning.gepa_integration import gepa_optimizer
 from plate_tuning.panel import (
@@ -22,6 +23,7 @@ from plate_tuning.rundir import Budget, Ledger, Run
 from plate_tuning.safety import CandidateRejectedError, validate_candidate
 from plate_tuning.tune import (
     PLATE_COMPONENT,
+    ClaudeReflector,
     EvalBatch,
     PlateTuningAdapter,
     ReflectionLM,
@@ -412,3 +414,87 @@ def test_missing_gepa_names_the_install_command(
             run_dir=tmp_path,
             seed=0,
         )
+
+
+def test_reflection_runs_with_no_tools_outside_the_run_directory(tmp_path: Path) -> None:
+    run, _panel, _ = make_run(tmp_path)
+    run.path("compare", "x-vs-y").mkdir(parents=True)
+    run.path("compare", "x-vs-y", "summary.json").write_text("{}")
+    captured = tmp_path / "captured"
+    stub = tmp_path / "claude"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {captured}.args\n"
+        f"pwd -P > {captured}.cwd\n"
+        f"ls -A > {captured}.here\n"
+        "cat > /dev/null\n"
+        "printf 'proposal'\n"
+    )
+    stub.chmod(0o755)
+    reflector = ClaudeReflector(run, replace(config(), claude_executable=str(stub)))
+
+    assert reflector("reflect on this") == "proposal"
+
+    args = Path(f"{captured}.args").read_text().split("\n")
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--setting-sources") + 1] == "project"
+    assert "--strict-mcp-config" in args
+    cwd = Path(Path(f"{captured}.cwd").read_text().strip())
+    assert not cwd.is_relative_to(run.root)
+    assert not cwd.exists()
+    assert Path(f"{captured}.here").read_text() == ""
+    assert Ledger(run.path("reflections.jsonl")).count("reflection-finished") == 1
+
+
+class FlakyGenerator:
+    """Fails each arm's first attempt on every species, then paints like the colour generator."""
+
+    def __init__(self, *, flaky_arms: tuple[str, ...]) -> None:
+        self.flaky_arms = flaky_arms
+        self.attempts: dict[tuple[str, int], int] = {}
+
+    def generate(self, request: GenerationRequest) -> None:
+        key = (request.arm.name, request.species.taxon_id)
+        self.attempts[key] = self.attempts.get(key, 0) + 1
+        if self.attempts[key] == 1 and any(a in request.arm.name for a in self.flaky_arms):
+            raise GenerationError("Codex timed out after 1 seconds")
+        colour = RED if "pale grey" in request.arm.instructions else BLUE
+        Image.new("RGB", (30, 40), colour).save(request.output_path)
+
+
+def test_a_flaky_generation_is_retried_before_the_candidate_is_scored(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    generator = FlakyGenerator(flaky_arms=("cand", "baseline"))
+    adapter = PlateTuningAdapter(
+        run, config(), generator, _judges(), _references(run, panel), budget=Budget(20), parallel=1
+    )
+
+    batch = adapter.evaluate(list(panel[:2]), {PLATE_COMPONENT: GREY})
+
+    assert batch.scores == [pytest.approx(1.0), pytest.approx(1.0)]
+    assert set(generator.attempts.values()) == {2}
+
+
+def test_a_baseline_that_cannot_be_generated_stops_tuning_instead_of_scoring_zero(
+    tmp_path: Path,
+) -> None:
+    run, panel, _ = make_run(tmp_path)
+
+    class BaselineFails:
+        def generate(self, request: GenerationRequest) -> None:
+            if request.arm.name == "baseline":
+                raise GenerationError("Codex exited with status 1")
+            Image.new("RGB", (30, 40), RED).save(request.output_path)
+
+    adapter = PlateTuningAdapter(
+        run,
+        config(),
+        BaselineFails(),
+        _judges(),
+        _references(run, panel),
+        budget=Budget(20),
+        parallel=1,
+    )
+
+    with pytest.raises(HarnessError, match="baseline plate"):
+        adapter.evaluate(list(panel[:1]), {PLATE_COMPONENT: GREY})

@@ -17,7 +17,14 @@ from inky_bird_frame.references import download_references
 from .calibrate import calibrate, calibration_plan
 from .compare import compare, plan
 from .config import EvalConfig, HarnessError, load_config
-from .generate import Arm, CodexGenerator, Generator, missing_samples, parse_arm
+from .generate import (
+    GENERATIONS_LEDGER,
+    Arm,
+    CodexGenerator,
+    Generator,
+    missing_samples,
+    parse_arm,
+)
 from .judges import Judge, build_judges, find_executable
 from .panel import (
     DEFAULT_PANEL,
@@ -29,9 +36,10 @@ from .panel import (
     select,
 )
 from .report import write_report
-from .rundir import Budget, Run
+from .rundir import Budget, Ledger, Run, locked
 from .tune import (
     BASELINE_ARM,
+    REVIEWS_LEDGER,
     ClaudeReflector,
     CodexReviewEvaluator,
     Optimizer,
@@ -144,6 +152,18 @@ def _require_cap(value: int | None, flag: str) -> int:
     return value
 
 
+def _run_budget(run: Run, cap: int, what: str) -> Budget:
+    """The cap covers the whole run directory: calls earlier commands started count too."""
+    if what == "review":
+        return Budget.for_run(cap, Ledger(run.path(REVIEWS_LEDGER)), "review-started", what=what)
+    ledger = Ledger(run.path(GENERATIONS_LEDGER))
+    return Budget.for_run(cap, ledger, "generation-started", what=what)
+
+
+def _cap_report(budget: Budget) -> dict[str, int]:
+    return {"cap": budget.limit, "used": budget.used, "remaining": budget.remaining}
+
+
 def _cache_references(
     args: argparse.Namespace, run: Run, panel: Sequence[PanelSpecies], tools: Tools
 ) -> dict[str, object]:
@@ -192,8 +212,9 @@ def _compare(
     species = select(panel, split=args.split, taxa=args.species)
     samples = args.samples or config.samples_per_species
     estimate = plan(run, first, second, species, samples, len(config.judges)).as_dict()
+    budget = _run_budget(run, cap, "generation")
     if args.dry_run:
-        return {"plan": estimate, "cap": cap}
+        return {"plan": estimate, **_cap_report(budget)}
     result = compare(
         run,
         config,
@@ -203,10 +224,10 @@ def _compare(
         second,
         species,
         samples=samples,
-        budget=Budget(cap),
+        budget=budget,
         parallel=args.parallel,
     )
-    return {"plan": estimate, **result.as_dict()}
+    return {"plan": estimate, **_cap_report(budget), **result.as_dict()}
 
 
 def _tune(
@@ -237,12 +258,14 @@ def _tune(
         "dev_species": len(dev),
         "holdout_species": len(holdout),
     }
+    budget = _run_budget(run, cap, "generation")
     if args.dry_run:
-        return {"plan": estimate, "cap": cap}
-    if cap < needed:
+        return {"plan": estimate, **_cap_report(budget)}
+    if budget.remaining < needed:
         raise HarnessError(
-            f"--max-generations {cap} is below the {needed} this tuning may need, so the"
-            " held-out test could not finish; raise the cap or lower --budget"
+            f"--max-generations {cap} leaves {budget.remaining} for this run, below the"
+            f" {needed} this tuning may need, so the held-out test could not finish;"
+            " raise the cap or lower --budget"
         )
     for entry in panel:
         frozen_references(run, entry)
@@ -254,12 +277,12 @@ def _tune(
         panel,
         optimizer=tools.optimizer(),
         reflection_lm=tools.reflector(run, config),
-        budget=Budget(cap),
+        budget=budget,
         metric_calls=args.budget,
         holdout_samples=holdout_samples,
         parallel=args.parallel,
     )
-    return {"plan": estimate, **result.as_dict()}
+    return {"plan": estimate, **_cap_report(budget), **result.as_dict()}
 
 
 def _tune_review(
@@ -277,12 +300,13 @@ def _tune_review(
     held_out = sum(1 for item in labels if splits.get(item.taxon_id) == "holdout")
     needed = args.budget + 2 * held_out
     estimate = {"labelled_plates": len(labels), "reviews_at_most": needed}
+    budget = _run_budget(run, cap, "review")
     if args.dry_run:
-        return {"plan": estimate, "cap": cap}
-    if cap < needed:
+        return {"plan": estimate, **_cap_report(budget)}
+    if budget.remaining < needed:
         raise HarnessError(
-            f"--max-reviews {cap} is below the {needed} this tuning may need;"
-            " raise the cap or lower --budget"
+            f"--max-reviews {cap} leaves {budget.remaining} for this run, below the"
+            f" {needed} this tuning may need; raise the cap or lower --budget"
         )
     summary = tune_review(
         run,
@@ -292,30 +316,31 @@ def _tune_review(
         labels,
         optimizer=tools.optimizer(),
         reflection_lm=tools.reflector(run, config),
-        budget=Budget(cap, what="review"),
+        budget=budget,
         metric_calls=args.budget,
         parallel=args.parallel,
     )
-    return {"plan": estimate, **summary}
+    return {"plan": estimate, **_cap_report(budget), **summary}
 
 
 def _run(args: argparse.Namespace, tools: Tools) -> dict[str, object]:
     config = load_config(args.config)
     if args.parallel < 1:
         raise HarnessError("--parallel must be at least 1")
-    run = Run.open(args.run_dir, seed=args.seed)
-    if args.command == "report":
-        return write_report(run)
-    panel = load_panel(args.catalog, args.panel)
-    if args.command == "cache-references":
-        return _cache_references(args, run, panel, tools)
-    commands = {
-        "calibrate": _calibrate,
-        "compare": _compare,
-        "tune": _tune,
-        "tune-review": _tune_review,
-    }
-    return commands[args.command](args, run, config, panel, tools)
+    with locked(args.run_dir.resolve()):
+        run = Run.open(args.run_dir, seed=args.seed)
+        if args.command == "report":
+            return write_report(run)
+        panel = load_panel(args.catalog, args.panel)
+        if args.command == "cache-references":
+            return _cache_references(args, run, panel, tools)
+        commands = {
+            "calibrate": _calibrate,
+            "compare": _compare,
+            "tune": _tune,
+            "tune-review": _tune_review,
+        }
+        return commands[args.command](args, run, config, panel, tools)
 
 
 def main(argv: Sequence[str] | None = None, *, tools: Tools | None = None) -> int:

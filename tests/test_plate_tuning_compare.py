@@ -53,8 +53,20 @@ def test_the_decision_uses_only_held_out_species_when_they_are_compared(
     assert result.decision is not None and not result.decision.accept
     saved = json.loads(run.path("compare", "candidate-vs-baseline", "summary.json").read_text())
     assert saved["decision_species"] == "holdout"
+    assert saved["judged_with"]["judges"][0] == {
+        "name": "fake-1",
+        "kind": "claude",
+        "model": "model-x",
+    }
+    assert len(saved["judged_with"]["rubric_sha256"]) == 64
     records = json.loads(run.path("compare", "candidate-vs-baseline", "pairs.json").read_text())
     assert len(records) == 8
+    # Plates inside the run are recorded run-relative, so no home folder is written down.
+    for record in records:
+        for role in ("first", "second"):
+            recorded = Path(record[role]["path"])
+            assert not recorded.is_absolute()
+            assert (run.root / recorded).is_file()
     assert {vote["anatomy"] for record in records for vote in record["votes"]} == {
         "first",
         "second",

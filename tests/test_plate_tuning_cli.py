@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -136,6 +138,8 @@ def test_cache_compare_and_report_end_to_end(
             "judgments_needed_at_most": 24,
         },
         "cap": 40,
+        "used": 0,
+        "remaining": 40,
     }
     assert tools.colour.calls == []
 
@@ -154,6 +158,10 @@ def test_cache_compare_and_report_end_to_end(
     report = (tmp_path / "run" / "report" / "report.md").read_text()
     assert "## compare: v9-vs-v8" in report
     assert "Decision on held-out species: **replace the baseline**" in report
+    assert "First arm `v9` (" in report and "the shipped plate instructions" in report
+    assert "Second arm `v8` (" in report and "only the wording differs" in report
+    assert "Judges fake-1, fake-2 use the same model and prompt" in report
+    assert "| Verdicts from fake-3 | 8 (missing 0) |" in report
     sheets = sorted((tmp_path / "run" / "report" / "sheets").rglob("*.png"))
     assert len(sheets) == 4
     with Image.open(sheets[0]) as sheet:
@@ -190,3 +198,53 @@ def test_spread_takes_one_species_per_body_plan_first(tmp_path: Path) -> None:
         "wader",
     ]
     assert len(spread(panel, 10)) == 4
+
+
+def test_the_generation_cap_covers_the_whole_run_across_resumes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = _common(tmp_path)
+    tools = Offline()
+    assert _invoke(["cache-references", *common], tools, capsys)[0] == 0
+    v8 = tmp_path / "v8.txt"
+    v8.write_text(PLATE_INSTRUCTIONS.replace("never in flight", "possibly in flight"))
+    compare = ["compare", *common, "--samples", "2", "v9=default", f"v8={v8}"]
+
+    code, out = _invoke([*compare, "--max-generations", "3"], tools, capsys)
+    assert code == 0 and _at(out, "data", "generation", "generated") == 3
+    code, out = _invoke([*compare, "--max-generations", "3"], tools, capsys)
+    assert code == 0 and _at(out, "data", "generation", "generated") == 0
+    assert len(tools.colour.calls) == 3
+
+    code, out = _invoke([*compare, "--max-generations", "10", "--dry-run"], tools, capsys)
+    assert {key: _at(out, "data", key) for key in ("cap", "used", "remaining")} == {
+        "cap": 10,
+        "used": 3,
+        "remaining": 7,
+    }
+    code, out = _invoke([*compare, "--max-generations", "10"], tools, capsys)
+    assert _at(out, "data", "generation", "generated") == 7
+    assert len(tools.colour.calls) == 10
+
+
+def test_a_second_command_on_a_busy_run_directory_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = _common(tmp_path)
+    tools = Offline()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    holder = os.open(run_dir / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, out = _invoke(
+            ["compare", *common, "--max-generations", "40", "v9=default", "v8=default"],
+            tools,
+            capsys,
+        )
+    finally:
+        os.close(holder)
+
+    assert code == 1 and "Another command is using this run directory" in str(out["error"])
+    assert tools.colour.calls == []
+    assert not (run_dir / "run.json").exists()

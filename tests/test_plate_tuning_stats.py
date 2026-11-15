@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -207,3 +208,33 @@ def test_improvement_decision_requires_an_interval_above_zero() -> None:
 
     _rate, decision = decide_improvement({}, iterations=10, seed=2)
     assert not decision.accept
+
+
+def test_summary_reports_each_judges_coverage() -> None:
+    pairs = _clear_win()
+    # The third judge answered only half of the pairs.
+    thinned = [
+        replace(pair, votes=pair.votes[:2]) if index % 2 else pair
+        for index, pair in enumerate(pairs)
+    ]
+
+    summary = summarize(thinned, ["j0", "j1", "j2"], iterations=200, seed=1)
+
+    assert summary.judge_missing == {"j0": 0, "j1": 0, "j2": 12}
+    assert summary.as_dict()["judge_coverage"] == {
+        "j0": {"votes": 24, "missing": 0},
+        "j1": {"votes": 24, "missing": 0},
+        "j2": {"votes": 12, "missing": 12},
+    }
+
+
+def test_decision_refuses_when_a_judge_is_missing_on_too_many_pairs() -> None:
+    judges = ["j0", "j1", "j2"]
+    pairs = _clear_win()
+    one_gap = [replace(pairs[0], votes=pairs[0].votes[:2]), *pairs[1:]]
+    many_gaps = [replace(pair, votes=pair.votes[:2]) for pair in pairs[:6]] + pairs[6:]
+
+    assert decide(summarize(one_gap, judges, iterations=200, seed=1), [], 0.1).accept
+    refused = decide(summarize(many_gaps, judges, iterations=200, seed=1), [], 0.1)
+    assert not refused.accept
+    assert refused.reasons == ("judge j2 gave no verdict on 6 of 24 pairs (above 10%)",)

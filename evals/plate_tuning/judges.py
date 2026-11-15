@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, Protocol
@@ -35,6 +39,10 @@ MAX_TEXT: Final = 2000
 PLATE_FILES: Final = {"A": "plate-A.png", "B": "plate-B.png"}
 RUBRIC_FILE: Final = "RUBRIC.md"
 REFERENCES_DIR: Final = "references"
+# Names the command-line agents read as project guidance or treat as a project root.
+PROJECT_MARKERS: Final = (".git", "AGENTS.md", "CLAUDE.md", ".claude", ".codex")
+# Every file a judge sees carries this time, so modification order reveals nothing.
+FIXED_MTIME: Final = 946684800
 
 _DEFECT_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -247,6 +255,52 @@ def run_bounded(
         raise JudgeError(f"{executable.name} failed: {exc}") from exc
 
 
+def _outside_any_project(path: Path) -> None:
+    for folder in (path, *path.parents):
+        if any((folder / marker).exists() for marker in PROJECT_MARKERS):
+            raise JudgeError(
+                "The temporary folder for judges lies inside a project; set TMPDIR to a"
+                " folder outside every repository"
+            )
+
+
+@contextmanager
+def scratch_folder(prefix: str) -> Iterator[Path]:
+    """An empty folder under the system temporary folder, outside any run or repository.
+
+    The folder is the only entry of a fresh parent, so its neighbours are
+    nothing, and it is removed afterwards.
+    """
+    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    try:
+        _outside_any_project(root)
+        folder = root / "work"
+        folder.mkdir()
+        yield folder
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@contextmanager
+def isolated_pair(request: JudgeRequest) -> Iterator[Path]:
+    """A private copy of one blind pair: the two plates, the references and the rubric."""
+    with scratch_folder("plate-judge-") as folder:
+        sources = [
+            *(PLATE_FILES[side] for side in ("A", "B")),
+            RUBRIC_FILE,
+            *(f"{REFERENCES_DIR}/{name}" for name in request.reference_files),
+        ]
+        (folder / REFERENCES_DIR).mkdir()
+        try:
+            for relative in sources:
+                shutil.copyfile(request.blind_dir / relative, folder / relative)
+            for relative in [*sources, REFERENCES_DIR, "."]:
+                os.utime(folder / relative, (FIXED_MTIME, FIXED_MTIME))
+        except OSError as exc:
+            raise JudgeError("The blind pair could not be copied for judging") from exc
+        yield folder
+
+
 def find_executable(name: str) -> Path:
     found = shutil.which(name)
     if found is None:
@@ -254,7 +308,19 @@ def find_executable(name: str) -> Path:
     return Path(found)
 
 
-def claude_command(executable: Path, model: str | None, schema: dict[str, object]) -> list[str]:
+# Settings, hooks, plugins and guidance load only from the (empty) project: never
+# the user's own configuration.
+CLAUDE_ISOLATION: Final = (
+    "--strict-mcp-config",
+    "--setting-sources",
+    "project",
+    "--no-session-persistence",
+)
+
+
+def claude_command(
+    executable: Path, model: str | None, schema: dict[str, object], folder: Path
+) -> list[str]:
     command = [str(executable), "-p", "--output-format", "json"]
     if model is not None:
         command.extend(["--model", model])
@@ -262,15 +328,14 @@ def claude_command(executable: Path, model: str | None, schema: dict[str, object
         [
             "--json-schema",
             json.dumps(schema, separators=(",", ":")),
-            # Only file reading, and no configured MCP servers or network tools.
+            # Only reading, and only inside the pair's folder; "//" marks an absolute path.
             "--tools",
             "Read",
             "--allowedTools",
-            "Read",
+            f"Read(/{folder}/**)",
             "--disallowedTools",
-            "Bash,Edit,Write,WebFetch,WebSearch",
-            "--strict-mcp-config",
-            "--no-session-persistence",
+            "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch",
+            *CLAUDE_ISOLATION,
         ]
     )
     return command
@@ -311,15 +376,24 @@ class ClaudeCliJudge:
 
     def judge(self, request: JudgeRequest) -> BlindVerdict:
         request.work_dir.mkdir(parents=True, exist_ok=True)
-        stdout = run_bounded(
-            self.executable,
-            request.blind_dir,
-            self.timeout,
-            claude_command(self.executable, self.model, VERDICT_SCHEMA),
-            request.prompt(),
-            request.work_dir / "judge.log",
-        )
+        with isolated_pair(request) as folder:
+            stdout = run_bounded(
+                self.executable,
+                folder,
+                self.timeout,
+                claude_command(self.executable, self.model, VERDICT_SCHEMA, folder),
+                request.prompt(),
+                request.work_dir / "judge.log",
+            )
         return parse_verdict(parse_claude_output(stdout))
+
+
+# No web search, no configured MCP servers and no AGENTS.md guidance for a judge.
+CODEX_JUDGE_OVERRIDES: Final = (
+    'web_search="disabled"',
+    "mcp_servers={}",
+    "project_doc_max_bytes=0",
+)
 
 
 def codex_command(
@@ -337,6 +411,8 @@ def codex_command(
         "--sandbox",
         "read-only",
     ]
+    for override in CODEX_JUDGE_OVERRIDES:
+        command.extend(["-c", override])
     if model is not None:
         command.extend(["--model", model])
     for image in images:
@@ -353,26 +429,26 @@ class CodexCliJudge:
         self.timeout = timeout
 
     def judge(self, request: JudgeRequest) -> BlindVerdict:
-        work = request.work_dir
-        work.mkdir(parents=True, exist_ok=True)
-        schema_path = work / "schema.json"
-        output_path = work / "verdict.json"
-        schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
-        output_path.unlink(missing_ok=True)
-        images = [request.blind_dir / PLATE_FILES["A"], request.blind_dir / PLATE_FILES["B"]]
-        images.extend(request.blind_dir / REFERENCES_DIR / name for name in request.reference_files)
-        run_bounded(
-            self.executable,
-            request.blind_dir,
-            self.timeout,
-            codex_command(self.executable, self.model, images, schema_path, output_path),
-            request.prompt(),
-            work / "judge.log",
-        )
-        try:
-            raw = json.loads(output_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise JudgeError("Codex did not write a JSON verdict") from exc
+        request.work_dir.mkdir(parents=True, exist_ok=True)
+        # The schema and the answer live in a second folder the judge is never pointed at.
+        with isolated_pair(request) as folder, scratch_folder("plate-judge-out-") as out:
+            schema_path = out / "schema.json"
+            output_path = out / "verdict.json"
+            schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
+            images = [folder / PLATE_FILES["A"], folder / PLATE_FILES["B"]]
+            images.extend(folder / REFERENCES_DIR / name for name in request.reference_files)
+            run_bounded(
+                self.executable,
+                folder,
+                self.timeout,
+                codex_command(self.executable, self.model, images, schema_path, output_path),
+                request.prompt(),
+                request.work_dir / "judge.log",
+            )
+            try:
+                raw = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise JudgeError("Codex did not write a JSON verdict") from exc
         return parse_verdict(raw)
 
 

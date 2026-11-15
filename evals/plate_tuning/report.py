@@ -13,7 +13,7 @@ from typing import Final
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .config import HarnessError
-from .rundir import Run, read_json, read_object, write_json, write_text
+from .rundir import Run, read_json, read_object, resolve_recorded, write_json, write_text
 
 THUMBNAIL: Final = (360, 480)
 MARGIN: Final = 16
@@ -37,7 +37,7 @@ def _majority(values: list[str]) -> str:
     return "tie"
 
 
-def _thumbnail(path: str) -> Image.Image:
+def _thumbnail(path: Path) -> Image.Image:
     try:
         with Image.open(path) as image:
             return ImageOps.contain(image.convert("RGB"), THUMBNAIL)
@@ -45,7 +45,9 @@ def _thumbnail(path: str) -> Image.Image:
         return Image.new("RGB", THUMBNAIL, (90, 90, 90))
 
 
-def contact_sheet(records: list[dict[str, object]], destination: Path, title: str) -> None:
+def contact_sheet(
+    records: list[dict[str, object]], destination: Path, title: str, root: Path
+) -> None:
     """One row per pair: the two plates side by side, the anatomy winner framed green."""
     font = ImageFont.load_default(size=18)
     row_height = THUMBNAIL[1] + HEADER + MARGIN
@@ -77,7 +79,9 @@ def contact_sheet(records: list[dict[str, object]], destination: Path, title: st
                 outline=colour,
                 width=6,
             )
-            sheet.paste(_thumbnail(str(plate.get("path"))), (left, top + HEADER))
+            sheet.paste(
+                _thumbnail(resolve_recorded(root, str(plate.get("path")))), (left, top + HEADER)
+            )
             draw.text((left, top + 4), str(plate.get("label")), fill=(0, 0, 0), font=font)
         draw.text(
             (MARGIN, top + 28),
@@ -99,10 +103,47 @@ def _number(value: object) -> str:
     return f"{value:.3f}" if isinstance(value, float | int) else "-"
 
 
-def _comparison_section(name: str, summary: dict[str, object]) -> list[str]:
+def _arm_lines(run: Run, summary: dict[str, object]) -> list[str]:
+    """What each arm is, so a wording-only arm is never read as a shipped prompt version."""
+    lines: list[str] = []
+    for role in ("first", "second"):
+        arm = summary.get(role)
+        name = arm.get("name") if isinstance(arm, dict) else None
+        if not isinstance(name, str):
+            continue
+        path = run.path("arms", f"{name}.json")
+        record = read_object(path) if path.exists() else {}
+        what = (
+            "the shipped plate instructions"
+            if record.get("is_default") is True
+            else "replacement instruction wording inside the current prompt template; only the"
+            " wording differs from the shipped prompt, not the data block or output lines"
+        )
+        lines.append(f"- {role.capitalize()} arm `{name}` ({record.get('label', '-')}): {what}.")
+    return [*lines, ""] if lines else []
+
+
+def _judge_notes(summary: dict[str, object]) -> list[str]:
+    """Say when judges share a model and prompt, since their votes then move together."""
+    judged_with = summary.get("judged_with")
+    judges = judged_with.get("judges") if isinstance(judged_with, dict) else None
+    groups: dict[tuple[object, object], list[str]] = defaultdict(list)
+    for judge in judges if isinstance(judges, list) else []:
+        if isinstance(judge, dict):
+            groups[(judge.get("kind"), judge.get("model"))].append(str(judge.get("name")))
+    return [
+        f"Judges {', '.join(names)} use the same model and prompt, so their votes are strongly"
+        " correlated: the majority leans on that model, and agreement and kappa overstate how"
+        " independent the panel is."
+        for names in groups.values()
+        if len(names) > 1
+    ]
+
+
+def _comparison_section(run: Run, name: str, summary: dict[str, object]) -> list[str]:
     stats = summary.get("summary")
     decision = summary.get("decision")
-    lines = [f"## {name}", ""]
+    lines = [f"## {name}", "", *_arm_lines(run, summary)]
     if not isinstance(stats, dict):
         return [*lines, "No pair has been judged yet.", ""]
     agreement = stats.get("agreement")
@@ -128,6 +169,17 @@ def _comparison_section(name: str, summary: dict[str, object]) -> list[str]:
         if isinstance(pairwise, dict):
             for judges, value in pairwise.items():
                 lines.append(f"| Anatomy agreement {judges} | {_number(value)} |")
+    coverage = stats.get("judge_coverage")
+    if isinstance(coverage, dict):
+        for judge, counts in coverage.items():
+            if isinstance(counts, dict):
+                lines.append(
+                    f"| Verdicts from {judge} | {counts.get('votes')}"
+                    f" (missing {counts.get('missing')}) |"
+                )
+    notes = _judge_notes(summary)
+    if notes:
+        lines.extend(["", *notes])
     if isinstance(decision, dict):
         verdict = "replace the baseline" if decision.get("accept") else "keep the baseline"
         on = "held-out species" if summary.get("decision_species") == "holdout" else "all species"
@@ -173,7 +225,7 @@ def write_report(run: Run) -> dict[str, object]:
         if scope not in {"compare", "tune"}:
             continue
         summary = read_object(summary_path)
-        lines.extend(_comparison_section(f"{scope}: {name}", summary))
+        lines.extend(_comparison_section(run, f"{scope}: {name}", summary))
         comparisons.append({"scope": scope, "name": name, **summary})
         records = _records(summary_path.parent / "pairs.json")
         by_species: dict[int, list[dict[str, object]]] = defaultdict(list)
@@ -183,7 +235,7 @@ def write_report(run: Run) -> dict[str, object]:
                 by_species[taxon].append(record)
         for taxon, species_records in sorted(by_species.items()):
             sheet = out / "sheets" / scope / name / f"{taxon}.png"
-            contact_sheet(species_records, sheet, f"{name} — taxon {taxon}")
+            contact_sheet(species_records, sheet, f"{name} — taxon {taxon}", run.root)
             sheets.append(str(sheet.relative_to(run.root)))
             lines.append(f"- [{taxon}](sheets/{scope}/{name}/{taxon}.png)")
         lines.append("")

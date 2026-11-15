@@ -11,10 +11,21 @@ from .config import EvalConfig
 from .generate import Arm, GenerationReport, Generator, Sample, generate_samples, missing_samples
 from .judges import Judge
 from .panel import FrozenReferences, PanelSpecies, frozen_references
-from .rundir import Budget, Run, write_json
+from .rundir import Budget, Run, run_relative, sha256_text, write_json
 from .stats import Decision, Summary, decide, summarize
 
 COMPARE_DIR: Final = "compare"
+
+
+def judged_with(config: EvalConfig) -> dict[str, object]:
+    """The rubric and judges a summary's verdicts came from."""
+    return {
+        "rubric_sha256": sha256_text(config.rubric()),
+        "judges": [
+            {"name": judge.name, "kind": judge.kind, "model": judge.model}
+            for judge in config.judges
+        ],
+    }
 
 
 def pair_identity(scope: str, first: Arm, second: Arm, taxon_id: int, index: int) -> str:
@@ -106,15 +117,24 @@ class CompareResult:
         }
 
 
-def pair_records(pairs: Sequence[JudgedPair]) -> list[dict[str, object]]:
-    """The unblinded per-pair record kept beside the summary for re-analysis and reports."""
+def pair_records(run: Run, pairs: Sequence[JudgedPair]) -> list[dict[str, object]]:
+    """The unblinded per-pair record kept beside the summary for re-analysis and reports.
+
+    Plate paths inside the run are run-relative.
+    """
     return [
         {
             "pair_id": pair.pair_id,
             "identity": pair.spec.identity,
             "taxon_id": pair.spec.taxon_id,
-            "first": {"label": pair.spec.first.label, "path": str(pair.spec.first.path)},
-            "second": {"label": pair.spec.second.label, "path": str(pair.spec.second.path)},
+            "first": {
+                "label": pair.spec.first.label,
+                "path": run_relative(run, pair.spec.first.path),
+            },
+            "second": {
+                "label": pair.spec.second.label,
+                "path": run_relative(run, pair.spec.second.path),
+            },
             "first_side": pair.first_side,
             "votes": [
                 {
@@ -180,7 +200,11 @@ def compare(
     decision_summary = _summary(
         [pair for pair in pairs if pair.spec.taxon_id in set(decision_taxa)], names, config, seed
     )
-    decision = None if decision_summary is None else decide(decision_summary, decision_taxa)
+    decision = (
+        None
+        if decision_summary is None
+        else decide(decision_summary, decision_taxa, config.max_missing_judge_share)
+    )
     result = CompareResult(
         first,
         second,
@@ -192,6 +216,6 @@ def compare(
         decision,
     )
     out = run.path(scope, f"{first.name}-vs-{second.name}")
-    write_json(out / "pairs.json", pair_records(pairs))
-    write_json(out / "summary.json", result.as_dict())
+    write_json(out / "pairs.json", pair_records(run, pairs))
+    write_json(out / "summary.json", {**result.as_dict(), "judged_with": judged_with(config)})
     return result

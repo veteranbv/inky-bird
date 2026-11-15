@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import secrets
 import shutil
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +22,7 @@ from inky_bird_frame.http import write_bytes_atomic, write_json_atomic
 from .config import BudgetExhaustedError, HarnessError
 
 RUN_FILE: Final = "run.json"
+LOCK_FILE: Final = ".lock"
 # Top-level names the harness owns; an arm can never be called one of these.
 RESERVED_NAMES: Final = frozenset(
     {
@@ -34,6 +38,7 @@ RESERVED_NAMES: Final = frozenset(
         "reviews",
         "tune",
         "tune-review",
+        "unblinding",
         "verdicts",
     }
 )
@@ -90,6 +95,17 @@ def write_text(path: Path, text: str) -> None:
     write_bytes_atomic(path, text.encode("utf-8"))
 
 
+def run_relative(run: Run, path: Path) -> str:
+    """A path inside the run as run-relative text, so records hold no home folder."""
+    resolved = path.resolve()
+    return str(resolved.relative_to(run.root)) if resolved.is_relative_to(run.root) else str(path)
+
+
+def resolve_recorded(root: Path, recorded: str) -> Path:
+    path = Path(recorded)
+    return path if path.is_absolute() else root / path
+
+
 def replace_directory(staging: Path, final: Path) -> None:
     """Publish a fully written staging directory under its final name in one rename."""
     if final.exists():
@@ -104,6 +120,26 @@ def staging_directory(final: Path) -> Path:
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     return staging
+
+
+@contextmanager
+def locked(root: Path) -> Iterator[None]:
+    """Hold a run directory for one command, so two never pay for the same work.
+
+    The kernel releases the lock when the process exits, however it exits.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(root / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HarnessError(
+                "Another command is using this run directory; wait for it to finish"
+            ) from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -153,37 +189,59 @@ class Ledger:
                 handle.write(line + "\n")
                 handle.flush()
 
-    def count(self, event: str) -> int:
+    def entries(self) -> list[dict[str, object]]:
         if not self.path.exists():
-            return 0
-        total = 0
-        with self.path.open(encoding="utf-8") as handle:
+            return []
+        found: list[dict[str, object]] = []
+        with self._lock, self.path.open(encoding="utf-8") as handle:
             for line in handle:
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     # A crash can cut the last line short; it recorded nothing usable.
                     continue
-                if isinstance(entry, dict) and entry.get("event") == event:
-                    total += 1
-        return total
+                if isinstance(entry, dict):
+                    found.append(entry)
+        return found
+
+    def count(self, event: str) -> int:
+        return sum(1 for entry in self.entries() if entry.get("event") == event)
+
+    def latest(self, *keys: str) -> dict[tuple[object, ...], str]:
+        """The last event recorded for each item, identified by the values of keys."""
+        last: dict[tuple[object, ...], str] = {}
+        for entry in self.entries():
+            event = entry.get("event")
+            if isinstance(event, str) and all(key in entry for key in keys):
+                last[tuple(entry[key] for key in keys)] = event
+        return last
 
 
 class Budget:
-    """A hard cap on paid calls started by one command."""
+    """A hard cap on paid calls; used counts calls already started, in this run or before."""
 
-    def __init__(self, limit: int, *, what: str = "generation") -> None:
+    def __init__(self, limit: int, *, what: str = "generation", used: int = 0) -> None:
         if limit < 0:
             raise HarnessError(f"The {what} cap must not be negative")
         self.limit = limit
         self.what = what
-        self._used = 0
+        self._used = used
         self._lock = threading.Lock()
+
+    @classmethod
+    def for_run(cls, limit: int, ledger: Ledger, event: str, *, what: str) -> Budget:
+        """A cap on the whole run: every call its ledger shows started counts against it."""
+        return cls(limit, what=what, used=ledger.count(event))
 
     @property
     def used(self) -> int:
         with self._lock:
             return self._used
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return max(self.limit - self._used, 0)
 
     def reserve(self) -> None:
         with self._lock:

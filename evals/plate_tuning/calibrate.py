@@ -7,6 +7,7 @@ sides swapped, so position bias shows up as inconsistency.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -16,25 +17,35 @@ from typing import Final
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from .blind import JudgedPair, PairSpec, PlateRef, Vote, expected_text, judge_pairs, other
+from .compare import judged_with
 from .config import EvalConfig, HarnessError
-from .judges import ANATOMY_CATEGORIES, Judge, Side
+from .judges import ANATOMY_CATEGORIES, Judge, PlateAssessment, Side
 from .panel import FrozenReferences, PanelSpecies
 from .rundir import Run, write_json
 
 PLANTED_KINDS: Final = ("stretch", "duplicate", "lettering")
-# The categories a judge may use to report each planted defect.
+# The categories a judge may use to report each planted defect. A defect is
+# found only when one of them is reported more often on the planted plate than
+# on the untouched original in the same verdict.
 EXPECTED_CATEGORIES: Final[dict[str, frozenset[str]]] = {
     "stretch": frozenset({"proportions", "legs", "tail"}),
     "duplicate": frozenset(ANATOMY_CATEGORIES),
     "lettering": frozenset({"lettering"}),
 }
-# Fractions of the page. The bird sits large and centered-right with its
-# legs and tail in the lower half; the left margin carries the measurements.
-STRETCH_BAND: Final = (0.50, 0.80)
+# Fractions of the page (left, top, right, bottom). The bird sits large in the
+# middle with its legs and tail in the lower half; the left margin carries the
+# measurements, the right edge the ruler and the bottom margin the studies.
+# The stretch stays inside the bird's column, so it touches no lettering or ruler.
+STRETCH_BOX: Final = (0.42, 0.50, 0.86, 0.78)
 STRETCH_FACTOR: Final = 1.35
 DUPLICATE_BOX: Final = (0.45, 0.55, 0.70, 0.78)
 DUPLICATE_SHIFT: Final = 0.14
 LETTERING_BOX: Final = (0.03, 0.12, 0.40, 0.22)
+# A pixel is drawing, not paper, when a channel differs from the paper by this much.
+PAPER_TOLERANCE: Final = 48
+# Below these shares of the region a planted defect could be all but invisible.
+MIN_DRAWING_SHARE: Final = 0.05
+MIN_CHANGED_SHARE: Final = 0.05
 _DIGIT: Final = re.compile(r"\d")
 
 
@@ -52,22 +63,46 @@ def _box(
     return (round(left * width), round(top * height), round(right * width), round(bottom * height))
 
 
+def _share_differing(image: Image.Image, reference: Image.Image) -> float:
+    """The share of pixels where some channel differs by more than the paper tolerance."""
+    difference = ImageChops.difference(image, reference)
+    strongest = functools.reduce(ImageChops.lighter, difference.split())
+    mask = strongest.point(lambda value: 255 if value > PAPER_TOLERANCE else 0)
+    return mask.histogram()[255] / (image.width * image.height)
+
+
+def _require_drawing(image: Image.Image, box: tuple[int, int, int, int], kind: str) -> None:
+    region = image.crop(box)
+    paper = image.getpixel((round(0.02 * image.width), round(0.02 * image.height)))
+    if _share_differing(region, Image.new("RGB", region.size, paper)) < MIN_DRAWING_SHARE:
+        raise HarnessError(
+            f"The {kind} region of this plate holds too little drawing to plant a visible defect"
+        )
+
+
 def plant_defect(source: Path, destination: Path, kind: str, length: str) -> None:
-    """Write a copy of an approved plate with one deliberate, known defect."""
+    """Write a copy of an approved plate with one deliberate, known, visible defect."""
     with Image.open(source) as opened:
-        image = opened.convert("RGB")
+        original = opened.convert("RGB")
+    image = original.copy()
     width, height = image.size
     if kind == "stretch":
-        top, bottom = round(STRETCH_BAND[0] * height), round(STRETCH_BAND[1] * height)
-        band = image.crop((0, top, width, bottom))
-        stretched = band.resize((width, round((bottom - top) * STRETCH_FACTOR)))
-        image.paste(stretched, (0, top))
+        box = _box(image.size, STRETCH_BOX)
+        _require_drawing(image, box, kind)
+        region = image.crop(box)
+        # Taller by the factor from the top of the box, cut back to the box.
+        stretched = region.resize((region.width, round(region.height * STRETCH_FACTOR)))
+        image.paste(stretched.crop((0, 0, region.width, region.height)), box[:2])
+        changed = box
     elif kind == "duplicate":
         box = _box(image.size, DUPLICATE_BOX)
-        region = image.crop(box)
-        image.paste(region, (box[0] + round(DUPLICATE_SHIFT * width), box[1]))
+        _require_drawing(image, box, kind)
+        offset = round(DUPLICATE_SHIFT * width)
+        image.paste(image.crop(box), (box[0] + offset, box[1]))
+        changed = (box[0] + offset, box[1], min(box[2] + offset, width), box[3])
     elif kind == "lettering":
         box = _box(image.size, LETTERING_BOX)
+        _require_drawing(image, box, kind)
         paper = image.getpixel((round(0.02 * width), round(0.02 * height)))
         # Drawn on a patch of the box's size, so the text cannot spill outside it.
         patch = Image.new("RGB", (box[2] - box[0], box[3] - box[1]), paper)
@@ -76,11 +111,11 @@ def plant_defect(source: Path, destination: Path, kind: str, length: str) -> Non
             (4, 4), f"Length: {altered_digits(length)}", fill=(40, 30, 20), font=font
         )
         image.paste(patch, box[:2])
+        changed = box
     else:
         raise HarnessError(f"Unknown planted defect: {kind}")
-    with Image.open(source) as original:
-        if ImageChops.difference(original.convert("RGB"), image).getbbox() is None:
-            raise HarnessError(f"The planted {kind} defect left {source.name} unchanged")
+    if _share_differing(image.crop(changed), original.crop(changed)) < MIN_CHANGED_SHARE:
+        raise HarnessError(f"The planted {kind} defect would barely change {source.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     image.save(destination, format="PNG")
 
@@ -173,8 +208,20 @@ def prefers_first(vote: Vote) -> bool:
     return "first" in outcomes and "second" not in outcomes
 
 
+def _count(plate: PlateAssessment, category: str) -> int:
+    return sum(1 for defect in plate.defects if defect.category == category)
+
+
 def flags_planted(vote: Vote, kind: str) -> bool:
-    return bool(vote.second.categories & EXPECTED_CATEGORIES[kind])
+    """True when the judge reported an expected category more on the planted plate.
+
+    A complaint the judge also makes about the untouched original says nothing
+    about the planted defect, so it does not count.
+    """
+    return any(
+        _count(vote.second, category) > _count(vote.first, category)
+        for category in EXPECTED_CATEGORIES[kind]
+    )
 
 
 @dataclass(frozen=True)
@@ -232,6 +279,7 @@ def score_judge(
     result = {
         "anchor_accuracy": (_share(anchors), config.anchor_accuracy_threshold),
         "planted_recall": (_share(recall), config.planted_recall_threshold),
+        "planted_preference": (_share(preference), config.planted_preference_threshold),
         "swap_consistency": (_share(consistent), config.swap_consistency_threshold),
     }
     failures = tuple(
@@ -243,7 +291,7 @@ def score_judge(
         judge=judge,
         anchor_accuracy=result["anchor_accuracy"][0],
         planted_recall=result["planted_recall"][0],
-        planted_preference=_share(preference),
+        planted_preference=result["planted_preference"][0],
         swap_consistency=result["swap_consistency"][0],
         judged=judged,
         passed=not failures,
@@ -276,6 +324,7 @@ def calibrate(
     write_json(
         run.path("calibration", "summary.json"),
         {
+            "judged_with": judged_with(config),
             "anchors_supplied": anchors is not None,
             "items": [{"kind": item.kind, "taxon_id": item.taxon_id} for item in items],
             "judges": [result.as_dict() for result in results],

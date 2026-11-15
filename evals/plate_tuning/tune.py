@@ -28,8 +28,15 @@ from inky_bird_frame.prompts import (
 from .blind import JudgedPair, Vote, judge_pairs
 from .compare import compare, pair_specs
 from .config import BudgetExhaustedError, EvalConfig, HarnessError
-from .generate import Arm, Generator, InstructedCodexRunner, generate_samples
-from .judges import CATEGORIES, Judge, find_executable, run_bounded
+from .generate import Arm, Generator, InstructedCodexRunner, Sample, generate_samples
+from .judges import (
+    CATEGORIES,
+    CLAUDE_ISOLATION,
+    Judge,
+    find_executable,
+    run_bounded,
+    scratch_folder,
+)
 from .panel import FrozenReferences, PanelSpecies, frozen_references
 from .rundir import (
     Budget,
@@ -37,6 +44,7 @@ from .rundir import (
     Run,
     read_json,
     read_object,
+    resolve_recorded,
     run_tasks,
     sha256_file,
     sha256_text,
@@ -49,6 +57,7 @@ from .stats import decide_improvement, majority_flag, pair_outcome, win_score
 PLATE_COMPONENT: Final = "plate_instructions"
 REVIEW_COMPONENT: Final = "review_instructions"
 BASELINE_ARM: Final = "baseline"
+REVIEWS_LEDGER: Final = "reviews.jsonl"
 
 ReflectionLM = Callable[[str], str]
 
@@ -103,7 +112,11 @@ class TuningAdapter(Protocol):
 
 
 class ClaudeReflector:
-    """The reflection model: one headless Claude call per proposal, with no tools."""
+    """The reflection model: one headless Claude call per proposal, with no tools.
+
+    It runs in an empty temporary folder outside the run directory, with none of
+    the user's settings, so nothing but the prompt can shape a proposal.
+    """
 
     def __init__(self, run: Run, config: EvalConfig) -> None:
         self.executable = find_executable(config.claude_executable)
@@ -122,10 +135,9 @@ class ClaudeReflector:
             "text",
             "--model",
             self.model,
-            "--disallowedTools",
-            "Bash,Edit,Write,Read,WebFetch,WebSearch",
-            "--strict-mcp-config",
-            "--no-session-persistence",
+            "--tools",
+            "",
+            *CLAUDE_ISOLATION,
         ]
 
     def __call__(self, prompt: str) -> str:
@@ -134,14 +146,15 @@ class ClaudeReflector:
             number = self._count
         self.work.mkdir(parents=True, exist_ok=True)
         self.ledger.record("reflection-started", number=number)
-        text = run_bounded(
-            self.executable,
-            self.work,
-            self.timeout,
-            self.command(),
-            prompt,
-            self.work / f"reflection-{number:04d}.log",
-        )
+        with scratch_folder("plate-reflect-") as folder:
+            text = run_bounded(
+                self.executable,
+                folder,
+                self.timeout,
+                self.command(),
+                prompt,
+                self.work / f"reflection-{number:04d}.log",
+            )
         self.ledger.record("reflection-finished", number=number)
         return text
 
@@ -285,17 +298,7 @@ class PlateTuningAdapter:
         digest = sha256_text(text)[:12]
         arm = Arm(f"cand-{digest}", text, f"candidate-{digest}")
         with_references = [(entry, self.references[entry.taxon_id]) for entry in species]
-        done, report = generate_samples(
-            self.run,
-            self.generator,
-            [arm, self.baseline],
-            with_references,
-            1,
-            budget=self.budget,
-            parallel=self.parallel,
-        )
-        if report.skipped_for_cap:
-            raise BudgetExhaustedError(f"The generation cap of {self.budget.limit} was reached")
+        done = self._generate(arm, with_references)
         specs = pair_specs("tune", arm, self.baseline, with_references, done, 1)
         judged = {
             pair.spec.taxon_id: pair
@@ -309,11 +312,15 @@ class PlateTuningAdapter:
         for entry in species:
             pair = judged.get(entry.taxon_id)
             if pair is None:
-                # A generation failed for this species; it scores nothing.
+                # The candidate's plate failed every attempt; it scores nothing.
                 outputs.append({"taxon_id": entry.taxon_id, "generated": False})
                 scores.append(0.0)
                 trajectories.append(
-                    {"item": entry.common_name, "feedback": "The plate could not be generated."}
+                    {
+                        "item": entry.common_name,
+                        "feedback": "The plate could not be generated in"
+                        f" {self.config.generation_attempts} attempts.",
+                    }
                 )
                 continue
             score = plate_score(pair, self.config)
@@ -327,6 +334,34 @@ class PlateTuningAdapter:
                 }
             )
         return EvalBatch(outputs, scores, trajectories if capture_traces else None)
+
+    def _generate(
+        self, arm: Arm, species: list[tuple[PanelSpecies, FrozenReferences]]
+    ) -> dict[tuple[str, int, int], Sample]:
+        """Both plates per species, retrying failures so flakiness is not read as quality."""
+        done: dict[tuple[str, int, int], Sample] = {}
+        for _attempt in range(self.config.generation_attempts):
+            done, report = generate_samples(
+                self.run,
+                self.generator,
+                [arm, self.baseline],
+                species,
+                1,
+                budget=self.budget,
+                parallel=self.parallel,
+                max_characters=self.config.max_candidate_characters,
+            )
+            if report.skipped_for_cap:
+                raise BudgetExhaustedError(f"The generation cap of {self.budget.limit} was reached")
+            if not report.failed:
+                break
+        for entry, _references in species:
+            if (BASELINE_ARM, entry.taxon_id, 1) not in done:
+                raise HarnessError(
+                    f"The baseline plate for {entry.common_name} could not be generated in"
+                    f" {self.config.generation_attempts} attempts; see generations.jsonl"
+                )
+        return done
 
     def make_reflective_dataset(
         self, candidate: dict[str, str], eval_batch: EvalBatch, components_to_update: list[str]
@@ -502,7 +537,7 @@ def build_labels(sources: Sequence[Path]) -> list[ReviewItem]:
             records = read_object_list(records_path)
             for record in records:
                 for role in ("first", "second"):
-                    item = _label(record, role)
+                    item = _label(source, record, role)
                     if item is not None:
                         items.setdefault(item.plate_id, item)
     return sorted(items.values(), key=lambda item: (item.taxon_id, item.plate_id))
@@ -515,12 +550,15 @@ def read_object_list(path: Path) -> list[dict[str, object]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def _label(record: dict[str, object], role: str) -> ReviewItem | None:
+def _label(source: Path, record: dict[str, object], role: str) -> ReviewItem | None:
     plate, votes, taxon = record.get(role), record.get("votes"), record.get("taxon_id")
     if not isinstance(plate, dict) or not isinstance(votes, list) or not isinstance(taxon, int):
         return None
-    path = plate.get("path")
-    if not isinstance(path, str) or not Path(path).is_file():
+    recorded = plate.get("path")
+    if not isinstance(recorded, str):
+        return None
+    path = resolve_recorded(source, recorded)
+    if not path.is_file():
         return None
     assessments = [vote.get(role) for vote in votes if isinstance(vote, dict)]
     usable = [item for item in assessments if isinstance(item, dict)]
@@ -539,9 +577,9 @@ def _label(record: dict[str, object], role: str) -> ReviewItem | None:
             if category in CATEGORIES:
                 counts[str(category)] += 1
     return ReviewItem(
-        plate_id=f"{taxon}-{sha256_file(Path(path))[:16]}",
+        plate_id=f"{taxon}-{sha256_file(path)[:16]}",
         taxon_id=taxon,
-        plate_path=Path(path),
+        plate_path=path,
         acceptable=bool(acceptable),
         categories=frozenset(name for name, count in counts.items() if 2 * count > len(usable)),
     )
@@ -647,7 +685,7 @@ class ReviewTuningAdapter:
         self.references = references
         self.budget = budget
         self.parallel = parallel
-        self.ledger = Ledger(run.path("reviews.jsonl"))
+        self.ledger = Ledger(run.path(REVIEWS_LEDGER))
         self.scores = _Scores(run.path("tune-review", "candidates"))
 
     def outcome(self, item: ReviewItem, text: str) -> tuple[ReviewOutcome | None, str | None]:

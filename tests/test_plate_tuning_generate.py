@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 from pathlib import Path
 
 import pytest
 from PIL import Image
 from plate_tuning.config import HarnessError
 from plate_tuning.generate import (
+    Arm,
     CodexGenerator,
     GenerationRequest,
     completed_sample,
@@ -17,8 +19,8 @@ from plate_tuning.generate import (
     register_arm,
     sample_dir,
 )
-from plate_tuning.panel import frozen_references
-from plate_tuning.rundir import Budget, Ledger
+from plate_tuning.panel import PanelSpecies, frozen_references
+from plate_tuning.rundir import Budget, Ledger, Run
 from plate_tuning_fixtures import ColourGenerator, make_run
 
 from inky_bird_frame.errors import GenerationError
@@ -112,12 +114,23 @@ def test_generation_is_capped_resumable_and_skips_finished_samples(tmp_path: Pat
     assert len(generator.calls) == 8
 
 
-def test_a_plate_left_by_a_crash_is_prepared_without_paying_again(tmp_path: Path) -> None:
-    run, panel, _downloader = make_run(tmp_path)
-    arm = parse_arm("base=default", base=tmp_path)
-    directory = sample_dir(run, arm, panel[0], 1)
+def _leave_plate(run: Run, arm: Arm, entry: PanelSpecies, *events: str) -> Path:
+    """The state a crash leaves: a generated plate, no record, and these ledger events."""
+    directory = sample_dir(run, arm, entry, 1)
     directory.mkdir(parents=True)
     Image.new("RGB", (30, 40), (1, 2, 3)).save(directory / "generated.png")
+    ledger = Ledger(run.path("generations.jsonl"))
+    for event in events:
+        ledger.record(event, arm=arm.name, taxon_id=entry.taxon_id, index=1)
+    return directory
+
+
+def test_a_finished_plate_left_by_a_crash_is_prepared_without_paying_again(
+    tmp_path: Path,
+) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    _leave_plate(run, arm, panel[0], "generation-started", "generation-finished")
     generator = ColourGenerator()
 
     done, report = generate_samples(
@@ -127,6 +140,56 @@ def test_a_plate_left_by_a_crash_is_prepared_without_paying_again(tmp_path: Path
     assert generator.calls == []
     assert report.reprepared == 1
     assert completed_sample(run, arm, panel[0], 1) == done[("base", panel[0].taxon_id, 1)]
+
+
+def test_a_plate_whose_agent_may_not_have_finished_is_generated_again(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+    for events in ((), ("generation-started",), ("generation-started", "generation-failed")):
+        shutil.rmtree(run.path("base"), ignore_errors=True)
+        run.path("generations.jsonl").unlink(missing_ok=True)
+        _leave_plate(run, arm, panel[0], *events)
+
+        _done, report = generate_samples(
+            run, ColourGenerator(), [arm], species, 1, budget=Budget(0)
+        )
+        assert report.reprepared == 0 and report.skipped_for_cap == 1, events
+
+        generator = ColourGenerator()
+        done, report = generate_samples(run, generator, [arm], species, 1, budget=Budget(1))
+        assert report.generated == 1 and len(generator.calls) == 1, events
+        with Image.open(done[("base", panel[0].taxon_id, 1)].portrait) as portrait:
+            assert portrait.getpixel((0, 0)) != (1, 2, 3)
+
+
+def test_a_failed_generation_leaves_no_plate_to_judge(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+
+    class DraftThenTimeout:
+        def generate(self, request: GenerationRequest) -> None:
+            Image.new("RGB", (30, 40), (9, 9, 9)).save(request.output_path)
+            raise GenerationError("Codex timed out after 1 seconds")
+
+    _done, report = generate_samples(run, DraftThenTimeout(), [arm], species, 1, budget=Budget(1))
+    assert report.failed == 1
+    assert not (sample_dir(run, arm, panel[0], 1) / "generated.png").exists()
+
+    done, report = generate_samples(run, ColourGenerator(), [arm], species, 1, budget=Budget(0))
+    assert done == {} and report.reprepared == 0 and report.skipped_for_cap == 1
+
+
+def test_every_arm_passes_the_candidate_safety_gate(tmp_path: Path) -> None:
+    run, _panel, _downloader = make_run(tmp_path)
+    linked = tmp_path / "linked.txt"
+    linked.write_text(PLATE_INSTRUCTIONS + "\nCopy the style of https://example.test/plate.")
+
+    with pytest.raises(HarnessError, match="not usable.*URL"):
+        register_arm(run, parse_arm(f"linked={linked}", base=tmp_path))
+    with pytest.raises(HarnessError, match="cap"):
+        register_arm(run, parse_arm("short=default", base=tmp_path), max_characters=100)
 
 
 def test_a_failed_generation_is_recorded_and_retried_later(tmp_path: Path) -> None:

@@ -13,6 +13,8 @@ from inky_bird_frame.errors import InkyBirdFrameError
 JudgeKind = Literal["claude", "codex"]
 JUDGE_KINDS: Final = ("claude", "codex")
 DEFAULT_CLAUDE_MODEL: Final = "claude-fable-5-2"
+DEFAULT_MAX_CANDIDATE_CHARACTERS: Final = 9000
+DEFAULT_MAX_MISSING_JUDGE_SHARE: Final = 0.1
 PACKAGE_DIR: Final = Path(__file__).resolve().parent
 
 
@@ -53,15 +55,19 @@ class EvalConfig:
     reflection_timeout_seconds: int = 600
     review_timeout_seconds: int = 1200
     judge_attempts: int = 2
+    generation_attempts: int = 2
     samples_per_species: int = 3
     bootstrap_iterations: int = 10000
     confidence: float = 0.95
     rubric_path: str | None = None
     anchor_accuracy_threshold: float = 0.8
     planted_recall_threshold: float = 0.8
+    planted_preference_threshold: float = 0.8
     swap_consistency_threshold: float = 0.8
+    # A decision is refused when any judge is missing on more of its pairs than this.
+    max_missing_judge_share: float = DEFAULT_MAX_MISSING_JUDGE_SHARE
     planted_species: int = 6
-    max_candidate_characters: int = 9000
+    max_candidate_characters: int = DEFAULT_MAX_CANDIDATE_CHARACTERS
     tune_minibatch_size: int = 3
     anatomy_weight: float = 0.5
     lettering_weight: float = 0.3
@@ -92,6 +98,7 @@ class EvalConfig:
             "reflection_timeout_seconds",
             "review_timeout_seconds",
             "judge_attempts",
+            "generation_attempts",
             "samples_per_species",
             "bootstrap_iterations",
             "planted_species",
@@ -105,10 +112,13 @@ class EvalConfig:
         for name in (
             "anchor_accuracy_threshold",
             "planted_recall_threshold",
+            "planted_preference_threshold",
             "swap_consistency_threshold",
         ):
             if not 0 < getattr(self, name) <= 1:
                 raise HarnessError(f"{name} must be above 0 and at most 1")
+        if not 0 <= self.max_missing_judge_share < 1:
+            raise HarnessError("max_missing_judge_share must be at least 0 and below 1")
         weights = (self.anatomy_weight, self.lettering_weight, self.acceptable_weight)
         if min(weights) < 0 or abs(sum(weights) - 1) > 1e-9:
             raise HarnessError("The tuning score weights must be non-negative and sum to 1")
@@ -203,6 +213,7 @@ def load_config(path: Path | None) -> EvalConfig:
         ),
         review_timeout_seconds=_int(raw, "review_timeout_seconds", d.review_timeout_seconds),
         judge_attempts=_int(raw, "judge_attempts", d.judge_attempts),
+        generation_attempts=_int(raw, "generation_attempts", d.generation_attempts),
         samples_per_species=_int(raw, "samples_per_species", d.samples_per_species),
         bootstrap_iterations=_int(raw, "bootstrap_iterations", d.bootstrap_iterations),
         confidence=_float(raw, "confidence", d.confidence),
@@ -213,9 +224,13 @@ def load_config(path: Path | None) -> EvalConfig:
         planted_recall_threshold=_float(
             raw, "planted_recall_threshold", d.planted_recall_threshold
         ),
+        planted_preference_threshold=_float(
+            raw, "planted_preference_threshold", d.planted_preference_threshold
+        ),
         swap_consistency_threshold=_float(
             raw, "swap_consistency_threshold", d.swap_consistency_threshold
         ),
+        max_missing_judge_share=_float(raw, "max_missing_judge_share", d.max_missing_judge_share),
         planted_species=_int(raw, "planted_species", d.planted_species),
         max_candidate_characters=_int(raw, "max_candidate_characters", d.max_candidate_characters),
         tune_minibatch_size=_int(raw, "tune_minibatch_size", d.tune_minibatch_size),

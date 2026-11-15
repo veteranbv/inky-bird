@@ -15,6 +15,7 @@ from itertools import combinations
 from typing import Final
 
 from .blind import JudgedPair, Outcome, Vote
+from .config import DEFAULT_MAX_MISSING_JUDGE_SHARE
 
 OUTCOMES: Final[tuple[Outcome, ...]] = ("first", "second", "tie")
 NO_BETTER: Final = 0.5
@@ -149,11 +150,21 @@ class Summary:
     anatomy_agreement: Agreement
     lettering_agreement: Agreement
     per_species: dict[int, dict[str, float | int]]
+    # Pairs (judged or not) each judge gave no verdict on.
+    judge_missing: dict[str, int]
+
+    @property
+    def total_pairs(self) -> int:
+        return self.pairs + self.unjudged_pairs
 
     def as_dict(self) -> dict[str, object]:
         return {
             "pairs": self.pairs,
             "unjudged_pairs": self.unjudged_pairs,
+            "judge_coverage": {
+                judge: {"votes": self.total_pairs - missing, "missing": missing}
+                for judge, missing in self.judge_missing.items()
+            },
             "judged_species": list(self.judged_species),
             "anatomy_win_rate": self.anatomy.as_dict(),
             "lettering_win_rate": self.lettering.as_dict(),
@@ -252,6 +263,10 @@ def summarize(
             [{vote.judge: vote.lettering for vote in pair.votes} for pair in pairs], judges
         ),
         per_species=per_species,
+        judge_missing={
+            judge: sum(1 for pair in pairs if judge not in {vote.judge for vote in pair.votes})
+            for judge in judges
+        },
     )
 
 
@@ -264,9 +279,15 @@ class Decision:
         return {"accept": self.accept, "reasons": list(self.reasons)}
 
 
-def decide(summary: Summary, required_species: Sequence[int]) -> Decision:
+def decide(
+    summary: Summary,
+    required_species: Sequence[int],
+    max_missing_share: float = DEFAULT_MAX_MISSING_JUDGE_SHARE,
+) -> Decision:
     """The fixed rule: the candidate replaces the baseline only if all of these hold.
 
+    0. No judge is missing on more than max_missing_share of the pairs, so the
+       decision rests on the whole panel.
     1. Every required (held-out) species has at least one judged pair.
     2. The species-clustered interval for the anatomy win rate lies wholly
        above 0.5, so "no better" is excluded.
@@ -274,6 +295,12 @@ def decide(summary: Summary, required_species: Sequence[int]) -> Decision:
     4. The candidate's fatal-defect rate is no higher than the baseline's.
     """
     reasons: list[str] = []
+    for judge, absent in summary.judge_missing.items():
+        if absent > max_missing_share * summary.total_pairs:
+            reasons.append(
+                f"judge {judge} gave no verdict on {absent} of {summary.total_pairs} pairs"
+                f" (above {max_missing_share:.0%})"
+            )
     missing = sorted(set(required_species) - set(summary.judged_species))
     if missing:
         reasons.append(f"{len(missing)} required species have no judged pair")
