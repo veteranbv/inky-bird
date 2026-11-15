@@ -291,5 +291,7 @@ export function renderFrame(context) {
     dock,
     note('Plates change once a minute while playing. This does not refresh the wall panel.'),
   );
+  if (!window.isSecureContext)
+    main.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
   show();
 }

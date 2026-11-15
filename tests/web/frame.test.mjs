@@ -59,7 +59,7 @@ async function flush() {
   for (let n = 0; n < 20; n++) await setImmediate();
 }
 
-async function open(t, { state, plate = () => Promise.resolve(png()) }) {
+async function open(t, { state, plate = () => Promise.resolve(png()), secure = true }) {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const names = ['document', 'window', 'location', 'fetch', 'navigator'];
   const saved = Object.fromEntries(
@@ -75,7 +75,7 @@ async function open(t, { state, plate = () => Promise.resolve(png()) }) {
   const define = (name, value) =>
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
   define('document', doc);
-  define('window', { isSecureContext: true });
+  define('window', { isSecureContext: secure });
   define('navigator', {});
   define('location', {
     href: 'https://inky.example.test/app?page=frame&view=current',
@@ -204,4 +204,15 @@ test('a plate that arrives in time is shown as before', async (t) => {
   assert.match(main.querySelector('.frame-caption').textContent, /Example Wren/);
   assert.ok(findButton(main, 'Next'));
   assert.ok(main.children.some((node) => node.classList.contains('frame-viewport')));
+});
+
+// Keeping the screen awake needs a secure context, which plain HTTP is not.
+test('Frame over plain HTTP says the screen may sleep', async (t) => {
+  const plain = await open(t, { state: () => journal(), secure: false });
+  assert.match(plain.main.textContent, /keeping it awake needs an HTTPS address/);
+});
+
+test('Frame in a secure context does not warn about sleep', async (t) => {
+  const { main } = await open(t, { state: () => journal() });
+  assert.doesNotMatch(main.textContent, /keeping it awake/);
 });
