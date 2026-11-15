@@ -367,6 +367,39 @@ async function ownerFrame(t) {
   const barBox = await page.locator('.frame-controls').boundingBox();
   assert(noticeBox && barBox && noticeBox.y >= 0 && noticeBox.y + noticeBox.height <= barBox.y);
   await page.unroute(plateRoute);
+  // A notice never covers the bird name or the note under the plate, on a
+  // small phone, a phone or a desktop.
+  const restoreSize = page.viewportSize();
+  for (const [width, height] of [
+    [320, 568],
+    [375, 812],
+    [1280, 800],
+  ]) {
+    t.phase = 'frame-notice-clear-' + width + 'x' + height;
+    await page.setViewportSize({ width, height });
+    await page.goto(origin + '/app?page=frame&view=all');
+    await page.locator('.frame-art').waitFor();
+    await page.route(plateRoute, (route) => route.abort());
+    await page.keyboard.press('Shift');
+    await page.locator('.frame-controls:not(.quiet)').waitFor();
+    await page.getByRole('button', { name: 'Next', exact: true }).click();
+    const shownNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
+    await shownNotice.waitFor();
+    await page.evaluate(() => scrollTo(0, 0));
+    const placed = await shownNotice.boundingBox();
+    const apart = (other) =>
+      other.y + other.height <= placed.y + 0.5 || placed.y + placed.height <= other.y + 0.5;
+    const name = await page.locator('.frame-caption').boundingBox();
+    assert(name && apart(name), width + 'x' + height + ': the notice covers the bird name');
+    const note = page.locator('main > p.hint', { hasText: 'Plates change once a minute' });
+    const noteBox = await note.boundingBox();
+    assert(noteBox && apart(noteBox), width + 'x' + height + ': the notice covers the note');
+    await page.unroute(plateRoute);
+  }
+  await page.setViewportSize(restoreSize);
+  await page.goto(origin + '/app?page=frame&view=all');
+  await page.locator('.frame-art').waitFor();
+  await page.locator('.frame-art').evaluate((image) => image.decode());
   t.phase = 'frame-swipe';
   // A horizontal mouse drag on the plate steps to the next plate instead of
   // starting a native image drag.

@@ -579,13 +579,17 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
 .presenting, body.presenting { background: #16120c; }
 .presenting {
   --frame-control: 44px;
-  /* The bar's offset from the bottom edge, its height (one control row plus
-     its padding and border) and a gap above it. */
-  --frame-bar-room: calc(max(14px, env(safe-area-inset-bottom)) + var(--frame-control) + 20px);
 }
 /* One screen tall: the plate takes whatever height the title, bird name and
-   note leave above the room kept for the control bar. */
+   note leave above the room kept for the bottom dock. */
 .presenting main {
+  /* The bar's offset from the bottom edge, its height (one control row plus
+     its padding and border), a gap above it, and any notice Frame shows
+     above the bar, which it measures. */
+  --frame-bar-room: calc(
+    max(14px, env(safe-area-inset-bottom)) + var(--frame-control) + 20px +
+      var(--frame-notice-room, 0px)
+  );
   display: flex;
   flex-direction: column;
   height: 100vh; height: 100svh;
@@ -727,6 +731,8 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   .list-tools { grid-template-columns: minmax(0, 420px) repeat(2, minmax(0, 13rem)); }
   .list-tools .list-field:first-child { grid-column: auto; }
   .journal main { padding-top: 24px; padding-bottom: 60px; }
+  /* Frame keeps its room for the bottom bar and any notice above it. */
+  :root:not(:fullscreen) .journal.presenting main { padding-bottom: var(--frame-bar-room); }
   .journal-navigation {
     position: sticky;
     top: 0;
