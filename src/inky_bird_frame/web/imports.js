@@ -330,15 +330,18 @@ export async function renderImports(ui, { base, link, note, kind }) {
         here = el('div');
       here.hidden = true;
       content.append(here);
-      // Offered only when there is eBird history to use.
+      // Hidden only when the journal shows there is no eBird history; when it
+      // cannot tell, the history may still be there to use.
       api('/v1/owner/journal')
         .then((journal) => {
-          here.hidden = !(journal.history_coverage || []).some(
-            (row) =>
-              row.source === 'ebird-archive' && row.status === 'available' && row.species_count > 0,
+          const row = (journal.history_coverage || []).find(
+            (entry) => entry.source === 'ebird-archive',
           );
+          here.hidden = !row || (row.status === 'available' && !(row.species_count > 0));
         })
-        .catch(() => {});
+        .catch(() => {
+          here.hidden = false;
+        });
       here.append(
         button('Use the history already here', async (event) => {
           const control = event.currentTarget;

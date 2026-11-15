@@ -427,18 +427,21 @@ test('choosing checklists says unmatched names are looked up on iNaturalist', as
   assert.match(text(env.main), /iNaturalist/);
 });
 
-// "Use the history already here" is offered only when eBird history exists.
+// "Use the history already here" is offered unless the journal shows there is
+// no eBird history: when it cannot tell, the history may still be there.
 for (const [name, coverage, offered] of [
   ['with eBird history', [{ source: 'ebird-archive', status: 'available', species_count: 3 }], true],
   ['on a new install', [], false],
-  ['when the history cannot be read', [{ source: 'ebird-archive', status: 'unavailable' }], false],
+  ['when the eBird history is empty', [{ source: 'ebird-archive', status: 'available', species_count: 0 }], false],
+  ['when the history cannot be read', [{ source: 'ebird-archive', status: 'unavailable' }], true],
+  ['when the journal cannot be read', new Error('Inky is not answering.'), true],
   ['when only another source has history', [{ source: 'birdbuddy', status: 'available', species_count: 3 }], false],
 ])
   test('using existing history is ' + (offered ? 'offered ' : 'not offered ') + name, async () => {
     const env = setup({
       '/v1/owner/operations': { operations: [] },
       '/v1/owner/imports': { preview: null },
-      '/v1/owner/journal': { history_coverage: coverage },
+      '/v1/owner/journal': coverage instanceof Error ? coverage : { history_coverage: coverage },
     });
     await renderImports(env.ui, env.helpers);
     for (let n = 0; n < 5; n++) await setImmediate();

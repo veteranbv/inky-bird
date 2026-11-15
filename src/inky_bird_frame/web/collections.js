@@ -1,6 +1,6 @@
 import { randomHex } from '/app/keys.js';
 import { waitForOperation } from '/app/manage.js';
-import { plural, plainDate } from '/app/words.js';
+import { plural, plainDate, when } from '/app/words.js';
 import { inlineProblem } from '/app/ui.js';
 
 export function renderCollections(context) {
@@ -492,7 +492,7 @@ export function renderCollection(context) {
             );
             summary.append(
               note(
-                (byId.get(id)?.common_name || 'Taxon ' + id) +
+                (byId.get(id)?.common_name || 'Bird ' + id) +
                   ': has a plate waiting for you or needs a hand. This leaves it as it is.',
               ),
               pending
@@ -503,9 +503,10 @@ export function renderCollection(context) {
           for (const item of plan.waiting)
             summary.append(
               note(
-                (byId.get(item.taxon_id)?.common_name || 'Taxon ' + item.taxon_id) +
-                  ': tries again after ' +
-                  new Date(item.next_attempt_at).toLocaleString(),
+                (byId.get(item.taxon_id)?.common_name || 'Bird ' + item.taxon_id) +
+                  ': tries again ' +
+                  (when(item.next_attempt_at) || 'after a short wait') +
+                  '.',
               ),
             );
           summary.append(

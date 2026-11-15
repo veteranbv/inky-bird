@@ -206,7 +206,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
           note('Shows birds until ' + when(grant.expires_at * 1000)),
           note(
             grant.last_seen_at
-              ? 'Last seen around ' + when(grant.last_seen_at * 1000)
+              ? 'Last seen ' + when(grant.last_seen_at * 1000)
               : 'Not connected yet',
           ),
         );

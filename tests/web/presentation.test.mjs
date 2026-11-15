@@ -245,3 +245,17 @@ test('revoking a status credential asks first', async (t) => {
   assert.deepEqual(changes(calls).map(({ body }) => [body.action, body.id]), [['revoke', 'g2']]);
   assert.equal(reloads.length, 1);
 });
+
+test('a screen seen a few days ago says the day, without "around on"', async (t) => {
+  const seen = new Date();
+  seen.setDate(seen.getDate() - 3);
+  const { main } = await open(t, 'displays', () => {
+    const value = state();
+    value.grants[0].last_seen_at = seen.getTime() / 1000;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Last seen'));
+  assert.deepEqual(lines, [
+    'Last seen on ' + ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][seen.getDay()],
+  ]);
+});
