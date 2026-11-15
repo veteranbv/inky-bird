@@ -586,7 +586,7 @@ export function renderCollection(context) {
         }
       }),
     );
-  const grid = el('div', '', 'bird-grid');
+  const grid = el('div', '', 'bird-grid bird-list');
   for (const bird of birds) {
     const node = card(bird),
       origin = group?.member_origins.find((member) => member.taxon_id === bird.taxon_id)?.origin;

@@ -216,6 +216,15 @@ async function collectionFilter(t) {
   await heading('Filter journey');
   await page.getByRole('link', { name: /Northern Cardinal/ }).first().waitFor();
   await page.getByRole('link', { name: /American Robin/ }).first().waitFor();
+  // On a phone the collection shows two plates side by side, like the birds list.
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 375, height: 812 });
+  const cards = page.locator('.bird-grid a.bird-card');
+  const [first, second] = [await cards.nth(0).boundingBox(), await cards.nth(1).boundingBox()];
+  assert.equal(Math.round(first.y), Math.round(second.y));
+  assert(second.x >= first.x + first.width);
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await page.setViewportSize(viewport);
   // Remove the journey collection so later phases see the expected state.
   // The Remove action lives in the collection page's tools.
   page.once('dialog', (dialog) => dialog.accept());
