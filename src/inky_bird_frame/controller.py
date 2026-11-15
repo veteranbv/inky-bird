@@ -1313,7 +1313,7 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
     try:
         result = run_refresh_cycle(config)
     except Exception as exc:
-        from .cli import _is_busy
+        from .cli import _failure_notification, _is_busy
 
         # Another refresh already running is not a failure of discovery.
         if not _is_busy(exc):
@@ -1321,8 +1321,7 @@ def refresh_observations(config: AppConfig) -> dict[str, object]:
                 config,
                 key="observation-refresh",
                 title="Bird discovery is degraded",
-                body=f"Observation refresh failed ({type(exc).__name__}). "
-                "Check controller logs for details.",
+                body=_failure_notification("Observation refresh", exc),
             )
         raise
     safe_record_recovery(

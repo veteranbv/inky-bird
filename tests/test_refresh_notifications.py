@@ -145,7 +145,9 @@ class RefreshNotificationTests(unittest.TestCase):
                     refresh_observations(config)
 
         self.assertEqual(calls.keys(calls.degraded), ["observation-refresh"])
-        self.assertIn("DataSourceError", calls.degraded.call_args.kwargs["body"])
+        body = calls.degraded.call_args.kwargs["body"]
+        self.assertIn("data source error", body)
+        self.assertNotIn("DataSourceError", body)
         calls.recovered.assert_not_called()
 
     def test_first_refresh_announces_discovered_species_in_this_year(self) -> None:

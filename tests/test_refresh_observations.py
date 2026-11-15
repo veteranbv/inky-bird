@@ -64,14 +64,14 @@ def found(species: list[BirdSpecies]) -> DiscoveryResult:
 
 class RefreshFailureTests(unittest.TestCase):
     def test_every_failure_that_is_not_a_busy_refresh_is_a_degradation(self) -> None:
-        failures: list[Exception] = [
-            DataSourceError("providers failed"),
-            CatalogError("state unreadable"),
-            OSError("disk full"),
-            ValueError("unexpected value"),
-            KeyError("missing"),
+        failures: list[tuple[Exception, str]] = [
+            (DataSourceError("providers failed"), "data source error"),
+            (CatalogError("state unreadable"), "catalog error"),
+            (OSError("disk full"), "storage error"),
+            (ValueError("unexpected value"), "internal error"),
+            (KeyError("missing"), "internal error"),
         ]
-        for failure in failures:
+        for failure, label in failures:
             with self.subTest(type(failure).__name__), TemporaryDirectory() as temporary:
                 config = load(temporary)
                 with (
@@ -84,6 +84,9 @@ class RefreshFailureTests(unittest.TestCase):
                     [call.kwargs["key"] for call in degraded.call_args_list],
                     ["observation-refresh"],
                 )
+                body = degraded.call_args.kwargs["body"]
+                self.assertIn(f"({label})", body)
+                self.assertNotIn(type(failure).__name__, body)
 
     def test_refresh_already_running_is_not_a_degradation(self) -> None:
         with TemporaryDirectory() as temporary:
