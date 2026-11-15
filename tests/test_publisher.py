@@ -1892,6 +1892,31 @@ class PublisherTests(unittest.TestCase):
             write_json_atomic(snapshot / "index.json", {"species": []})
             self.assertEqual(len(validate_public_catalog(catalog)), 1)
 
+    def test_a_failed_catalog_snapshot_is_removed_without_touching_live_files(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "catalog"
+            protected = _create_species(catalog, 1, "Alpha Bird")
+            unreadable = _create_species(catalog, 2, "Beta Bird")
+            for path in protected.iterdir():
+                path.chmod(0o444)
+            protected.chmod(0o555)
+            unreadable.chmod(0o000)
+            try:
+                # The snapshot's owner removes it after the failure, as a publication run does.
+                with TemporaryDirectory(dir=root) as work, self.assertRaises(shutil.Error):
+                    _snapshot_catalog(catalog, Path(work) / "snapshot")
+                modes = {
+                    path.name: stat.S_IMODE(path.lstat().st_mode) for path in protected.iterdir()
+                }
+                directory_mode = stat.S_IMODE(protected.lstat().st_mode)
+            finally:
+                unreadable.chmod(0o755)
+                protected.chmod(0o755)
+
+            self.assertEqual(directory_mode, 0o555)
+            self.assertEqual(set(modes.values()), {0o444}, modes)
+
     def test_catalog_snapshot_copies_when_files_cannot_be_linked(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

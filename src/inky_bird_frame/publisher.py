@@ -150,18 +150,28 @@ def _snapshot_catalog(source: Path, destination: Path) -> None:
                 linking = False
         return shutil.copy2(source_file, destination_file, follow_symlinks=False)
 
-    shutil.copytree(
-        source,
-        destination,
-        symlinks=True,
-        ignore=shutil.ignore_patterns(_FINDER_METADATA),
-        copy_function=place,
-    )
-    # Snapshot directories are its own: keep them writable, so removing the snapshot never
-    # resorts to changing permissions on a file it shares with the live catalog.
-    for directory, _, _ in os.walk(destination):
+    def writable(directory: str) -> None:
         mode = os.lstat(directory).st_mode
-        os.chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU)
+        if stat.S_ISDIR(mode):
+            os.chmod(directory, stat.S_IMODE(mode) | stat.S_IRWXU)
+
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(_FINDER_METADATA),
+            copy_function=place,
+        )
+    finally:
+        # Snapshot directories are its own, even after a failed copy: keep them writable, so
+        # removing the snapshot never resorts to changing permissions on a file it shares
+        # with the live catalog.
+        if destination.is_dir():
+            writable(str(destination))
+            for directory, directories, _ in os.walk(destination):
+                for name in directories:
+                    writable(os.path.join(directory, name))
 
 
 def _abandoned_publish_work(work_parent: Path) -> tuple[Path, ...]:
