@@ -111,12 +111,17 @@ def end_group(group: int) -> list[str]:
 
 
 def run_contained(
-    command: list[str], environment: dict[str, str], timeout: int = RUN_TIMEOUT_SECONDS
+    command: list[str],
+    environment: dict[str, str],
+    timeout: int = RUN_TIMEOUT_SECONDS,
+    *,
+    watch: Callable[[int], contextlib.AbstractContextManager[None]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an installer in its own process group; nothing it starts outlives it.
 
     A run that times out, or leaves a process behind, fails the test after the
-    whole group is killed and reaped.
+    whole group is killed and reaped. ``watch`` is entered with the group's ID
+    for as long as the run lasts.
     """
     assert timeout <= RUN_TIMEOUT_SECONDS
     process = subprocess.Popen(
@@ -127,17 +132,18 @@ def run_contained(
         text=True,
         start_new_session=True,
     )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        end_group(process.pid)
-        process.communicate()
-        raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-    survivors = end_group(process.pid)
+    with watch(process.pid) if watch is not None else contextlib.nullcontext():
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            end_group(process.pid)
+            process.communicate()
+            raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        survivors = end_group(process.pid)
     assert not survivors, f"{command[-1]} left processes running: {survivors}"
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -212,7 +218,9 @@ class Host:
         family: str = "inky-bird",
         *,
         number_file_commands: bool = False,
+        create: bool = True,
     ) -> None:
+        """``create=False`` names the paths of a host already on disk, such as a copy."""
         self.root = root
         self.system = system
         self.family = family
@@ -228,6 +236,8 @@ class Host:
         self.agents = self.home / "Library/LaunchAgents"
         self.venv = self.home / ".virtualenvs/pimoroni"
         self.tmp = root / "tmp"
+        if not create:
+            return
         for directory in (self.bin, self.home, self.support, self.state, self.units, self.tmp):
             directory.mkdir(parents=True, exist_ok=True)
         (self.fake / "LaunchDaemons").mkdir()
@@ -294,6 +304,10 @@ class Host:
         )
         # Polling for the cycle lock helper is only a wait; a short one keeps runs quick.
         text = text.replace("poll_seconds=1\n", "poll_seconds=0.05\n")
+        # So is the helper's own watch for its installer to end, and its wait for a
+        # plate; a run's output only closes once the helper has gone.
+        text = text.replace("\n    time.sleep(1)\n", "\n    time.sleep(0.05)\n")
+        text = text.replace("\n        time.sleep(2)\n", "\n        time.sleep(0.05)\n")
         target = (self.source if source is None else source) / "deploy" / name
         target.write_text(text)
         target.chmod(0o755)

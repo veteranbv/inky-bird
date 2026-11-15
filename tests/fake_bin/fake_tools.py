@@ -13,17 +13,13 @@ call fail (``expire``), or stops the installer once it completes: SIGTERM
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
-import plistlib
-import shlex
-import shutil
-import signal
-import subprocess
 import sys
-import time
 from pathlib import Path
+
+# Every installer step starts a fresh interpreter; importing what only some
+# tools need where they use it takes about a quarter off each call.
 
 FAKE = Path(os.environ.get("FAKE", "/nonexistent"))
 TOOLS = Path(__file__).resolve()
@@ -56,6 +52,8 @@ STOP = "kill"
 
 
 def _step_lock() -> Path:
+    import time
+
     lock = FAKE / "steps.lock"
     deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
     while True:
@@ -99,6 +97,8 @@ def step(tool: str, arguments: list[str], *, action: bool) -> str:
 def _installer_pid() -> int | None:
     """The nearest installer script above this call, not one of its subshells."""
 
+    import subprocess
+
     def parent_and_command(pid: int) -> tuple[int, str]:
         output = subprocess.run(
             ["/bin/ps", "-o", "ppid=", "-o", "command=", "-p", str(pid)],
@@ -123,12 +123,14 @@ def _installer_pid() -> int | None:
     return None
 
 
-STOP_SIGNALS = {"kill": signal.SIGTERM, "hangup": signal.SIGHUP, "interrupt": signal.SIGINT}
+STOP_SIGNALS = {"kill": "SIGTERM", "hangup": "SIGHUP", "interrupt": "SIGINT"}
 
 
 def kill_installer(mode: str = "kill") -> None:
     """Stop the installer: TERM or HUP to the script itself, or INT to its whole
     process group as Ctrl-C does. This call ignores the interrupt it sends."""
+    import signal
+
     pid = _installer_pid()
     if pid is None:
         return
@@ -136,13 +138,15 @@ def kill_installer(mode: str = "kill") -> None:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         os.killpg(os.getpgid(pid), signal.SIGINT)
     else:
-        os.kill(pid, STOP_SIGNALS[mode])
+        os.kill(pid, getattr(signal, STOP_SIGNALS[mode]))
 
 
 def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> int:
     """Replace this process, or run and wait when the installer is stopped after."""
     environment = dict(os.environ) if environment is None else environment
     if KILL:
+        import subprocess
+
         return subprocess.run(arguments, env=environment, check=False).returncode
     os.execvpe(arguments[0], arguments, environment)
     return 1
@@ -151,6 +155,10 @@ def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> in
 def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path) -> int:
     """The cycle lock helper runs in the background until the installer ends it;
     stop the installer once the helper holds the lock, and end with it."""
+    import signal
+    import subprocess
+    import time
+
     global KILL
     KILL = False
     helper = subprocess.Popen(command, env=environment)
@@ -174,6 +182,8 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
 
 
 def _cycle_lock_held() -> bool:
+    import fcntl
+
     lock = Path(os.environ["FAKE_STATE_DIR"]) / "controller.lock"
     if not lock.exists():
         return False
@@ -234,7 +244,13 @@ export FAKE_DEPTH=$depth
 def wrapper(tool: str, *, own_path: bool = True) -> str:
     """A stand-in executable for ``tool``; ``own_path`` passes its path so a
     venv's fake knows which runtime it belongs to."""
-    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} {tool}"
+    import shlex
+
+    # Imported, not run as a script, so its compiled form is cached; -I keeps the
+    # caller's directory and PYTHON* settings out of the fake's own imports.
+    program = f"import sys; sys.path.insert(0, {str(TOOLS.parent)!r}); import fake_tools; "
+    program += "raise SystemExit(fake_tools.main())"
+    command = f"{shlex.quote(sys.executable)} -I -S -c {shlex.quote(program)} {tool}"
     own = ' "$0"' if own_path else ""
     return f'#!/bin/sh\n{DEPTH_GUARD}exec {command}{own} "$@"\n'
 
@@ -275,6 +291,8 @@ def identity(arguments: list[str]) -> int:
 
 def system_python(arguments: list[str]) -> int:
     if arguments and arguments[0].endswith("native_names.py"):
+        import shlex
+
         for name in ("service_prefix", "app_dir", "support_dir", "config_path"):
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
@@ -282,6 +300,8 @@ def system_python(arguments: list[str]) -> int:
 
 
 def launchctl(arguments: list[str]) -> int:
+    import plistlib
+
     loaded = _state("launchd")
     verb = arguments[0]
     if verb == "print":
@@ -327,6 +347,8 @@ def launchctl(arguments: list[str]) -> int:
 
 
 def plutil(arguments: list[str]) -> int:
+    import plistlib
+
     assert arguments[:3] == ["-replace", "RunAtLoad", "-bool"], arguments
     path = Path(arguments[4])
     payload = plistlib.loads(path.read_bytes())
@@ -465,6 +487,8 @@ def sudo(arguments: list[str]) -> int:
 
 
 def rsync(arguments: list[str]) -> int:
+    import shutil
+
     paths: list[str] = []
     skip = False
     for argument in arguments:
@@ -492,6 +516,8 @@ def rsync(arguments: list[str]) -> int:
 
 
 def ssh(arguments: list[str]) -> int:
+    import subprocess
+
     command = arguments[-1]
     _log("ssh", command)
     result = subprocess.run(
@@ -531,6 +557,8 @@ def _python_path(venv: Path, runtime: Path) -> str:
 
 
 def _remove(venv: Path, name: str) -> None:
+    import shutil
+
     site = site_packages(venv)
     if name == "inky-bird-frame":
         shutil.rmtree(site / "inky_bird_frame", ignore_errors=True)
@@ -612,6 +640,8 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                 print("synthetic catalog source is missing", file=sys.stderr)
                 return 1
         if "plistlib" in source:
+            import plistlib
+
             paths = arguments[1:7]
             app_dir = Path(arguments[8])
             order = (
@@ -642,6 +672,8 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                     content += f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/inky-bird\n"
                 (unit_dir / f"{prefix}-{name}").write_text(content)
         elif "display_systemd_units" in source:
+            import subprocess
+
             # Render with whichever package the venv's import order selects.
             return subprocess.run(
                 [sys.executable, "-S", "-", *arguments[1:]],
