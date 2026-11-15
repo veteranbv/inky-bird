@@ -7,14 +7,21 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's
 and include the affected revision, impact, reproduction steps, and any proposed
 mitigation. Remove unrelated credentials, locations, and personal data.
 
-The maintainer will acknowledge a report as soon as practical, investigate it,
-and coordinate disclosure after a fix is available. Please do not disclose an
-unresolved vulnerability publicly.
+What to expect:
 
-## Supported code
+- The maintainer acknowledges your report within 7 days.
+- Disclosure is coordinated with you. The goal is a fix and public disclosure
+  within 90 days of your report. Please do not disclose an unresolved
+  vulnerability publicly before then.
+- You are credited in the advisory if you ask to be.
+- Fixes are announced in a
+  [GitHub Security Advisory](https://github.com/veteranbv/inky-bird/security/advisories)
+  and in the release notes.
 
-Security fixes target the current release and `main`. Older releases do not
-have separate support windows yet.
+## Supported versions
+
+Security fixes go to the latest 1.x release and to `main`. Older releases are
+not patched; upgrade to the latest 1.x release to get a fix.
 
 ## Trust boundaries
 
