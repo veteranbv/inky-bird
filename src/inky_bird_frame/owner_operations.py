@@ -539,13 +539,14 @@ def execute_owner_operation(
                 "Inky could not take this selection. Check In the works and try again."
             ) from exc
         return {
-            "message": "These birds will be tried again, after anything already being drawn. "
+            "message": "These birds will be tried again once any plate in progress is finished. "
             "A plate you kept is never replaced. In the works shows how each one goes. "
             + (
-                "Inky will check as soon as it can; plate making must be on "
-                "and the sources checked."
+                "Plate making is off. These birds wait until you turn it on."
+                if not config.controller.generation_enabled
+                else "Inky tries them as soon as it can, once the sources are checked."
                 if kind == "retry-now"
-                else "They are drawn at the next scheduled check, not now."
+                else "They are tried at the next scheduled check."
             ),
             "taxon_ids": [row.taxon_id for row in requests],
             "request_ids": [row.request_id for row in requests],
