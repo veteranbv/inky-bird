@@ -385,9 +385,25 @@ def test_every_journal_route_uses_owner_and_csrf_boundary(tmp_path: Path) -> Non
         assert client.get("/app/../journal.json").status_code == 404
         # Corruption errors never echo a private filename or a stored payload.
         (controller.state_dir / "journal.json").write_text("PRIVATE_PAYLOAD")
+        # Damaged local state is the controller's problem, not the request's.
         failed = client.get("/v1/owner/journal")
-        assert failed.status_code == 400
+        assert failed.status_code == 503
+        assert failed.json()["error"]["code"] == "journal_unavailable"
         assert "PRIVATE_PAYLOAD" not in failed.text and str(tmp_path) not in failed.text
+        refused = client.post(
+            "/v1/owner/journal/collections/save",
+            json={**body, "revision": 1},
+            headers={"Origin": ORIGIN, "X-Inky-CSRF": csrf},
+        )
+        assert refused.status_code == 503
+        (controller.state_dir / "journal.json").unlink()
+        mistake = client.post(
+            "/v1/owner/journal/collections/save",
+            json={**body, "revision": 0, "taxon_ids": ["not a bird"]},
+            headers={"Origin": ORIGIN, "X-Inky-CSRF": csrf},
+        )
+        assert mistake.status_code == 400
+        assert mistake.json()["error"]["code"] == "journal_error"
 
 
 def test_journal_keeps_missing_birds_and_projects_all_source_types_without_raw_errors(

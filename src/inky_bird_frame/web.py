@@ -58,6 +58,7 @@ from .journal import (
     JournalConflictError,
     JournalError,
     JournalService,
+    JournalUnavailableError,
     JournalViewRemovedError,
     remove_collection,
 )
@@ -1762,7 +1763,9 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         # gets safe text; the private log keeps the cause, paths included.
         if isinstance(exc, (CatalogError, OSError)):
             _LOG.warning("An owner request could not read local state", exc_info=exc)
-        if isinstance(exc, LocalStateUnavailableError):
+        if isinstance(exc, JournalUnavailableError):
+            _LOG.warning("An owner request could not read the saved journal", exc_info=exc)
+        if isinstance(exc, (LocalStateUnavailableError, JournalUnavailableError)):
             return _error(503, "journal_unavailable", str(exc))
         if isinstance(exc, (CatalogError, OSError)):
             return _error(

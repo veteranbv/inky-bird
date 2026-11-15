@@ -168,6 +168,10 @@ class JournalViewRemovedError(JournalError):
     """A selected view was authoritatively removed, not temporarily unavailable."""
 
 
+class JournalUnavailableError(JournalError):
+    """The saved journal is damaged, unreadable or too new; not a request mistake."""
+
+
 @dataclass(frozen=True)
 class ChecklistEvidence:
     checklist_hash: str
@@ -399,6 +403,16 @@ def _newer_schema(value: object, supported: int) -> bool:
 
 
 def read_journal(state_dir: Path) -> JournalState:
+    try:
+        return _read_journal(state_dir)
+    except JournalUnavailableError:
+        raise
+    except JournalError as exc:
+        # Every refusal here is about the saved file, whatever helper raised it.
+        raise JournalUnavailableError(str(exc)) from exc
+
+
+def _read_journal(state_dir: Path) -> JournalState:
     path = state_dir / "journal.json"
     try:
         info = path.lstat()
