@@ -159,6 +159,10 @@ class FeatureUnavailableError(AccessError):
     """The request is understood, but this installation has the feature turned off."""
 
 
+class SecureAccessRequiredError(AccessError):
+    """The request must arrive over HTTPS (or the genuine loopback address)."""
+
+
 def _route_path(scope: Scope) -> str:
     """The path the router matches: the request path without any root path."""
     # Starlette's own helper, so the boundary and the router agree by construction.
@@ -1017,7 +1021,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             and request.client is not None
             and _loopback(request.client.host)
         ):
-            raise AccessDeniedError(
+            # Every released screen page treats this code like sign_in_required.
+            raise SecureAccessRequiredError(
                 "Paired screens need HTTPS or the controller's genuine loopback address. "
                 "Local owner Frame remains available without pairing."
             )
@@ -1026,7 +1031,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         require_screen_transport(request)
         await _json_body(request, set())
         if await run_in_threadpool(store.setup_status) is not None:
-            raise AccessDeniedError("Set up the Inky owner first, then pair this screen")
+            raise FeatureUnavailableError("Set up the Inky owner first, then pair this screen")
         secret, result = await run_in_threadpool(
             presentation.request_pair, request.cookies.get(screen_cookie(request), "")
         )
@@ -1160,8 +1165,12 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         destination: Literal["wall", "dashboard"] = (
             "wall" if request.url.path.startswith("/wall/") else "dashboard"
         )
-        with _readable_screen_state():
-            entries = await run_in_threadpool(presentation.selected, destination)
+        try:
+            with _readable_screen_state():
+                entries = await run_in_threadpool(presentation.selected, destination)
+        except AccessDeniedError as exc:
+            # Raised only while the owner has dashboard art turned off.
+            raise FeatureUnavailableError(str(exc)) from exc
         relative = request.path_params.get("asset")
         if relative is not None:
             entry = next(
@@ -1711,6 +1720,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     async def access_error(request: Request, exc: Exception) -> Response:
         if isinstance(exc, FeatureUnavailableError):
             return _error(403, "feature_unavailable", str(exc))
+        if isinstance(exc, SecureAccessRequiredError):
+            return _error(403, "secure_access_required", str(exc))
         if isinstance(exc, AccessRateLimitError):
             return _error(429, "sign_in_rate_limited", str(exc))
         if isinstance(exc, AccessConfirmationRequiredError):
