@@ -5,7 +5,7 @@ import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -965,3 +965,67 @@ def test_failed_unauthenticated_requests_do_not_rewrite_access_state(tmp_path: P
                 store.confirm_password("forged-session-secret", PASSPHRASE, now=NOW)
         store.authenticate(local.secret, now=NOW)
     write.assert_not_called()
+
+
+def test_anonymous_sign_in_starts_never_write_access_state(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    before = store.path.read_bytes()
+    with patch("inky_bird_frame.access.write_json_atomic") as write:
+        # More starts than there are slots, so the oldest are replaced too.
+        started = [
+            store.begin_oidc(now=NOW + timedelta(seconds=index))
+            for index in range(MAX_OIDC_TRANSACTIONS + 3)
+        ]
+        later = NOW + timedelta(seconds=MAX_OIDC_TRANSACTIONS + 3)
+        tx, browser = started[-1]
+        assert store.consume_oidc(tx.state, browser, now=later) == tx
+    write.assert_not_called()
+    assert store.path.read_bytes() == before
+
+
+def test_a_restart_mid_sign_in_asks_to_start_again(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    tx, browser = store.begin_oidc(now=NOW)
+    restarted = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    with pytest.raises(AccessDeniedError, match=r"^This sign-in request expired .*again\.$"):
+        restarted.consume_oidc(tx.state, browser, now=NOW)
+    # Starting again on the restarted service works.
+    tx, browser = restarted.begin_oidc(now=NOW)
+    assert restarted.consume_oidc(tx.state, browser, now=NOW) == tx
+
+
+def test_signed_in_sign_in_starts_still_survive_a_restart(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    link, browser = store.begin_oidc(link_secret=local.secret, now=NOW)
+    restarted = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    assert restarted.consume_oidc(link.state, browser, now=NOW) == link
+
+
+def test_state_with_previously_saved_anonymous_starts_still_loads(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE, now=NOW)
+    link, link_browser = store.begin_oidc(link_secret=local.secret, now=NOW)
+    old_anonymous, old_browser = store.begin_oidc(now=NOW)
+    # Earlier releases saved anonymous starts in access.json too.
+    payload = json.loads(store.path.read_text())
+    payload["oidc_transactions"].append(asdict(old_anonymous))
+    store.path.write_text(json.dumps(payload))
+    upgraded = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    upgraded.authenticate(local.secret, now=NOW)
+    with pytest.raises(AccessDeniedError, match="Start sign-in again"):
+        upgraded.consume_oidc(old_anonymous.state, old_browser, now=NOW)
+    assert upgraded.consume_oidc(link.state, link_browser, now=NOW) == link
+    upgraded.begin_oidc(link_secret=local.secret, now=NOW)
+    assert old_anonymous.state not in upgraded.path.read_text()
+
+
+def test_owner_changes_end_anonymous_sign_in_starts_held_in_memory(tmp_path: Path) -> None:
+    store = AccessStore(tmp_path, oidc_provider_id="synthetic-provider")
+    local = _owner_session(store, "birder", PASSPHRASE)
+    tx, browser = store.begin_oidc()
+    store.update_account(local.secret, "birder")
+    with pytest.raises(AccessDeniedError, match="Start sign-in again"):
+        store.consume_oidc(tx.state, browser)

@@ -146,6 +146,10 @@ class AccessState:
     oidc_verified_provider_id: str | None = None
 
 
+def _anonymous(transaction: OIDCTransaction) -> bool:
+    return transaction.owner_session_hash is None and transaction.confirmation_session_hash is None
+
+
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -430,6 +434,10 @@ class AccessStore:
         self.path = self.directory / "access.json"
         self.oidc_provider_id = oidc_provider_id
         self.password_login_enabled = password_login_enabled
+        # Anyone who can reach the sign-in page can start one, so these stay in
+        # memory: they never cause a disk write, and a restart only means
+        # starting sign-in again. Signed-in links and confirmations are saved.
+        self._anonymous_transactions: list[OIDCTransaction] = []
 
     @contextmanager
     def _locked(self) -> Iterator[AccessState]:
@@ -453,7 +461,15 @@ class AccessStore:
                     raise AccessError("Owner access lock must use mode 0600")
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 try:
-                    yield self._read()
+                    state = self._read()
+                    # Earlier releases also saved anonymous starts; drop those.
+                    state.oidc_transactions = [
+                        t for t in state.oidc_transactions if not _anonymous(t)
+                    ] + self._anonymous_transactions
+                    yield state
+                    self._anonymous_transactions = [
+                        t for t in state.oidc_transactions if _anonymous(t)
+                    ]
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError as exc:
@@ -479,7 +495,10 @@ class AccessStore:
             raise AccessError("Owner access state is invalid; restore its private backup") from exc
 
     def _save(self, state: AccessState) -> None:
-        write_json_atomic(self.path, {"schema_version": 2, **asdict(state)}, mode=0o600)
+        saved = replace(
+            state, oidc_transactions=[t for t in state.oidc_transactions if not _anonymous(t)]
+        )
+        write_json_atomic(self.path, {"schema_version": 2, **asdict(saved)}, mode=0o600)
 
     def owner_exists(self) -> bool:
         with self._locked() as state:
@@ -594,7 +613,11 @@ class AccessStore:
             return secret_path
 
     def _prune(self, state: AccessState, now: float) -> None:
-        counts = (len(state.sessions), len(state.login_failures), len(state.oidc_transactions))
+        def counts() -> tuple[int, int, int]:
+            saved = sum(not _anonymous(t) for t in state.oidc_transactions)
+            return len(state.sessions), len(state.login_failures), saved
+
+        before = counts()
         # Only forward expiry deletes a session; see _usable for a clock behind.
         state.sessions = [
             s
@@ -615,7 +638,7 @@ class AccessStore:
             if _recent(now - t.created_at, OIDC_TRANSACTION_SECONDS)
             and t.provider_id == self.oidc_provider_id
         ]
-        if counts != (len(state.sessions), len(state.login_failures), len(state.oidc_transactions)):
+        if before != counts():
             # Expiry stays revoked if a later permission check fails or the clock moves back.
             self._save(state)
 
@@ -909,7 +932,8 @@ class AccessStore:
                 confirmation_hash,
             )
             state.oidc_transactions.append(transaction)
-            self._save(state)
+            if not _anonymous(transaction):
+                self._save(state)
             return transaction, browser_secret
 
     def consume_oidc(
@@ -938,7 +962,8 @@ class AccessStore:
                     "This sign-in request expired or was already used. Start sign-in again."
                 )
             state.oidc_transactions.remove(tx)
-            self._save(state)
+            if not _anonymous(tx):
+                self._save(state)
             return tx
 
     def complete_oidc(
