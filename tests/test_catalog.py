@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import unittest
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time_ns
+from typing import BinaryIO
 from unittest.mock import patch
 
 import pytest
 from png_fixtures import write_plate_pair, write_png, write_truncated_png
 
+from inky_bird_frame import catalog as catalog_module
 from inky_bird_frame.birds import BirdSpecies
 from inky_bird_frame.catalog import (
     CandidateApprovalError,
@@ -231,6 +237,23 @@ class CatalogTests(unittest.TestCase):
             with self.assertRaises(CatalogError):
                 approve_candidate(state, catalog, species.taxon_id)
 
+    def test_finder_metadata_inside_a_candidate_is_left_out_of_the_catalog(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            candidate = make_candidate(state, species, review)
+            (candidate / ".DS_Store").write_bytes(b"\0\0\0\1Bud1")
+
+            entry = approve_candidate(state, catalog, species.taxon_id)
+
+            self.assertEqual(entry.taxon_id, species.taxon_id)
+            self.assertFalse(candidate.exists())
+            self.assertFalse((catalog / "species/7513-carolina-wren/.DS_Store").exists())
+            self.assertTrue(has_valid_approved_candidate(catalog, species.taxon_id))
+
     def test_valid_approved_candidate_requires_complete_checked_assets(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
         review = QualityReview(True, 4, 4, 4, 4, True, ())
@@ -346,6 +369,152 @@ class CatalogTests(unittest.TestCase):
         if isinstance(index, dict):
             self.assertNotIn(kept.taxon_id, [item["taxon_id"] for item in index["species"]])
 
+    def test_catalog_reads_reject_two_entries_for_one_taxon(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        for copy_name in ("7513-carolina-wren-old", "1-renamed-bird"):
+            with self.subTest(copy_name=copy_name), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = root / "state"
+                catalog = root / "catalog"
+                make_candidate(state, species, review)
+                approve_candidate(state, catalog, species.taxon_id)
+                index_before = (catalog / "index.json").read_bytes()
+                shutil.copytree(
+                    catalog / "species/7513-carolina-wren", catalog / "species" / copy_name
+                )
+
+                with self.assertRaisesRegex(CatalogError, "more than one entry for taxon 7513"):
+                    read_catalog_entries(catalog)
+                with self.assertRaises(CatalogError):
+                    rebuild_catalog_index(catalog)
+                index_after = (catalog / "index.json").read_bytes()
+
+                self.assertEqual(index_after, index_before)
+
+    def test_index_rebuild_leaves_an_identical_index_file_in_place(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            index = catalog / "index.json"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            before = index.lstat()
+
+            rebuild_catalog_index(catalog)
+            unchanged = index.lstat()
+            index.write_text(index.read_text().replace("Carolina Wren", "Stale Name"))
+            rebuild_catalog_index(catalog)
+            repaired = index.read_bytes()
+            index.unlink()
+            index.symlink_to(root / "elsewhere.json")
+            (root / "elsewhere.json").write_bytes(repaired)
+            rebuild_catalog_index(catalog)
+
+            self.assertEqual(
+                (unchanged.st_ino, unchanged.st_mtime_ns), (before.st_ino, before.st_mtime_ns)
+            )
+            self.assertIn(b"Carolina Wren", repaired)
+            self.assertNotIn(b"Stale Name", repaired)
+            self.assertFalse(index.is_symlink())
+            self.assertEqual(index.read_bytes(), repaired)
+
+    def test_approval_refuses_a_taxon_another_directory_already_holds(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            (catalog / "species/7513-carolina-wren").rename(catalog / "species/1-renamed-bird")
+            rebuild_catalog_index(catalog)
+            candidate = make_candidate(state, species, review)
+
+            with self.assertRaisesRegex(CandidateApprovalError, "already has a catalog entry"):
+                approve_candidate(state, catalog, species.taxon_id)
+            entries = read_catalog_entries(catalog)
+            pending_kept = (candidate / "manifest.json").is_file()
+
+        self.assertEqual([entry.slug for entry in entries], ["carolina-wren"])
+        self.assertTrue(pending_kept)
+
+    def test_unchanged_assets_are_hashed_once_and_changed_ones_again(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            catalog = root / "catalog"
+            make_candidate(state, species, review)
+            approve_candidate(state, catalog, species.taxon_id)
+            portrait = catalog / "species/7513-carolina-wren/portrait.png"
+            hashed: list[object] = []
+            original = catalog_module._sha256_handle
+
+            def counting(handle: BinaryIO) -> str:
+                hashed.append(handle)
+                return original(handle)
+
+            with patch("inky_bird_frame.catalog._sha256_handle", side_effect=counting):
+                read_catalog_entries(catalog)
+                read_catalog_entries(catalog)
+                fresh = len(hashed)
+                hashed.clear()
+                # Distinct explicit times keep this independent of timestamp granularity.
+                os.utime(portrait, ns=(10**18, 10**18))
+                with patch("inky_bird_frame.catalog.time_ns", return_value=time_ns() + 10**10):
+                    read_catalog_entries(catalog)
+                    first = len(hashed)
+                    read_catalog_entries(catalog)
+                    repeated = len(hashed) - first
+                    body = bytearray(portrait.read_bytes())
+                    body[-20] ^= 0xFF
+                    portrait.write_bytes(bytes(body))
+                    os.utime(portrait, ns=(10**18 + 1, 10**18 + 1))
+                    with self.assertRaisesRegex(CatalogError, "checksum mismatch"):
+                        read_catalog_entries(catalog)
+
+        self.assertEqual(fresh, 4)
+        self.assertEqual(first, 2)
+        self.assertEqual(repeated, 0)
+
+    def test_approval_refuses_text_with_private_terms_and_keeps_the_candidate(self) -> None:
+        species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
+        review = QualityReview(True, 4, 4, 4, 4, True, ())
+        private = (re.compile("exampleville"),)
+        for filename in ("manifest.json", "profile.json", "quality-review.json"):
+            with self.subTest(filename=filename), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = root / "state"
+                catalog = root / "catalog"
+                candidate = make_candidate(state, species, review)
+                manifest = read_json(candidate / "manifest.json")
+                assert isinstance(manifest, dict)
+                if filename == "manifest.json":
+                    manifest["profile"]["habitat"] = "Gardens of Exampleville"
+                    write_json_atomic(candidate / "manifest.json", manifest)
+                else:
+                    payload = manifest[
+                        "profile" if filename == "profile.json" else "quality_review"
+                    ]
+                    payload = {**payload, "note": "Seen near EXAMPLEVILLE station"}
+                    write_json_atomic(candidate / filename, payload)
+
+                with self.assertRaisesRegex(CandidateApprovalError, "location or a local path"):
+                    approve_candidate(state, catalog, species.taxon_id, private_patterns=private)
+                pending_kept = (candidate / "manifest.json").is_file()
+                catalog_entry = (catalog / "species/7513-carolina-wren").exists()
+
+                self.assertTrue(pending_kept)
+                self.assertFalse(catalog_entry)
+                approve_candidate(state, catalog, species.taxon_id)
+                self.assertTrue(has_valid_approved_candidate(catalog, species.taxon_id))
+
     def test_truncated_pending_image_is_refused_before_anything_is_staged(self) -> None:
         species = BirdSpecies(7513, "Carolina Wren", "Thryothorus ludovicianus", 5, "test")
         review = QualityReview(True, 4, 4, 4, 4, True, ())
@@ -421,8 +590,13 @@ class CatalogTests(unittest.TestCase):
             candidate = make_candidate(state, species, review)
             original_copytree = shutil.copytree
 
-            def short_copy(source: Path, destination: Path) -> object:
-                result = original_copytree(source, destination)
+            def short_copy(
+                source: Path,
+                destination: Path,
+                *,
+                ignore: Callable[[str, list[str]], Iterable[str]],
+            ) -> object:
+                result = original_copytree(source, destination, ignore=ignore)
                 with (Path(destination) / "portrait.png").open("r+b") as handle:
                     handle.truncate(10)
                 return result

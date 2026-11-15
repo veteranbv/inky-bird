@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 from pathlib import Path
+from time import monotonic
 from unittest.mock import patch
 
 import pytest
@@ -30,7 +32,7 @@ from inky_bird_frame.controller import (
     retry_approved_candidate,
     run_controller_cycle,
 )
-from inky_bird_frame.errors import CatalogError
+from inky_bird_frame.errors import BusyError, CatalogError
 from inky_bird_frame.geo import DiscoveryLocation
 from inky_bird_frame.models import QualityReview, SpeciesProfileData
 from inky_bird_frame.prompts import PROMPT_VERSION
@@ -509,3 +511,69 @@ def test_retry_archives_an_invalid_approval_whose_manifest_names_another_bird(
     assert [(item.taxon_id, item.common_name) for item in queued] == [
         (WREN.taxon_id, WREN.common_name)
     ]
+
+
+def _hold_catalog_lock(
+    state_dir: Path, *, shared: bool = False
+) -> tuple[threading.Event, threading.Thread]:
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with catalog_module.catalog_state_lock(state_dir, shared=shared):
+            held.set()
+            release.wait(10)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    assert held.wait(5)
+    return release, worker
+
+
+def test_timed_catalog_lock_gives_up_while_a_writer_holds_it(tmp_path: Path) -> None:
+    release, worker = _hold_catalog_lock(tmp_path)
+    try:
+        started = monotonic()
+        with (
+            pytest.raises(BusyError, match="busy"),
+            catalog_module.catalog_state_lock(tmp_path, shared=True, timeout=0.2),
+        ):
+            pass
+        waited = monotonic() - started
+    finally:
+        release.set()
+        worker.join()
+
+    assert 0.2 <= waited < 2
+    with catalog_module.catalog_state_lock(tmp_path, timeout=0.2):
+        pass
+
+
+def test_a_busy_catalog_is_a_catalog_error_for_callers_that_handle_those(tmp_path: Path) -> None:
+    release, worker = _hold_catalog_lock(tmp_path)
+    try:
+        with (
+            pytest.raises(CatalogError, match="busy") as raised,
+            catalog_module.catalog_state_lock(tmp_path, timeout=0.05),
+        ):
+            pass
+    finally:
+        release.set()
+        worker.join()
+
+    assert isinstance(raised.value, BusyError)
+
+
+def test_shared_catalog_locks_do_not_wait_for_each_other(tmp_path: Path) -> None:
+    release, worker = _hold_catalog_lock(tmp_path, shared=True)
+    try:
+        with catalog_module.catalog_state_lock(tmp_path, shared=True, timeout=0.2):
+            pass
+        with (
+            pytest.raises(BusyError),
+            catalog_module.catalog_state_lock(tmp_path, timeout=0.2),
+        ):
+            pass
+    finally:
+        release.set()
+        worker.join()
