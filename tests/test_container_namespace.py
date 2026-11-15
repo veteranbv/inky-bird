@@ -522,3 +522,38 @@ def test_release_promotes_instead_of_rebuilding_and_keeps_assets_immutable() -> 
     bundle = workflow.split("\n  release-bundle:\n", 1)[1]
     assert "- promote-release" in bundle
     assert "--clobber" not in workflow
+
+
+def _from_lines() -> list[list[str]]:
+    lines = (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+    return [line.split() for line in lines if line.startswith("FROM ")]
+
+
+def test_base_images_are_literal_digest_pins_an_updater_can_read() -> None:
+    stages: set[str] = set()
+    external: dict[str, str] = {}
+    for words in _from_lines():
+        assert len(words) == 4 and words[2] == "AS", words
+        image, stage = words[1], words[3]
+        assert "$" not in image
+        if image not in stages:
+            match = re.fullmatch(r"([a-z0-9./-]+):([A-Za-z0-9._-]+)@sha256:[0-9a-f]{64}", image)
+            assert match is not None, image
+            external[match.group(1)] = match.group(2)
+        stages.add(stage)
+    assert set(external) == {"python", "ghcr.io/astral-sh/uv"}
+    assert external["python"].startswith("3.11.") and external["python"].endswith("-slim-bookworm")
+    assert "ARG PYTHON_IMAGE" not in (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert {"build", "tool-downloads", "runtime"} <= stages
+
+
+def test_scheduler_stop_grace_covers_a_clean_generation_stop() -> None:
+    from inky_bird_frame.codex_runner import TERMINATE_GRACE_SECONDS
+
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    scheduler = compose.split("\n  scheduler:\n", 1)[1].split("\nvolumes:", 1)[0]
+    match = re.search(r"^    stop_grace_period: (\d+)s$", scheduler, re.MULTILINE)
+    assert match is not None
+    # The agent gets TERM, then its group gets TERM and KILL, each with a grace
+    # wait; the job then records its outcome before the scheduler exits.
+    assert int(match.group(1)) >= 3 * TERMINATE_GRACE_SECONDS + 30

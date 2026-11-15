@@ -13,6 +13,7 @@ export class Element {
     this.disabled = false;
     this.focusVisible = false;
     this.text = '';
+    this.value = '';
     this.classList = {
       contains: (name) => this.classes.has(name),
       remove: (...names) => names.forEach((name) => this.classes.delete(name)),
@@ -30,6 +31,13 @@ export class Element {
   }
   set className(value) {
     this.classes = new Set(value.split(' ').filter(Boolean));
+  }
+  // Recorded, never parsed: tests check that owner text is not set as markup.
+  get innerHTML() {
+    return this.html;
+  }
+  set innerHTML(value) {
+    this.html = String(value);
   }
   get textContent() {
     return this.children.length ? this.children.map((node) => node.textContent).join('') : this.text;
@@ -50,6 +58,28 @@ export class Element {
     this.children = [];
     this.text = '';
     this.append(...nodes);
+  }
+  prepend(...nodes) {
+    const existing = this.children;
+    this.children = [];
+    this.append(...nodes);
+    this.children.push(...existing);
+  }
+  after(...nodes) {
+    const parent = this.parent;
+    const index = parent.children.indexOf(this) + 1;
+    for (const node of nodes) node.remove();
+    parent.children.splice(index, 0, ...nodes);
+    for (const node of nodes) node.parent = parent;
+  }
+  replaceWith(node) {
+    this.after(node);
+    this.remove();
+  }
+  get isConnected() {
+    let item = this;
+    while (item.parent) item = item.parent;
+    return item.tagName === '#DOCUMENT';
   }
   remove() {
     if (!this.parent) return;
@@ -136,6 +166,32 @@ export class Element {
   }
 }
 
+// An <img> that records the order in which its loading properties are set.
+export class ImageElement extends Element {
+  constructor() {
+    super('img');
+    this.assigned = [];
+    this.values = {};
+  }
+  decode() {
+    return Promise.resolve();
+  }
+  removeAttribute(name) {
+    super.removeAttribute(name);
+    if (name === 'src') delete this.values.src;
+  }
+}
+for (const name of ['src', 'loading', 'decoding', 'width', 'height'])
+  Object.defineProperty(ImageElement.prototype, name, {
+    get() {
+      return this.values[name];
+    },
+    set(value) {
+      this.assigned.push(name);
+      this.values[name] = value;
+    },
+  });
+
 export function fakeDocument() {
   const doc = new Element('#document');
   doc.hidden = false;
@@ -144,7 +200,7 @@ export function fakeDocument() {
   doc.append(doc.body);
   doc.activeElement = doc.body;
   doc.documentElement = {};
-  doc.createElement = (tag) => new Element(tag);
+  doc.createElement = (tag) => (tag === 'img' ? new ImageElement() : new Element(tag));
   doc.createElementNS = (_namespace, tag) => new Element(tag);
   return doc;
 }

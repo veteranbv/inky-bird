@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -117,3 +118,68 @@ def test_private_json_rejects_unsafe_oversized_and_symlinked_state(tmp_path: Pat
     link.symlink_to(path)
     with pytest.raises(DataSourceError):
         read_private_json(link, maximum=100)
+
+
+def _nameless(taxon_id: int) -> dict[str, object]:
+    return {
+        "count": 1,
+        "taxon": {"id": taxon_id, "rank": "species", "name": "Exemplum ignotum"},
+    }
+
+
+@pytest.mark.parametrize("all_nameless", [False, True])
+def test_species_without_an_english_name_is_skipped_and_counted(
+    tmp_path: Path, all_nameless: bool
+) -> None:
+    payload = result()
+    rows = cast(list[object], payload["results"])
+    if all_nameless:
+        rows.clear()
+    rows.extend([_nameless(7), _nameless(8)])
+    payload["total_results"] = len(rows)
+    history = CommunityHistory(tmp_path)
+    with patch("inky_bird_frame.community.get_json", return_value=payload):
+        outcome = history.preview(choices())
+    assert outcome["skipped_count"] == 2
+    preview = history.status()
+    members = cast(dict[str, list[dict[str, object]]], preview["collection"])["members"]
+    assert [member["taxon_id"] for member in members] == ([] if all_nameless else [1])
+    assert "2 species" in str(preview["notice"])
+    history.save(str(preview["preview_hash"]))
+
+
+@pytest.mark.parametrize("count", ["4", None, 4.0])
+def test_named_species_with_a_malformed_count_is_refused_not_skipped(
+    tmp_path: Path, count: object
+) -> None:
+    payload = result()
+    rows = cast(list[dict[str, object]], payload["results"])
+    rows[0]["count"] = count
+    rows.append(_nameless(7))
+    payload["total_results"] = len(rows)
+    history = CommunityHistory(tmp_path)
+    with (
+        patch("inky_bird_frame.community.get_json", return_value=payload),
+        pytest.raises(JournalError, match="complete usable result"),
+    ):
+        history.preview(choices())
+    assert history.status() == {"status": "empty"}
+
+
+@pytest.mark.parametrize("count", ["4", None, 4.0, True])
+def test_nameless_species_with_a_malformed_count_is_refused_not_skipped(
+    tmp_path: Path, count: object
+) -> None:
+    payload = result()
+    rows = cast(list[dict[str, object]], payload["results"])
+    malformed = _nameless(7)
+    malformed["count"] = count
+    rows.append(malformed)
+    payload["total_results"] = len(rows)
+    history = CommunityHistory(tmp_path)
+    with (
+        patch("inky_bird_frame.community.get_json", return_value=payload),
+        pytest.raises(JournalError, match="complete usable result"),
+    ):
+        history.preview(choices())
+    assert history.status() == {"status": "empty"}

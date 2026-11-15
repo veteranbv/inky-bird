@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from inky_bird_frame.birds import (
+    TAXONOMY_MATCH_STRATEGY,
     BirdBuddySpecies,
     BirdNetGoSpecies,
     BirdSpecies,
@@ -487,7 +488,7 @@ class EbirdTests(unittest.TestCase):
         other = BirdNetGoSpecies("Pacific Wren", other_name, 3, observed_at)
         weather_wren = BirdWeatherSpecies(42, "Winter Wren", old_name, 4, observed_at)
         old_miss = {
-            "match_strategy": "scientific-name-or-exact-synonym-v1",
+            "match_strategy": TAXONOMY_MATCH_STRATEGY,
             "scientific_name": old_name,
             "retry_at": "2026-11-18T00:00:00+00:00",
         }

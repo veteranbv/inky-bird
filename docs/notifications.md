@@ -89,8 +89,15 @@ The controller checks display staleness each time it runs `notifications
 dispatch`, so display monitoring runs only when `[notifications]` has
 `enabled = true`. With notifications off, nothing checks for a stale display.
 A stale display counts as a degradation, so the threshold and cooldown below
-also apply to it. A selected wall view that is empty pauses the panel without a
-completed update, so it is reported as stale too.
+also apply to it.
+
+An empty wall view is a pause, not a failure. When the display uses the wall
+address (`.../wall`), its latest fetch was recorded on that route within the
+stale threshold, and the selected wall view is empty, the display check reports
+`paused: true` and `stale: false` and sends no notice. Moving from stale to
+paused records neither a degradation nor a recovery, so an earlier "Display
+updates are stale" notice stays open until real updates resume. A display that
+reads `/v1/catalog`, or that stops fetching, still raises the stale notice.
 
 Routine successes do not notify. Transient failures notify only after
 `degradation_failure_threshold` consecutive failures or
@@ -119,10 +126,20 @@ roll back discovery, generation, publication, or display state.
 
 The controller stores a durable private outbox under `state_dir`. It records
 each destination separately. If Discord succeeds and Pushover fails, only
-Pushover is retried. After `max_delivery_attempts`, the message moves to a
-visible dead-letter count for inspection. A bounded event ledger prevents
-completed messages from being resent after a restart. A slow provider cannot
-block or overwrite application events.
+Pushover is retried. The first retry waits `delivery_retry_minutes`; each later
+wait doubles, up to 6 hours (or `delivery_retry_minutes` if that is longer).
+After `max_delivery_attempts`, the message moves to a visible dead-letter count
+for inspection. With the defaults (5 minutes, 20 attempts) that happens after
+about 82 hours of failures. A bounded event ledger prevents completed messages
+from being resent after a restart. A slow provider cannot block or overwrite
+application events.
+
+`notifications status` shows `pending`, `dead_letters`, `oldest_pending_at`,
+`next_attempt_at` and a `retry` object with `first_delay_minutes`,
+`max_delay_minutes`, `max_delivery_attempts` and `dead_letter_after_minutes`.
+`status` and the controller doctor (`notification_dead_letters`) also report
+dead letters. After fixing a destination, `notifications retry` puts dead
+letters back in the queue and tries to deliver them.
 
 ## Provider setup
 

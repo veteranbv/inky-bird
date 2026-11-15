@@ -38,6 +38,7 @@ from inky_bird_frame.cli import (
     birdnet_analyzer_import_command,
     build_parser,
     catalog_prepare_command,
+    catalog_publish_command,
     catalog_sync_command,
     config_install_command,
     config_validate_command,
@@ -54,7 +55,13 @@ from inky_bird_frame.cli import (
     species_to_dict,
     status_command,
 )
-from inky_bird_frame.config import AppConfig, DiscoveryProvider
+from inky_bird_frame.config import (
+    AppConfig,
+    DiscoveryProvider,
+    NotificationEvent,
+    NotificationsConfig,
+    load_config,
+)
 from inky_bird_frame.controller import (
     HUMAN_REVIEW_SOURCE,
     REVIEW_FAILURE_FALLBACK,
@@ -63,11 +70,13 @@ from inky_bird_frame.controller import (
 )
 from inky_bird_frame.ebird_archive import EbirdArchiveHistory, EbirdArchiveImportStats
 from inky_bird_frame.errors import (
+    CatalogError,
     CatalogPublishError,
     ConfigurationError,
     DataSourceError,
     GenerationError,
     SpeciesStateError,
+    UsageError,
 )
 from inky_bird_frame.models import ProfileConflict
 from inky_bird_frame.retry import RetryStore
@@ -79,7 +88,7 @@ def test_cli_scopes_native_trust_without_retaining_it(previous: str | None, fail
     def command(args: Namespace) -> int:
         assert os.environ["SSL_CERT_FILE"] == "/operator/roots.pem"
         if failure:
-            raise ValueError("synthetic failure")
+            raise GenerationError("synthetic failure")
         return 0
 
     with (
@@ -359,7 +368,7 @@ class CliTests(unittest.TestCase):
         stdin = SimpleNamespace(isatty=lambda: False)
         with (
             patch("inky_bird_frame.cli.sys.stdin", stdin),
-            self.assertRaisesRegex(DataSourceError, "confirmation is required"),
+            self.assertRaisesRegex(UsageError, "confirmation is required"),
         ):
             _confirm_birdbuddy_authorization(False)
 
@@ -402,7 +411,7 @@ class CliTests(unittest.TestCase):
     def test_birdbuddy_logout_requires_yes_before_loading_config(self) -> None:
         with (
             patch("inky_bird_frame.cli._config") as load,
-            self.assertRaisesRegex(DataSourceError, "requires --yes"),
+            self.assertRaisesRegex(UsageError, "requires --yes"),
         ):
             birdbuddy_logout_command(Namespace(yes=False, config=Path("instance.toml")))
 
@@ -993,7 +1002,8 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             state = Path(temporary)
             config = SimpleNamespace(
-                controller=SimpleNamespace(catalog_dir=state / "catalog", state_dir=state)
+                controller=SimpleNamespace(catalog_dir=state / "catalog", state_dir=state),
+                notifications=NotificationsConfig(),
             )
             output = io.StringIO()
             with (
@@ -1037,6 +1047,7 @@ class CliTests(unittest.TestCase):
                     catalog_dir=catalog, state_dir=state, configuration_ownership="managed"
                 ),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
                 discovery_revision=None,
             )
             output = io.StringIO()
@@ -1065,6 +1076,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=catalog, state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
 
             with (
@@ -1084,6 +1096,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             lock_held = False
             retained_retries = [SimpleNamespace(as_dict=lambda: {"taxon_id": 42})]
@@ -1163,6 +1176,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             output = io.StringIO()
 
@@ -1217,6 +1231,7 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 controller=SimpleNamespace(catalog_dir=root / "catalog", state_dir=state),
                 schedule=SimpleNamespace(refresh_minutes=15),
+                notifications=NotificationsConfig(),
             )
             generation_payload = {
                 "terminal_blocked": [
@@ -1542,7 +1557,7 @@ rotation_mode = "shuffle_bag"
         payload = json.loads(output.getvalue())
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["schema_version"], 1)
-        self.assertEqual(payload["error"]["type"], "ConfigurationError")
+        self.assertEqual(payload["error"]["type"], "configuration")
 
     def test_generate_notifies_for_approved_pending_candidate(self) -> None:
         result = {
@@ -3658,6 +3673,313 @@ rotation_mode = "shuffle_bag"
 
         recovered_keys = [call.kwargs["key"] for call in recovery.call_args_list]
         self.assertIn("birdbuddy-taxonomy", recovered_keys)
+
+
+def _generation_config() -> SimpleNamespace:
+    return SimpleNamespace(controller=SimpleNamespace(generation_enabled=True))
+
+
+def _busy_error(exc: Exception) -> Exception:
+    exc.__cause__ = BlockingIOError(35, "Resource temporarily unavailable")
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("failure", "label"),
+    [
+        (GenerationError("PRIVATE_DETAIL"), "generation error"),
+        (DataSourceError("PRIVATE_DETAIL"), "data source error"),
+        (CatalogError("PRIVATE_DETAIL"), "catalog error"),
+        (ConfigurationError("PRIVATE_DETAIL"), "configuration error"),
+        (PermissionError(13, "PRIVATE_DETAIL"), "storage error"),
+        (RuntimeError("PRIVATE_DETAIL"), "internal error"),
+        (KeyError("PRIVATE_DETAIL"), "internal error"),
+    ],
+)
+def test_generate_records_a_degradation_for_every_failure(failure: Exception, label: str) -> None:
+    with (
+        patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+        patch("inky_bird_frame.cli.run_generation_cycle", side_effect=failure),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        pytest.raises(type(failure)),
+    ):
+        generate_command(Namespace())
+
+    assert degrade.call_count == 1
+    kwargs = degrade.call_args.kwargs
+    assert kwargs["key"] == "generation-cycle"
+    assert kwargs["body"] == (
+        f"Generation cycle failed ({label}). Check controller logs for details."
+    )
+    assert "PRIVATE_DETAIL" not in kwargs["body"] + kwargs["title"]
+    assert type(failure).__name__ not in kwargs["body"]
+
+
+def test_generate_busy_failure_is_not_a_degradation() -> None:
+    with (
+        patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+        patch(
+            "inky_bird_frame.cli.run_generation_cycle",
+            side_effect=_busy_error(GenerationError("Another controller cycle is already running")),
+        ),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        pytest.raises(GenerationError),
+    ):
+        generate_command(Namespace())
+
+    degrade.assert_not_called()
+
+
+def test_generate_failures_notify_terminal_errors_and_defer_transient_ones() -> None:
+    result = {
+        "published_pending": [],
+        "generated": [{"taxon_id": 7, "common_name": "Example Bird"}],
+        "failures": [
+            {"taxon_id": 1, "common_name": "Stopped Bird", "failure": "quality", "terminal": True},
+            {"taxon_id": 2, "failure": "research", "terminal": True},
+            {"taxon_id": 3, "common_name": "Waiting Bird", "failure": "network"},
+            {"taxon_id": 4, "common_name": "Waiting Bird Two", "terminal": False},
+            "not-a-record",
+        ],
+        "outstanding_retry_count": 2,
+    }
+    with (
+        patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+        patch("inky_bird_frame.cli.run_generation_cycle", return_value=result),
+        patch("inky_bird_frame.cli.safe_notify") as notify,
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        patch("inky_bird_frame.cli.safe_record_recovery") as recover,
+        redirect_stdout(io.StringIO()),
+    ):
+        assert generate_command(Namespace()) == 0
+
+    notices = [
+        (call.args[1], call.kwargs["dedupe_key"], call.kwargs["title"])
+        for call in notify.call_args_list
+    ]
+    assert notices == [
+        (NotificationEvent.GENERATION_APPROVED, "7", "Example Bird plate approved"),
+        (
+            NotificationEvent.TERMINAL_ERROR,
+            "generation:1:quality",
+            "Generation stopped for Stopped Bird",
+        ),
+        (
+            NotificationEvent.TERMINAL_ERROR,
+            "generation:2:research",
+            "Generation stopped for a bird",
+        ),
+    ]
+    assert [call.kwargs["key"] for call in degrade.call_args_list] == ["generation-items"]
+    item = degrade.call_args.kwargs
+    assert item["title"] == "Some bird generations are retrying"
+    assert item["body"] == "2 species failed and were deferred without blocking the queue."
+    assert [call.kwargs["key"] for call in recover.call_args_list] == ["generation-cycle"]
+
+
+def test_generate_reports_both_deferred_and_manual_retry_items() -> None:
+    result = {
+        "failures": [{"taxon_id": 3, "failure": "network"}],
+        "manual_retry_required_count": 2,
+    }
+    with (
+        patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+        patch("inky_bird_frame.cli.run_generation_cycle", return_value=result),
+        patch("inky_bird_frame.cli.safe_notify"),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        patch("inky_bird_frame.cli.safe_record_recovery"),
+        redirect_stdout(io.StringIO()),
+    ):
+        generate_command(Namespace())
+
+    item = degrade.call_args.kwargs
+    assert item["title"] == "Some bird generations need attention"
+    assert item["body"].startswith(
+        "1 species failed and were deferred without blocking the queue; 2 retained species"
+    )
+    assert item["body"].endswith("retry each retained taxon you still want processed.")
+
+
+def test_generate_clears_item_alert_when_nothing_is_outstanding() -> None:
+    with (
+        patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+        patch(
+            "inky_bird_frame.cli.run_generation_cycle",
+            return_value={"failures": [], "outstanding_retry_count": 0},
+        ),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        patch("inky_bird_frame.cli.safe_record_recovery") as recover,
+        redirect_stdout(io.StringIO()),
+    ):
+        generate_command(Namespace())
+
+    degrade.assert_not_called()
+    assert [call.kwargs["key"] for call in recover.call_args_list] == [
+        "generation-items",
+        "generation-cycle",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "label"),
+    [
+        (CatalogPublishError("PRIVATE_DETAIL"), "publication error"),
+        (CatalogError("PRIVATE_DETAIL"), "catalog error"),
+        (OSError(28, "PRIVATE_DETAIL"), "storage error"),
+        (ValueError("PRIVATE_DETAIL"), "internal error"),
+        (RuntimeError("PRIVATE_DETAIL"), "internal error"),
+    ],
+)
+def test_catalog_publish_records_a_degradation_for_every_failure(
+    failure: Exception, label: str
+) -> None:
+    with (
+        patch("inky_bird_frame.cli._config"),
+        patch("inky_bird_frame.cli.run_catalog_publish", side_effect=failure),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        patch("inky_bird_frame.cli.safe_record_recovery") as recover,
+        pytest.raises(type(failure)),
+    ):
+        catalog_publish_command(Namespace(dry_run=False))
+
+    assert degrade.call_count == 1
+    kwargs = degrade.call_args.kwargs
+    assert kwargs["key"] == "catalog-publication"
+    assert kwargs["event"] is NotificationEvent.PUBLICATION_ERROR
+    assert kwargs["body"] == (
+        f"Catalog publication failed ({label}). Check controller logs for details."
+    )
+    recover.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _busy_error(CatalogPublishError("Another catalog publication is running")),
+        CatalogPublishError("PRIVATE_DETAIL"),
+    ],
+)
+def test_catalog_publish_dry_run_and_busy_failures_are_not_degradations(
+    failure: Exception,
+) -> None:
+    dry_run = "PRIVATE_DETAIL" in str(failure)
+    with (
+        patch("inky_bird_frame.cli._config"),
+        patch("inky_bird_frame.cli.run_catalog_publish", side_effect=failure),
+        patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
+        pytest.raises(CatalogPublishError),
+    ):
+        catalog_publish_command(Namespace(dry_run=dry_run))
+
+    degrade.assert_not_called()
+
+
+def test_catalog_publish_success_records_recovery_except_for_dry_run() -> None:
+    for dry_run, expected in ((False, 1), (True, 0)):
+        output = io.StringIO()
+        with (
+            patch("inky_bird_frame.cli._config"),
+            patch("inky_bird_frame.cli.run_catalog_publish", return_value={"published": 1}),
+            patch("inky_bird_frame.cli.safe_record_recovery") as recover,
+            redirect_stdout(output),
+        ):
+            assert catalog_publish_command(Namespace(dry_run=dry_run)) == 0
+
+        assert recover.call_count == expected
+        if expected:
+            assert recover.call_args.kwargs["key"] == "catalog-publication"
+            assert recover.call_args.kwargs["event"] is NotificationEvent.PUBLICATION_RECOVERED
+        assert json.loads(output.getvalue())["data"] == {"published": 1}
+
+
+def _status_fixture(tmp_path: Path) -> Path:
+    from inky_bird_frame.settings import initialize_config
+
+    path = tmp_path / "config.toml"
+    initialize_config(path)
+    catalog = tmp_path / "catalog"
+    (catalog / "species").mkdir(parents=True)
+    (catalog / "index.json").write_text(
+        json.dumps({"schema_version": 1, "generated_at": None, "species": []})
+    )
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "notifications.json").write_text("{}")
+    return path
+
+
+def test_status_reports_notification_retries_and_dead_letters(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    output = io.StringIO()
+    with (
+        patch(
+            "inky_bird_frame.cli.notification_status",
+            return_value={
+                "enabled": True,
+                "destinations": [{"name": "first", "scheme": "ntfy", "events": []}],
+                "pending": 2,
+                "dead_letters": 1,
+                "oldest_pending_at": "2026-07-10T00:00:00+00:00",
+                "next_attempt_at": "2026-07-10T00:05:00+00:00",
+                "retry": {"dead_letter_after_minutes": 4955},
+            },
+        ) as status,
+        redirect_stdout(output),
+    ):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert status.call_count == 1
+    assert json.loads(output.getvalue())["data"]["notifications"] == {
+        "available": True,
+        "enabled": True,
+        "pending": 2,
+        "dead_letters": 1,
+        "next_attempt_at": "2026-07-10T00:05:00+00:00",
+    }
+
+
+def test_status_without_an_outbox_reports_nothing_waiting(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    (state_dir / "notifications.json").unlink()
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {
+        "available": True,
+        "enabled": False,
+        "pending": 0,
+        "dead_letters": 0,
+        "next_attempt_at": None,
+    }
+    assert not (state_dir / "notifications.lock").exists()
+
+
+def test_status_survives_unreadable_notification_state(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    output = io.StringIO()
+    with (
+        patch(
+            "inky_bird_frame.cli.notification_status",
+            side_effect=CatalogError("Invalid notification state"),
+        ),
+        redirect_stdout(output),
+    ):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {"available": False}
+
+
+def test_status_survives_a_notification_outbox_that_is_not_utf8(tmp_path: Path) -> None:
+    path = _status_fixture(tmp_path)
+    state_dir = load_config(path, load_secrets=False).controller.state_dir
+    (state_dir / "notifications.json").write_bytes(b"\xff\xfe not json")
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert main(["status", "--config", str(path)]) == 0
+
+    assert json.loads(output.getvalue())["data"]["notifications"] == {"available": False}
 
 
 if __name__ == "__main__":

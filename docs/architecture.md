@@ -98,15 +98,19 @@ configuration, and neither that URL nor detection times enter the reusable
 catalog.
 
 BirdNET Analyzer imports use `birdnet-analyzer-detections.json` under
-`state_dir`. The private mode-`0600` file stores a one-way recording-segment
-fingerprint, species names, and an optional operator-supplied date. It never
-stores source paths, offsets, confidence values, or audio. Reimports update a
-segment's classification atomically; date-window discovery excludes undated
-segments rather than inventing observation times.
+`state_dir`. The private mode-`0600` file stores an unsalted SHA-256 of each
+recording segment's file name and times, species names, and an optional
+operator-supplied date. It never stores source paths, offsets, confidence
+values, or audio in readable form. Each species in a segment is its own record.
+Reimports replace the species list of each segment in the upload atomically, so
+a re-analysis can add, change or remove detections; date-window discovery
+excludes undated segments rather than inventing observation times.
 
 eBird Archive imports use `ebird-archive-observations.json` under `state_dir`.
-The complete-snapshot state retains one-way checklist fingerprints, calendar
-dates, and species identity only. Account details, raw checklist and location
+The complete-snapshot state retains an unsalted SHA-256 of each eBird
+submission ID, calendar dates, and species identity only. Submission IDs are
+short numbers, so these hashes can be reversed by trying every ID: treat them as
+private owner data at rest, not as anonymous identifiers. Account details, raw checklist and location
 identifiers, coordinates, counts, comments, effort, and media metadata are
 discarded during import. A mode-`0600` atomic replacement occurs only after the
 entire export validates; a missing previously imported checklist fails closed
@@ -205,6 +209,18 @@ immutable-cacheable only when its `sha256` query matches the verified active
 catalog digest. Catalog JSON and image responses carry
 `X-Content-Type-Options: nosniff`.
 
+The owner application follows its own caching rules. Static `/app` files,
+`/screen` and `/favicon.ico` send `Cache-Control: no-cache` and revalidate by
+ETag (`304` for a matching `If-None-Match`). An owner or paired-screen plate
+image whose `?revision=<portrait_sha256>` matches the current plate gets
+`private, max-age=31536000, immutable`; without it, or with a stale revision,
+it gets `no-store`, like every other owner response. The owner bird image route
+accepts a `thumbnail` kind beside `portrait` and `profile`. Grid cards and
+collection covers use thumbnails: JPEG (WebP where Pillow has no JPEG support)
+up to 480x640 at quality 85, made on demand and cached under
+`state_dir/plate-thumbnails/`. Frame, Home, the bird page and paired screens use
+the full PNG. Display-node `/wall` assets and the public catalog are unchanged.
+
 The featured-plate route is a small HTML representation for dashboards. It
 selects the active entry with the newest valid `latest_detection_at`, then the
 newest `approved_at`, then the lower taxon ID for a deterministic tie. Entries
@@ -233,7 +249,9 @@ field comes from installed package metadata.
 After a display node parses the catalog, it posts the fixed JSON payload
 `{"schema_version": 1}` to `/v1/display-fetch`. It posts the same bounded
 payload to `/v1/display-success` only after a verified panel update. The server
-records those times under `state_dir`, and the notifications cycle uses them to
+records those times, and which route received them (the additive `route` field:
+`catalog` or `wall`), under `state_dir`. The
+notifications cycle uses them to
 raise the display-staleness events described in
 [`notifications.md`](notifications.md#events-and-noise-controls). The POST
 routes reject browser `Origin` headers and do not grant CORS access.

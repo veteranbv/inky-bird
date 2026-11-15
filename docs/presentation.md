@@ -117,9 +117,11 @@ Displays show only the last confirmed physical success.
 
 An empty or removed selected view pauses rotation. The panel keeps its last
 image; Inky does not fall back to other birds or claim a new physical success.
-Because no update completes, a controller with notifications enabled sends a
-`display_stale` notice once the [staleness threshold](notifications.md#events-and-noise-controls)
-passes, and repeats it after each cooldown.
+While the display keeps fetching the wall address, the controller reports it as
+paused, not stale, and sends no `display_stale` notice. A notice still follows
+the [staleness threshold](notifications.md#events-and-noise-controls) if the
+display stops fetching. An earlier stale notice stays open until updates
+resume.
 Choose a populated view to resume at the next scheduled cycle. This also means
 removing a bird from the view cannot erase pixels already on an e-paper panel.
 

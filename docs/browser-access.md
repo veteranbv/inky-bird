@@ -175,6 +175,15 @@ origin checks or a different port. Local HTTP deliberately supports a trusted
 home network and trusted host services; it does not isolate hostile apps.
 See [RFC 6265's cookie security limits](https://www.rfc-editor.org/rfc/rfc6265#section-8.5).
 
+Plate images in the journal (portraits, grid thumbnails and paired-screen
+plates) are kept in that browser's private cache when their address names the
+current plate revision (`Cache-Control: private, max-age=31536000,
+immutable`). They can stay in the browser's cache after sign-out; clear the
+browser's cache to remove them. Every other owner and private response is
+`no-store`. Grid thumbnails are small copies cached on the controller under
+`state_dir/plate-thumbnails/`; that folder is safe to delete and rebuilds
+itself.
+
 ## Recover a forgotten password
 
 Use a private interactive terminal on the computer running Inky:
@@ -608,7 +617,16 @@ Operator recovery remains available.
 The library verifies signature, issuer, audience, nonce and token lifetime.
 The controller bounds responses/timeouts, requires HTTPS endpoints and fetches
 fresh signing keys for each exchange. Pending requests expire in ten minutes,
-work once and are tied to that browser. The redirect cookie permits only the
+work once and are tied to that browser. At most 16 sign-in starts are pending
+at once. When all 16 are in use, a new start replaces the oldest start made
+without a signed-in session, and that replaced start is refused when its
+browser returns. A start from a signed-in session (account linking or identity
+confirmation) replaces such an anonymous start first, so anonymous starts
+cannot lock out the signed-in owner. Only when all 16 are signed-in starts is a
+new anonymous start refused with "Too many sign-in requests; wait ten minutes
+before trying again". With `sso_only`, a flood of anonymous starts from the
+network can still displace your first sign-in from a new browser; try again.
+A client secret that is only whitespace counts as missing. The redirect cookie permits only the
 provider's return journey; normal owner cookies remain SameSite=Strict.
 Provider tokens stay in memory and are not retained as login refresh tokens.
 Proxy logs sit outside Inky's controls. Do not log passwords, request bodies,

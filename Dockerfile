@@ -1,11 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-ARG PYTHON_IMAGE=python:3.11.16-slim-bookworm@sha256:0bee7276f83efd4a1ee05bbbf4281d95ed28e079220a9457f25a93e3f1e3c31b
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff
+FROM ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff AS uv
 
-FROM ${UV_IMAGE} AS uv
+FROM python:3.11.16-slim-bookworm@sha256:0bee7276f83efd4a1ee05bbbf4281d95ed28e079220a9457f25a93e3f1e3c31b AS python-base
 
-FROM ${PYTHON_IMAGE} AS build
+FROM python-base AS build
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
@@ -14,7 +13,7 @@ COPY src ./src
 COPY docs/browser-access.md ./docs/browser-access.md
 RUN uv sync --locked --no-dev --extra controller --no-editable
 
-FROM ${PYTHON_IMAGE} AS tool-downloads
+FROM python-base AS tool-downloads
 ARG TARGETARCH
 ARG CODEX_VERSION=0.151.0
 ARG CODEX_AMD64_SHA256=605b4b183f22c645f5def63a5b7191767407fb66a6feaec4eaf10b5b7e0058f6
@@ -54,7 +53,7 @@ RUN set -eux; \
     chmod 0755 /out/codex /out/gh; \
     chmod 0644 /out/licenses/codex/LICENSE /out/licenses/codex/NOTICE /out/licenses/github-cli/LICENSE
 
-FROM ${PYTHON_IMAGE} AS runtime
+FROM python-base AS runtime
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="Inky Bird Controller" \
