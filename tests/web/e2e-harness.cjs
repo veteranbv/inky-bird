@@ -12,7 +12,12 @@ const root = path.resolve(__dirname, '../..');
 const python = process.env.INKY_QA_PYTHON || path.join(root, '.venv/bin/python');
 const username = 'synthetic-owner';
 const password = require('node:crypto').randomBytes(32).toString('base64url');
-const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'inky-history-browser-'));
+// Everything in the fixture is synthetic: a fresh configuration, a random
+// password and its sessions, the public plates and synthetic history. CI keeps
+// it under INKY_QA_EVIDENCE_DIR so a failed run can upload it.
+const fixture = fs.mkdtempSync(
+  path.join(process.env.INKY_QA_EVIDENCE_DIR || os.tmpdir(), 'inky-history-browser-'),
+);
 const configPath = path.join(fixture, 'config.toml');
 // The server binds its own free port and reports it here, so parallel runs
 // never collide and readiness can only ever reach this run's server.
