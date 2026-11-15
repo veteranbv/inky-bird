@@ -45,9 +45,11 @@ export function outcomeTitle(kind) {
   return outcomes[kind]?.[0] || 'Your request';
 }
 export function outcomeSentence(receipt) {
-  return receipt.status === 'succeeded'
-    ? outcomes[receipt.kind]?.[1] || 'Done.'
-    : statusText(receipt.status);
+  if (receipt.status !== 'succeeded') return statusText(receipt.status);
+  // A history file with nothing new returns no counts.
+  if (receipt.kind === 'import-commit' && !('rows' in (receipt.result || {})))
+    return 'Your history had no changes.';
+  return outcomes[receipt.kind]?.[1] || 'Done.';
 }
 
 const countWords = {
@@ -185,7 +187,13 @@ export async function renderOperation(context) {
       sentence.setAttribute('role', 'status');
       content.replaceChildren(sentence);
       const result = receipt.result || {};
-      if (typeof result.message === 'string') content.append(el('p', result.message));
+      // A finished request this page can name says it in its own sentence; the
+      // controller's words stay for anything else, and for why one did not finish.
+      if (
+        typeof result.message === 'string' &&
+        (receipt.status !== 'succeeded' || !outcomes[receipt.kind])
+      )
+        content.append(el('p', result.message));
       for (const id of Array.isArray(result.taxon_ids) ? result.taxon_ids : [])
         content.append(link(byId.get(id)?.common_name || 'Bird ' + id, 'work', { bird: id }));
       for (const provider of Array.isArray(result.providers) ? result.providers : [])
@@ -291,21 +299,34 @@ export async function renderGuides(context) {
   }
 }
 
+// What In the works lists under "Needs a hand": unfinished new plates, birds
+// waiting for the owner to try again, and stopped ones. A new plate waiting for
+// a look is good news, not one of them.
+function handGroups(work) {
+  const terminal = (work?.terminal_details || []).filter((detail) => detail.state !== 'pending');
+  const unfinished = (work?.in_review?.candidates || []).filter(
+    (candidate) =>
+      !candidate.inspect_available &&
+      !terminal.some((detail) => detail.taxon_id === candidate.taxon_id),
+  );
+  const waiting = (work?.retry_details || []).filter((detail) =>
+    (work.needs_attention || []).includes(detail.taxon_id),
+  );
+  return { terminal, unfinished, waiting };
+}
+export function needsHand(work) {
+  const { terminal, unfinished, waiting } = handGroups(work);
+  return new Set([...unfinished, ...waiting, ...terminal].map((bird) => bird.taxon_id));
+}
+
 // What needs the owner, counted for Manage. Good news first.
 export function manageNotes(management) {
   if (!management?.available) return [];
   const candidates = management.work?.in_review?.candidates || [];
-  const waiting = new Set(
+  const ready = new Set(
     candidates.filter((candidate) => candidate.inspect_available).map((bird) => bird.taxon_id),
-  );
-  const ready = waiting.size;
-  // A new plate waiting for a look is good news, not a bird that needs help.
-  const hand = new Set(
-    [
-      ...(management.work?.needs_attention || []),
-      ...candidates.filter((candidate) => !candidate.inspect_available).map((bird) => bird.taxon_id),
-    ].filter((id) => !waiting.has(id)),
   ).size;
+  const hand = needsHand(management.work).size;
   const failing = (management.sources || []).filter(
     (source) => source.enabled && source.status === 'error',
   ).length;
@@ -519,7 +540,8 @@ export async function renderStatus(context) {
     timer = setTimeout(update, 5000);
   }
   if (area === 'sources') {
-    main.append(note('Birds noted in the ' + windowName(management.window).toLowerCase() + '. Inky checks each source on a schedule; it does not listen all the time.'));
+    const span = management.window === 'all-time' ? 'at any time' : 'in the ' + windowName(management.window).toLowerCase();
+    main.append(note('Birds noted ' + span + '. Inky checks each source on a schedule; it does not listen all the time.'));
     main.append(operationAction('Check sources now', 'refresh',
       'Inky checks each source that is on. One that fails does not stop the others.'));
     const schedule = el('section', '', 'journal-card');
@@ -642,7 +664,7 @@ export async function renderStatus(context) {
       if (current.generation_enabled) runtime.append(note(unavailable ? 'Next check: not known right now.' : nextCheck(activity['job-generate'])));
       const waiting = work.queue || [];
       queue.replaceChildren(el('h2', 'Next up'),
-        note(waiting.length ? 'Next up, as of the last check. The order can change.' : 'Nothing is waiting.'));
+        note(waiting.length ? 'As of the last check. The order can change.' : 'Nothing is waiting.'));
       const list = el('ol');
       for (const bird of waiting)
         list.append(el('li', bird.common_name + (!unavailable && generation.status === 'running' && generation.taxon_id === bird.taxon_id ? ' · being drawn now' : '')));
@@ -676,17 +698,12 @@ export async function renderStatus(context) {
       holds.replaceChildren(el('h2', 'Needs a hand'));
       retrying.replaceChildren(el('h2', 'Trying again soon'));
       let soon = 0;
-      const held = new Set();
-      const terminal = (work.terminal_details || []).filter((detail) => detail.state !== 'pending');
-      for (const candidate of candidates)
-        if (!candidate.inspect_available && !terminal.some((detail) => detail.taxon_id === candidate.taxon_id)) {
-          held.add(candidate.taxon_id);
-          holds.append(note(candidate.common_name + ': its new plate is unfinished. Whoever runs Inky can recover it before it is tried again.'));
-        }
+      const { terminal, unfinished } = handGroups(work);
+      for (const candidate of unfinished)
+        holds.append(note(candidate.common_name + ': its new plate is unfinished. Whoever runs Inky can recover it before it is tried again.'));
       for (const detail of work.retry_details || []) {
         const waitsForOwner = work.needs_attention.includes(detail.taxon_id);
-        if (waitsForOwner) held.add(detail.taxon_id);
-        else soon += 1;
+        if (!waitsForOwner) soon += 1;
         (waitsForOwner ? holds : retrying).append(
           link(detail.common_name || 'Bird ' + detail.taxon_id, 'bird', { bird: detail.taxon_id }),
           note(detail.failure_message), stamp('Last try', detail.last_failed_at),
@@ -695,7 +712,6 @@ export async function renderStatus(context) {
             : 'Inky tries again on its own after ' + (when(detail.next_attempt_at) || 'a short wait') + '.'));
       }
       for (const detail of terminal) {
-        held.add(detail.taxon_id);
         holds.append(link(detail.common_name, 'bird', { bird: detail.taxon_id }),
           note(holdWords[detail.state] || 'It is waiting for you.'), note(detail.failure_message),
           stamp('Last try', detail.last_failed_at), stamp('Last started', detail.last_attempt_at),
@@ -703,7 +719,7 @@ export async function renderStatus(context) {
           ...Object.entries(detail.review_scores || {}).map(([axis, score]) => note((axisWords[axis] || axis.replaceAll('_', ' ')) + ': ' + score + ' out of 5')),
           note('Choose it above to try again.'));
       }
-      if (!held.size) holds.append(note('Nothing needs a hand.'));
+      if (!needsHand(work).size) holds.append(note('Nothing needs a hand.'));
       retrying.hidden = !soon;
       requests.replaceChildren(el('h2', 'Recent requests to try again'));
       for (const request of (work.retry_requests || []).slice(-32).reverse())

@@ -74,6 +74,15 @@ with store._locked() as state:
   assert.equal(await page.getByLabel('eBird API key', { exact: true }).inputValue(), '');
 }
 
+// An outcome page says what happened in its own sentence, never the controller's.
+async function plainOutcome(page) {
+  const text = await page.locator('main').innerText();
+  assert(
+    !/Candidate (approved|rejected)|locally|catalog publication|explicit reviewed|no model|Plate work|Operation outcome|Owner operation|succeeded|_/i.test(text),
+    'machine words on the outcome page: ' + text,
+  );
+}
+
 // In the works: new plates and plates that need a hand.
 async function candidates(t) {
   const { page, origin, fixture, heading } = t;
@@ -105,6 +114,7 @@ async function candidates(t) {
   }
   await page.getByText('The plate is in your journal.', { exact: true }).waitFor();
   await heading('Keeping a new plate');
+  await plainOutcome(page);
   assert(
     fs.existsSync(
       path.join(fixture, 'catalog/species/9999991-synthetic-qa-candidate-9999991/manifest.json'),
@@ -124,6 +134,7 @@ async function candidates(t) {
   }
   await page.getByText('The plate was sent back.', { exact: true }).waitFor();
   await heading('Sending a plate back');
+  await plainOutcome(page);
   assert(
     fs.existsSync(
       path.join(

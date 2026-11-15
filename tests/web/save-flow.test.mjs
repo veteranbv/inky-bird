@@ -666,7 +666,7 @@ test('a bird page with approved art removes it in one tap', async (t) => {
 });
 
 test('an interrupted change says to check On my frame', async (t) => {
-  const message = 'Interrupted. The outcome is not confirmed. Inspect state before an explicit retry.';
+  const message = 'Inky could not confirm how this ended.';
   const server = savedServer({}, 'interrupted', { message });
   const { context, main } = page(t, server.respond);
   const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
@@ -758,4 +758,132 @@ test('a community collection that cannot be saved keeps its preview on the page'
   const shown = texts(main);
   assert(shown.includes('This community preview changed or expired. Search again.'));
   assert(shown.includes('Example Wren · Exempli wren'));
+});
+
+// The receipt messages the controller writes for each request, as it writes them.
+const serverMessages = {
+  'approve-candidate': 'Candidate approved locally. Existing catalog publication and display schedules still apply.',
+  'reject-candidate': 'Candidate rejected. It remains held until an explicit reviewed retry; no model was started.',
+  retry: "Retry requests saved. Check Plate work for each bird's outcome. No model was started by this action.",
+  'notification-retry': 'Dead letters were returned to the existing outbox.',
+  refresh: 'Discovery refreshed. Provider results remain separate; existing generation policy applies.',
+  'queue-plates': 'Missing-plate requests saved. No model started, and Saved birds and wall selection did not change.',
+};
+async function outcome(t, receipt) {
+  const { context, main } = page(t, () => ({ operation_id: 'op1', ...receipt }));
+  context.query = new URLSearchParams({ operation: 'op1' });
+  await manage.renderOperation(context);
+  return texts(main);
+}
+for (const [kind, message] of Object.entries(serverMessages))
+  test(`a finished ${kind} says what happened in one sentence, without the controller's words`, async (t) => {
+    const shown = await outcome(t, { kind, status: 'succeeded', result: { message } });
+    assert(shown.includes(manage.outcomeSentence({ kind, status: 'succeeded' })));
+    assert(!shown.includes(message));
+  });
+
+test('a request that did not finish keeps the controller’s reason', async (t) => {
+  const message = 'Settings changed. Reload and try again.';
+  const shown = await outcome(t, { kind: 'retry', status: 'failed', result: { message } });
+  assert(shown.includes('This did not finish.'));
+  assert(shown.includes(message));
+});
+
+test('a request this page has no words for keeps the controller’s sentence', async (t) => {
+  const shown = await outcome(t, { kind: 'newer-kind', status: 'succeeded', result: { message: 'Done the newer way.' } });
+  assert(shown.includes('Done the newer way.'));
+});
+
+test('a history file with nothing new says so, not that the history was updated', async (t) => {
+  const shown = await outcome(t, {
+    kind: 'import-commit',
+    status: 'succeeded',
+    result: { message: 'No history changes. Continue to checklist selection or finish.', upload_id: 'u'.repeat(32) },
+  });
+  assert(shown.includes('Your history had no changes.'));
+  assert(!shown.includes('Your history was updated.'));
+  assert(!shown.some((text) => text.startsWith('No history changes')));
+});
+
+test('a history file with changes says the history was updated', async (t) => {
+  const shown = await outcome(t, {
+    kind: 'import-commit',
+    status: 'succeeded',
+    result: { message: 'History updated. Trip not saved yet.', rows: 3, added_checklists: 1 },
+  });
+  assert(shown.includes('Your history was updated.'));
+});
+
+for (const [window, span] of [
+  ['last-day', 'in the last day'],
+  ['last-week', 'in the last week'],
+  ['last-30-days', 'in the last 30 days'],
+  ['last-year', 'in the last year'],
+  ['all-time', 'at any time'],
+])
+  test(`the Sources page says ${window} in a sentence`, async (t) => {
+    const { context, main } = page(t, (path) => {
+      if (path === '/v1/owner/operations') return { operations: [] };
+      throw new Error('unexpected ' + path);
+    });
+    Object.assign(context, {
+      area: 'sources',
+      data: {},
+      management: {
+        available: true,
+        window,
+        refresh_minutes: 15,
+        sources: [],
+        work: { complete: true },
+        activity: { entries: {} },
+        recent_detections: [],
+      },
+      unreadable: () => new Element('div'),
+      empty: () => new Element('section'),
+      operationAction: () => new Element('section'),
+      currentRun: () => 0,
+    });
+    await manage.renderStatus(context);
+    assert(
+      texts(main).includes(
+        'Birds noted ' + span + '. Inky checks each source on a schedule; it does not listen all the time.',
+      ),
+    );
+  });
+
+const workWith = (work) => ({
+  available: true,
+  sources: [],
+  notifications: {},
+  work: { needs_attention: [], retry_details: [], terminal_details: [], ...work },
+});
+
+test('Manage counts a new plate as ready and an unfinished one as needing a hand', () => {
+  const notes = manage.manageNotes(
+    workWith({
+      in_review: {
+        status: 'ok',
+        candidates: [
+          { taxon_id: 1, common_name: 'Brown Creeper', inspect_available: true },
+          { taxon_id: 2, common_name: 'Winter Wren', inspect_available: false },
+        ],
+      },
+      needs_attention: [1, 2],
+    }),
+  );
+  assert.deepEqual(notes.map(([text]) => text), ['1 new plate is ready to look at.', '1 plate needs a hand']);
+});
+
+test('Manage and In the works agree on what needs a hand', () => {
+  // The new-plate list is unreadable, so a waiting plate shows only as pending.
+  const management = workWith({
+    in_review: { status: 'unavailable', candidates: [] },
+    needs_attention: [5],
+    terminal_details: [{ taxon_id: 5, state: 'pending' }],
+  });
+  assert.deepEqual(manage.manageNotes(management), []);
+  assert.equal(manage.needsHand(management.work).size, 0);
+  management.work.terminal_details = [{ taxon_id: 5, state: 'failed' }];
+  assert.deepEqual(manage.manageNotes(management).map(([text]) => text), ['1 plate needs a hand']);
+  assert.deepEqual([...manage.needsHand(management.work)], [5]);
 });

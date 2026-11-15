@@ -312,10 +312,7 @@ class OwnerOperations:
                                 else "interrupted",
                                 updated_at=_stamp(),
                                 result=recovered.get(row.operation_id)
-                                or {
-                                    "message": "Interrupted. The outcome is not confirmed. "
-                                    "Inspect state before an explicit retry."
-                                },
+                                or {"message": "Inky could not confirm how this ended."},
                             )
                             if row.status in {"pending", "running"}
                             else row
@@ -510,8 +507,7 @@ def execute_owner_operation(
         refreshed = refresh_observations(config)
         providers = cast(list[dict[str, object]], refreshed["providers"])
         return {
-            "message": "Discovery refreshed. Provider results remain separate; "
-            "existing generation policy applies to newly eligible birds.",
+            "message": "Sources checked. Each source's result is listed on its own.",
             "species_count": refreshed["species_count"],
             "providers": [
                 {
@@ -537,17 +533,16 @@ def execute_owner_operation(
             )
         except (ValueError, CatalogError) as exc:
             raise OwnerOperationError(
-                "Retry queue could not accept this selection; check Plate work or operator evidence"
+                "Inky could not take this selection. Check In the works and try again."
             ) from exc
         return {
-            "message": "Retry requests saved. Preparation waits safely behind any active cycle. "
-            "Approved plates are never replaced. Check Plate work for each bird's outcome. "
+            "message": "These birds will be tried again, after anything already being drawn. "
+            "A plate you kept is never replaced. In the works shows how each one goes. "
             + (
-                "The existing scheduler was asked to check as soon as possible; "
-                "generation must be enabled and discovery healthy."
+                "Inky will check as soon as it can; plate making must be on "
+                "and the sources checked."
                 if kind == "retry-now"
-                else "The next scheduled generation check will prepare these retries. "
-                "No model was started by this action."
+                else "They are drawn at the next scheduled check, not now."
             ),
             "taxon_ids": [row.taxon_id for row in requests],
             "request_ids": [row.request_id for row in requests],
@@ -557,9 +552,9 @@ def execute_owner_operation(
         result = send_notification_test(config)
         failures = cast(list[object], result["failures"])
         return {
-            "message": "Test delivery failed for one or more destinations."
+            "message": "The test did not reach every destination."
             if failures
-            else "Test delivered to every configured destination.",
+            else "The test reached every destination.",
             "delivered_count": len(cast(list[object], result["delivered"])),
             "failed_count": len(failures),
         }
@@ -567,8 +562,8 @@ def execute_owner_operation(
         requeued = requeue_dead_letters(config)
         delivery = dispatch_notifications(config)
         return {
-            "message": "Dead letters were returned to the existing outbox. "
-            "Delivery results below are not a promise that every destination accepted them.",
+            "message": "Undelivered messages were sent again. "
+            "A destination can still turn a message away after it is sent.",
             "requeued": requeued,
             **{
                 key: value
