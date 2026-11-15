@@ -16,29 +16,73 @@ if ! sudo -v; then
   exit 1
 fi
 
+failures=()
+installed() {
+  [ "$(systemctl show --property=LoadState --value "$1" 2>/dev/null || true)" != "not-found" ] || \
+    [ -e "/etc/systemd/system/$1" ]
+}
+disable_unit() {
+  if ! installed "$1"; then
+    return 0
+  fi
+  if sudo systemctl disable --now "$1"; then
+    echo "Stopped and disabled $1."
+  else
+    failures+=("$1")
+  fi
+}
+stop_unit() {
+  if ! installed "$1"; then
+    return 0
+  fi
+  if sudo systemctl stop "$1"; then
+    echo "Stopped $1."
+  else
+    failures+=("$1")
+  fi
+}
+
+not_stopped() {
+  local failed
+  for failed in "${failures[@]+"${failures[@]}"}"; do
+    [ "${failed}" = "$1" ] && return 0
+  done
+  return 1
+}
+
 for name in refresh generate catalog-publish notifications; do
-  timer="${service_prefix}-${name}.timer"
-  service="${service_prefix}-${name}.service"
-  sudo systemctl disable --now "${timer}" 2>/dev/null || true
-  echo "Stopped and disabled ${timer}."
-  sudo systemctl stop "${service}" 2>/dev/null || true
-  echo "Stopped ${service}."
+  disable_unit "${service_prefix}-${name}.timer"
+  stop_unit "${service_prefix}-${name}.service"
 done
-sudo systemctl disable --now "${service_prefix}-controller.service" 2>/dev/null || true
-sudo systemctl disable --now "${service_prefix}-scheduler.service" 2>/dev/null || true
-echo "Stopped and disabled ${service_prefix}-controller.service."
+disable_unit "${service_prefix}-controller.service"
+disable_unit "${service_prefix}-scheduler.service"
 
 for name in controller scheduler refresh generate catalog-publish notifications; do
   for unit in "${service_prefix}-${name}.service" "${service_prefix}-${name}.timer"; do
+    # Keep the file of a unit that may still run so a rerun finds and stops it.
+    if not_stopped "${unit}"; then
+      continue
+    fi
     if [ -f "/etc/systemd/system/${unit}" ]; then
-      sudo rm -f "/etc/systemd/system/${unit}"
-      echo "Removed /etc/systemd/system/${unit}."
+      if sudo rm -f "/etc/systemd/system/${unit}"; then
+        echo "Removed /etc/systemd/system/${unit}."
+      else
+        failures+=("/etc/systemd/system/${unit}")
+      fi
     fi
   done
 done
-sudo systemctl daemon-reload
-echo "Reloaded the systemd unit configuration."
+if sudo systemctl daemon-reload; then
+  echo "Reloaded the systemd unit configuration."
+else
+  failures+=("systemd unit reload")
+fi
 
+if [ "${#failures[@]}" -gt 0 ]; then
+  echo "Uninstall did not finish. Could not stop or remove: ${failures[*]}." >&2
+  echo "Fix the cause shown above and run the uninstaller again." >&2
+  exit 1
+fi
 echo "Controller services uninstalled."
 echo "Intentionally left in place:"
 echo "  Application runtime and managed catalog: ${app_dir}"
