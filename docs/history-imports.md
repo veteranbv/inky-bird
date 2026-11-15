@@ -94,9 +94,11 @@ ceiling, the ZIP format's maximum size for one entry's header, name, extra data
 and comment. Inky bounds these reads before allocating member objects; ZIP64
 remains supported. Large CSV contents still stream under the decoded limit.
 An export is also refused when it has more than 8,388,608 rows, more than 256
-columns, more than 50,000 distinct species names, or a line longer than
-262,144 characters. Each refusal names the limit it hit. An official export
-within the 512 MiB limit stays within these counts.
+columns, more than 50,000 distinct species (each different pair of scientific
+and common name counts once), or a line longer than 262,144 characters. The
+refusals for rows, columns and species give the limit; the one for a long line
+gives the line number. An official export within the 512 MiB limit stays
+within these counts.
 These are rejection bounds, not measured promises
 that every maximum-size archive is practical on every controller. An offline
 synthetic test checked 900,000 rows in 90,000 checklists: 509.7 MiB decoded CSV,

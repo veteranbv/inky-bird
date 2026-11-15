@@ -110,15 +110,17 @@ a probe never uses up a sign-in.
 
 Plate images whose address names the current plate revision (portraits, grid
 thumbnails and paired-screen plates) are kept in the browser's private cache
-for up to a year. Every other owner and private response is `no-store`.
+for up to a year. The app's own files (pages, scripts, styles and icons) are
+`no-cache`, so the browser checks them on each load. Every other owner and
+private response is `no-store`.
 Signing out and **Forget this screen** send `Clear-Site-Data: "cache"`, so the
 browser drops those cached plates. Browsers apply that header only over HTTPS
 or on the controller's own loopback address; over plain LAN HTTP, clear the
 browser's cache yourself.
 
-Static app files carry an `ETag` made from the installed file's time and size.
-Installing a release normally resets those times, so browsers fetch the new
-files.
+Those app files carry an `ETag` made from the installed file's time and size,
+and an unchanged file answers 304. Installing a release normally resets those
+times, so browsers fetch the new files.
 
 Inky does not send `Strict-Transport-Security`. Browsers would otherwise refuse
 plain HTTP on that hostname for a long time and stop letting you click through

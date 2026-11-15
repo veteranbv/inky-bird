@@ -67,7 +67,9 @@ Tests must not require network access, Codex authentication, notification
 credentials, or Inky hardware. Mock those boundaries and keep fixtures
 location-neutral. The suite enforces this: `tests/conftest.py` refuses DNS
 lookups, connections and UDP to anything but loopback, and child processes get
-a `git` limited to local repositories and a closed loopback proxy. Free-space
+a `git` limited to local repositories and a closed loopback proxy. Tools that
+ignore proxy settings, such as `ssh`, `nc` or `dig`, are not contained, so do
+not call them from tests. Free-space
 checks always see at least 64 GiB free; a test of the low-space branch patches
 `shutil.disk_usage` itself.
 

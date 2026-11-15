@@ -101,8 +101,10 @@ reads `/v1/catalog`, or that stops fetching, still raises the stale notice.
 
 Right after the controller's web server starts, the display may not have
 reported to it yet. For one rotation interval plus the display's startup delay,
-its rotation jitter and five minutes, the display check reports
-`resuming: true` and `stale: false`. It neither opens nor closes a stale notice.
+its rotation jitter and five minutes, a display check that would otherwise
+report a stale display reports `resuming: true` and `stale: false` instead. It
+neither opens nor closes a stale notice. A display that is up to date, or
+paused on an empty wall view, reports as usual.
 The start time is kept in `controller-started.json` under `state_dir`. A real
 outage that begins just before a restart is therefore reported up to that much
 later.

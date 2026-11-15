@@ -194,7 +194,9 @@ you signed in. Up to 60 seconds of clock difference is tolerated for sessions,
 recent confirmations and single sign-on. If the controller's clock is further
 behind than that, for example a Raspberry Pi without a real-time clock before
 it has synchronized the time, sign-ins are refused until the clock is right.
-They are kept, not deleted, and work again once the clock is correct. A clock
+They are kept and work again once the clock is correct, unless all 16 owner
+logins are in use: then a new sign-in replaces the longest-idle login the
+clock cannot use. A clock
 that jumps forward past a sign-in's expiry ends that sign-in for good.
 
 ## Recover a forgotten password

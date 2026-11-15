@@ -29,11 +29,11 @@ making the active observation window permanently broad.
 The daily research limit resets at midnight UTC. When it is reached, the
 controller records the next attempt at that reset instead of running backoff
 retries that cannot succeed. `max_searches_per_species` is a total for each
-bird, not a daily count. It resets only when a bird starts fresh: its first
-try, your `retry` or replacement, or after it stopped for you, and when a run
-produces a plate. Automatic retries do not reset it. A search that ends without
-an answer (a timeout, an outage or a failed start) is given back. A bird that uses its whole allowance stops and waits for
-`retry TAXON_ID`. `research-budget.json` keeps these totals in
+bird, not a daily count. It goes back to zero when a run produces a plate,
+when the bird stops and waits for you, and when you retry or replace it.
+Automatic retries keep it. A search that ends without an answer (a timeout, an
+outage or a failed start) is given back. A bird that uses its whole allowance
+stops and waits for `retry TAXON_ID`. `research-budget.json` keeps these totals in
 `species_totals`. An explicit `retry` never bypasses the daily limit.
 
 The controller's `workspace_dir` must be writable because the Codex image tool
@@ -132,7 +132,9 @@ terminal and requires `retry TAXON_ID`.
 After 12 failed automatic tries (about a week with the default backoff), a bird
 stops as a terminal failure, the `terminal_error` notice is sent, and the bird
 waits for `retry TAXON_ID`. Waits for missing reference photos and for the
-shared daily research limit do not count toward the 12. Failures from before
+shared daily research limit do not count toward the 12. A try cut short by a
+stop signal counts, but never stops the bird by itself; the next real failure
+decides. Failures from before
 this release are not counted; an upgraded bird gets 12 counted tries from its
 next failure.
 

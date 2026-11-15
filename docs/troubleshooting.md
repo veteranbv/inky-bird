@@ -134,9 +134,9 @@ could not be loaded" notice through the last good destinations. Run
 `"$IBF" config validate --config "$CONFIG"`, fix the file, and the jobs resume.
 
 A scheduler that starts with a broken file, for example after a reboot or a
-restart that followed a hand edit, exits `1` and is restarted by systemd,
-launchd or Docker about every 10 seconds (Docker waits longer after
-repeated failures), with no notice. Only a break while the scheduler is
+restart that followed a hand edit, exits `1` and is restarted with no notice:
+about every 10 seconds by systemd or launchd, and by Docker after a delay that
+starts short and doubles with each failure. Only a break while the scheduler is
 already running sends the notice above. Check the service status
 and its log, then fix the file.
 
