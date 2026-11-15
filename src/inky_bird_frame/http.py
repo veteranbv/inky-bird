@@ -7,13 +7,13 @@ import os
 import socket
 import stat
 import threading
-import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from http.client import HTTPConnection, HTTPException, HTTPMessage, HTTPResponse, HTTPSConnection
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import monotonic
 from typing import IO, TYPE_CHECKING, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -76,7 +76,7 @@ class _Deadline:
     """Shut down this exchange's sockets once its total time is spent."""
 
     def __init__(self, seconds: float) -> None:
-        self.ends_at = time.monotonic() + seconds
+        self.ends_at = monotonic() + seconds
         self.expired = False
         self._sockets: list[socket.socket] = []
         self._lock = threading.Lock()
@@ -91,7 +91,7 @@ class _Deadline:
 
     @property
     def spent(self) -> bool:
-        return self.expired or time.monotonic() >= self.ends_at
+        return self.expired or monotonic() >= self.ends_at
 
     def watch(self, sock: socket.socket) -> None:
         with self._lock:
@@ -126,7 +126,7 @@ def _bound_connect_timeout(connection: HTTPConnection) -> None:
     deadline = _current_deadline.get()
     if deadline is None:
         return
-    remaining = deadline.ends_at - time.monotonic()
+    remaining = deadline.ends_at - monotonic()
     if remaining <= 0:
         raise TimeoutError("timed out")
     current = connection.timeout
@@ -255,7 +255,11 @@ def _fetch(
             # Build it after the caller has selected this process's native trust.
             opener = build_opener(redirects, _DeadlineHTTPHandler, _DeadlineHTTPSHandler)
             with opener.open(request, timeout=timeout_seconds) as response:
-                body = _read_capped(cast(HTTPResponse, response), limit, display_url)
+                http_response = cast(HTTPResponse, response)
+                # A declared length or chunked framing proves the whole body
+                # arrived; a read cut short by the deadline raises instead.
+                framed = http_response.chunked or http_response.length is not None
+                body = _read_capped(http_response, limit, display_url)
         except DataSourceError:
             raise
         except (URLError, HTTPException, OSError) as exc:
@@ -265,7 +269,7 @@ def _fetch(
             if deadline.spent and not isinstance(exc, HTTPError):
                 raise DataSourceError(f"Timed out reading {display_url}") from exc
             raise _transport_error(exc, display_url) from exc
-        if deadline.expired:
+        if deadline.expired and not framed:
             raise DataSourceError(f"Timed out reading {display_url}")
         return body
 

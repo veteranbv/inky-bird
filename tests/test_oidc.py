@@ -336,7 +336,7 @@ def test_expired_provider_metadata_is_served_while_it_refreshes() -> None:
     with _with_provider(provider):
         first = asyncio.run(metadata(CONFIG))
         provider.mode = "down"
-        later = oidc.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
+        later = time.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
 
         async def stale_read() -> object:
             value = await metadata(CONFIG)
@@ -365,7 +365,7 @@ def test_a_provider_failure_is_remembered_briefly_and_then_retried() -> None:
             assert "private-provider-detail" not in str(raised.value)
         assert provider.requests == 1
         provider.mode = "ok"
-        retry = oidc.monotonic() + oidc.METADATA_FAILURE_SECONDS + 1
+        retry = time.monotonic() + oidc.METADATA_FAILURE_SECONDS + 1
         with patch("inky_bird_frame.oidc.monotonic", return_value=retry):
             assert asyncio.run(metadata(CONFIG)).token_endpoint == "https://id.example.test/token"
         assert provider.requests == 2
@@ -402,7 +402,7 @@ def test_an_unexpected_background_refresh_failure_is_logged_once_and_paused(
             await asyncio.sleep(0)
         return values
 
-    later = oidc.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
+    later = time.monotonic() + oidc.METADATA_FRESH_SECONDS + 1
     with (
         patch("inky_bird_frame.oidc._fetch_metadata", broken),
         patch("inky_bird_frame.oidc.monotonic", return_value=later),

@@ -6,7 +6,7 @@ import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
 from email.message import Message
-from http.client import HTTPMessage, IncompleteRead, RemoteDisconnected
+from http.client import HTTPMessage, HTTPResponse, IncompleteRead, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -347,10 +347,37 @@ class DeadlineAndLimitTests(unittest.TestCase):
         clock = iter([0.0])
         with (
             _serving() as port,
-            patch("inky_bird_frame.http.time.monotonic", lambda: next(clock, 1e9)),
+            patch("inky_bird_frame.http.monotonic", lambda: next(clock, 1e9)),
             self.assertRaisesRegex(DataSourceError, "^Timed out reading "),
         ):
             get_bytes(f"http://127.0.0.1:{port}/payload", deadline_seconds=60)
+
+    def test_a_deadline_that_ends_after_a_complete_body_keeps_the_response(self) -> None:
+        read_capped = inky_bird_frame.http._read_capped
+
+        def read_then_expire(response: HTTPResponse, limit: int, display_url: str) -> bytes:
+            body = read_capped(response, limit, display_url)
+            deadline = inky_bird_frame.http._current_deadline.get()
+            assert deadline is not None
+            deadline._expire()
+            return body
+
+        cases = (("/payload", b"payload-bytes"), ("/chunked-with-length", b'{"a": 1}'))
+        for path, expected in cases:
+            with (
+                self.subTest(path=path),
+                _serving() as port,
+                patch("inky_bird_frame.http._read_capped", read_then_expire),
+            ):
+                self.assertEqual(get_bytes(f"http://127.0.0.1:{port}{path}"), expected)
+        # A body that ends only when the connection closes cannot show it is
+        # complete, so a deadline that has ended still makes it a timeout.
+        with (
+            _serving() as port,
+            patch("inky_bird_frame.http._read_capped", read_then_expire),
+            self.assertRaisesRegex(DataSourceError, "^Timed out reading "),
+        ):
+            get_bytes(f"http://127.0.0.1:{port}/undeclared-large")
 
     def test_a_status_that_arrives_after_the_deadline_is_still_reported(self) -> None:
         # A complete status line is an answer, not an interrupted read.
