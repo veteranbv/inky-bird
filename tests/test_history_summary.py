@@ -294,7 +294,7 @@ def test_fresh_summaries_answer_the_journal_without_reading_full_histories(
     ]
     coverage = cast(list[dict[str, object]], snapshot["history_coverage"])
     assert [row["status"] for row in coverage] == ["available"] * 3
-    assert coverage[1]["coverage"] == "Retained imports; 1 undated segments"
+    assert coverage[1]["coverage"] == "Your imported recordings; 1 without a date"
     assert snapshot["recent_species"] == [
         {
             "taxon_id": 1,

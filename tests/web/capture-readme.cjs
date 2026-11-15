@@ -84,7 +84,7 @@ async function capture() {
     await page.getByLabel('Choose your Inky password', { exact: true }).fill(password);
     await page.getByLabel('Confirm your password', { exact: true }).fill(password);
     await page.getByRole('button', { name: 'Create account', exact: true }).click();
-    await page.getByRole('heading', { name: 'Your field journal', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Your journal', exact: true }).waitFor();
 
     await page.goto(origin + '/app?page=edit-collection');
     await page.getByLabel('Collection name', { exact: true }).fill('Garden birds');
@@ -105,10 +105,10 @@ async function capture() {
     await page.evaluate(() => scrollTo(0, 0));
     await image('journal-collection.png');
     await page.goto(origin + '/app?page=bird&bird=9083');
-    await page.getByRole('button', { name: 'Add to Saved birds', exact: true }).click();
-    await page.getByText('Added to Saved birds.', { exact: true }).waitFor({ timeout: 30000 });
+    await page.getByRole('button', { name: 'Add to my frame', exact: true }).click();
+    await page.getByText('Added to On my frame.', { exact: true }).waitFor({ timeout: 30000 });
     await page.goto(origin + '/app');
-    await page.getByRole('heading', { name: 'Your field journal', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Your journal', exact: true }).waitFor();
     await page.getByRole('link', { name: 'Play', exact: true }).waitFor();
     await image('journal-home.png');
     if (process.argv.includes('--export-sample')) {
@@ -141,7 +141,7 @@ async function capture() {
       const started = performance.now();
       film.on('pageerror', (error) => errors.push(error.message));
       await film.goto(origin + '/app');
-      await film.getByRole('heading', { name: 'Your field journal', exact: true }).waitFor();
+      await film.getByRole('heading', { name: 'Your journal', exact: true }).waitFor();
       await film.locator('main img').first().evaluate((image) => image.decode());
       const trimStart = (performance.now() - started) / 1000;
       const sceneStart = performance.now();

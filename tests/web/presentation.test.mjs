@@ -7,7 +7,7 @@ import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 let source = await readFile(new URL('presentation.js', web), 'utf8');
-for (const name of ['ui.js', 'frame-tools.js'])
+for (const name of ['ui.js', 'frame-tools.js', 'words.js'])
   source = source.replace(
     `'/app/${name}'`,
     JSON.stringify(moduleURL(await readFile(new URL(name, web), 'utf8'))),
@@ -103,7 +103,7 @@ const changes = (calls) => calls.filter(({ body }) => body);
 
 test('presentation state that cannot load keeps the page and offers a retry', async (t) => {
   const { main, reloads } = await open(t, 'displays', () => failure('Displays could not be read.', 'journal_error'));
-  assert.equal(main.children[0].textContent, 'Displays');
+  assert.equal(main.children[0].textContent, 'Wall frame');
   assert.deepEqual(alerts(main), ['Displays could not be read.']);
   findButton(main, 'Try again').fire('click');
   assert.equal(reloads.length, 1);
@@ -128,15 +128,15 @@ test('repeated failures in one place replace each other', async (t) => {
   const { main } = await open(t, 'displays', (path, body) =>
     body ? failure('The wall could not be changed.') : state(),
   );
-  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'Physical wall panel');
+  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'What your wall frame shows');
   for (let n = 0; n < 3; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
-  assert.deepEqual(alerts(wall), ['Confirm the wall change first.']);
+  assert.deepEqual(alerts(wall), ['Tick the box first.']);
   walk(wall).find((node) => node.tagName === 'INPUT' && node.type === 'checkbox').checked = true;
   for (let n = 0; n < 3; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
   assert.deepEqual(alerts(wall), ['The wall could not be changed.']);
@@ -149,10 +149,10 @@ test('a second confirmation request does not stack another panel', async (t) => 
     (path, body) => (body ? failure('Confirm it is you.', 'confirmation_required') : state()),
     { localPasswordAllowed: true },
   );
-  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'Physical wall panel');
+  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'What your wall frame shows');
   walk(wall).find((node) => node.tagName === 'INPUT' && node.type === 'checkbox').checked = true;
   for (let n = 0; n < 2; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
   assert.equal(walk(wall).filter((node) => node.textContent === 'Confirm and retry').length, 1);
@@ -244,4 +244,45 @@ test('revoking a status credential asks first', async (t) => {
   await flush();
   assert.deepEqual(changes(calls).map(({ body }) => [body.action, body.id]), [['revoke', 'g2']]);
   assert.equal(reloads.length, 1);
+});
+
+test('a screen seen a few days ago says the day, without "around on"', async (t) => {
+  const seen = new Date();
+  seen.setDate(seen.getDate() - 3);
+  const { main } = await open(t, 'displays', () => {
+    const value = state();
+    value.grants[0].last_seen_at = seen.getTime() / 1000;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Last seen'));
+  assert.deepEqual(lines, [
+    'Last seen on ' + ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][seen.getDay()],
+  ]);
+});
+
+test('a screen whose end date cannot be read leaves that line out', async (t) => {
+  const { main } = await open(t, 'displays', () => {
+    const value = state();
+    delete value.grants[0].expires_at;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Shows birds until'));
+  assert.deepEqual(lines, []);
+});
+
+test('a screen says until when it shows birds', async (t) => {
+  const { main } = await open(t, 'displays', state);
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Shows birds until'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^Shows birds until \d{1,2} [A-Z][a-z]{2} \d{4}$/);
+});
+
+test('a status sensor whose end date cannot be read shows no dangling until', async (t) => {
+  const { main } = await open(t, 'integrations', () => {
+    const value = state();
+    delete value.grants[1].expires_at;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => /until/.test(text || ''));
+  assert.deepEqual(lines.filter((text) => /until\s*$/.test(text)), []);
 });

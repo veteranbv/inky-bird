@@ -52,13 +52,11 @@ COLLECTION_ID = re.compile(r"[0-9a-f]{32}\Z")
 STOPPED_GUIDANCE = {
     "retry_limit": (
         "retry_limit",
-        "Automatic retries have stopped after repeated failed tries. "
-        "Choose this bird for retry to try again.",
+        "Automatic retries have stopped after repeated failed tries.",
     ),
     "research_limit": (
         "research_limit",
-        "This bird used its research allowance. Automatic retries have stopped; "
-        "choose it for retry to try again.",
+        "This bird used its research allowance. Automatic retries have stopped.",
     ),
 }
 
@@ -71,45 +69,44 @@ def failure_guidance(error_type: object, stop_reason: object = None) -> dict[str
     messages = {
         "QualityReviewError": (
             "quality_review",
-            "The plate exhausted its review rounds without passing. Retry preserves "
-            "correction guidance; inspect a pending candidate before approving.",
+            "The plate did not pass its checks after every try. Trying again keeps "
+            "the notes from the earlier tries.",
         ),
         "InsufficientReferencesError": (
             "references",
-            "Not enough usable reference photos. Wait for source coverage to improve, "
-            "or review the source before retrying.",
+            "Inky could not find enough good reference photos. Try again once "
+            "your sources have more of this bird.",
         ),
         "ResearchLimitError": (
             "research_limit",
-            "Research allowance is temporarily unavailable. Automatic work waits until "
-            "its next eligibility time.",
+            "Inky has used its research allowance for now. It tries again on its own later.",
         ),
         "DataSourceError": (
             "source",
-            "A source or research request could not complete. Check Sources; "
-            "automatic retry uses backoff.",
+            "A source or a research lookup did not answer. Inky tries again on its "
+            "own, waiting longer each time; Sources shows which one.",
         ),
         "GenerationError": (
             "generation",
-            "The model or generated artifact could not complete validation. Retry is "
-            "serialized behind active work; inspect private operator evidence if it repeats.",
+            "The drawing could not be finished. Inky tries again after other plates; "
+            "if this keeps happening, the controller log has the details.",
         ),
         "SpeciesStateError": (
             "retained_state",
-            "Retained identity or correction evidence needs inspection. Retrying cannot "
-            "bypass provenance or review checks.",
+            "This bird's saved work needs a look from whoever runs Inky before it "
+            "can be tried again. Its checks still apply.",
         ),
         "MissingDependencyError": (
             "dependency",
-            "A controller dependency is unavailable. An operator must repair it before retrying.",
+            "Part of Inky's setup is missing. Whoever runs Inky needs to repair it "
+            "before this can be tried again.",
         ),
     }
     code, message = messages.get(
         str(error_type),
         (
             "unknown",
-            "Details are unavailable in this saved record. Inspect retained operator "
-            "evidence before repeating the attempt.",
+            "Inky has no details for this. Check the controller log before trying again.",
         ),
     )
     return {"failure_kind": code, "failure_message": message}
@@ -844,59 +841,63 @@ class JournalService:
             free = shutil.disk_usage(self.config.state_dir).free
         checks: list[dict[str, str]] = [
             {
-                "name": "Approved catalog index",
+                "name": "Your plates",
                 "status": "ok",
-                "detail": f"{len(entries)} approved entries parsed. "
-                "Each served image is checked against its approved hash.",
+                "detail": f"{len(entries)} {'plate' if len(entries) == 1 else 'plates'} read. "
+                "Each one shown is checked against its saved fingerprint.",
             },
             {
-                "name": "Private storage",
+                "name": "Storage",
                 "status": "info",
                 "detail": f"{free / (1024**3):.1f} GiB free. "
-                "History uploads require at least 2 GiB before admission.",
+                "A history upload needs at least 2 GiB free.",
             },
         ]
         if management.get("available"):
             work = cast(dict[str, object], management["work"])
             providers = cast(list[dict[str, object]], management["sources"])
             notifications = cast(dict[str, object], management["notifications"])
+            pending = cast(int, notifications["pending"])
+            undelivered = cast(int, notifications["dead_letters"])
             checks.extend(
                 [
                     {
-                        "name": "Discovery",
+                        "name": "Finding new birds",
                         "status": "ok" if work["complete"] else "attention",
-                        "detail": "Saved discovery state: " + cast(str, work["discovery_status"]),
+                        "detail": "The last check for new birds finished."
+                        if work["complete"]
+                        else "The last check for new birds did not finish.",
                     },
                     {
-                        "name": "Configured sources",
+                        "name": "Sources",
                         "status": "attention"
                         if any(item["enabled"] and item["status"] != "ok" for item in providers)
                         else "ok",
-                        "detail": "Inspect enabled source checks in Sources. "
+                        "detail": "Sources shows how each check went. "
                         "Imported history is not a live feed.",
                     },
                     {
-                        "name": "Notification delivery",
-                        "status": "attention" if notifications["dead_letters"] else "ok",
-                        "detail": f"{notifications['pending']} pending; "
-                        f"{notifications['dead_letters']} dead letters.",
+                        "name": "Notifications",
+                        "status": "attention" if undelivered else "ok",
+                        "detail": f"{pending} {'message' if pending == 1 else 'messages'} "
+                        f"waiting; {undelivered} could not be delivered.",
                     },
                     {
-                        "name": "Generation policy",
+                        "name": "Plate making",
                         "status": "info",
-                        "detail": "Enabled; AI allowance and review rules apply."
+                        "detail": "On, with your own image-generation account. "
+                        "Every new plate must pass its checks before it joins your journal."
                         if management["generation_enabled"]
-                        else "Off by choice. No new model work starts.",
+                        else "Off. No new plates are drawn.",
                     },
                 ]
             )
         return {
             "version": __version__,
             "checks": checks,
-            "notice": "These are read-only application checks, not privileged host "
-            "or service validation. Run the controller doctor for installed services, "
-            "executables and network diagnostics. "
-            "No raw logs or secret configuration are returned.",
+            "notice": "These checks only read Inky's own files. For installed services "
+            "and the network, run the controller doctor. Logs and secret settings "
+            "are not shown here.",
         }
 
     def favorite(self, *, revision: object, taxon_id: object, favorite: object) -> JournalState:
@@ -1052,7 +1053,7 @@ class JournalService:
             )
             if preview["preview_hash"] != preview_hash:
                 raise JournalConflictError(
-                    "Plate work changed. Review missing-plate requests again."
+                    "In the works changed. Ask for the missing plates again."
                 )
             return queue_owner_selection_locked(cast(AppConfig, self.app_config), species)
 
@@ -1328,8 +1329,8 @@ class JournalService:
                 management = {"available": False, "reason": "unreadable"}
                 degrade(
                     "plate-work",
-                    "Plate work could not be read. Manage shows it again "
-                    "once its files are readable.",
+                    "In the works could not be read. Manage shows it again "
+                    "once its files can be read.",
                     error,
                     lists_birds=False,
                 )
@@ -1446,10 +1447,12 @@ class JournalService:
                 records: list[SpeciesSummary]
                 if source == "ebird-archive":
                     records = read_ebird_archive_summary(self.config.state_dir)
-                    description = "Complete retained archive; checklist dates, not event instants"
+                    description = "Your whole checklist history, by checklist date"
                 elif source == "birdnet-analyzer":
                     records, undated = read_birdnet_analyzer_summary(self.config.state_dir)
-                    description = f"Retained imports; {undated} undated segments"
+                    description = "Your imported recordings" + (
+                        f"; {undated} without a date" if undated else ""
+                    )
                 else:
                     records, description = read_birdbuddy_history_summary(
                         self.config.state_dir,
@@ -1530,8 +1533,8 @@ class JournalService:
                     {
                         "source": source,
                         "status": "unavailable",
-                        "coverage": "Retained history needs attention. "
-                        "Inspect this source before importing or restoring.",
+                        "coverage": "Your saved history from this source cannot be read. "
+                        "Check it before importing or restoring.",
                     }
                 )
         if strict:

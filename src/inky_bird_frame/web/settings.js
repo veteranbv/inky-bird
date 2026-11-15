@@ -1,5 +1,6 @@
 // Settings edit the controller's authoritative file. Secrets are write-only.
 import { inlineProblem } from '/app/ui.js';
+import { windowName, eventName } from '/app/words.js';
 
 const secretNames = {
   ebird_api_key: 'eBird API key',
@@ -14,7 +15,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     source ? sourceNames[source][0] : 'Settings and backups',
     source
       ? sourceNames[source][1]
-      : 'Choose how Inky runs. Installation and network settings stay with the installer.',
+      : 'Choose how Inky runs. Installation and network settings stay with whoever runs Inky.',
   );
   if (source) main.append(link('Back to Sources', 'sources'));
   main.append(link('Back to Manage', 'manage'));
@@ -43,7 +44,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   }
   if (!settings.editable) {
     main.append(
-      el('h2', 'Managed by your installer'),
+      el('h2', 'Managed by whoever runs Inky'),
       note(
         'Your TOML file and environment remain authoritative. Change the file, validate it, then re-run native setup or restart Docker. This page never edits a temporary copy that startup will replace.',
       ),
@@ -59,7 +60,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             ),
             ...(settings.adoption_notice ? [note(settings.adoption_notice)] : []),
             note(
-              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. To undo adoption, stop Inky and restore the matching previous file, then run setup again.',
+              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. ' +
+                // Before adoption the copy exists only when an earlier adoption made it.
+                (settings.original_backup && settings.original_backup_available === false
+                  ? 'To undo adoption, stop Inky, put ' +
+                    settings.original_backup +
+                    ' back in place of your configuration file, then run setup again.'
+                  : 'To undo adoption, stop Inky and restore the matching previous file, then run setup again.'),
             ),
             button('Confirm switch', async (event) => {
               const control = event.currentTarget;
@@ -114,7 +121,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (type === 'number') {
       field.step = ['latitude', 'longitude'].includes(key) ? 'any' : '1';
     }
-    if (external) field.placeholder = 'Managed by the installer environment';
+    if (external) field.placeholder = 'Set by whoever runs Inky';
     else if (secret)
       field.placeholder = settings.credentials[key]?.configured
         ? 'Already set. Leave empty to keep it.'
@@ -144,11 +151,11 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   if (source) {
     const group = section(
       'Use this source',
-      'Enabling a source can put newly observed birds into the live selection. It does not download media. Automatic plate work follows your generation setting.',
+      'Birds this source notes can go on your frame. Plates for them are made only if plate making is on.',
     );
     checkbox(
       group,
-      'Include ' + sourceNames[source][0] + ' in scheduled discovery',
+      'Check ' + sourceNames[source][0] + ' for new birds',
       fields.sources.includes(source),
       (checked) => {
         // Sources this page does not know, such as one from a newer release, stay.
@@ -186,12 +193,12 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       );
     if (source === 'birdbuddy') {
       const group = section(
-        'Manual records',
-        'Bird Buddy manual sightings can be account-wide and may not belong to your selected feeder. They are separate from automatic feeder detections.',
+        'Birds added by hand',
+        'Birds added by hand in Bird Buddy can come from your whole account, not just this feeder. They are separate from the postcards your feeder sends.',
       );
       checkbox(
         group,
-        'Include manually entered sightings',
+        'Include birds added by hand',
         fields.birdbuddy_include_manual_sightings,
         (checked) => {
           changes.discovery.birdbuddy_include_manual_sightings = checked;
@@ -201,7 +208,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (['ebird-archive', 'birdnet-analyzer'].includes(source))
       form.append(
         note(
-          'An import is retained history, not a live connection. Enabling it selects records within the shared window; it does not request a new file automatically.',
+          'This is history you imported, not a live connection. Turning it on uses its records within your window; it never fetches a new file.',
         ),
       );
   } else {
@@ -261,13 +268,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         changes.discovery.geoapify_api_key = null;
     });
     const selection = section(
-      'Shared live selection',
-      'Collections keep their own fixed membership. These choices control scheduled observation refreshes. eBird nearby supports up to 30 days and 50 km.',
+      'What your regular checks look for',
+      'Collections keep their own birds. eBird nearby looks back at most 30 days and 50 km.',
     );
     const window = el('select');
     window.setAttribute('aria-label', 'Observation window');
     for (const key of ['last-day', 'last-week', 'last-30-days', 'last-year', 'all-time']) {
-      const option = el('option', key.replaceAll('-', ' '));
+      const option = el('option', windowName(key));
       option.value = key;
       window.append(option);
     }
@@ -279,15 +286,15 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     input(selection, 'radius_km', 'Radius in kilometers', fields.radius_km, { type: 'number' });
     input(selection, 'species_limit', 'Live species limit', fields.species_limit, {
       type: 'number',
-      hint: 'This limits live discovery, not the membership of a saved trip. BirdWeather supports at most 100.',
+      hint: 'The most birds your regular checks bring in. Saved trips keep all their birds. BirdWeather supports at most 100.',
     });
     const generation = section(
-      'Plate generation',
-      'Approved art is free to browse. First install and sign in to Codex through the operator setup, then run the controller doctor. Creating missing plates uses that AI account and its allowance or costs. Inky keeps sourced review and retry limits. Disabling generation leaves history and queued work intact. An attempt already running can finish.',
+      'Plate making',
+      'Browsing your plates is free. New plates are drawn with your own image-generation account, and that provider’s charges apply. Set the account up on the controller first, then run the controller doctor. Every new plate must pass its checks before it joins your journal. Turning this off keeps your history and waiting requests; a plate already being drawn can finish.',
     );
     checkbox(
       generation,
-      'Enable scheduled plate generation',
+      'Make new plates on a schedule',
       settings.generation_enabled,
       (checked) => {
         changes.controller.generation_enabled = checked;
@@ -295,13 +302,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     );
     const consent = checkbox(
       generation,
-      'I understand that enabling generation can start AI work at the next scheduled cycle.',
+      'I understand this can start using my image-generation account at the next check.',
       false,
       () => {},
     );
     read.push(() => {
       if (!settings.generation_enabled && changes.controller.generation_enabled && !consent.checked)
-        throw new Error('Confirm AI use before enabling generation.');
+        throw new Error('Tick the box to confirm before turning plate making on.');
     });
     const notifications = section(
       'Notifications',
@@ -353,7 +360,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
           field = el('input');
         field.type = 'checkbox';
         field.checked = !saved.events || saved.events.includes(event);
-        label.append(field, document.createTextNode(event.replaceAll('_', ' ')));
+        label.append(field, document.createTextNode(eventName(event)));
         row.append(label);
         checked.push([event, field]);
       }
@@ -377,7 +384,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (external)
       notifications.append(
         note(
-          'Destination credentials are managed by the environment. Change them through the installer.',
+          'Destination credentials are managed by the environment. Ask whoever runs Inky to change them.',
         ),
       );
     else {
@@ -424,14 +431,14 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
       const summary = [];
       if (source)
         summary.push(
-          (changes.discovery.sources.includes(source) ? 'Use ' : 'Do not use ') +
+          (changes.discovery.sources.includes(source) ? 'Check ' : 'Do not check ') +
             sourceNames[source][0] +
-            ' in scheduled discovery.',
+            ' for new birds.',
         );
       else
         summary.push(
-          'Live window: ' + changes.discovery.window.replaceAll('-', ' ') + '.',
-          'Generation: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
+          'Window: ' + windowName(changes.discovery.window) + '.',
+          'Plate making: ' + (changes.controller.generation_enabled ? 'on' : 'off') + '.',
           'Notifications: ' + (changes.notifications.enabled ? 'on' : 'off') + '.',
         );
       summary.push(...differences(settings, changes));
@@ -439,7 +446,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         el('h2', 'Save these choices?'),
         ...summary.map(note),
         note(
-          'Inky validates the whole file before saving. A private previous-file backup is kept. The scheduler reads changes on its next check. Saving a new source does not run a connection test.',
+          'Inky checks the whole file before saving and keeps a private copy of the previous one. Changes apply from the next check. Saving a source does not test its connection.',
         ),
         button('Save settings', async (event) => {
           const control = event.currentTarget;
@@ -616,7 +623,7 @@ async function birdBuddyAccount(ui, main, note) {
       note(
         'Role: ' +
           state.feeder.role +
-          '. Saved credentials are present; this is not a live token check. Use Refresh observations on Sources to check the enabled provider.',
+          '. Its sign-in is saved; that alone does not show it still works. Use Check sources now on Sources to try it.',
       ),
     );
     if (!state.least_privilege_guest)
@@ -630,16 +637,14 @@ async function birdBuddyAccount(ui, main, note) {
     if (state.history) {
       section.append(
         note(
-          'Last successful synchronization: ' +
+          'Last check that worked: ' +
             new Date(state.history.last_successful_sync_at).toLocaleString(),
         ),
         note(
-          'Retained postcards: ' +
+          'Postcards in your journal: ' +
             state.history.retained_postcards +
-            '. Manual sightings: ' +
-            (state.history.manual_sightings_included
-              ? 'included by your explicit setting'
-              : 'excluded') +
+            '. Birds added by hand: ' +
+            (state.history.manual_sightings_included ? 'included' : 'left out') +
             '.',
         ),
       );
@@ -648,7 +653,7 @@ async function birdBuddyAccount(ui, main, note) {
       button('Remove local Bird Buddy login', async (event) => {
         if (
           !confirm(
-            'Remove this installation’s Bird Buddy login and permission attestation? Retained detections and plates stay. This does not revoke the token at Bird Buddy.',
+            'Remove this Inky’s Bird Buddy login and your permission note? Birds already noted and your plates stay. This does not sign Inky out at Bird Buddy itself.',
           )
         )
           return;
@@ -668,8 +673,8 @@ async function birdBuddyAccount(ui, main, note) {
     section.append(
       note(
         state.history_present
-          ? 'No saved login. Earlier private detection history is retained.'
-          : 'Not signed in. No private detection history is available yet.',
+          ? 'No saved login. Birds noted earlier stay in your journal.'
+          : 'Not signed in. Nothing from Bird Buddy is in your journal yet.',
       ),
     );
   if (!response.secure_bootstrap) {

@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import patch
 
 import pytest
@@ -144,7 +144,12 @@ def test_restart_marks_unknown_work_interrupted_without_replay(tmp_path: Path) -
     worker.path.write_text(json.dumps(raw))
     restarted = OwnerOperations(tmp_path)
     try:
-        assert restarted.status(str(receipt["operation_id"]))["status"] == "interrupted"
+        interrupted = restarted.status(str(receipt["operation_id"]))
+        assert interrupted["status"] == "interrupted"
+        assert interrupted["result"] == {
+            "message": "Inky could not confirm how this ended. "
+            "Check what changed before trying again."
+        }
         with patch("inky_bird_frame.owner_operations._stamp"):
             duplicate = restarted.submit(
                 "retry",
@@ -224,6 +229,36 @@ def test_adapter_refresh_uses_real_zero_source_logic_and_rejects_stale_settings(
         execute_owner_operation(config, "refresh", revision="old")
 
 
+@pytest.mark.parametrize(
+    ("kind", "enabled", "ending"),
+    [
+        ("retry", False, "Plate making is off. These birds wait until you turn it on."),
+        ("retry-now", False, "Plate making is off. These birds wait until you turn it on."),
+        ("retry", True, "They are tried at the next scheduled check."),
+        ("retry-now", True, "Inky tries them as soon as it can, once the sources are checked."),
+    ],
+)
+def test_retry_message_holds_whether_plate_making_is_on(
+    tmp_path: Path, kind: Literal["retry", "retry-now"], enabled: bool, ending: str
+) -> None:
+    path = tmp_path / "config.toml"
+    initialize_config(path)
+    if enabled:
+        path.write_text(
+            path.read_text().replace('"generation_enabled" = false', '"generation_enabled" = true')
+        )
+    config = load_config(path, load_secrets=False)
+    assert config.controller.generation_enabled is enabled
+    with patch("inky_bird_frame.retry_requests.retry_wake_available", return_value=True):
+        result = execute_owner_operation(
+            config, kind, revision=str(settings_status(config)["revision"]), taxon_ids=[303]
+        )
+    message = str(result["message"])
+    assert message == (
+        "A plate you kept is never replaced. In the works shows how each one goes. " + ending
+    )
+
+
 def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     initialize_config(path)
@@ -239,7 +274,7 @@ def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_
             config, "notification-test", revision=str(settings_status(config)["revision"])
         )
     assert result["failed_count"] == result["delivered_count"] == 1
-    assert "failed" in str(result["message"])
+    assert str(result["message"]) == "The test did not reach every destination."
 
 
 def test_concurrent_save_cannot_change_confirmed_notification_destinations(tmp_path: Path) -> None:

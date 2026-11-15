@@ -4,12 +4,20 @@ import { setImmediate } from 'node:timers/promises';
 import test, { mock } from 'node:test';
 import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 
-const source = await readFile(
-  new URL('../../src/inky_bird_frame/web/imports.js', import.meta.url),
-  'utf8',
-);
+const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
+const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+// A data: module cannot resolve '/app/' paths, so its imports are inlined too.
+const inlined = new Map();
+async function inline(source) {
+  for (const [, path] of source.matchAll(/from '(\/app\/[\w-]+\.js)'/g)) {
+    if (!inlined.has(path))
+      inlined.set(path, moduleURL(await inline(await readFile(new URL(path.slice(5), web), 'utf8'))));
+    source = source.replace(`'${path}'`, JSON.stringify(inlined.get(path)));
+  }
+  return source;
+}
 const { renderImports } = await import(
-  'data:text/javascript;base64,' + Buffer.from(source).toString('base64')
+  moduleURL(await inline(await readFile(new URL('imports.js', web), 'utf8')))
 );
 
 const HOUR = 3600 * 1000;
@@ -241,7 +249,7 @@ test('a repeated failure to check a running step shows one error', async () => {
     mock.timers.tick(1000);
     await setImmediate();
     await setImmediate();
-    await click(findButton(env.main, 'Check this operation again'));
+    await click(findButton(env.main, 'Check again'));
     await settled(env.actions);
 
     const alerts = findAll(env.main, (node) => node.getAttribute('role') === 'alert').filter(
@@ -254,7 +262,7 @@ test('a repeated failure to check a running step shows one error', async () => {
   }
 });
 
-test('a small upload is described in KiB', async () => {
+test('a small upload is described in KB', async () => {
   const env = setup({
     '/v1/owner/operations': { operations: [] },
     '/v1/owner/imports': { preview: null },
@@ -268,7 +276,7 @@ test('a small upload is described in KiB', async () => {
   await setImmediate();
 
   const status = findAll(form, (node) => node.getAttribute('role') === 'status')[0];
-  assert.match(text(status), /Uploading 1 KiB privately/);
+  assert.match(text(status), /Uploading 1 KB privately/);
 });
 
 test('the controller, not the browser clock, decides that a preview expired', async () => {
@@ -304,7 +312,7 @@ test('an upload reports how much has been sent', async () => {
   report(50 * 1024 * 1024, 200 * 1024 * 1024);
   const status = findAll(form, (node) => node.getAttribute('role') === 'status')[0];
   assert.match(text(status), /25%/);
-  assert.match(text(status), /50 of 200 MiB/);
+  assert.match(text(status), /50 of 200 MB/);
   finish({});
   await setImmediate();
 });
@@ -418,3 +426,28 @@ test('choosing checklists says unmatched names are looked up on iNaturalist', as
 
   assert.match(text(env.main), /iNaturalist/);
 });
+
+// "Use the history already here" is offered unless the journal shows there is
+// no eBird history: when it cannot tell, the history may still be there.
+for (const [name, coverage, offered] of [
+  ['with eBird history', [{ source: 'ebird-archive', status: 'available', species_count: 3 }], true],
+  ['on a new install', [], false],
+  ['when the eBird history is empty', [{ source: 'ebird-archive', status: 'available', species_count: 0 }], false],
+  ['when the history cannot be read', [{ source: 'ebird-archive', status: 'unavailable' }], true],
+  ['when the journal cannot be read', new Error('Inky is not answering.'), true],
+  ['when only another source has history', [{ source: 'birdbuddy', status: 'available', species_count: 3 }], false],
+])
+  test('using existing history is ' + (offered ? 'offered ' : 'not offered ') + name, async () => {
+    const env = setup({
+      '/v1/owner/operations': { operations: [] },
+      '/v1/owner/imports': { preview: null },
+      '/v1/owner/journal': coverage instanceof Error ? coverage : { history_coverage: coverage },
+    });
+    await renderImports(env.ui, env.helpers);
+    for (let n = 0; n < 5; n++) await setImmediate();
+    const control = findButton(env.main, 'Use the history already here');
+    assert.ok(control);
+    assert.equal(!control.parent.hidden, offered);
+    assert(text(env.main).includes('Files up to 512 MB.'));
+    assert(!/MiB|GiB|retained/.test(text(env.main)));
+  });

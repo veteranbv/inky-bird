@@ -1013,8 +1013,8 @@ def queue_owner_selection_locked(
         )
         _write_generation_queue(config, current)
     return {
-        "message": "Missing-plate requests saved. Existing holds and retry dates remain. "
-        "No model started, and Saved birds and wall selection did not change.",
+        "message": "The missing plates were asked for. Birds already waiting or held "
+        "are left as they are. Nothing is drawn yet, and your frame did not change.",
         "queued": len(new_ids),
         "already_queued": len(cast(list[int], plan["already_queued"])),
         "held": len(cast(list[int], plan["held"])),
@@ -2229,9 +2229,7 @@ def _change_collection(
                 ).encode()
             ).hexdigest()
             if expected_revision is not None and expected_revision != revision:
-                raise CatalogError(
-                    "Saved birds or approved artwork changed. Review this action again."
-                )
+                raise CatalogError("On my frame or your plates changed. Review this again.")
             requested_taxa = (
                 {entry.taxon_id for entry in approved} if taxon_ids is None else taxon_ids
             )
@@ -2293,11 +2291,11 @@ def change_saved_collection(
     if action not in {"add", "remove", "import-approved"} or (action == "import-approved") != (
         taxon_id is None
     ):
-        raise ValueError("Choose a supported Saved birds action")
+        raise ValueError("Choose a supported change to On my frame")
     if action == "add" and not any(
         entry.taxon_id == taxon_id for entry in read_catalog_entries(config.controller.catalog_dir)
     ):
-        raise CatalogError("Choose approved artwork before adding it to Saved birds")
+        raise CatalogError("Choose a bird with a plate before adding it to On my frame")
     with catalog_state_lock(config.controller.state_dir) if dry_run else nullcontext():
         return _change_collection(
             config,

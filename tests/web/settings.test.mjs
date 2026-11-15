@@ -7,8 +7,13 @@ import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 const uiURL = moduleURL(await readFile(new URL('ui.js', web), 'utf8'));
+const wordsURL = moduleURL(await readFile(new URL('words.js', web), 'utf8'));
 const { renderSettings } = await import(
-  moduleURL((await readFile(new URL('settings.js', web), 'utf8')).replace("'/app/ui.js'", JSON.stringify(uiURL)))
+  moduleURL(
+    (await readFile(new URL('settings.js', web), 'utf8'))
+      .replace("'/app/ui.js'", JSON.stringify(uiURL))
+      .replace("'/app/words.js'", JSON.stringify(wordsURL)),
+  )
 );
 
 const sourceNames = {
@@ -164,7 +169,7 @@ test('Bird Buddy state that cannot load still leaves the source switch', async (
   );
   assert.deepEqual(alerts(main), ['Bird Buddy state could not be read.']);
   assert.ok(
-    walk(main).some((node) => node.textContent === 'Include Bird Buddy in scheduled discovery'),
+    walk(main).some((node) => node.textContent === 'Check Bird Buddy for new birds'),
     'the switch to turn Bird Buddy off is still there',
   );
 });
@@ -346,4 +351,36 @@ test('destination fields have visible labels and say when a secret is saved', as
   assert.equal(saved(main), 0);
   const ebird = await open(t, { '/v1/owner/settings': settings() }, { source: 'ebird' });
   assert.equal(saved(ebird.main), 1);
+});
+
+test('the plate making note promises only what Inky does with each new plate', async (t) => {
+  const { main } = await open(t, { '/v1/owner/settings': settings() });
+  const shown = walk(main).map((node) => node.textContent).join('\n');
+  // A plate that passes its checks joins the journal without the owner's look.
+  assert.doesNotMatch(shown, /before you keep it/);
+  assert.match(shown, /Every new plate must pass its checks before it joins your journal\./);
+});
+
+test('the regular-check choices are named in plain words', async (t) => {
+  const { main } = await open(t, { '/v1/owner/settings': settings() });
+  const shown = walk(main).map((node) => node.textContent).join('\n');
+  assert.doesNotMatch(shown, /Shared live selection|live discovery/);
+  assert.match(shown, /What your regular checks look for/);
+});
+
+test('undoing adoption names the copy Inky keeps of the original file', async (t) => {
+  const managed = settings({
+    ownership: 'managed',
+    editable: false,
+    original_backup: 'config.toml.original',
+    original_backup_available: false,
+  });
+  const { main } = await open(t, { '/v1/owner/settings': managed });
+  findButton(main, 'Preview switch to app-managed settings').click();
+  const shown = walk(main).map((node) => node.textContent).join('\n');
+  assert.match(shown, /To undo adoption, stop Inky, put config\.toml\.original back in place of your configuration file, then run setup again\./);
+  // An older server that does not name the copy keeps the general sentence.
+  const older = await open(t, { '/v1/owner/settings': settings({ ownership: 'managed', editable: false }) });
+  findButton(older.main, 'Preview switch to app-managed settings').click();
+  assert.match(walk(older.main).map((node) => node.textContent).join('\n'), /restore the matching previous file/);
 });

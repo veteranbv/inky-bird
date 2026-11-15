@@ -175,6 +175,28 @@ function collectServerErrors(t) {
   }
 }
 
+// Every page the journeys reach reads in the owner's words: no retired names
+// and no raw machine values. Commands and typed values are not prose.
+const RETIRED = [
+  'Saved birds', 'Current and saved', 'current selection', 'Available artwork',
+  'Review candidate', 'Plate work', 'Runnable', 'held for recovery', 'Operation outcome',
+  'Owner operation', 'Wall panel', 'not a sighting', 'approved artwork', 'dead letter',
+  'Refresh observations', 'Confirm action',
+];
+async function plainWords(page, label) {
+  const text = await page.evaluate(() => {
+    const main = document.querySelector('main');
+    if (!main) return '';
+    const copy = main.cloneNode(true);
+    for (const node of copy.querySelectorAll('pre, code, input, textarea, select')) node.remove();
+    return copy.textContent;
+  });
+  for (const old of RETIRED)
+    assert(!text.toLowerCase().includes(old.toLowerCase()), label + ': old name ' + old);
+  const raw = text.match(/\b(true|false|succeeded|last-\d+-days|last-week|last-day|all-time)\b/);
+  assert.equal(raw, null, label + ': a raw machine value is shown: ' + raw?.[0]);
+}
+
 function run(body) {
   const t = { phase: 'start', engine, root, fixture, publicCatalog, cardinal, robin, plateRoute, username, password };
   let browser, page;
@@ -215,8 +237,24 @@ function run(body) {
     context.on('response', (response) => {
       if (response.status() >= 500 || response.status() === 404) collectServerErrors(t);
     });
+    let shots = 0;
     async function heading(name) {
       await page.getByRole('heading', { name, exact: true }).waitFor();
+      await plainWords(page, name);
+      // For reading every page as the owner would; never part of a normal run.
+      if (process.env.INKY_QA_SHOTS) {
+        const size = page.viewportSize();
+        const slug = String(++shots).padStart(3, '0') + '-' + name.replace(/[^A-Za-z0-9]+/g, '-');
+        for (const [width, height] of [[375, 812], [1280, 800]]) {
+          await page.setViewportSize({ width, height });
+          await page.waitForTimeout(100);
+          await page.screenshot({
+            path: path.join(process.env.INKY_QA_SHOTS, slug + '-' + width + '.png'),
+            fullPage: true,
+          });
+        }
+        await page.setViewportSize(size);
+      }
     }
     async function step(name) {
       for (let n = 0; n < 30; n++) {

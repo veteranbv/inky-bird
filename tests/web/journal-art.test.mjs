@@ -33,6 +33,15 @@ test('collection covers use the small plate', async (t) => {
   for (const image of covers) assert.match(image.src, /\/thumbnail\?revision=[a-f]{64}$/);
 });
 
+test('every collection card has its own title', async (t) => {
+  const { main } = await open(t, { page: 'collections' });
+  const titles = nodes(main)
+    .filter((node) => node.className === 'collection-title')
+    .map((node) => node.textContent);
+  assert(titles.length >= 4, titles.join(' | '));
+  assert.equal(new Set(titles).size, titles.length, titles.join(' | '));
+});
+
 test('search hides cards instead of rebuilding them', async (t) => {
   const { main } = await open(t, { page: 'birds' });
   const grid = main.querySelector('.bird-grid');
@@ -187,7 +196,7 @@ for (const [name, change] of [
     });
 
 test('plate work that could not be read says so instead of asking for setup', async (t) => {
-  const message = 'Plate work could not be read. Manage shows it again once its files are readable.';
+  const message = 'In the works could not be read. Manage shows it again once its files can be read.';
   const { main } = await open(t, { page: 'work' }, {
     state: withState({
       management: { available: false, reason: 'unreadable' },
@@ -195,8 +204,8 @@ test('plate work that could not be read says so instead of asking for setup', as
     }),
   });
   const text = main.textContent;
-  assert(!text.includes('Full configuration unavailable'));
-  assert(!text.includes('documented serve command'));
+  assert(!text.includes('Settings are not available here'));
+  assert(!text.includes('usual serve command'));
   const [box] = notices(main);
   assert.equal(box?.textContent, message);
 });
@@ -205,13 +214,34 @@ test('unreadable plate work without its notice still says it could not be read',
   const { main } = await open(t, { page: 'sources' }, {
     state: withState({ management: { available: false, reason: 'unreadable' } }),
   });
-  assert(!main.textContent.includes('Full configuration unavailable'));
-  assert.equal(notices(main)[0]?.textContent, 'Plate work could not be read.');
+  assert(!main.textContent.includes('Settings are not available here'));
+  assert.equal(notices(main)[0]?.textContent, 'Plates in the works could not be read.');
 });
 
 test('an install without plate work configured keeps its setup message', async (t) => {
   const { main } = await open(t, { page: 'work' });
-  assert(main.textContent.includes('Full configuration unavailable'));
-  assert(main.textContent.includes('Start Inky through its documented serve command'));
+  assert(main.textContent.includes('Settings are not available here'));
+  assert(main.textContent.includes('Start Inky with its usual serve command to see this page.'));
   assert.deepEqual(notices(main), []);
+});
+
+test('Health shows each check in plain words, never a raw status', async (t) => {
+  const { main } = await open(t, { page: 'health' }, {
+    respond(path) {
+      if (path === '/v1/owner/health')
+        return {
+          version: '1.0.0',
+          notice: 'These checks only read.',
+          checks: [
+            { name: 'Your plates', status: 'ok', detail: '3 plates read.' },
+            { name: 'Storage', status: 'info', detail: '9.0 GiB free.' },
+            { name: 'Notifications', status: 'attention', detail: '1 message could not be delivered.' },
+            { name: 'Something newer', status: 'unexpected', detail: 'A later check.' },
+          ],
+        };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  const headings = nodes(main).filter((node) => node.tagName === 'H2').map((node) => node.textContent);
+  assert.deepEqual(headings.slice(0, 4), ['Your plates · Fine', 'Storage', 'Notifications · Needs a look', 'Something newer']);
 });

@@ -199,7 +199,7 @@ test('field notes that fail to load leave the rest of the bird page working', as
   });
   assert.deepEqual(problems, []);
   assert(findButton(main, 'Add to Favorites'), 'Favorites still works');
-  assert(findButton(main, 'Add to Saved birds'), 'Saved birds still works');
+  assert(findButton(main, 'Add to my frame'), 'On my frame still works');
   assert(nodes(main).some((node) => node.textContent === 'Field notes are unavailable.'));
 });
 
@@ -211,7 +211,7 @@ test('field notes arrive below the bird actions, so nothing moves under a finger
   const holding = (target) => notes.children.findIndex((child) => child === target || nodes(child).includes(target));
   const fieldNotes = notes.children.findIndex((node) => node.classList.contains('field-notes'));
   const favorites = holding(findButton(main, 'Add to Favorites'));
-  const saved = holding(findButton(main, 'Add to Saved birds'));
+  const saved = holding(findButton(main, 'Add to my frame'));
   assert(favorites >= 0 && saved >= 0 && fieldNotes >= 0);
   assert(fieldNotes > favorites && fieldNotes > saved, 'field notes come after the actions');
 });
@@ -239,11 +239,13 @@ test('the bird page shows its notes beside the plate', async (t) => {
   assert(layout.children[1].contains(findButton(main, 'Add to Favorites')));
 });
 
-const welcome = 'Welcome. Start wherever you like.';
+const welcome = 'Connect a source (optional)';
+const start = 'Pick a few birds you love to start your frame.';
 const empty = { birds: [], active_taxon_ids: [], featured_taxon_id: null };
-test('a new journal shows the welcome', async (t) => {
+test('a new journal offers a first start', async (t) => {
   const { main } = await open(t, { page: 'home' }, { state: withState(empty) });
   assert(main.textContent.includes(welcome));
+  assert(main.textContent.includes(start));
 });
 
 for (const [name, change] of [
@@ -254,7 +256,7 @@ for (const [name, change] of [
   test('a journal with ' + name + ' and no birds is not shown as new', async (t) => {
     const { main } = await open(t, { page: 'home' }, { state: withState({ ...empty, ...change }) });
     assert(!main.textContent.includes(welcome));
-    assert(main.textContent.includes('Make room for a bird'));
+    assert.equal(main.textContent.includes(start), !change.notices);
   });
 
 for (const [plateReady, oneTap] of [
@@ -279,10 +281,10 @@ for (const [plateReady, oneTap] of [
         throw new Error('unexpected ' + path);
       },
     });
-    findButton(main, 'Remove from Saved birds').click();
+    findButton(main, 'Remove from my frame').click();
     await flush();
     assert.equal(changes.length, oneTap ? 1 : 0);
-    assert.equal(Boolean(findButton(main, 'Confirm Saved birds change')), !oneTap);
+    assert.equal(Boolean(findButton(main, 'Change my frame')), !oneTap);
     assert.equal(Boolean(findButton(main, 'Undo')), oneTap);
     assert.deepEqual(assigned, []);
   });
@@ -303,7 +305,7 @@ test('a favorite that cannot be saved says so beside the bird', async (t) => {
   await flush();
   assert.deepEqual(problems, []);
   assert(nodes(main).some((node) => node.textContent === 'The journal changed. Reload and try again.'));
-  assert(findButton(main, 'Add to Saved birds'), 'the rest of the page stays');
+  assert(findButton(main, 'Add to my frame'), 'the rest of the page stays');
   assert.equal(favorite.disabled, false);
 });
 
@@ -328,17 +330,57 @@ test('an action that cannot start says so in its own section', async (t) => {
       throw new Error('unexpected ' + path);
     },
   });
-  findButton(main, 'Refresh observations').click();
+  findButton(main, 'Check sources now').click();
   await flush();
   assert.deepEqual(problems, []);
   assert.equal(main.querySelector('h1').textContent, 'Sources');
-  const message = 'This service has no authoritative configuration file.';
+  const message = 'Inky was started without its settings file, so this cannot run here.';
   assert(nodes(main).some((node) => node.textContent === message));
-  findButton(main, 'Refresh observations').click();
+  findButton(main, 'Check sources now').click();
   await flush();
   assert.equal(
     nodes(main).filter((node) => node.tagName === 'P' && node.textContent === message).length,
     1,
+  );
+});
+
+// The confirm step says what will happen in the owner's words, once.
+test('a confirm step is named for what it does and a lost answer says what to check', async (t) => {
+  const source = { name: 'inaturalist', enabled: true, status: 'ok', activity: {} };
+  const { main } = await open(t, { page: 'sources' }, {
+    state: withState({
+      management: {
+        available: true,
+        window: 'last-30-days',
+        refresh_minutes: 15,
+        sources: [source],
+        work: { complete: true, discovery_status: 'ok' },
+        activity: { entries: {} },
+        recent_detections: [],
+      },
+    }),
+    respond(path, body) {
+      if (path === '/v1/owner/settings') return { revision: 'r'.repeat(64) };
+      if (path === '/v1/owner/operations' && body)
+        throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+      if (path === '/v1/owner/operations') return { operations: [] };
+      throw new Error('unexpected ' + path);
+    },
+  });
+  findButton(main, 'Check sources now').click();
+  await flush();
+  const shown = nodes(main).filter((node) => !node.children.length).map((node) => node.textContent);
+  assert(nodes(main).some((node) => node.tagName === 'H2' && node.textContent === 'Check sources now'));
+  for (const old of ['Refresh observations', 'Confirm action']) assert(!shown.includes(old), old);
+  const confirm = findButton(main, 'Confirm');
+  confirm.fire('click', { currentTarget: confirm });
+  await flush();
+  assert(
+    nodes(main).some(
+      (node) =>
+        node.textContent ===
+        'Inky cannot be reached. If the connection dropped, check this page before trying again.',
+    ),
   );
 });
 

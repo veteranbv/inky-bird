@@ -1,12 +1,13 @@
 import { randomHex } from '/app/keys.js';
-import { plural, waitForOperation } from '/app/manage.js';
+import { waitForOperation } from '/app/manage.js';
+import { WORDS, plural, plainDate, when } from '/app/words.js';
 import { inlineProblem } from '/app/ui.js';
 
 export function renderCollections(context) {
   const { el, main, data, link, note, art, members, viewLabel, base, playLink } = context;
   base(
     'Collections',
-    'Keep a selection together. Saving a group does not change your wall or request new art.',
+    'Groups of birds you keep together. Making one does not change your frame.',
   );
   const grid = el('div', '', 'bird-grid');
   for (const key of [
@@ -29,8 +30,8 @@ export function renderCollections(context) {
     node.append(
       link(viewLabel(key), 'collection', { view: key }, 'collection-title'),
       note(
-        ready.length + (ready.length === 1 ? ' plate ready · ' : ' plates ready · ') +
-        (birds.length - ready.length) + ' not ready',
+        plural(ready.length, 'plate', 'plates') +
+          (birds.length > ready.length ? ' · ' + (birds.length - ready.length) + ' not drawn yet' : ''),
       ),
       playLink(key),
     );
@@ -43,7 +44,7 @@ export function renderCollections(context) {
     link('Import a collection', 'import-collection'),
     grid,
     note(
-      'Current and saved keeps the existing controller selection. Named collections do not join it automatically. Available artwork is not personal evidence.',
+      'A collection’s birds go on your frame only when you add them there.',
     ),
   );
 }
@@ -52,7 +53,7 @@ export async function renderCommunity(context) {
   const { ui, el, button, api, main, href, link, note, base } = context;
   base(
     'Birds reported near a place',
-    'Search iNaturalist community reports. These are not your personal sightings. The query sends this point, radius and dates to iNaturalist.',
+    'Birds other people reported to iNaturalist. Searching sends the point, distance and dates you enter to iNaturalist.',
   );
   const preview = await api('/v1/owner/community');
   const key = () => randomHex(24);
@@ -60,8 +61,8 @@ export async function renderCommunity(context) {
     const group = preview.collection;
     main.append(
       el('h2', group.label),
-      note(group.start_date + ' through ' + group.end_date + ' · inclusive dates'),
-      note(group.members.length + ' species · complete search result'),
+      note(plainDate(group.start_date) + ' to ' + plainDate(group.end_date)),
+      note(plural(group.members.length, 'kind of bird', 'kinds of bird')),
       note(preview.notice),
     );
     const list = el('ul');
@@ -70,7 +71,7 @@ export async function renderCommunity(context) {
     main.append(list);
     const requestKey = key();
     main.append(
-      button('Save community collection', async () => {
+      button('Save as a collection', async () => {
         try {
           const receipt = await api('/v1/owner/community/save', {
             key: requestKey,
@@ -86,7 +87,7 @@ export async function renderCommunity(context) {
   }
   main.append(
     button(
-      preview.status === 'ready' ? 'Discard preview and search again' : 'New community search',
+      preview.status === 'ready' ? 'Search again' : 'Search for birds',
       () => {
         const form = el('form'),
           inputs = {};
@@ -120,13 +121,11 @@ export async function renderCommunity(context) {
         }
         form.append(
           note(
-            'Searches must contain no more than 500 species. Narrow a larger result; Inky never saves a truncated selection.',
+            'A search can hold up to 500 kinds of bird. Narrow the dates or distance if it finds more.',
           ),
-          note(
-            'A successful new search replaces only the temporary preview, not saved collections.',
-          ),
+          note('A new search replaces only this preview, not your collections.'),
         );
-        const submit = el('button', 'Check community reports');
+        const submit = el('button', 'Search iNaturalist');
         submit.type = 'submit';
         const problem = el('p', '', 'error');
         problem.setAttribute('role', 'alert');
@@ -168,12 +167,12 @@ export function renderEditCollection(context) {
   const selected = new Set(group?.taxon_ids || [Number(query.get('bird'))].filter(Boolean));
   base(
     group ? 'Edit collection' : 'New collection',
-    'Choose species for a private saved selection. This does not claim that you saw them.',
+    'Choose the birds for this collection.',
   );
   if (group?.kind === 'personal-trip')
     main.append(
       note(
-        'Existing checklist links stay with retained members. Any bird you add here is a manual selection, not a new personal sighting. Unresolved source names stay until you remove or resolve them below.',
+        'Birds from your checklists keep their checklist links. Birds you add here are marked as added by you.',
       ),
     );
   const form = el('form');
@@ -208,7 +207,7 @@ export function renderEditCollection(context) {
     );
     row.append(
       input,
-      document.createTextNode(bird.common_name + (bird.plate_ready ? '' : ' · plate not ready')),
+      document.createTextNode(bird.common_name + (bird.plate_ready ? '' : ' · no plate yet')),
     );
     rows.push([bird, row]);
     fields.append(row);
@@ -224,7 +223,7 @@ export function renderEditCollection(context) {
       if (!hidden) shown += 1;
     }
     matches.textContent = term
-      ? shown + (shown === 1 ? ' species shown' : ' species shown') + ' · chosen birds stay chosen'
+      ? plural(shown, 'bird', 'birds') + ' shown · chosen birds stay chosen'
       : '';
   }
   finder.addEventListener('input', filterRows);
@@ -239,7 +238,7 @@ export function renderEditCollection(context) {
   const pending = el('fieldset');
   if (unresolved.length) {
     pending.append(
-      el('legend', 'Unresolved species'),
+      el('legend', 'Names Inky could not match'),
       note(
         'Untick a name to remove it. For a name marked "matches", also choose that bird above to keep its checklist links.',
       ),
@@ -300,7 +299,7 @@ export function renderImportCollection(context) {
   const { ui, el, button, api, main, data, href, link, note, base } = context;
   base(
     'Import a collection',
-    'Bring a saved selection to this controller. Imported labels are not proof that you saw a bird.',
+    'Add a collection from an Inky collection file.',
   );
   const label = el('label', 'Inky collection file');
   label.htmlFor = 'collection-file';
@@ -318,33 +317,33 @@ export function renderImportCollection(context) {
       const file = input.files[0];
       if (!file) return;
       if (file.size > 1024 * 1024)
-        throw new Error('Choose a collection file no larger than 1 MiB.');
+        throw new Error('Choose a collection file of 1 MB or less.');
       const document = JSON.parse(await file.text());
       const preview = await api('/v1/owner/journal/collections/import-preview', { document });
       if (selection !== pending || !content.isConnected) return;
       content.append(
         el('h2', preview.label),
         note(
-          preview.resolved +
-            ' matched species · ' +
-            preview.ready +
-            ' approved plates · ' +
-            preview.unresolved.length +
-            ' unresolved',
+          plural(preview.resolved, 'bird', 'birds') +
+            ' · ' +
+            plural(preview.ready, 'plate', 'plates') +
+            (preview.unresolved.length
+              ? ' · ' + preview.unresolved.length + ' not matched'
+              : ''),
         ),
         note(preview.notice),
       );
       if (preview.start_date)
         content.append(
-          note(preview.start_date + ' through ' + preview.end_date + ' · inclusive dates'),
+          note(plainDate(preview.start_date) + ' to ' + plainDate(preview.end_date)),
         );
       for (const member of preview.unresolved)
-        content.append(note('Unresolved: ' + (member.scientific_name || member.common_name)));
+        content.append(note('Not matched: ' + (member.scientific_name || member.common_name)));
       const collection_id = randomHex(16);
       const problem = el('p', '', 'error');
       problem.setAttribute('role', 'alert');
       content.append(
-        button('Import this selection', async (event) => {
+        button('Add this collection', async (event) => {
           const control = event.currentTarget;
           control.disabled = true;
           try {
@@ -361,7 +360,7 @@ export function renderImportCollection(context) {
             else
               problem.textContent =
                 error.message +
-                ' You can retry this same save safely, or check Collections for its result.';
+                ' You can try again safely, or check Collections to see whether it was added.';
           }
         }),
         problem,
@@ -389,40 +388,36 @@ export function renderCollection(context) {
   base(
     viewLabel(view),
     view === 'all'
-      ? 'Artwork, not a record of personal sightings.'
-      : 'A saved view. Play does not change the physical wall.',
+      ? 'Every plate you could add.'
+      : 'Play shows these birds here. Your wall frame keeps its own birds.',
   );
   main.append(playLink(view));
   const tools = el('section', '', 'collection-tools');
   if (view === 'saved')
-    tools.append(savedReview(context, 'Review adding all available approved art', 'import-approved'));
+    tools.append(savedReview(context, 'Add every bird with a plate', 'import-approved'));
   const group = data.collections.find((item) => item.collection_id === view);
   if (group) {
     main.append(
       note(
         group.kind === 'personal-trip'
-          ? 'Personal trip · linked eBird checklists'
+          ? 'A trip from your eBird checklists'
           : group.kind === 'community-history'
-            ? 'Community reports · not your personal sightings'
+            ? 'Birds other people reported nearby'
             : group.kind === 'imported-selection'
-              ? 'Imported selection · personal evidence not verified here'
+              ? 'Added from a collection file'
               : group.kind === 'favorites'
-                ? 'Bookmarks · not sightings'
-                : 'Saved selection · not a sighting record',
+                ? 'Birds you’ve marked.'
+                : 'A collection you made',
       ),
     );
     if (group.start_date)
-      main.append(note(group.start_date + ' through ' + group.end_date + ' · inclusive dates'));
+      main.append(note(plainDate(group.start_date) + ' to ' + plainDate(group.end_date)));
     for (const member of group.unresolved)
       main.append(
-        note(
-          'Unresolved: ' +
-            (member.scientific_name || member.common_name) +
-            ' · no generation requested',
-        ),
+        note('Not matched: ' + (member.scientific_name || member.common_name)),
       );
     if (group.unresolved.length && group.kind !== 'favorites')
-      main.append(note('Edit this collection to remove or resolve unresolved species.'));
+      main.append(note('Edit this collection to remove names Inky could not match.'));
     for (const member of group.evidence || [])
       if (member.status !== 'linked')
         main.append(
@@ -431,8 +426,8 @@ export function renderCollection(context) {
             (byId.get(member.taxon_id)?.common_name || member.scientific_name) +
               ': ' +
               (member.status === 'source-changed'
-                ? 'Source record changed. Your curated selection stays, but its original personal evidence no longer matches.'
-                : 'Source history is unavailable. Inky cannot confirm this member’s evidence.'),
+                ? 'its checklist changed after you made this collection. It stays in the collection.'
+                : 'its checklist history cannot be read right now.'),
             'notice',
           ),
         );
@@ -440,7 +435,7 @@ export function renderCollection(context) {
       button('Export collection', async () => {
         if (
           !confirm(
-            'This file includes this collection’s name, dates and species. It does not include credentials or private source identifiers. Check those details before sharing it.',
+            'The file holds this collection’s name, dates and birds, and where each bird came from. Share it only if you are happy to share those.',
           )
         )
           return;
@@ -466,7 +461,7 @@ export function renderCollection(context) {
       problem = el('p', '', 'error');
     problem.setAttribute('role', 'alert');
     request.append(
-      button('Review missing-plate requests', async (event) => {
+      button('Ask for the missing plates', async (event) => {
         const control = event.currentTarget;
         control.disabled = true;
         try {
@@ -480,18 +475,15 @@ export function renderCollection(context) {
             plan = preview.plan;
           const summary = el('div', '', 'notice');
           summary.append(
-            el('h2', 'Queue missing plates?'),
+            el('h2', 'Draw the missing plates?'),
             note(
-              plan.new_requests.length +
-                ' new requests · ' +
-                plan.already_queued.length +
-                ' already queued · ' +
-                plan.held.length +
-                ' held · ' +
-                plan.ready.length +
-                ' ready · ' +
-                preview.unresolved +
-                ' unresolved',
+              [
+                plural(plan.new_requests.length, 'bird', 'birds') + ' to draw',
+                plan.already_queued.length + ' already waiting',
+                plan.held.length + ' left as they are',
+                plural(plan.ready.length, 'bird', 'birds') + ' with a plate',
+                ...(preview.unresolved ? [preview.unresolved + ' not matched'] : []),
+              ].join(' · '),
             ),
           );
           for (const id of plan.held) {
@@ -500,36 +492,35 @@ export function renderCollection(context) {
             );
             summary.append(
               note(
-                (byId.get(id)?.common_name || 'Taxon ' + id) +
-                  ': existing review or recovery hold. This action will not clear it.',
+                (byId.get(id)?.common_name || 'Bird ' + id) +
+                  ': has a plate waiting for you or needs a hand. This leaves it as it is.',
               ),
               pending
-                ? link('Inspect the pending candidate', 'candidate', { bird: id })
-                : link('Inspect this bird’s recovery', 'work', { bird: id }),
+                ? link('Look at the new plate', 'candidate', { bird: id })
+                : link('See what it needs', 'work', { bird: id }),
             );
           }
           for (const item of plan.waiting)
             summary.append(
               note(
-                (byId.get(item.taxon_id)?.common_name || 'Taxon ' + item.taxon_id) +
-                  ': retry not before ' +
-                  new Date(item.next_attempt_at).toLocaleString(),
+                (byId.get(item.taxon_id)?.common_name || 'Bird ' + item.taxon_id) +
+                  ': tries again ' +
+                  (when(item.next_attempt_at) || 'after a short wait') +
+                  '.',
               ),
             );
           summary.append(
             note(
               settings.generation_enabled
-                ? 'Automatic generation is enabled. Eligible requests can use your AI allowance or incur costs at a scheduled cycle.'
-                : 'Generation is off. Requests stay queued until you deliberately enable it.',
+                ? 'Plates are drawn with your own image-generation account, and its charges apply.'
+                : 'Plate making is off. These requests wait until you turn it on.',
             ),
-            note(
-              'This does not start a model, add Saved birds, clear a hold, reset retry timing or change the wall. Unresolved identities cannot request a plate.',
-            ),
+            note('Your frame stays as it is. Names Inky could not match cannot be drawn.'),
           );
           if (plan.new_requests.length) {
             const key = randomHex(16);
             summary.append(
-              button('Confirm these plate requests', async (event) => {
+              button('Ask for these plates', async (event) => {
                 const confirm = event.currentTarget;
                 confirm.disabled = true;
                 try {
@@ -545,13 +536,14 @@ export function renderCollection(context) {
                   if (error.code === 'sign_in_required') ui.showProblem(error);
                   else
                     problem.textContent =
-                      error.message + ' Check recent operations if the response was lost.';
+                      error.message +
+                      ' If the connection dropped, check In the works before asking again.';
                 }
               }),
             );
           }
           summary.append(
-            button('Close preview', () => {
+            button('Not now', () => {
               summary.remove();
               control.disabled = false;
               control.focus();
@@ -575,7 +567,7 @@ export function renderCollection(context) {
       button('Remove collection', async () => {
         if (
           !confirm(
-            'Remove this collection? Source history, Saved birds and approved plates stay unchanged.',
+            'Remove this collection? Your journal, plates and frame stay as they are.',
           )
         )
           return;
@@ -599,20 +591,20 @@ export function renderCollection(context) {
       node.append(
         note(
           origin === 'ebird-checklist' && linked === 'linked'
-            ? 'Your eBird checklist · linked within this trip’s dates'
+            ? 'On your checklists during this trip'
             : origin === 'ebird-checklist'
-              ? 'Saved trip member · personal evidence needs attention'
-              : 'Manual selection · not a personal sighting record',
+              ? 'Its checklist link needs a look'
+              : 'Added by you',
         ),
       );
     } else if (group?.kind === 'imported-selection')
-      node.append(note('Imported selection · personal evidence not verified here'));
+      node.append(note('From a collection file'));
     else if (group?.kind === 'community-history')
       node.append(
         note(
           origin === 'community-report'
-            ? 'Community report · not your personal sighting'
-            : 'Manual selection · no community report linked',
+            ? 'Reported by others'
+            : 'Added by you',
         ),
       );
     grid.append(node);
@@ -620,44 +612,87 @@ export function renderCollection(context) {
   if (!birds.length)
     grid.append(
       empty(
-        'An empty collection is fine',
-        'Add birds when you are ready. Nothing outside this view will play.',
+        'No birds here yet',
+        'Add birds when you are ready.',
       ),
     );
   main.append(grid);
   if (tools.childElementCount) main.append(el('h2', 'Collection tools'), tools);
 }
 
+// "Adding 1 bird." Only the parts that change are named.
+const changesNothing = (counts) =>
+  !counts.added_count && !counts.removed_count && !counts.migrated_legacy_queue_count;
+
 function savedSummary(preview) {
-  return (
-    plural(preview.added_count, 'addition', 'additions') +
-    ' · ' +
-    plural(preview.removed_count, 'removal', 'removals') +
-    ' · ' +
-    plural(
-      preview.migrated_legacy_queue_count,
-      'legacy seed member migrated',
-      'legacy seed members migrated',
-    )
-  );
+  const parts = [];
+  if (preview.added_count) parts.push('Adding ' + plural(preview.added_count, 'bird', 'birds') + '.');
+  if (preview.removed_count)
+    parts.push('Removing ' + plural(preview.removed_count, 'bird', 'birds') + '.');
+  if (preview.migrated_legacy_queue_count)
+    parts.push(
+      'Keeping ' +
+        plural(preview.migrated_legacy_queue_count, 'bird', 'birds') +
+        ' from your earlier setup.',
+    );
+  return parts.join(' ') || 'Nothing changes.';
 }
 
 // The server's own refusals are complete; only a change lost after it was sent
 // leaves the outcome open.
 function savedProblem(error, sent = true) {
+  if (sent && error.code === 'interrupted')
+    return 'Inky could not confirm whether your frame changed. Check On my frame before trying again.';
   return (
     error.message +
-    (sent && ['offline', 'invalid_response', 'interrupted'].includes(error.code)
-      ? ' Check Saved birds if the connection was lost.'
+    (sent && ['offline', 'invalid_response'].includes(error.code)
+      ? ' Check On my frame to see whether it changed.'
       : '')
   );
+}
+
+// The page cannot see which address the wall frame uses, so it speaks about
+// the wall frame only while the wall view is one that follows On my frame on
+// either address.
+const wallFollows = (wall) => ['current', 'saved'].includes(wall);
+
+// The default wall view also keeps birds that are still being noted, so a
+// removed bird leaves it only when the controller's list no longer has it.
+// Null when that list cannot be read.
+async function stillShown(api, taxonId) {
+  try {
+    const journal = await api('/v1/owner/journal');
+    return Array.isArray(journal?.active_taxon_ids)
+      ? journal.active_taxon_ids.includes(taxonId)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// What the inline result can say for certain after one bird was added or removed.
+function toggleResult(name, saved, wall, stays) {
+  const done = saved ? 'Added to On my frame.' : 'Removed from On my frame.';
+  if (!wallFollows(wall)) return done;
+  // The default view already shows a bird that is being noted.
+  if (saved) return wall === 'saved' ? name + ' will show on your frame from the next refresh.' : done;
+  if (stays === false) return name + ' will leave your frame at the next refresh.';
+  if (wall === 'current' && stays === true)
+    return done + ' ' + name + ' stays on your wall frame while it is still being noted.';
+  return done;
 }
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
 function confirmSaved(context, section, problem, body, preview, reason = '') {
   const { el, button, api, note, href } = context;
+  if (changesNothing(preview)) {
+    const close = button('Close', () => location.reload());
+    section.append(el('h2', 'Nothing to change'), note(savedSummary(preview)), close);
+    close.focus();
+    return;
+  }
   const key = randomHex(24);
-  const confirm = button('Confirm Saved birds change', async (event) => {
+  const confirm = button('Change my frame', async (event) => {
     const control = event.currentTarget;
     control.disabled = true;
     try {
@@ -674,12 +709,12 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
     }
   });
   section.append(
-    el('h2', 'Change Saved birds?'),
+    el('h2', 'Change what is on your frame?'),
     note(savedSummary(preview)),
     ...(reason ? [note(reason)] : []),
-    note(
-      'Saved birds join the compatible current selection and can affect the existing wall immediately at its next refresh. This is curation, not a sighting. Other named collections and source history stay unchanged. No model starts.',
-    ),
+    ...(wallFollows(preview.wall)
+      ? [note('Your wall frame uses the new list from its next refresh.')]
+      : []),
     confirm,
     button('Cancel', () => location.reload()),
   );
@@ -687,13 +722,19 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
 }
 
 async function savedPreview(api, action, taxonId) {
-  const settings = await api('/v1/owner/settings');
+  const [settings, wall] = await Promise.all([
+    api('/v1/owner/settings'),
+    api('/v1/owner/presentation').then(
+      (state) => state?.wall_view,
+      () => null,
+    ),
+  ]);
   const body = { action, configuration_revision: settings.revision };
   if (taxonId) body.taxon_id = taxonId;
-  return [body, await api('/v1/owner/saved/preview', body)];
+  return [body, { ...(await api('/v1/owner/saved/preview', body)), wall }];
 }
 
-// Bulk Saved birds changes keep their review, confirmation and outcome page.
+// Changes to many birds keep their review, confirmation and outcome page.
 export function savedReview(context, label, action, taxonId) {
   const { el, button, api } = context;
   const section = el('section', '', 'journal-card'),
@@ -719,6 +760,7 @@ export function savedReview(context, label, action, taxonId) {
 // restore it.
 export function savedToggle(context, bird) {
   const { ui, el, button, api } = context;
+  const name = bird.common_name || context.byId?.get(bird.taxon_id)?.common_name || 'This bird';
   const section = el('section', '', 'journal-card'),
     status = el('p', '', 'hint'),
     problem = el('p', '', 'error');
@@ -731,7 +773,7 @@ export function savedToggle(context, bird) {
     sent = false;
   const control = button('', () => change(saved ? 'remove' : 'add', true));
   const label = () => {
-    control.textContent = saved ? 'Remove from Saved birds' : 'Add to Saved birds';
+    control.textContent = saved ? 'Remove from my frame' : 'Add to my frame';
   };
   label();
   async function change(action, offerUndo) {
@@ -740,7 +782,7 @@ export function savedToggle(context, bird) {
     undo = null;
     problem.textContent = '';
     sent = false;
-    status.textContent = 'Updating Saved birds…';
+    status.textContent = 'Updating your frame…';
     try {
       const [body, preview] = await savedPreview(api, action, bird.taxon_id);
       const own = action === 'add' ? preview.added_count : preview.removed_count;
@@ -750,7 +792,7 @@ export function savedToggle(context, bird) {
         saved = action === 'add';
         if (saved) plateReady = true;
         label();
-        status.textContent = saved ? 'Already in Saved birds.' : 'Not in Saved birds.';
+        status.textContent = saved ? 'Already on your frame.' : 'Not on your frame.';
         return;
       }
       if (
@@ -768,7 +810,7 @@ export function savedToggle(context, bird) {
           body,
           preview,
           action === 'remove' && !plateReady
-            ? 'This bird has no approved art yet, so it cannot be added back until it does.'
+            ? 'This bird has no plate yet, so you can add it back only once it has one.'
             : '',
         );
         return;
@@ -793,7 +835,11 @@ export function savedToggle(context, bird) {
       saved = action === 'add';
       if (saved) plateReady = true;
       label();
-      status.textContent = saved ? 'Added to Saved birds.' : 'Removed from Saved birds.';
+      const stays =
+        !saved && ['current', 'saved'].includes(preview.wall)
+          ? await stillShown(api, bird.taxon_id)
+          : null;
+      status.textContent = toggleResult(name, saved, preview.wall, stays);
       if (offerUndo) {
         undo = button('Undo', () => change(saved ? 'remove' : 'add', false));
         status.after(undo);
@@ -814,7 +860,7 @@ export function savedToggle(context, bird) {
   return section;
 }
 
-// The journal's Saved birds action: one bird toggles, everything else is reviewed.
+// The journal's On my frame action: one bird toggles, everything else is reviewed.
 export function savedChange(context, label, action, taxonId, plateReady = false) {
   return taxonId
     ? savedToggle(context, {

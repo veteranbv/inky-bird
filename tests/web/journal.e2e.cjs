@@ -56,6 +56,10 @@ async function ownerSetup(t) {
   for (const width of [320, 390]) {
     await page.setViewportSize({ width, height: 844 });
     await noSideways(page, 'Registration at ' + width + ' px');
+    // The account form leads; the longer connection facts follow it.
+    const form = await page.getByLabel('Username', { exact: true }).boundingBox();
+    const more = await page.getByText('About this home-network connection', { exact: true }).boundingBox();
+    assert(form && more && form.y < more.y, 'the account form comes before the connection details at ' + width + ' px');
   }
   fs.writeFileSync(fixture + '/sign-in-phone.png', await page.screenshot({ fullPage: true }), {
     mode: 0o600,
@@ -64,16 +68,26 @@ async function ownerSetup(t) {
   await page.getByLabel('Choose your Inky password', { exact: true }).fill(password);
   await page.getByLabel('Confirm your password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Create account', exact: true }).click();
-  await heading('Your field journal');
+  await heading('Your journal');
   await page
-    .getByText('No sources selected for refresh. Artwork and saved collections still work.', {
+    .getByText('No sources are checked for new birds. Plates and collections still work.', {
       exact: true,
     })
     .waitFor();
-  assert.equal(await page.getByText(/The last saved selection may be out of date/).count(), 0);
-  await page.getByRole('link', { name: '2 plates ready for your review', exact: true }).waitFor();
-  await page.getByRole('link', { name: '1 plate held for recovery', exact: true }).waitFor();
-  assert.equal(await page.getByText(/3 plates ready for your review/).count(), 0);
+  assert.equal(await page.getByText(/may be out of date/).count(), 0);
+  // New plates are good news on Home; plates that need a hand stay in Manage.
+  await page.getByRole('link', { name: '2 new plates are ready to look at.', exact: true }).waitFor();
+  assert.equal(await page.getByText(/held for recovery|needs a hand/i).count(), 0);
+  assert.equal(await page.locator('.attention-banner').count(), 0);
+  // Nothing is on the frame yet: Home still opens on a plate and invites a start.
+  await page.locator('.featured-art img').waitFor();
+  await page.getByText('Pick a few birds you love to start your frame.', { exact: true }).waitFor();
+  await page.getByRole('link', { name: 'Choose birds', exact: true }).waitFor();
+  for (const [width, height] of [[375, 812], [1280, 800]]) {
+    await page.setViewportSize({ width, height });
+    await noSideways(page, 'First Home at ' + width + ' px');
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
 }
 
 async function providerSignIn(t) {
@@ -152,13 +166,13 @@ async function finish(t) {
     const { default: AxeBuilder } = require(process.env.INKY_QA_AXE),
       audits = [];
     for (const [area, title] of [
-      ['home', 'Your field journal'],
+      ['home', 'Your journal'],
       ['birds', 'Your birds'],
       ['collections', 'Collections'],
       ['manage', 'Manage'],
       ['health', 'Health and help'],
       ['integrations', 'Integrations'],
-      ['displays', 'Displays'],
+      ['displays', 'Wall frame'],
       ['settings', 'Settings and backups'],
     ]) {
       t.phase = 'accessibility-' + area;

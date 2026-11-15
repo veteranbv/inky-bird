@@ -117,6 +117,7 @@ STATIC_PAGES = {
     "/app/work-status.js": "work-status.js",
     "/app/manifest.webmanifest": "manifest.webmanifest",
     "/app/keys.js": "keys.js",
+    "/app/words.js": "words.js",
     "/app/home.js": "home.js",
     "/app/birds.js": "birds.js",
     "/app/collections.js": "collections.js",
@@ -1023,7 +1024,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         if app_config is None:
             raise JournalError("Start Inky with its configuration file")
         if request.path_params["action"] not in {"preview", "change"}:
-            return _error(404, "not_found", "Choose a supported Saved birds step")
+            return _error(404, "not_found", "Choose a supported change to On my frame")
         preview = request.path_params["action"] == "preview"
         fields = {"action", "configuration_revision"} | (
             set() if preview else {"key", "confirm", "collection_revision"}
@@ -1038,7 +1039,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             or id is not None
             and (type(id) is not int or id <= 0)
         ):
-            raise JournalError("Choose approved art or an existing Saved birds member")
+            raise JournalError("Choose a bird with a plate, or one already on your frame")
 
         def execute() -> dict[str, object]:
             selected = confirmed_config(
@@ -1064,7 +1065,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         if preview:
             return _result(await run_in_threadpool(execute))
         if body["confirm"] is not True:
-            raise JournalError("Confirm this Saved birds membership change")
+            raise JournalError("Confirm this change to On my frame")
         return _result(
             await run_in_threadpool(
                 operations.submit,
@@ -1545,13 +1546,13 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 return Response(body, media_type="image/png")
             return _result(await run_in_threadpool(pending_candidate, app_config, taxon_id))
         if action not in {"approve", "reject"}:
-            return _error(404, "not_found", "Choose a supported candidate decision")
+            return _error(404, "not_found", "Choose to keep the new plate or send it back")
         fields = {"key", "configuration_revision", "candidate_revision", "confirm"}
         if action == "reject":
             fields.add("reason")
         body_json = await _json_body(request, fields, structured={"confirm"})
         if body_json["confirm"] is not True:
-            raise JournalError("Inspect the full candidate and confirm this decision")
+            raise JournalError("Look at the whole new plate and confirm this decision")
 
         def execute() -> dict[str, object]:
             captured = confirmed_config(
@@ -1728,6 +1729,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         Route("/app/work-status.js", page),
         Route("/app/manifest.webmanifest", page),
         Route("/app/keys.js", page),
+        Route("/app/words.js", page),
         Route("/app/home.js", page),
         Route("/app/birds.js", page),
         Route("/app/collections.js", page),

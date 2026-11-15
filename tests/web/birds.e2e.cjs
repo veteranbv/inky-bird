@@ -14,7 +14,7 @@ async function unreadableNotice(t) {
   const queueBefore = fs.existsSync(queuePath) ? fs.readFileSync(queuePath) : null;
   fs.writeFileSync(queuePath, '{ damaged');
   const queueNotice = 'The list of birds waiting for plates could not be read.';
-  for (const [query, title] of [['', 'Your field journal'], ['?page=birds', 'Your birds']]) {
+  for (const [query, title] of [['', 'Your journal'], ['?page=birds', 'Your birds']]) {
     await page.goto(origin + '/app' + query);
     await heading(title);
     await page.getByRole('status').filter({ hasText: queueNotice }).waitFor();
@@ -22,7 +22,7 @@ async function unreadableNotice(t) {
   if (queueBefore) fs.writeFileSync(queuePath, queueBefore);
   else fs.rmSync(queuePath);
   await page.goto(origin + '/app');
-  await heading('Your field journal');
+  await heading('Your journal');
   assert.equal(await page.getByText(queueNotice).count(), 0);
 }
 
@@ -33,7 +33,7 @@ async function artDelivery(t) {
   // cache. Any route disables the HTTP cache, so routing is lifted for this
   // phase only. Same-origin CSP still keeps every request local.
   await page.goto(origin + '/app?page=birds&scope=art');
-  await heading('Available artwork');
+  await heading('More plates');
   const gridImages = page.locator('.bird-grid img');
   assert(await gridImages.count() > 0);
   const gridSources = await gridImages.evaluateAll((images) => images.map((image) => image.src));
@@ -99,7 +99,7 @@ async function startUp(t) {
   page.on('response', answered);
   page.on('requestfailed', lost);
   await page.goto(origin + '/app');
-  await heading('Your field journal');
+  await heading('Your journal');
   page.off('response', answered);
   page.off('requestfailed', lost);
   assert.deepEqual(failed, []);
@@ -180,6 +180,40 @@ async function checkLayout(page, label) {
 
 const box = (locator) => locator.evaluate((node) => node.getBoundingClientRect().toJSON());
 
+// Words the owner reads: no raw machine values, and counts that agree with one.
+async function plainWords(page, label) {
+  const text = await page.locator('main').innerText();
+  const raw = text.match(/\b(true|false|succeeded|last-\d+-days|last-week|last-day|all-time|[a-z]+_[a-z_]+)\b/);
+  assert.equal(raw, null, label + ': a raw machine value is shown: ' + raw?.[0]);
+  const wrong = text.match(/\b1 (records|birds|plates|checklists)\b|\b(?:[02-9]|\d\d+) (record|bird|plate) (?!is\b)/);
+  assert.equal(wrong, null, label + ': a count disagrees with its noun: ' + wrong?.[0]);
+  for (const old of ['Available artwork', 'Current and saved', 'not a sighting', 'held for recovery', 'Plate work'])
+    assert(!text.includes(old), label + ': old name ' + old);
+}
+
+// Lately, the journal size and the reason the featured plate is shown.
+async function journalHeart(page, size) {
+  const lately = page.locator('.lately');
+  await lately.getByRole('heading', { name: 'Lately', exact: true }).waitFor();
+  const entries = lately.locator('a.lately-bird');
+  const count = await entries.count();
+  assert(count >= 1 && count <= 3, size + ': Lately shows one to three birds');
+  // The newest record in the synthetic history is the robin's.
+  assert.equal(await entries.first().getAttribute('aria-label'), null);
+  assert.equal((await entries.first().textContent()).replace(/\s+/g, ' ').trim(), 'American Robin 2 Mar 2001');
+  assert.match(new URL(await entries.first().getAttribute('href'), 'https://inky.example.test').search, /page=bird&bird=\d+/);
+  const sizeLine = await page.locator('.journal-size').innerText();
+  assert.match(sizeLine, /^\d+ birds? in your journal( · (1 with a plate|\d+ with plates))?$/, size);
+  const why = page.locator('.why-this-bird');
+  if (await why.count())
+    assert.match(await why.innerText(), /^(Noted( (at your feeder|on your microphone|in your checklists))? this week|Seen nearby this week|From your journal, \d{4})$/);
+  await plainWords(page, 'Home ' + size);
+  for (const [a, b] of [['.home-feature', '.lately']]) {
+    const [first, second] = [await box(page.locator(a)), await box(page.locator(b))];
+    await measured.layout(page, second.top >= first.bottom - 0.5, size + ': Lately overlaps the plate', { first, second });
+  }
+}
+
 // Birds list, bird page and Home at phone, small-phone and desktop sizes.
 async function layout(t) {
   const { page, origin, heading, cardinal } = t;
@@ -195,6 +229,7 @@ async function layout(t) {
     await page.goto(origin + '/app?page=birds');
     await heading('Your birds');
     await checkLayout(page, 'Birds ' + size);
+    await plainWords(page, 'Birds ' + size);
     const cards = page.locator('.bird-grid a.bird-card');
     assert(await cards.count() >= 2, 'the list has at least two birds to lay out');
     const [first, second] = [await box(cards.nth(0)), await box(cards.nth(1))];
@@ -219,6 +254,11 @@ async function layout(t) {
     await heading('Northern Cardinal');
     await page.locator('.detail-art').evaluate((image) => image.decode());
     await checkLayout(page, 'Bird ' + size);
+    // The synthetic eBird history holds one checklist for the cardinal.
+    await page
+      .getByText('In your journal: noted 1 Mar 2001 · 1 record from your checklists', { exact: true })
+      .waitFor();
+    await plainWords(page, 'Bird ' + size);
     const back = await box(page.getByRole('link', { name: 'Back to birds', exact: true }));
     const title = await box(page.getByRole('heading', { name: 'Northern Cardinal', exact: true }));
     await check(back.bottom <= title.top + 0.5, size + ': Back does not come before the title', { back, title });
@@ -243,8 +283,9 @@ async function layout(t) {
 
     t.phase = 'home-layout-' + size;
     await page.goto(origin + '/app');
-    await heading('Your field journal');
+    await heading('Your journal');
     await checkLayout(page, 'Home ' + size);
+    await journalHeart(page, size);
     if (width >= 960) {
       const [hero, rail] = [await box(page.locator('.featured-art')), await box(page.locator('.home-rail'))];
       await check(hero.right <= rail.left, size + ': the caption does not sit beside the plate', { hero, rail });
@@ -259,7 +300,7 @@ async function listReturn(t) {
   const { page, origin, heading, cardinal } = t;
   t.phase = 'birds-list-return';
   await page.goto(origin + '/app?page=birds&scope=art');
-  await heading('Available artwork');
+  await heading('More plates');
   await page.getByLabel('Sort by', { exact: true }).selectOption('scientific');
   await page.getByLabel('Find a bird', { exact: true }).fill('cardinal');
   const address = new URLSearchParams(await page.evaluate(() => location.search));
@@ -268,7 +309,7 @@ async function listReturn(t) {
   await page.locator('.bird-grid a.bird-card:visible').first().click();
   await heading('Northern Cardinal');
   await page.goBack();
-  await heading('Available artwork');
+  await heading('More plates');
   assert.equal(await page.getByLabel('Find a bird', { exact: true }).inputValue(), 'cardinal');
   assert.equal(await page.getByLabel('Sort by', { exact: true }).inputValue(), 'scientific');
   assert.equal(
