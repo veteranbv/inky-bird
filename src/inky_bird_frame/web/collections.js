@@ -228,6 +228,10 @@ export function renderEditCollection(context) {
       : '';
   }
   finder.addEventListener('input', filterRows);
+  // Enter in the search box would otherwise submit the form and save.
+  finder.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') event.preventDefault();
+  });
   // Unresolved names stay unless the owner unticks them. Choosing the bird
   // with the same scientific name and unticking its name resolves it.
   const unresolved = group?.unresolved || [];

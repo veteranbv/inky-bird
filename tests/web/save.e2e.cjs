@@ -189,7 +189,10 @@ async function collectionFilter(t) {
   // Filtering hides non-matching rows (role queries exclude hidden nodes)
   // while chosen birds stay chosen. Scientific names match too.
   await page.getByLabel('Find a bird to add', { exact: true }).fill('Turdus');
+  // Enter in the search box finishes the search; it does not save.
+  await page.getByLabel('Find a bird to add', { exact: true }).press('Enter');
   await page.getByRole('checkbox', { name: /American Robin/ }).waitFor();
+  await heading('New collection');
   assert.equal(await page.getByRole('checkbox', { name: /Northern Cardinal/ }).count(), 0);
   await page.getByRole('checkbox', { name: /American Robin/ }).check();
   await page.getByLabel('Find a bird to add', { exact: true }).fill('zz-no-such-bird');
