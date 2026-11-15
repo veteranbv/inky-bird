@@ -7,7 +7,7 @@ const PLATE_TIMEOUT = 90000;
 export function renderFrame(context) {
   const {
     ui, el, button, api, main, view, data, byId, plateURL, href, link, note, members, viewLabel,
-    base, empty, closeJournal, setStopScreen, setFrameSignOut,
+    base, empty, closeJournal, setStopScreen, setFrameSignOut, whyThisBird,
   } = context;
   let birds = members(view).filter((bird) => bird.plate_ready);
   base('Play', viewLabel(view));
@@ -66,7 +66,10 @@ export function renderFrame(context) {
   image.hidden = true;
   image.draggable = false;
   const caption = el('p', '', 'frame-caption'),
+    // "Noted at your feeder this week": only when the page's helper has a line for this bird.
+    why = el('p', '', 'hint frame-why'),
     status = el('p', '', 'hint');
+  why.hidden = true;
   status.setAttribute('role', 'status');
   const controls = el('div', '', 'frame-controls');
   const viewport = el('div', '', 'frame-viewport');
@@ -79,6 +82,8 @@ export function renderFrame(context) {
     image.removeAttribute('src');
     image.hidden = true;
     caption.textContent = '';
+    why.textContent = '';
+    why.hidden = true;
   }
   function signedOut() {
     if (expired) return;
@@ -146,6 +151,8 @@ export function renderFrame(context) {
         el('span', bird.common_name),
         el('span', bird.scientific_name, 'scientific'),
       );
+      why.textContent = whyThisBird?.(bird) || '';
+      why.hidden = !why.textContent;
       details.href = href('bird', { bird: bird.taxon_id });
       details.hidden = false;
       status.textContent = '';
@@ -296,6 +303,7 @@ export function renderFrame(context) {
   const side = el('div', '', 'frame-side');
   side.append(
     caption,
+    why,
     note('Plates change once a minute while playing. Your wall frame is not affected.'),
   );
   if (!window.isSecureContext)

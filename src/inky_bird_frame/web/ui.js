@@ -86,9 +86,11 @@ export function clampedNotice(status, button) {
   more.hidden = true;
   const watchers = [];
   if (typeof MutationObserver === 'function') {
-    // New text starts folded again.
+    // New text starts folded again; the same text written again stays as it is.
+    let shown = status.textContent;
     const changed = new MutationObserver(() => {
-      show(false);
+      if (status.textContent !== shown) show(false);
+      shown = status.textContent;
       measure();
     });
     changed.observe(status, { childList: true, characterData: true, subtree: true });

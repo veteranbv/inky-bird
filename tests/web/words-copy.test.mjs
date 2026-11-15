@@ -27,3 +27,23 @@ test('a moment reads as today, yesterday, a weekday or a date', () => {
   assert.equal(words.when(null, now), '');
   assert.equal(words.when('not a date', now), '');
 });
+
+// One name per thing: the old names of renamed things are gone from these pages.
+const owned = [
+  'collections.js', 'manage.js', 'frame.js', 'settings.js', 'imports.js', 'presentation.js',
+  'viewer.js', 'app.js', 'work-status.js', 'ui.js', 'index.html', 'screen.html',
+];
+const retired = [
+  /Saved birds/i, /Current and saved/i, /current selection/i, /\byour wall\b(?! frame)/i,
+  /Plate work/i, /Runnable queue/i, /held for recovery/i, /wall panel/i,
+  /Operation outcome/i, /Owner operation/i, /legacy seed/i, /not a sighting/i, /No model start/i,
+];
+const literal = /'([^'\n]*)'|"([^"\n]*)"|`([^`]*)`|>([^<>]+)</g;
+for (const file of owned)
+  test(file + ' uses only the current names', async () => {
+    const text = await readFile(new URL('../../src/inky_bird_frame/web/' + file, import.meta.url), 'utf8');
+    for (const match of text.matchAll(literal)) {
+      const shown = match.slice(1).find((group) => group !== undefined);
+      for (const name of retired) assert.doesNotMatch(shown, name, file);
+    }
+  });

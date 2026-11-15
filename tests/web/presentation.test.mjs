@@ -259,3 +259,20 @@ test('a screen seen a few days ago says the day, without "around on"', async (t)
     'Last seen on ' + ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][seen.getDay()],
   ]);
 });
+
+test('a screen whose end date cannot be read leaves that line out', async (t) => {
+  const { main } = await open(t, 'displays', () => {
+    const value = state();
+    delete value.grants[0].expires_at;
+    return value;
+  });
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Shows birds until'));
+  assert.deepEqual(lines, []);
+});
+
+test('a screen says until when it shows birds', async (t) => {
+  const { main } = await open(t, 'displays', state);
+  const lines = walk(main).map((node) => node.textContent).filter((text) => text?.startsWith('Shows birds until'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^Shows birds until \d{1,2} [A-Z][a-z]{2} \d{4}$/);
+});

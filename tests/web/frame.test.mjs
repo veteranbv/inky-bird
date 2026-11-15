@@ -238,3 +238,84 @@ test('Frame in a secure context does not warn about sleep', async (t) => {
   const { main } = await open(t, { state: () => journal() });
   assert.doesNotMatch(main.textContent, /keeping it awake/);
 });
+
+// The "why this bird" line under the plate comes from the page's shared helper
+// when it has one; Play shows nothing in its place otherwise.
+const { renderFrame } = await import(
+  moduleURL(await inline(await readFile(new URL('frame.js', web), 'utf8')))
+);
+async function play(t, whyThisBird) {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const names = ['document', 'window', 'fetch'];
+  const saved = Object.fromEntries(
+    names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+  );
+  const define = (name, value) =>
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  const doc = fakeDocument();
+  const main = new Element('main');
+  doc.body.append(main);
+  define('document', doc);
+  define('window', { isSecureContext: true });
+  define('fetch', () => Promise.resolve(png()));
+  let stop = () => {};
+  t.after(() => {
+    stop();
+    for (const [name, descriptor] of Object.entries(saved))
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+  });
+  const el = (tag, text, className) => {
+    const node = doc.createElement(tag);
+    if (text) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  const state = journal();
+  renderFrame({
+    ui: { showProblem() {}, sessionExpired() {} },
+    el,
+    button: (text, action) => {
+      const node = el('button', text, 'secondary');
+      node.addEventListener('click', action);
+      return node;
+    },
+    api: async () => state,
+    main,
+    view: 'current',
+    data: state,
+    byId: new Map(),
+    plateURL: (bird) => '/plate/' + bird.taxon_id,
+    href: () => '/app',
+    link: (text) => el('a', text, 'text-link'),
+    note: (text) => el('p', text, 'hint'),
+    members: () => state.birds,
+    viewLabel: () => 'On my frame',
+    base: (title) => main.replaceChildren(el('h1', title)),
+    empty: (title) => el('section', title),
+    closeJournal() {},
+    setStopScreen: (callback) => {
+      stop = callback;
+    },
+    setFrameSignOut() {},
+    ...(whyThisBird ? { whyThisBird } : {}),
+  });
+  await flush();
+  return main.querySelector('.frame-why');
+}
+
+test('Play shows the why-this-bird line its helper gives', async (t) => {
+  const why = await play(t, (bird) => (bird.taxon_id === 1 ? 'Noted at your feeder this week' : ''));
+  assert.equal(why.textContent, 'Noted at your feeder this week');
+  assert.equal(why.hidden, false);
+});
+
+for (const [name, helper] of [
+  ['without a helper', null],
+  ['when its helper has nothing to say', () => ''],
+])
+  test('Play leaves the why-this-bird line out ' + name, async (t) => {
+    const why = await play(t, helper);
+    assert.equal(why.textContent, '');
+    assert.equal(why.hidden, true);
+  });

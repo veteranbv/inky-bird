@@ -203,7 +203,9 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
       } else
         section.append(
           note(label(grant.view)),
-          note('Shows birds until ' + when(grant.expires_at * 1000)),
+          ...(when(grant.expires_at * 1000)
+            ? [note('Shows birds until ' + when(grant.expires_at * 1000))]
+            : []),
           note(
             grant.last_seen_at
               ? 'Last seen ' + when(grant.last_seen_at * 1000)
