@@ -13,7 +13,7 @@ from inky_bird_frame.prompts import PROMPT_VERSION, plate_prompt, profile_prompt
 
 class PromptTests(unittest.TestCase):
     def test_prompt_contract_version(self) -> None:
-        self.assertEqual(PROMPT_VERSION, "field-journal-v9")
+        self.assertEqual(PROMPT_VERSION, "field-journal-v10")
 
     def test_edit_target_does_not_freeze_anatomy_flagged_for_redraw(self) -> None:
         species = BirdSpecies(1, "Test Bird", "Avis test", 1, "test")
@@ -229,17 +229,15 @@ class PromptTests(unittest.TestCase):
         self.assertIn("not a request to redraw a feature", normalized_prompt)
         self.assertIn("Do not shrink the bird", prompt)
         self.assertIn(
-            "Letter its label as the words BODY LENGTH, a colon, a space and the exact"
-            ' "length" value',
+            'BODY LENGTH, a colon, a space and the exact "length" value',
             normalized_prompt,
         )
         self.assertIn('"length": "7 in"', prompt)
         self.assertIn("SCHEMATIC — NOT TO SCALE", prompt)
-        self.assertIn("minimum at the bottom and maximum at the top", prompt)
-        self.assertIn("roughly even, unlabeled interior ticks", normalized_prompt)
-        self.assertIn("count and spacing do not encode measurement units", normalized_prompt)
-        self.assertIn("Do not draw a zero-based or wider full-range axis", prompt)
-        self.assertIn("do not add a separate range bracket", normalized_prompt)
+        self.assertIn("minimum at the bottom, maximum at the top", prompt)
+        self.assertIn("Interior ticks are unlabeled and even", normalized_prompt)
+        self.assertIn("No zero-based or wider axis", prompt)
+        self.assertIn("no separate range bracket", normalized_prompt)
         self.assertIn("Match both the direction and degree", normalized_prompt)
         self.assertIn("the lower mandible is the jaw below the gape line", normalized_prompt)
         self.assertIn("its tip must be farther from the shared bill base", normalized_prompt)
@@ -255,7 +253,7 @@ class PromptTests(unittest.TestCase):
             "thin black vertical slit rather than a round or oval pupil", normalized_prompt
         )
         self.assertIn("Never invent a vertical slit", normalized_prompt)
-        self.assertIn("compare every visible text line character-for-character", normalized_prompt)
+        self.assertIn("compare every text line character-for-character", normalized_prompt)
         self.assertNotIn("Undo any incidental", normalized_prompt)
         self.assertNotIn("Do not copy or lightly edit", prompt)
 
@@ -431,6 +429,7 @@ RENDERED_PROMPT_SHA256 = {
     "field-journal-v7": "84079b7217e69381494122bdee62257b08f9b216b2c9094e566e90239cf90816",
     "field-journal-v8": "9164b21301e4386d75ef442cb6a1db00f93443fbfbdd7f0bae9a45551975e877",
     "field-journal-v9": "a46acbd1f99bd08ed9ee6e1d762e485083ca46e9c3b763446e73f9a5c4a14fee",
+    "field-journal-v10": "f1446aeda88291b9a01065311b039a34a92dd983a7c4fd69391dd523d016cfaf",
 }
 
 
@@ -450,19 +449,18 @@ class PlateWordingTests(unittest.TestCase):
 
         self.assertNotIn("natural perched posture", prompt)
         self.assertIn(
-            "a natural resting posture for the species, never in flight (perched, standing,"
-            " clinging or swimming, as fits it)",
+            "a natural resting posture (perched, standing, clinging or swimming, as fits the"
+            " species), never in flight",
             prompt,
         )
-        posture_options = prompt.split("never in flight (", 1)[1].split(")", 1)[0]
+        posture_options = prompt.split("resting posture (", 1)[1].split(")", 1)[0]
         self.assertNotIn("flight", posture_options)
         self.assertNotIn("or in flight", prompt)
         self.assertIn(
-            "If perched or clinging, show only a short plain twig, bare ground or a plain vertical"
-            " surface, and no other scenery.",
+            "on at most a short plain twig, bare ground or a plain vertical surface.",
             prompt,
         )
-        self.assertIn("Quiet margins. No scenery,", prompt)
+        self.assertIn("Quiet margins. No invented prose, scenery,", prompt)
 
     def test_skimmer_and_slit_pupil_notes_only_for_skimmers(self) -> None:
         skimmer_notes = (
@@ -492,7 +490,7 @@ class PlateWordingTests(unittest.TestCase):
 
         self.assertNotIn("drift", prompt)
         self.assertIn("Generate exactly one image", prompt)
-        self.assertIn("compare every visible text line character-for-character", prompt)
+        self.assertIn("compare every text line character-for-character", prompt)
 
     def test_constraints_are_labelled_by_origin(self) -> None:
         for has_source in (True, False):
@@ -582,16 +580,15 @@ class PlateWordingTests(unittest.TestCase):
 
 class PlateLabelTests(unittest.TestCase):
     LABEL_LINES = (
-        '- "Length:", "Wingspan:" and "Weight:", followed by the "length", "wingspan" and'
-        ' "weight" values.',
-        '- "Habitat:" followed by the "habitat" value.',
-        '- "Behavior:" followed by the "behavior" value.',
-        '- A "Field marks" heading, with each "field_marks" entry on its own line.',
+        '- "Length:", "Wingspan:" and "Weight:" with the "length", "wingspan" and "weight" values.',
+        '- "Habitat:" with the "habitat" value.',
+        '- "Behavior:" with the "behavior" value.',
+        '- A "Field marks" heading, then each "field_marks" entry on its own line, exactly as'
+        " supplied,",
         '- Color swatches, each labelled with one "plumage_palette" name.',
-        'Never print a reference-data key name, such as "field_notes" or a lowercase "length:",'
-        " on the plate.",
-        '- Family: the "family" value in the reference data, lettered on its own line beneath'
-        " the scientific name",
+        'Never print a reference-data key name, such as "field_notes" or a lowercase "length:".',
+        '- Family: the "family" value in the reference data, on its own line beneath the'
+        " scientific name",
     )
 
     @staticmethod
