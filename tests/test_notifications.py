@@ -20,9 +20,11 @@ from inky_bird_frame.notifications import (
     NotificationItem,
     _deliver,
     check_display_heartbeat,
+    controller_started_path,
     dispatch_notifications,
     enqueue_notification,
     notification_status,
+    record_controller_start,
     record_degradation,
     record_recovery,
     requeue_dead_letters,
@@ -895,7 +897,7 @@ class DisplayHeartbeatTests(unittest.TestCase):
         self.assertTrue(past_floor["stale"])
         self.assertEqual(notify.call_count, 1)
 
-    def test_old_update_right_after_controller_downtime_is_not_stale(self) -> None:
+    def test_old_update_right_after_the_controller_starts_is_not_stale(self) -> None:
         now = datetime(2026, 7, 10, tzinfo=UTC)
         with TemporaryDirectory() as temporary:
             config = self._config(temporary)
@@ -906,8 +908,9 @@ class DisplayHeartbeatTests(unittest.TestCase):
                 return_value={"queued": True},
             ) as notify:
                 before = check_display_heartbeat(config, now=now)
-                # The controller is away for four hours, so the display cannot report.
+                # The controller is off for four hours, so the display cannot report.
                 back = now + timedelta(hours=4)
+                record_controller_start(config, now=back)
                 checks = [
                     check_display_heartbeat(config, now=back + timedelta(minutes=minutes))
                     for minutes in (0, 5, 10, 15, 20, 25)
@@ -936,6 +939,7 @@ class DisplayHeartbeatTests(unittest.TestCase):
             ) as notify:
                 check_display_heartbeat(config, now=now)
                 back = now + timedelta(hours=4)
+                record_controller_start(config, now=back)
                 check_display_heartbeat(config, now=back)
                 check_display_heartbeat(config, now=back + timedelta(minutes=20))
                 late = check_display_heartbeat(config, now=back + timedelta(minutes=40))
@@ -943,6 +947,37 @@ class DisplayHeartbeatTests(unittest.TestCase):
         self.assertTrue(late["stale"])
         self.assertFalse(late["resuming"])
         self.assertIs(notify.call_args.args[1], NotificationEvent.DISPLAY_STALE)
+
+    def test_a_long_gap_between_checks_alone_gives_no_grace(self) -> None:
+        # A long job can hold up the checks while the controller keeps serving.
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            record_controller_start(config, now=now - timedelta(days=1))
+            self._write_success(config, now - timedelta(minutes=10))
+            with patch(
+                "inky_bird_frame.notifications.safe_notify",
+                return_value={"queued": True},
+            ) as notify:
+                check_display_heartbeat(config, now=now)
+                late = check_display_heartbeat(config, now=now + timedelta(hours=4))
+
+        self.assertTrue(late["stale"])
+        self.assertFalse(late["resuming"])
+        self.assertIs(notify.call_args.args[1], NotificationEvent.DISPLAY_STALE)
+
+    def test_unreadable_start_record_gives_no_grace(self) -> None:
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        with TemporaryDirectory() as temporary:
+            config = self._config(temporary)
+            self._write_wall(config, members=True)
+            self._write_success(config, now - timedelta(hours=5))
+            controller_started_path(config).write_text("{not json")
+            result = check_display_heartbeat(config, now=now)
+
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["resuming"])
 
     def test_regular_checks_keep_reporting_a_stale_display(self) -> None:
         now = datetime(2026, 7, 10, tzinfo=UTC)

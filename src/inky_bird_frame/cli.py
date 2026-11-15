@@ -81,6 +81,7 @@ from .notifications import (
     dispatch_notifications,
     notification_state_path,
     notification_status,
+    record_controller_start,
     requeue_dead_letters,
     safe_notify,
     safe_record_degradation,
@@ -703,6 +704,8 @@ def access_recover_command(args: argparse.Namespace) -> int:
 
 def serve_command(args: argparse.Namespace) -> int:
     config = _config(args, load_secrets=False)
+    # Display checks allow one rotation for the display to reach a restarted server.
+    record_controller_start(config)
     serve_catalog(config.controller, app_config=config)
     return 0
 

@@ -96,8 +96,31 @@ def retry_policy(settings: NotificationsConfig) -> dict[str, int]:
     }
 
 
-def display_check_path(config: AppConfig) -> Path:
-    return config.controller.state_dir / "display-check.json"
+def controller_started_path(config: AppConfig) -> Path:
+    return config.controller.state_dir / "controller-started.json"
+
+
+def record_controller_start(config: AppConfig, *, now: datetime | None = None) -> None:
+    """Note when the web server that receives display reports started."""
+    current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    try:
+        write_json_atomic(
+            controller_started_path(config),
+            {"schema_version": 1, "started_at": current.isoformat()},
+        )
+    except OSError:
+        # Without the record a display check simply applies no grace.
+        _LOG.warning("Controller start time could not be saved")
+
+
+def _controller_started_at(config: AppConfig) -> datetime | None:
+    try:
+        raw = json.loads(controller_started_path(config).read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        return None
+    return _health_datetime(raw.get("started_at"))
 
 
 def display_stale_threshold(config: AppConfig) -> timedelta:
@@ -105,48 +128,13 @@ def display_stale_threshold(config: AppConfig) -> timedelta:
     return timedelta(minutes=max(3 * config.schedule.rotation_minutes, 60))
 
 
-def _check_gap(config: AppConfig) -> timedelta:
-    # Display checks run with notification delivery; a longer silence means the
-    # controller was down or busy and could not have heard from the display.
-    return timedelta(minutes=max(3 * config.notifications.delivery_retry_minutes, 30))
-
-
 def _resume_grace(config: AppConfig) -> timedelta:
-    # After such a silence the display needs up to one rotation to report again.
+    # After the controller starts, the display needs up to one rotation to report again.
     schedule = config.schedule
     return timedelta(
         minutes=schedule.rotation_minutes + 5,
         seconds=schedule.rotation_jitter_seconds + schedule.display_startup_delay_seconds,
     )
-
-
-def _watching_since(config: AppConfig, current: datetime) -> datetime | None:
-    """Return when display checks resumed after a silence, and record this check."""
-    path = display_check_path(config)
-    previous: datetime | None = None
-    since: datetime | None = None
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        raw = None
-    if isinstance(raw, dict) and raw.get("schema_version") == 1:
-        previous = _health_datetime(raw.get("checked_at"))
-        since = _health_datetime(raw.get("watching_since"))
-    if previous is not None and current - previous > _check_gap(config):
-        since = current
-    try:
-        write_json_atomic(
-            path,
-            {
-                "schema_version": 1,
-                "checked_at": current.isoformat(),
-                "watching_since": since.isoformat() if since is not None else None,
-            },
-        )
-    except OSError:
-        # Without the record the next check simply applies no grace.
-        _LOG.warning("Display check time could not be saved")
-    return since
 
 
 def _new_notifier() -> apprise.Apprise:
@@ -485,7 +473,7 @@ def safe_record_recovery(
 
 def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -> dict[str, object]:
     current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
-    watching_since = _watching_since(config, current)
+    started_at = _controller_started_at(config)
     success_at, success_warning, _ = _read_display_heartbeat(
         display_success_path(config), "succeeded_at"
     )
@@ -526,13 +514,13 @@ def check_display_heartbeat(config: AppConfig, *, now: datetime | None = None) -
         and current - fetched_at <= threshold
         and _wall_view_is_empty(config)
     )
-    # Right after the controller was away, an old update only shows that the
+    # Right after the web server starts, an old update may only show that the
     # display could not reach it; wait one rotation before calling it stale.
     resuming = (
         stale
         and not paused
-        and watching_since is not None
-        and current - watching_since <= _resume_grace(config)
+        and started_at is not None
+        and timedelta(0) <= current - started_at <= _resume_grace(config)
     )
     if paused:
         assert fetched_at is not None

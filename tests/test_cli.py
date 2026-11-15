@@ -729,12 +729,30 @@ class CliTests(unittest.TestCase):
                 return_value=SimpleNamespace(controller=controller),
             ) as load,
             patch("inky_bird_frame.cli.serve_catalog") as serve,
+            patch("inky_bird_frame.cli.record_controller_start"),
         ):
             result = serve_command(args)
 
         self.assertEqual(result, 0)
         load.assert_called_once_with(Path("instance.toml"), load_secrets=False)
         serve.assert_called_once_with(controller, app_config=load.return_value)
+
+    def test_serve_notes_its_start_before_serving(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = controller_config(Path(temporary))
+            started = Path(temporary) / "controller-started.json"
+            seen: list[bool] = []
+
+            def serve(*_args: object, **_kwargs: object) -> None:
+                seen.append(started.is_file())
+
+            with (
+                patch("inky_bird_frame.cli.load_config", return_value=config),
+                patch("inky_bird_frame.cli.serve_catalog", side_effect=serve),
+            ):
+                serve_command(Namespace(config=Path("instance.toml")))
+
+        self.assertEqual(seen, [True])
 
     def test_access_bootstrap_never_prints_the_setup_secret(self) -> None:
         with TemporaryDirectory() as temporary:
