@@ -1,4 +1,5 @@
 import { frameTools, compact, glyph, stepIndex } from '/app/frame-tools.js';
+import { clampedNotice } from '/app/ui.js';
 
 // Longer than one playing turn, so a slow plate is replaced by the next turn first.
 const PLATE_TIMEOUT = 90000;
@@ -6,10 +7,10 @@ const PLATE_TIMEOUT = 90000;
 export function renderFrame(context) {
   const {
     ui, el, button, api, main, view, data, byId, plateURL, href, link, note, members, viewLabel,
-    base, empty, closeJournal, setStopScreen, setFrameSignOut,
+    base, empty, closeJournal, setStopScreen, setFrameSignOut, whyThisBird,
   } = context;
   let birds = members(view).filter((bird) => bird.plate_ready);
-  base(viewLabel(view));
+  base('Play', viewLabel(view));
   // The members of this view in the journal `current`; undefined when removed.
   const viewIds = (current) =>
     view === 'favorites'
@@ -25,8 +26,8 @@ export function renderFrame(context) {
     Boolean(ids) &&
     ids.some((id) => current.birds.some((bird) => bird.taxon_id === id && bird.plate_ready));
   if (!birds.length) {
-    const card = empty('No approved plates in this view', 'Inky will not switch to another collection.');
-    main.append(card, link('Exit Frame', 'collections'));
+    const card = empty('No plates here yet', 'Play starts by itself once this view has plates.');
+    main.append(card, link('Exit Play', 'collections'));
     let left = false;
     // A view that is empty for now starts playing once its plates arrive.
     const waiting = setInterval(async () => {
@@ -65,7 +66,10 @@ export function renderFrame(context) {
   image.hidden = true;
   image.draggable = false;
   const caption = el('p', '', 'frame-caption'),
+    // "Noted at your feeder this week": only when the page's helper has a line for this bird.
+    why = el('p', '', 'hint frame-why'),
     status = el('p', '', 'hint');
+  why.hidden = true;
   status.setAttribute('role', 'status');
   const controls = el('div', '', 'frame-controls');
   const viewport = el('div', '', 'frame-viewport');
@@ -78,6 +82,8 @@ export function renderFrame(context) {
     image.removeAttribute('src');
     image.hidden = true;
     caption.textContent = '';
+    why.textContent = '';
+    why.hidden = true;
   }
   function signedOut() {
     if (expired) return;
@@ -85,10 +91,10 @@ export function renderFrame(context) {
     expired = true;
     pause();
     closeJournal();
-    image.alt = 'Last visible approved bird plate';
+    image.alt = 'The last plate shown';
     document.title = 'Inky';
     status.textContent =
-      'Signed out. The last approved image stays visible. Sign in, or pair this screen for continuous read-only viewing.';
+      'You are signed out. The last plate stays here. Sign in, or pair this screen to keep showing birds.';
     main.replaceChildren(image, status, link('Sign in', 'home'));
     byId.clear();
     for (const key of Object.keys(data)) delete data[key];
@@ -131,7 +137,7 @@ export function renderFrame(context) {
       const nextImage = el('img', '', 'frame-art');
       nextImage.draggable = false;
       nextImage.src = nextURL;
-      nextImage.alt = 'Approved plate: ' + bird.common_name;
+      nextImage.alt = 'Plate: ' + bird.common_name;
       await nextImage.decode();
       if (request.signal.aborted || expired || !image.isConnected) return;
       image.replaceWith(nextImage);
@@ -145,6 +151,8 @@ export function renderFrame(context) {
         el('span', bird.common_name),
         el('span', bird.scientific_name, 'scientific'),
       );
+      why.textContent = whyThisBird?.(bird) || '';
+      why.hidden = !why.textContent;
       details.href = href('bird', { bird: bird.taxon_id });
       details.hidden = false;
       status.textContent = '';
@@ -154,8 +162,8 @@ export function renderFrame(context) {
       if ((timedOut || !request.signal.aborted) && !expired && image.isConnected) {
         if (!paused) position = index;
         status.textContent = paused
-          ? 'Plate unavailable. Keeping the last approved plate. Try Next when the connection returns.'
-          : 'Plate unavailable. Keeping the last approved plate. Playback continues.';
+          ? 'This plate did not load. Keeping the last one. Try Next when the connection is back.'
+          : 'This plate did not load. Keeping the last one; Play goes on.';
       }
     } finally {
       clearTimeout(deadline);
@@ -218,7 +226,7 @@ export function renderFrame(context) {
         'next',
       ),
     ],
-    secondary: [details, link('Exit Frame', 'collections'), random, labels],
+    secondary: [details, link('Exit Play', 'collections'), random, labels],
     previous: () => step(-1),
     next: () => step(1),
     togglePlay,
@@ -237,7 +245,7 @@ export function renderFrame(context) {
         withdraw();
         details.hidden = true;
         status.textContent =
-          'This view has no approved plates or was removed. Inky will not switch views.';
+          'This view has no plates now. Play waits here and starts again when it has some.';
         return;
       }
       const next = current.birds.filter(
@@ -275,29 +283,33 @@ export function renderFrame(context) {
         signedOut();
       } else {
         loading?.abort();
-        status.textContent = 'Offline. Keeping the last approved plate. Inky will keep checking.';
+        status.textContent = 'Offline. Keeping the last plate; Inky keeps checking.';
       }
     }
   }, 60000);
+  const notice = clampedNotice(status, button);
   setStopScreen(() => {
     clearInterval(timer);
     clearInterval(check);
     loading?.abort();
     if (objectURL) URL.revokeObjectURL(objectURL);
     stopTools();
+    notice.stop();
   });
   setFrameSignOut(signedOut);
   const dock = el('div', '', 'frame-dock');
-  dock.append(status, controls);
-  main.append(
-    viewport,
+  dock.append(status, notice.control, controls);
+  // The bird name and notes sit beside the plate on a short landscape screen.
+  const side = el('div', '', 'frame-side');
+  side.append(
     caption,
-    note('Plates change once a minute while playing. This does not refresh the wall panel.'),
+    why,
+    note('Plates change once a minute while playing. Your wall frame is not affected.'),
   );
   if (!window.isSecureContext)
-    main.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
+    side.append(note('This screen may sleep: keeping it awake needs an HTTPS address.'));
   // Last in the column, so a notice of any length takes its own room above
   // the bar instead of covering the bird name or the notes.
-  main.append(dock);
+  main.append(viewport, side, dock);
   show();
 }

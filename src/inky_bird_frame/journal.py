@@ -52,13 +52,11 @@ COLLECTION_ID = re.compile(r"[0-9a-f]{32}\Z")
 STOPPED_GUIDANCE = {
     "retry_limit": (
         "retry_limit",
-        "Automatic retries have stopped after repeated failed tries. "
-        "Choose this bird for retry to try again.",
+        "Automatic retries have stopped after repeated failed tries.",
     ),
     "research_limit": (
         "research_limit",
-        "This bird used its research allowance. Automatic retries have stopped; "
-        "choose it for retry to try again.",
+        "This bird used its research allowance. Automatic retries have stopped.",
     ),
 }
 
@@ -71,45 +69,44 @@ def failure_guidance(error_type: object, stop_reason: object = None) -> dict[str
     messages = {
         "QualityReviewError": (
             "quality_review",
-            "The plate exhausted its review rounds without passing. Retry preserves "
-            "correction guidance; inspect a pending candidate before approving.",
+            "The plate did not pass its checks after every try. Trying again keeps "
+            "the notes from the earlier tries.",
         ),
         "InsufficientReferencesError": (
             "references",
-            "Not enough usable reference photos. Wait for source coverage to improve, "
-            "or review the source before retrying.",
+            "Inky could not find enough good reference photos. Try again once "
+            "your sources have more of this bird.",
         ),
         "ResearchLimitError": (
             "research_limit",
-            "Research allowance is temporarily unavailable. Automatic work waits until "
-            "its next eligibility time.",
+            "Inky has used its research allowance for now. It tries again on its own later.",
         ),
         "DataSourceError": (
             "source",
-            "A source or research request could not complete. Check Sources; "
-            "automatic retry uses backoff.",
+            "A source or a research lookup did not answer. Inky tries again on its "
+            "own, waiting longer each time; Sources shows which one.",
         ),
         "GenerationError": (
             "generation",
-            "The model or generated artifact could not complete validation. Retry is "
-            "serialized behind active work; inspect private operator evidence if it repeats.",
+            "The drawing could not be finished. Inky tries again after other plates; "
+            "if this keeps happening, the controller log has the details.",
         ),
         "SpeciesStateError": (
             "retained_state",
-            "Retained identity or correction evidence needs inspection. Retrying cannot "
-            "bypass provenance or review checks.",
+            "This bird's saved work needs a look from whoever runs Inky before it "
+            "can be tried again. Its checks still apply.",
         ),
         "MissingDependencyError": (
             "dependency",
-            "A controller dependency is unavailable. An operator must repair it before retrying.",
+            "Part of Inky's setup is missing. Whoever runs Inky needs to repair it "
+            "before this can be tried again.",
         ),
     }
     code, message = messages.get(
         str(error_type),
         (
             "unknown",
-            "Details are unavailable in this saved record. Inspect retained operator "
-            "evidence before repeating the attempt.",
+            "Inky has no details for this. Check the controller log before trying again.",
         ),
     )
     return {"failure_kind": code, "failure_message": message}

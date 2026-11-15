@@ -1,5 +1,8 @@
 // Raw files live only in controller staging and the browser's file input.
 // History confirmation and trip saving are separate, recoverable steps.
+import { statusText } from '/app/manage.js';
+import { plural, plainDate, when } from '/app/words.js';
+
 export async function renderImports(ui, { base, link, note, kind }) {
   const { element: el, button, api, upload } = ui;
   if (!['ebird-archive', 'birdnet-analyzer'].includes(kind))
@@ -120,15 +123,15 @@ export async function renderImports(ui, { base, link, note, kind }) {
     if (stopped || !content.isConnected) return;
     content.replaceChildren(
       el('h2', 'Working on this step'),
-      note(receipt.status),
-      link('Saved operation outcome', 'operation', { operation: id }),
+      note(statusText(receipt.status)),
+      link('See how it went', 'operation', { operation: id }),
     );
     if (['pending', 'running'].includes(receipt.status)) {
       timer = setTimeout(
         () =>
           watch(id, done).catch((error) => {
             if (!stopped) {
-              const retry = recovery('Check this operation again', () => watch(id, done));
+              const retry = recovery('Check again', () => watch(id, done));
               content.append(retry);
               recoveryFailed(retry, error);
             }
@@ -152,9 +155,9 @@ export async function renderImports(ui, { base, link, note, kind }) {
         'h2',
         receipt.status === 'interrupted' ? 'This step was interrupted' : 'This step did not finish',
       ),
-      note(receipt.result?.message || 'Inspect saved state before an explicit retry.'),
+      note(receipt.result?.message || 'Check what was saved before trying again.'),
       recovery('Check saved state', load),
-      link('See the saved outcome', 'operation', { operation: id }),
+      link('See how it went', 'operation', { operation: id }),
     );
   }
   async function load() {
@@ -168,13 +171,13 @@ export async function renderImports(ui, { base, link, note, kind }) {
     if (state.kind !== kind) {
       content.append(
         el('h2', 'Another history preview is open'),
-        link('Resume that preview', 'imports', { kind: state.kind }),
+        link('Go back to it', 'imports', { kind: state.kind }),
         cancel(state),
       );
       return;
     }
     content.append(
-      note('Private source file expires: ' + new Date(state.expires_at).toLocaleString()),
+      note('Inky keeps this file privately until ' + (when(state.expires_at) || 'the preview ends') + '.'),
     );
     // The controller removes an expired preview and refuses its steps, so the
     // browser clock never decides expiry.
@@ -182,7 +185,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       content.append(
         el('h2', 'Upload did not finish'),
         note(
-          'Confirmed history and saved trips stay intact. Cancel this temporary file and select the original again.',
+          'Your history and trips are unchanged. Cancel this file and choose it again.',
         ),
         cancel(state),
       );
@@ -192,7 +195,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       content.append(
         el('h2', '2. Check the file'),
         note(
-          'Inky validates the complete file and compares it with retained history. This step does not change history.',
+          'Inky reads the whole file and compares it with the history it already has. Nothing changes yet.',
         ),
         operation('Check this file', 'import-preview', state.upload_id, () => ({})),
         cancel(state),
@@ -201,15 +204,13 @@ export async function renderImports(ui, { base, link, note, kind }) {
     }
     if (state.status === 'committed') {
       content.append(
-        el('h2', 'History is confirmed'),
-        note(
-          'The confirmed history step is complete. A trip has not been saved unless you see it in Collections.',
-        ),
+        el('h2', 'Your history is updated'),
+        note('A trip is saved only once you see it in Collections.'),
       );
       if (kind === 'birdnet-analyzer') {
         content.append(
           note(
-            'Import does not enable this source, refresh observations, queue a plate or change the wall.',
+            'This does not turn the source on, ask for plates or change your frame.',
           ),
           cancel(state, 'Finish'),
           link('Analyzer settings', 'settings', { source: kind }),
@@ -226,20 +227,20 @@ export async function renderImports(ui, { base, link, note, kind }) {
     const preview = state.preview;
     content.append(el('h2', '3. Review history changes'));
     const labels = {
-      rows: 'Source rows',
+      rows: 'Rows in the file',
       checklists: 'Checklists',
-      species: 'Species names',
-      duplicate_rows: 'Duplicate rows',
+      species: 'Bird names',
+      duplicate_rows: 'Repeated rows',
       added_checklists: 'New checklists',
       updated_checklists: 'Changed checklists',
       removed_checklists: 'Removed checklists',
       unchanged_checklists: 'Unchanged checklists',
-      imported: 'New detections',
-      updated: 'Changed detections',
-      removed: 'Removed detections',
-      duplicates: 'Unchanged detections',
-      dated: 'Dated detections',
-      undated: 'Undated detections',
+      imported: 'New records',
+      updated: 'Changed records',
+      removed: 'Removed records',
+      duplicates: 'Unchanged records',
+      dated: 'Dated records',
+      undated: 'Undated records',
     };
     const counts = el('dl', '', 'measurements');
     for (const [key, label] of Object.entries(labels))
@@ -250,23 +251,22 @@ export async function renderImports(ui, { base, link, note, kind }) {
       note(preview.notice),
       note(
         preview.impact.live_source_enabled
-          ? 'This source already participates in scheduled discovery.'
+          ? 'This source is on, so these birds join your regular checks.'
           : 'This source is off. Importing will not turn it on.',
       ),
       note(
         preview.generation_enabled
-          ? 'Automatic generation is enabled. New eligible species can use your AI allowance after refresh.'
-          : 'Generation is off. This import will not turn it on.',
+          ? 'Plate making is on. New birds can be drawn after the next check, with your own image-generation account; its charges apply.'
+          : 'Plate making is off. This will not turn it on.',
       ),
     );
     if (preview.impact.entering_window)
       content.append(
         note(
-          'Source names entering the live date window: ' +
-            preview.impact.entering_window.length +
-            '. Leaving: ' +
+          plural(preview.impact.entering_window.length, 'bird name comes', 'bird names come') +
+            ' into your current window, and ' +
             preview.impact.leaving_window.length +
-            '. Provider limits and cross-source matching still apply.',
+            ' leave it.',
         ),
       );
     if (preview.impact.undated_notice) content.append(note(preview.impact.undated_notice));
@@ -283,22 +283,22 @@ export async function renderImports(ui, { base, link, note, kind }) {
         acknowledge,
         document.createTextNode(
           kind === 'birdnet-analyzer'
-            ? 'I reviewed the removed detections. Remove them from Analyzer history.'
-            : 'I reviewed removed checklists and changed collection evidence. Keep my curated groups and mark changed evidence.',
+            ? 'I have checked the removed records. Remove them from my Analyzer history.'
+            : 'I have checked the removed checklists. Keep my collections and mark the birds whose checklists changed.',
         ),
       );
       for (const name of preview.impact.affected_collections || [])
-        content.append(note('Evidence changes in: ' + name));
+        content.append(note('Checklists change in: ' + name));
       content.append(label);
     }
     content.append(
       operation(
-        preview.unchanged ? 'No history changes · continue' : 'Confirm history update',
+        preview.unchanged ? 'Nothing changed · continue' : 'Confirm history update',
         'import-commit',
         state.upload_id,
         () => {
           if (acknowledge && !acknowledge.checked)
-            throw new Error('Confirm that you reviewed removals and changed evidence.');
+            throw new Error('Tick the box to say you have checked what will be removed.');
           return {
             preview_hash: preview.preview_hash,
             allow_reduction: acknowledge?.checked || false,
@@ -326,9 +326,24 @@ export async function renderImports(ui, { base, link, note, kind }) {
   }
   function chooseFile() {
     if (kind === 'ebird-archive') {
-      const error = problem();
-      content.append(
-        button('Use retained history without an upload', async (event) => {
+      const error = problem(),
+        here = el('div');
+      here.hidden = true;
+      content.append(here);
+      // Hidden only when the journal shows there is no eBird history; when it
+      // cannot tell, the history may still be there to use.
+      api('/v1/owner/journal')
+        .then((journal) => {
+          const row = (journal.history_coverage || []).find(
+            (entry) => entry.source === 'ebird-archive',
+          );
+          here.hidden = !row || (row.status === 'available' && !(row.species_count > 0));
+        })
+        .catch(() => {
+          here.hidden = false;
+        });
+      here.append(
+        button('Use the history already here', async (event) => {
           const control = event.currentTarget;
           control.disabled = true;
           try {
@@ -340,16 +355,16 @@ export async function renderImports(ui, { base, link, note, kind }) {
           }
         }),
         note(
-          'Choose from retained checklist dates and species. Upload the original archive if you need location labels or updated history.',
+          'Make a trip from the checklists Inky already has. Upload your archive again for place names or newer checklists.',
         ),
         error,
       );
     }
     content.append(
-      el('h2', '1. Choose the complete source file'),
+      el('h2', '1. Choose your file'),
       note(
         kind === 'ebird-archive'
-          ? 'Use the official eBird Download My Data ZIP or CSV. Do not trim it to one trip: the archive replaces retained history.'
+          ? 'Use the ZIP or CSV from eBird’s Download My Data, as it comes. It replaces the history Inky has, so do not trim it to one trip.'
           : 'Use BirdNET Analyzer CSV output. A known recording date applies to this batch. Leave it blank if the date is unknown.',
       ),
     );
@@ -370,7 +385,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
     recheck.hidden = true;
     form.append(
       note(
-        'Up to 512 MiB on the wire; eBird ZIP contents must also decode to no more than 512 MiB. Inky requires 2 GiB free before upload. Files stay private and expire after the configured preview period.',
+        'Files up to 512 MB. A ZIP must also unpack to 512 MB or less. Inky needs 2 GB free to receive it, and keeps it privately for a limited time.',
       ),
       send,
       cancel,
@@ -379,7 +394,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       recheck,
     );
     const MIB = 1024 * 1024;
-    const unit = (total) => (total < MIB ? ' KiB' : ' MiB');
+    const unit = (total) => (total < MIB ? ' KB' : ' MB');
     const amount = (bytes, total) =>
       total < MIB ? String(Math.ceil(bytes / 1024)) : (bytes / MIB).toFixed(total < 10 * MIB ? 1 : 0);
     form.addEventListener('submit', async (event) => {
@@ -387,7 +402,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       const source = file.files[0];
       if (!source) return;
       if (!source.size || source.size > 512 * 1024 * 1024) {
-        error.textContent = 'Choose a nonempty file no larger than 512 MiB.';
+        error.textContent = 'Choose a file up to 512 MB.';
         return;
       }
       send.disabled = true;
@@ -448,7 +463,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
     content.append(
       el('h2', '4. Choose your checklists'),
       note(
-        'Calendar dates include both endpoints. Location names come only from this private source file and are not copied into the saved trip.',
+        'Both dates are included. Place names come only from your file and are not kept in the saved trip.',
       ),
       note(
         'Checking a trip looks up species names Inky has not matched before on iNaturalist. Only the names are sent.',
@@ -511,12 +526,11 @@ export async function renderImports(ui, { base, link, note, kind }) {
           label.append(
             input,
             document.createTextNode(
-              record.observed_on +
+              (plainDate(record.observed_on) || record.observed_on) +
                 ' · ' +
-                (record.location || 'Location unavailable') +
+                (record.location || 'No place name') +
                 ' · ' +
-                record.species_count +
-                ' species',
+                plural(record.species_count, 'species', 'species'),
             ),
           );
           fields.append(label);
@@ -525,10 +539,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
         choices.replaceChildren(
           fields,
           note(
-            result.checklists.length +
-              ' checklists. ' +
+            plural(result.checklists.length, 'checklist', 'checklists') +
+              '. ' +
               (draft.checklist_keys
-                ? 'Previous choices are restored where they still exist. Review them against the current history.'
+                ? 'Your earlier choices are back where they still exist. Check them before you go on.'
                 : 'None are selected automatically.'),
           ),
           operation('Review this trip', 'trip-preview', state.upload_id, async () => {
@@ -560,21 +574,19 @@ export async function renderImports(ui, { base, link, note, kind }) {
       el('h2', '5. Save your trip'),
       el('p', preview.label),
       note(
-        preview.matched +
-          ' matched species · ' +
-          preview.ready +
-          ' plates ready · ' +
-          preview.unresolved.length +
-          ' unresolved',
+        plural(preview.matched, 'bird', 'birds') +
+          ' · ' +
+          plural(preview.ready, 'plate', 'plates') +
+          (preview.unresolved.length ? ' · ' + preview.unresolved.length + ' not matched' : ''),
       ),
       note(preview.notice),
     );
     for (const member of preview.unresolved)
       content.append(
         note(
-          'Unresolved: ' +
+          'Not matched: ' +
             (member.scientific_name || member.common_name) +
-            '. No generation will be requested for it.',
+            '. It will not be drawn.',
         ),
       );
     // The controller refuses to save while any name is still waiting.
@@ -593,7 +605,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
         await load();
       }),
       cancel(state, 'Finish without saving this trip'),
-      link('Check saved collections', 'collections'),
+      link('Collections', 'collections'),
     );
   }
   async function resume() {

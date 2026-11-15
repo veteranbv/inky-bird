@@ -144,7 +144,12 @@ def test_restart_marks_unknown_work_interrupted_without_replay(tmp_path: Path) -
     worker.path.write_text(json.dumps(raw))
     restarted = OwnerOperations(tmp_path)
     try:
-        assert restarted.status(str(receipt["operation_id"]))["status"] == "interrupted"
+        interrupted = restarted.status(str(receipt["operation_id"]))
+        assert interrupted["status"] == "interrupted"
+        assert interrupted["result"] == {
+            "message": "Inky could not confirm how this ended. "
+            "Check what changed before trying again."
+        }
         with patch("inky_bird_frame.owner_operations._stamp"):
             duplicate = restarted.submit(
                 "retry",
@@ -239,7 +244,7 @@ def test_adapter_test_delivery_never_claims_failed_destinations_received_it(tmp_
             config, "notification-test", revision=str(settings_status(config)["revision"])
         )
     assert result["failed_count"] == result["delivered_count"] == 1
-    assert "failed" in str(result["message"])
+    assert str(result["message"]) == "The test did not reach every destination."
 
 
 def test_concurrent_save_cannot_change_confirmed_notification_destinations(tmp_path: Path) -> None:

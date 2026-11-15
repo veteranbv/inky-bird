@@ -613,7 +613,7 @@ async function accountAccess(access, session, message = '') {
         confirmationBox.append(
           element(
             'p',
-            'Your sign-in provider is unavailable. This change needs a fresh sign-in. Ask the installer to restore the provider, or enable local login through operator recovery.',
+            'This change needs a fresh sign-in, but your sign-in provider is not answering. Try again once it is back, or ask whoever runs Inky to turn on the Inky password.',
           ),
           cancel,
         );

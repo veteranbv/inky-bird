@@ -206,7 +206,7 @@ test('unreadable plate work without its notice still says it could not be read',
     state: withState({ management: { available: false, reason: 'unreadable' } }),
   });
   assert(!main.textContent.includes('Full configuration unavailable'));
-  assert.equal(notices(main)[0]?.textContent, 'Plate work could not be read.');
+  assert.equal(notices(main)[0]?.textContent, 'Plates in the works could not be read.');
 });
 
 test('an install without plate work configured keeps its setup message', async (t) => {

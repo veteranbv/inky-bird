@@ -199,7 +199,7 @@ test('field notes that fail to load leave the rest of the bird page working', as
   });
   assert.deepEqual(problems, []);
   assert(findButton(main, 'Add to Favorites'), 'Favorites still works');
-  assert(findButton(main, 'Add to Saved birds'), 'Saved birds still works');
+  assert(findButton(main, 'Add to my frame'), 'On my frame still works');
   assert(nodes(main).some((node) => node.textContent === 'Field notes are unavailable.'));
 });
 
@@ -211,7 +211,7 @@ test('field notes arrive below the bird actions, so nothing moves under a finger
   const holding = (target) => notes.children.findIndex((child) => child === target || nodes(child).includes(target));
   const fieldNotes = notes.children.findIndex((node) => node.classList.contains('field-notes'));
   const favorites = holding(findButton(main, 'Add to Favorites'));
-  const saved = holding(findButton(main, 'Add to Saved birds'));
+  const saved = holding(findButton(main, 'Add to my frame'));
   assert(favorites >= 0 && saved >= 0 && fieldNotes >= 0);
   assert(fieldNotes > favorites && fieldNotes > saved, 'field notes come after the actions');
 });
@@ -281,10 +281,10 @@ for (const [plateReady, oneTap] of [
         throw new Error('unexpected ' + path);
       },
     });
-    findButton(main, 'Remove from Saved birds').click();
+    findButton(main, 'Remove from my frame').click();
     await flush();
     assert.equal(changes.length, oneTap ? 1 : 0);
-    assert.equal(Boolean(findButton(main, 'Confirm Saved birds change')), !oneTap);
+    assert.equal(Boolean(findButton(main, 'Change my frame')), !oneTap);
     assert.equal(Boolean(findButton(main, 'Undo')), oneTap);
     assert.deepEqual(assigned, []);
   });
@@ -305,7 +305,7 @@ test('a favorite that cannot be saved says so beside the bird', async (t) => {
   await flush();
   assert.deepEqual(problems, []);
   assert(nodes(main).some((node) => node.textContent === 'The journal changed. Reload and try again.'));
-  assert(findButton(main, 'Add to Saved birds'), 'the rest of the page stays');
+  assert(findButton(main, 'Add to my frame'), 'the rest of the page stays');
   assert.equal(favorite.disabled, false);
 });
 
@@ -330,13 +330,13 @@ test('an action that cannot start says so in its own section', async (t) => {
       throw new Error('unexpected ' + path);
     },
   });
-  findButton(main, 'Refresh observations').click();
+  findButton(main, 'Check sources now').click();
   await flush();
   assert.deepEqual(problems, []);
   assert.equal(main.querySelector('h1').textContent, 'Sources');
   const message = 'This service has no authoritative configuration file.';
   assert(nodes(main).some((node) => node.textContent === message));
-  findButton(main, 'Refresh observations').click();
+  findButton(main, 'Check sources now').click();
   await flush();
   assert.equal(
     nodes(main).filter((node) => node.tagName === 'P' && node.textContent === message).length,
