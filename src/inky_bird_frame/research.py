@@ -11,12 +11,28 @@ from .http import write_json_atomic
 
 
 class ResearchBudget:
-    """A daily search total plus a per-species total that does not reset by day.
+    """A shared daily search total plus a per-species total for one run of work.
 
-    The per-species total covers one run of automatic work for a bird. The
-    generation cycle clears it with reset_species when that run ends, with a
-    plate or a stop for the owner, so a process that dies mid-research keeps
-    its count.
+    A run is the automatic work toward one plate for one bird. Every event:
+
+    | Event                                    | Per-species total | Daily total    |
+    |------------------------------------------|-------------------|----------------|
+    | Research call starts (saved first)       | +1                | +1             |
+    | Call completes, usable answer or not     | kept              | kept           |
+    | Call ends without an answer (timeout,    | -1 (refund)       | -1 if the same |
+    |   agent outage, failed start)            |                   |   day, else -  |
+    | Process dies or is stopped mid-call      | kept              | kept           |
+    | Automatic retry after a failure          | kept              | kept           |
+    | Run ends with a plate (pending or held)  | reset to 0        | kept           |
+    | Stop for the owner (any terminal stop)   | reset to 0        | kept           |
+    | Owner retry, with or without fresh       | reset to 0        | kept           |
+    |   research (CLI or the web page)         |                   |                |
+    | Owner replacement of an approved plate   | reset to 0        | kept           |
+    | Owner rejection of a pending plate       | kept (already 0)  | kept           |
+    | New UTC day                              | kept              | starts at 0    |
+
+    The per-species limit is checked against the run's total; the daily limit
+    against the day's total. tests/test_research_allowance.py walks every row.
     """
 
     def __init__(self, path: Path, *, daily_limit: int, species_limit: int) -> None:

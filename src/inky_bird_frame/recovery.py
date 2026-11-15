@@ -31,6 +31,7 @@ from .controller import (
     ensure_generation_retry,
     exclusive_cycle_lock,
     read_generation_queue,
+    reset_research_allowance,
     retry_approved_candidate,
 )
 from .errors import (
@@ -937,6 +938,8 @@ def retry_species(
                     shutil.move(str(source), destination)
                     moved.append(str(destination))
         retry_store.clear(taxon_id)
+        # The owner's retry starts a new run with a full research allowance.
+        reset_research_allowance(config, taxon_id)
         queued_for_generation = any(
             species.taxon_id == taxon_id for species in read_generation_queue(config)
         )

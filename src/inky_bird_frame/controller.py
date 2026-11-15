@@ -2040,6 +2040,7 @@ def retry_approved_candidate(
                     cache_sources,
                 )
                 active_count = _write_active_catalog(config, observed)
+                reset_research_allowance(config, taxon_id)
                 return {
                     "taxon_id": taxon_id,
                     "status": "eligible",
@@ -2130,6 +2131,8 @@ def retry_approved_candidate(
                     )
                 active_count = _write_active_catalog_after_removal(config, observed, taxon_id)
                 moved.extend(_archive_controller_paths(config.controller.state_dir, [withdrawn]))
+            # The owner's replacement starts a new run.
+            reset_research_allowance(config, taxon_id)
 
     return {
         "taxon_id": taxon_id,
@@ -2423,6 +2426,11 @@ def _research_budget(config: AppConfig) -> ResearchBudget:
         daily_limit=config.research.max_searches_per_day,
         species_limit=config.research.max_searches_per_species,
     )
+
+
+def reset_research_allowance(config: AppConfig, taxon_id: int) -> None:
+    """Give a bird a full research allowance for a new run; the daily total stays."""
+    _research_budget(config).reset_species(taxon_id)
 
 
 def _research_profile(
