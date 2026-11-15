@@ -427,9 +427,7 @@ class RetryCeilingTests(unittest.TestCase):
         return config, result
 
     def test_last_automatic_try_stops_the_bird_for_the_owner(self) -> None:
-        config, result = self.cycle_with(
-            DataSourceError("source down"), TRIES_BEFORE_STOP - 1
-        )
+        config, result = self.cycle_with(DataSourceError("source down"), TRIES_BEFORE_STOP - 1)
         failure = first_failure(result)
         work = read_generation_work(config)
 
@@ -446,9 +444,7 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertEqual(work.actionable, [])
 
     def test_earlier_tries_keep_retrying_with_backoff(self) -> None:
-        config, result = self.cycle_with(
-            DataSourceError("source down"), TRIES_BEFORE_STOP - 2
-        )
+        config, result = self.cycle_with(DataSourceError("source down"), TRIES_BEFORE_STOP - 2)
         failure = first_failure(result)
         record = retries(config).get(FIRST.taxon_id)
 
@@ -457,9 +453,7 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertEqual(list((config.controller.state_dir / "failed").glob("*")), [])
 
     def test_unexpected_errors_count_toward_the_ceiling(self) -> None:
-        config, result = self.cycle_with(
-            RuntimeError("/private/path"), TRIES_BEFORE_STOP - 1
-        )
+        config, result = self.cycle_with(RuntimeError("/private/path"), TRIES_BEFORE_STOP - 1)
         failure = first_failure(result)
 
         self.assertIs(failure["terminal"], True)
