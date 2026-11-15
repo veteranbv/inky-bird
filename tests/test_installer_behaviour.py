@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -174,6 +174,25 @@ class Host:
             timeout=120,
         )
 
+    def start(
+        self,
+        name: str,
+        output: Path,
+        *,
+        shell: str = "bash",
+        quiesce_timeout: int = 3,
+        **extra: str,
+    ) -> subprocess.Popen[str]:
+        """Start a script in the background with stdout and stderr in ``output``."""
+        with output.open("w") as handle:
+            return subprocess.Popen(
+                [shell, str(self.script(name, quiesce_timeout))],
+                env=self.environment(**extra),
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
     def fail(self, *rules: str) -> None:
         (self.fake / "fail").write_text("\n".join(rules) + "\n")
 
@@ -256,30 +275,48 @@ def bootstraps(host: Host) -> list[list[str]]:
 
 
 @contextmanager
-def running_generation(host: Host, seconds: float) -> Iterator[None]:
-    """Hold the controller cycle lock the way a running generation does."""
+def running_generation(host: Host) -> Iterator[Callable[[], None]]:
+    """Hold the controller cycle lock the way a running generation does.
+
+    The lock is held until the yielded ``release`` is called or the block ends.
+    """
     holder = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import fcntl, sys, time\n"
+            "import fcntl, sys\n"
             "handle = open(sys.argv[1], 'a+')\n"
             "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
             "print('locked', flush=True)\n"
-            "time.sleep(float(sys.argv[2]))\n",
+            "sys.stdin.read()\n",
             str(host.state / "controller.lock"),
-            str(seconds),
         ],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
     )
+
+    def release() -> None:
+        assert holder.stdin is not None
+        holder.stdin.close()
+        assert holder.wait(timeout=30) == 0
+
     try:
         assert holder.stdout is not None
         assert holder.stdout.readline().strip() == "locked"
-        yield
+        yield release
     finally:
         holder.kill()
         holder.wait()
+
+
+def wait_until(condition: Callable[[], bool], what: str, timeout: float = 60.0) -> None:
+    """Poll ``condition`` and fail the test loudly if it is not met in time."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"timed out after {timeout:.0f}s waiting for {what}")
+        time.sleep(0.05)
 
 
 # Uninstallers ----------------------------------------------------------------
@@ -618,7 +655,7 @@ def test_linux_app_owned_upgrade_stops_scheduler_only_between_plates(tmp_path: P
 
 def test_linux_app_owned_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
     host = linux_host(tmp_path, mode="app")
-    with running_generation(host, 60):
+    with running_generation(host):
         result = run_linux(host, APP_UNITS)
     assert result.returncode == 3
     assert "still being made" in result.stderr and "No changes made" in result.stderr
@@ -742,7 +779,7 @@ def test_macos_failed_stop_is_not_ignored(tmp_path: Path) -> None:
 
 def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
     host = macos_host(tmp_path, "serve", "refresh")
-    with running_generation(host, 60):
+    with running_generation(host):
         result = run_macos(host)
     assert result.returncode == 3
     assert "still being made" in result.stderr and "No changes made" in result.stderr
@@ -755,13 +792,33 @@ def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> No
 
 def test_macos_upgrade_waits_for_a_plate_to_finish(tmp_path: Path) -> None:
     host = macos_host(tmp_path, "serve", "refresh")
-    started = time.monotonic()
-    with running_generation(host, 1.5):
-        result = run_macos(host)
-    assert result.returncode == 0, result.stderr
-    assert "Waiting for the plate being made to finish" in result.stderr
-    assert time.monotonic() - started >= 1.5
+    output = tmp_path / "installer.out"
+    waiting = "Waiting for the plate being made to finish"
+    with running_generation(host) as release:
+        installer = host.start(
+            "install-controller.sh",
+            output,
+            shell=MACOS_BASH,
+            quiesce_timeout=120,
+            FAKE_AGENTS="serve refresh",
+        )
+        try:
+            wait_until(
+                lambda: waiting in output.read_text() or installer.poll() is not None,
+                "the installer to try the cycle lock",
+            )
+            # Still blocked on the plate: nothing stopped yet.
+            assert installer.poll() is None, output.read_text()
+            assert not bootouts(host)
+            release()
+            returncode = installer.wait(timeout=120)
+        finally:
+            if installer.poll() is None:
+                installer.kill()
+                installer.wait()
+    assert returncode == 0, output.read_text()
     assert [call[3] for call in bootouts(host)] == ["lock-held", "lock-held"]
+    assert host.installed_version() == "new"
 
 
 def test_macos_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
