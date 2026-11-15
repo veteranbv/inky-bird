@@ -804,15 +804,16 @@ def _renew_session(state: BirdBuddyAuthState) -> tuple[str, str, str]:
 
 
 def _session_access_token(
-    state_dir: Path, current: datetime, *, reuse: bool
+    state_dir: Path, current: datetime, *, refused: str | None = None
 ) -> tuple[str, BirdBuddyFeeder, bool]:
     """Return an access token, the feeder and whether the token was a saved one."""
     with _auth_lock(state_dir):
         state = _read_auth_state(state_dir)
-        saved = _usable_access_token(state, current) if reuse else None
-        if saved is not None:
+        saved = _usable_access_token(state, current)
+        if saved is not None and saved != refused:
+            # Another sync may have renewed after this one read the refused token.
             return saved, state.feeder, True
-        if not reuse and state.access_token is not None:
+        if refused is not None and state.access_token == refused:
             # Forget a token Bird Buddy refused before renewing, so a failed
             # renewal does not leave it to be tried again next cycle.
             state = replace(state, access_token=None, access_token_expires_at=None)
@@ -2021,13 +2022,11 @@ def _update_history(
             if (
                 existing is not None
                 and existing.owner_confirmed
-                and not confirmed_complete
+                and not confirmed_checked
                 and existing.observed_at == postcard.observed_at
                 and existing.media_ids == postcard.media_ids
-                and _confirmed_species_for_media(postcard.media_ids, confirmed_species_by_media)
-                is None
             ):
-                # Keep the owner's correction until a complete confirmed read drops it.
+                # Keep the owner's correction until the next confirmed read.
                 duplicates += 1
                 continue
             if (
@@ -2224,14 +2223,15 @@ _RemoteFetch = tuple[
 def _fetch_remote(
     state_dir: Path, current: datetime, include_manual_sightings: bool
 ) -> _RemoteFetch:
-    access_token, feeder, saved = _session_access_token(state_dir, current, reuse=True)
+    access_token, feeder, saved = _session_access_token(state_dir, current)
     try:
         return _fetch_with(state_dir, access_token, feeder, current, include_manual_sightings)
     except DataSourceError as exc:
         if not saved or isinstance(exc, _ThrottledError) or not _access_refused(exc):
             raise
-    # The saved token was refused before its expiry: renew once and start over.
-    access_token, feeder, _ = _session_access_token(state_dir, current, reuse=False)
+    # The saved token was refused before its expiry: renew once (unless another
+    # sync already saved a newer token) and start over.
+    access_token, feeder, _ = _session_access_token(state_dir, current, refused=access_token)
     return _fetch_with(state_dir, access_token, feeder, current, include_manual_sightings)
 
 

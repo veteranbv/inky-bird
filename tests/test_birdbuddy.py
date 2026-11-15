@@ -1747,6 +1747,77 @@ class BirdBuddyTests(unittest.TestCase):
         )
         self.assertEqual(after_by_name["Cardinalis cardinalis"].detection_count, 1)
 
+    def test_a_correction_is_archived_under_its_species_whether_or_not_the_read_is_skipped(
+        self,
+    ) -> None:
+        feeder = BirdBuddyFeeder("feeder-1", "Garden feeder", "member")
+        now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+        # Old enough to be archived by the second sync, two hours later.
+        preview = postcard("postcard-1", now - timedelta(days=366) + timedelta(hours=1))
+        cardinal = PostcardSpecies("species-cardinal", "Northern Cardinal", "Cardinalis cardinalis")
+        confirmed = _ConfirmedHistoryFetch(
+            [ConfirmedSpeciesEvidence(cardinal, preview.observed_at, "selected_feeder")],
+            1,
+            1,
+            1,
+            0,
+            0,
+            {"media-1": (cardinal,)},
+        )
+        for interval, reads in ((timedelta(0), 3), (timedelta(hours=24), 2)):
+            with TemporaryDirectory() as temporary, self.subTest(interval=interval):
+                state_dir = Path(temporary)
+                with patch(
+                    "inky_bird_frame.birdbuddy._authenticate",
+                    return_value=("access", "refresh", [feeder]),
+                ):
+                    login_birdbuddy(
+                        state_dir,
+                        email="birder@example.test",
+                        password="private-password",
+                        authorization_confirmed=True,
+                        now=now,
+                    )
+                stored = []
+                with (
+                    patch(
+                        "inky_bird_frame.birdbuddy.BIRDBUDDY_CONFIRMED_HISTORY_INTERVAL", interval
+                    ),
+                    patch(
+                        "inky_bird_frame.birdbuddy._refresh_access_token",
+                        return_value=("access", "replacement"),
+                    ),
+                    patch(
+                        "inky_bird_frame.birdbuddy._fetch_postcards",
+                        side_effect=[([preview], 1, 1, 0), ([], 1, 0, 0), ([], 1, 0, 0)],
+                    ),
+                    patch(
+                        "inky_bird_frame.birdbuddy._fetch_confirmed_history",
+                        return_value=confirmed,
+                    ) as fetch_confirmed,
+                ):
+                    for hours in (0, 2, 25):
+                        sync_birdbuddy_detections(
+                            state_dir,
+                            window=ObservationWindow.ALL_TIME,
+                            limit=20,
+                            now=now + timedelta(hours=hours),
+                        )
+                        history = json.loads((state_dir / "birdbuddy-detections.json").read_text())
+                        stored.append(history["feeders"]["feeder-1"])
+
+                self.assertEqual(fetch_confirmed.call_count, reads)
+                for later in stored[1:]:
+                    self.assertEqual(later["postcards"], [])
+                    self.assertEqual(list(later["archived_species"]), ["species-cardinal"])
+                    self.assertEqual(
+                        later["archived_species"]["species-cardinal"]["detection_count"], 1
+                    )
+                    self.assertEqual(
+                        [item["species_ids"] for item in later["archived_postcards"]],
+                        [["species-cardinal"]],
+                    )
+
     def test_archived_identity_correction_survives_confirmed_record_removal(self) -> None:
         observed_at = "2025-08-01T10:00:00+00:00"
         media_ids = ("media-1",)

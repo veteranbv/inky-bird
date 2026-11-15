@@ -1246,6 +1246,72 @@ class AccessTokenReuseTests(unittest.TestCase):
         self.assertNotEqual(saved.get("access_token"), stale)
         self.assertEqual(saved["refresh_token"], "refresh-renewed")
 
+    def test_a_refused_token_is_forgotten_even_when_renewal_fails(self) -> None:
+        stale = signed_token(NOW + timedelta(hours=1), "stale")
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if token == stale:
+                raise HTTPError(
+                    "https://example.test/graphql", 401, "expired", Message(), io.BytesIO()
+                )
+            if query == _REFRESH_TOKEN:
+                raise HTTPError(
+                    "https://example.test/graphql", 503, "unavailable", Message(), io.BytesIO()
+                )
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, stale)
+            with self.assertRaises(DataSourceError):
+                sync_at(state_dir, NOW, transport)
+            saved = auth_state(state_dir)
+
+        self.assertNotIn("access_token", saved)
+        self.assertEqual(saved["refresh_token"], "refresh-0")
+
+    def test_a_saved_token_is_not_reused_for_more_than_twelve_hours(self) -> None:
+        transport = ScriptedTransport(feed_and_history)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            sync_at(state_dir, NOW + timedelta(hours=11, minutes=50), transport)
+            self.assertEqual(transport.count(_REFRESH_TOKEN), 0)
+            sync_at(state_dir, NOW + timedelta(hours=11, minutes=56), transport)
+
+        self.assertEqual(transport.count(_REFRESH_TOKEN), 1)
+
+    def test_a_token_renewed_by_another_sync_is_used_instead_of_renewing_again(self) -> None:
+        stale = signed_token(NOW + timedelta(hours=1), "stale")
+        fresh = signed_token(NOW + timedelta(hours=1), "fresh")
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if token == stale:
+                # Another sync renewed the sign-in while this one was reading.
+                state = auth_state(state_dir)
+                state["access_token"] = fresh
+                state["refresh_token"] = "refresh-other"
+                path = state_dir / "birdbuddy-auth.json"
+                path.write_text(json.dumps(state))
+                path.chmod(0o600)
+                raise HTTPError(
+                    "https://example.test/graphql", 401, "expired", Message(), io.BytesIO()
+                )
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, stale)
+            sync_at(state_dir, NOW, transport, persist_history=False)
+            saved = auth_state(state_dir)
+
+        self.assertEqual(transport.count(_REFRESH_TOKEN), 0)
+        self.assertIn(fresh, [token for query, token in transport.calls if query in _FEED_QUERIES])
+        self.assertEqual(saved["access_token"], fresh)
+        self.assertEqual(saved["refresh_token"], "refresh-other")
+
     def test_a_token_without_a_readable_expiry_is_not_kept(self) -> None:
         def answer(query: str, variables: dict[str, object], token: str | None) -> object:
             if query == _REFRESH_TOKEN:
@@ -1359,6 +1425,44 @@ class ConfirmedHistoryCadenceTests(unittest.TestCase):
             [HUMMINGBIRD.common_name],
         )
         self.assertEqual([item.common_name for item in withdrawn.species], ["Eastern Bluebird"])
+
+    def test_a_withdrawn_correction_follows_the_feed_on_incomplete_full_reads(self) -> None:
+        confirms = {"media": True}
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _CONFIRMED_HISTORY:
+                # A record Inky does not know is skipped on every read.
+                records = [confirmed_record("media-other", origin="NEW")]
+                if confirms["media"]:
+                    records.append(confirmed_record("media-p1"))
+                return {"data": confirmed_page(*records)}
+            if query == _FEED_QUERIES[1]:
+                return {"data": page(node("p1", variant="SightingRecognizedBirdUnlocked"))}
+            if query in _FEED_QUERIES:
+                return {"data": page(node("p1", species=BLUEBIRD))}
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        names: list[list[str]] = []
+        stored_names: list[list[str]] = []
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=5)))
+            first = sync_at(state_dir, NOW, transport)
+            confirms["media"] = False
+            for hours in (25, 50, 75):
+                result = sync_at(state_dir, NOW + timedelta(hours=hours), transport)
+                self.assertIs(result.stats.confirmed_history_checked, True)
+                self.assertIs(result.stats.confirmed_history_complete, False)
+                names.append([item.common_name for item in result.species])
+                stored = json.loads((state_dir / "birdbuddy-detections.json").read_text())
+                postcard = stored["feeders"]["feeder-1"]["postcards"][0]
+                stored_names.append([species["common_name"] for species in postcard["species"]])
+
+        self.assertEqual([item.common_name for item in first.species], [HUMMINGBIRD.common_name])
+        for listed in names:
+            self.assertIn("Eastern Bluebird", listed)
+        self.assertEqual(stored_names, [["Eastern Bluebird"]] * 3)
 
     def test_skipped_days_report_the_completeness_of_the_last_full_read(self) -> None:
         for records, complete in (
