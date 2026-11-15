@@ -679,10 +679,11 @@ class CodexRunner:
                 species,
                 profile,
                 references,
-                output_path,
+                output_path.resolve(),
                 correction_findings,
                 invariant_findings=invariant_findings,
                 has_correction_source=correction_source_path is not None,
+                workspace=self.workspace,
             ),
             log_path,
         )
