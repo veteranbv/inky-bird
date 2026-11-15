@@ -100,9 +100,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
         accepted = true;
         if (!stopped) await watch(receipt.operation_id, onSuccess);
       } catch (failure) {
-        // An accepted step or a possibly lost reply is sent again unchanged, so
-        // the controller can recognise it. A refusal is rebuilt from current choices.
-        if (!accepted && !unknownOutcome.includes(failure.code)) {
+        // An accepted step, a possibly lost reply or a server failure (which may
+        // follow the saved receipt) is sent again unchanged, so the controller can
+        // recognise it. A refusal is rebuilt from current choices.
+        if (!accepted && !unknownOutcome.includes(failure.code) && !(failure.status >= 500)) {
           request = null;
           key = randomId();
         }
@@ -402,8 +403,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
         amount(source.size, source.size) +
         unit(source.size) +
         ' privately. No history has changed. Keep this page open.';
+      let delivered = false;
       const sent = (loaded, total) => {
         if (stopped || !total) return;
+        delivered = loaded >= total;
         progress.textContent =
           'Uploading privately: ' +
           Math.floor((100 * Math.min(loaded, total)) / total) +
@@ -420,7 +423,10 @@ export async function renderImports(ui, { base, link, note, kind }) {
         if (!stopped) await load();
       } catch (failure) {
         if (!stopped) {
-          if (failure.code === 'stopped') progress.textContent = failure.message;
+          // Once the whole file is sent, the controller may already hold it.
+          if (failure.code === 'stopped')
+            progress.textContent =
+              failure.message + (delivered ? ' Check the saved upload before sending again.' : '');
           else {
             progress.textContent =
               'No history changed. If the response was lost, check the saved upload before sending again.';

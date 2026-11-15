@@ -193,6 +193,16 @@ test('the review names removed destinations, a new location and replaced secrets
   );
 });
 
+test('a config without a radius or species limit does not report them as changed', async (t) => {
+  const saved = settings();
+  delete saved.discovery.radius_km;
+  delete saved.discovery.species_limit;
+  const { main } = await open(t, { '/v1/owner/settings': saved });
+  submit(main);
+  assert.ok(findButton(main, 'Save settings'));
+  assert.doesNotMatch(reviewText(main).join('\n'), /Radius|Live species limit/);
+});
+
 test('the review names a cleared Geoapify key', async (t) => {
   const saved = settings();
   saved.credentials.geoapify_api_key.configured = true;

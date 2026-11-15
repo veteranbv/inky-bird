@@ -19,9 +19,10 @@ for (const name of ['pointerdown', 'keydown'])
   });
 
 class RequestError extends Error {
-  constructor(message, code) {
+  constructor(message, code, status) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -144,6 +145,7 @@ async function reply(response) {
     throw new RequestError(
       result.error?.message || 'Inky could not complete this request.',
       result.error?.code,
+      response.status,
     );
   return result.data;
 }

@@ -73,6 +73,7 @@ async function open(t, journal, { offline = false } = {}) {
     if (path === '/v1/access') return json(access);
     if (path === '/v1/owner/session') return json({ csrf: 'token', single_sign_on: false });
     if (path === '/v1/owner/logout') return json({});
+    if (path === '/v1/owner/broken') return json({ code: 'internal', message: 'Inky hit a problem.' }, 500);
     return json({ code: 'not_found', message: 'Not found' }, 404);
   });
   globalThis.testJournal = journal;
@@ -142,4 +143,17 @@ test('a change that timed out says it may have been saved', async (t) => {
     write.message,
     'Inky did not answer in time. The change may still have been saved, so reload before trying again.',
   );
+});
+
+test('a refusal carries its HTTP status', async (t) => {
+  let pending;
+  await open(t, async (ui) => {
+    pending = ui.api('/v1/owner/broken', {}).then(
+      () => null,
+      (error) => error,
+    );
+  });
+  const error = await pending;
+  assert.equal(error.code, 'internal');
+  assert.equal(error.status, 500);
 });

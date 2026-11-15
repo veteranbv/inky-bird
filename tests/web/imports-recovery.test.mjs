@@ -29,9 +29,10 @@ function findAll(root, predicate, found = []) {
 }
 
 class RequestError extends Error {
-  constructor(message, code) {
+  constructor(message, code, status) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -137,6 +138,27 @@ test('a stopped upload reads as stopped, not as a network fault', async () => {
   assert.equal(findButton(form, 'Check saved upload').hidden, false);
 });
 
+test('an upload stopped after the whole file was sent says to check the saved upload', async () => {
+  const env = setup({
+    '/v1/owner/operations': { operations: [] },
+    '/v1/owner/imports': { preview: null },
+    upload: (onProgress) => {
+      onProgress(10, 10);
+      throw new RequestError('Upload stopped. No history changed.', 'stopped');
+    },
+  });
+  await renderImports(env.ui, env.helpers);
+  const form = findAll(env.main, (node) => node.tagName === 'FORM')[0];
+  findAll(form, (node) => node.tagName === 'INPUT')[0].files = [{ size: 10 }];
+  form.fire('submit', {});
+  await setImmediate();
+  const status = findAll(form, (node) => node.getAttribute('role') === 'status')[0];
+  assert.equal(
+    text(status),
+    'Upload stopped. No history changed. Check the saved upload before sending again.',
+  );
+});
+
 test('a page that cannot read its saved state says so in place', async () => {
   let fail = true;
   const env = setup({
@@ -172,12 +194,17 @@ test('a refused step is sent again with fresh choices, a lost reply with the sam
   await click(findButton(env.main, 'Check this file'));
   answer = new RequestError('Inky did not answer in time.', 'timeout');
   await click(findButton(env.main, 'Check this file'));
+  answer = new RequestError('Inky hit a problem.', 'internal', 500);
+  await click(findButton(env.main, 'Check this file'));
+  await click(findButton(env.main, 'Check this file'));
   await settled(env.actions);
-  const [refused, lost, again] = sent().map(({ body }) => body);
+  const [refused, lost, again, failed, afterFailure] = sent().map(({ body }) => body);
   assert.equal(refused.revision, 'r1');
   assert.equal(lost.revision, 'r2', 'a refused request is rebuilt');
   assert.notEqual(lost.key, refused.key, 'a refused request gets a new key');
   assert.deepEqual(again, lost, 'an unknown outcome is retried unchanged');
+  assert.deepEqual(failed, lost);
+  assert.deepEqual(afterFailure, lost, 'a server failure may have started the step: same key');
 });
 
 test('a step error stays visible after the step was replaced', async () => {

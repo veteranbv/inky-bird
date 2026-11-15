@@ -479,9 +479,9 @@ function differences(settings, changes) {
     const after = Object.fromEntries(keys.map((key) => [key, key in next ? next[key] : fields[key]]));
     if (place(after) !== place(fields)) lines.push('Community location: ' + place(after) + '.');
   }
-  if ('radius_km' in next && next.radius_km !== fields.radius_km)
+  if ('radius_km' in next && next.radius_km !== (fields.radius_km ?? null))
     lines.push('Radius: ' + (next.radius_km ?? 'not set') + (next.radius_km == null ? '.' : ' km.'));
-  if ('species_limit' in next && next.species_limit !== fields.species_limit)
+  if ('species_limit' in next && next.species_limit !== (fields.species_limit ?? null))
     lines.push('Live species limit: ' + (next.species_limit ?? 'not set') + '.');
   if ('birdnet_go_url' in next && next.birdnet_go_url !== (fields.birdnet_go_url ?? null))
     lines.push('BirdNET-Go base URL: ' + (next.birdnet_go_url ?? 'not set') + '.');
