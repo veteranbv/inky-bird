@@ -81,7 +81,8 @@ No source is required to browse approved art, save collections or play plates.
 
 Browse, save collections, and play plates in the browser. With approved
 artwork, you need no camera, microphone, provider account, or Codex login.
-New app-managed setups start with generation off.
+New setups start with generation off. Turning it on uses your own Codex account,
+and that provider's charges apply.
 
 These docs describe `main`, which may be ahead of your install. If you run a
 [tagged release](https://github.com/veteranbv/inky-bird/releases), follow

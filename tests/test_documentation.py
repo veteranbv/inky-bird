@@ -772,3 +772,37 @@ def test_architecture_describes_the_fields_the_request_log_actually_writes() -> 
     assert "with source IP address, path and query" not in guide
     assert "It never logs the source address, query, cookies" in guide
     assert "Owner, screen, wall and status routes are not logged per request" in guide
+
+
+def _markdown_table(section: str, header: str) -> list[list[str]]:
+    lines = section.split(header, 1)[1].lstrip("\n").splitlines()
+    rows = []
+    for line in lines[1:]:  # skip the separator row
+        if not line.startswith("|"):
+            break
+        rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+    return rows
+
+
+def test_cli_exit_codes_and_error_types_match_the_code() -> None:
+    from inky_bird_frame.cli import ERROR_CODES, EXIT_CODES
+
+    guide = (ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    section = guide.split("### Command results and exit codes", 1)[1].split("\n### ", 1)[0]
+
+    documented_exits = {
+        int(row[0].strip("`")): row[1]
+        for row in _markdown_table(section, "| Exit code | Meaning |")
+    }
+    assert set(documented_exits) == {0, 1, *EXIT_CODES.values()}
+
+    types = _markdown_table(section, "| `error.type` | Meaning |")
+    assert [row[0].strip("`") for row in types] == list(ERROR_CODES)
+    for row in types:
+        code = row[0].strip("`")
+        stated = re.search(r"exit code `(\d)`", row[1])
+        expected = EXIT_CODES.get(code, 1)
+        if stated is not None:
+            assert int(stated.group(1)) == expected, code
+        else:
+            assert expected == 1, f"{code} exits {expected}; the table must say so"
