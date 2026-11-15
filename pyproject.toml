@@ -76,16 +76,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/inky_bird_frame"]
 
-[tool.hatch.build.targets.sdist]
-# The prompt evaluation harness is a separate development tool (evals/pyproject.toml).
-exclude = ["evals"]
-
 [tool.hatch.build.targets.wheel.force-include]
 "docs/browser-access.md" = "inky_bird_frame/web/access-guide.txt"
 
 [tool.hatch.build.targets.sdist]
-# The plate catalog (over 1 GB) is published data, not package source.
-exclude = ["/catalog"]
+# The plate catalog (over 1 GB) is published data, not package source. The
+# prompt evaluation harness is a separate development tool (evals/pyproject.toml).
+exclude = ["/catalog", "/evals"]
 
 [tool.ruff]
 line-length = 100
