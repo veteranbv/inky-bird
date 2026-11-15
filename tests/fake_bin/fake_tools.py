@@ -84,14 +84,15 @@ def uname(arguments: list[str]) -> int:
 
 
 def identity(arguments: list[str]) -> int:
+    # A fixed non-root account, whoever runs pytest; FAKE_UID overrides the UID.
     if arguments == ["-u"]:
-        print(os.environ.get("FAKE_UID", str(os.getuid())))
+        print(os.environ.get("FAKE_UID", "1000"))
         return 0
     if arguments == ["-un"]:
         print("fixture")
         return 0
-    os.execv("/usr/bin/id", ["id", *arguments])
-    return 1
+    print(f"unexpected id call: {arguments}", file=sys.stderr)
+    return 64
 
 
 def system_python(arguments: list[str]) -> int:
