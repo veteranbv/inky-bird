@@ -15,6 +15,11 @@ const sorts = {
     (a, b) => (a.scientific_name || '').localeCompare(b.scientific_name || '') || byName(a, b),
   ],
   recent: ['Last noted', (a, b) => lastNoted(b).localeCompare(lastNoted(a)) || byName(a, b)],
+  // Birds without approved art, or from an older controller, sort last.
+  added: [
+    'Recently added',
+    (a, b) => (b.approved_at || '').localeCompare(a.approved_at || '') || byName(a, b),
+  ],
 };
 const shows = {
   all: ['All', () => true],

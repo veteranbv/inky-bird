@@ -1337,3 +1337,16 @@ def test_the_collection_route_removes_unresolved_members_and_old_pages_still_sav
         )
         assert removed.status_code == 200, removed.text
         assert removed.json()["data"]["collections"][0]["unresolved"] == unresolved[:1]
+
+
+def test_owner_bird_rows_say_when_their_art_was_approved(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    save_collection(tmp_path / "state", revision=0, label="Waiting", taxon_ids=[2])
+    birds = {
+        cast(int, bird["taxon_id"]): bird
+        for bird in cast(list[dict[str, object]], JournalService(controller).snapshot()["birds"])
+    }
+    assert birds[1]["approved_at"] == STAMP
+    # A bird without approved art has no approval time to show.
+    assert "approved_at" not in birds[2]

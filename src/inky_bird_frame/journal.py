@@ -1293,6 +1293,7 @@ class JournalService:
                         else [],
                         "portrait_url": f"/v1/owner/journal/birds/{taxon_id}/portrait",
                         "portrait_sha256": entry["portrait_sha256"],
+                        "approved_at": entry["approved_at"],
                     }
                 )
             approved_ids = {cast(int, bird["taxon_id"]) for bird in birds}

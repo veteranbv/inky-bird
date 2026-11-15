@@ -341,3 +341,16 @@ test('an action that cannot start says so in its own section', async (t) => {
     1,
   );
 });
+
+test('recently added puts the newest approved art first', async (t) => {
+  const state = () => {
+    const value = flock();
+    value.birds[0].approved_at = '2001-03-01T00:00:00+00:00';
+    value.birds[1].approved_at = '2001-05-01T00:00:00+00:00';
+    value.birds[2].approved_at = '2001-04-01T00:00:00+00:00';
+    return value;
+  };
+  const { main } = await open(t, { page: 'birds', sort: 'added' }, { state });
+  assert.equal(byId(main, 'bird-sort').value, 'added');
+  assert.deepEqual(names(main), ['Sample Finch', 'Test Heron', 'Example Wren', 'Demo Plover']);
+});
