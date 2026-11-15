@@ -17,6 +17,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+# Private in Starlette, but it is what the router matches; an import failure is loud.
 from starlette._utils import get_route_path
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -169,6 +170,10 @@ def _owner_message(exc: Exception, fallback: str) -> str:
     return fallback if not message or _PATH_OR_URL.search(message) else message
 
 
+class LocalStateUnavailableError(CatalogError):
+    """Local state is damaged or unwritable; the message names the recovery step."""
+
+
 @contextmanager
 def _readable_screen_state() -> Iterator[None]:
     """Damaged screen or journal state is unavailable, not the caller's mistake."""
@@ -177,13 +182,17 @@ def _readable_screen_state() -> Iterator[None]:
     except (JournalConflictError, JournalViewRemovedError):
         raise
     except JournalError as exc:
-        raise CatalogError("Screen access state cannot be read") from exc
+        raise LocalStateUnavailableError(
+            _owner_message(exc, "Screen access state cannot be read")
+        ) from exc
 
 
 def _storage_reason(exc: BaseException) -> str:
     """Name the operating-system error behind a failure without its paths."""
     cause: BaseException | None = exc
-    while cause is not None:
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
         code = cause.errno if isinstance(cause, OSError) else None
         if code is not None and code in errno.errorcode:
             return errno.errorcode[code]
@@ -647,8 +656,12 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         )
 
     async def start_oidc(request: Request) -> JSONResponse:
-        if config.oidc is None or request.url.scheme != "https":
+        if config.oidc is None:
             raise FeatureUnavailableError("Single sign-on needs a configured HTTPS provider")
+        if request.url.scheme != "https":
+            return _error(
+                403, "secure_access_required", "Open the HTTPS Inky address to use single sign-on"
+            )
         body = await _json_body(request, set(), optional={"remember", "return_to_access"})
         link = request.url.path.endswith("/link")
         confirm = body.get("return_to_access") is True and not link
@@ -1499,7 +1512,9 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 )
             )
         if request.method != "POST":
-            return _error(405, "method_not_allowed", "Use the documented collection operation")
+            refused = _error(405, "method_not_allowed", "Use the documented collection operation")
+            refused.headers["Allow"] = "POST"
+            return refused
         if action in {"queue-preview", "queue"}:
             if app_config is None:
                 raise JournalError("Start Inky with its configuration file")
@@ -1704,6 +1719,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
 
     async def journal_error(request: Request, exc: Exception) -> Response:
         # Damaged local state is one 503, whichever module read it.
+        if isinstance(exc, LocalStateUnavailableError):
+            return _error(503, "journal_unavailable", str(exc))
         if isinstance(exc, (CatalogError, OSError)):
             return _error(
                 503,

@@ -1593,8 +1593,11 @@ def test_telemetry_survives_deep_nesting_and_a_dropped_client(tmp_path: Path) ->
         headers=[*json_headers, (b"content-length", b"21")],
         messages=[{"type": "http.request", "body": b'{"sche', "more_body": True}],
     )
-    assert status == 400
-    assert json.loads(body)["error"]["code"] == "request_incomplete"
+    # The display routes keep their own error shape when the client goes away.
+    assert (status, json.loads(body)) == (
+        400,
+        {"ok": False, "error": "request incomplete", "schema_version": 1},
+    )
     assert not (config.state_dir / "display-last-fetch.json").exists()
 
 

@@ -444,6 +444,7 @@ class CatalogService:
 
     async def telemetry_response(self, request: Request) -> Response:
         from starlette.concurrency import run_in_threadpool
+        from starlette.requests import ClientDisconnect
 
         events = {
             "/v1/display-fetch": ("display-last-fetch.json", "fetched_at"),
@@ -486,14 +487,19 @@ class CatalogService:
                 request, 413, {"ok": False, "error": "request body too large", "schema_version": 1}
             )
         body = bytearray()
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > MAX_TELEMETRY_REQUEST_BYTES:
-                return self._json(
-                    request,
-                    413,
-                    {"ok": False, "error": "request body too large", "schema_version": 1},
-                )
+        try:
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > MAX_TELEMETRY_REQUEST_BYTES:
+                    return self._json(
+                        request,
+                        413,
+                        {"ok": False, "error": "request body too large", "schema_version": 1},
+                    )
+        except ClientDisconnect:
+            return self._json(
+                request, 400, {"ok": False, "error": "request incomplete", "schema_version": 1}
+            )
         try:
             payload = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):

@@ -343,6 +343,29 @@ def test_incorrect_confirmation_password_keeps_the_session_and_allows_retry(tmp_
         )
 
 
+def test_single_sign_on_over_plain_http_asks_for_secure_access(tmp_path: Path) -> None:
+    oidc = OIDCConfig(
+        "https://id.example.test/",
+        "client",
+        "https://inky.example.test/v1/owner/oidc/callback",
+        "SYNTHETIC_SECRET",
+        owner_subject="owner-subject",
+    )
+    origin = "http://127.0.0.1:8000"
+    with (
+        TestClient(
+            create_app(replace(_config(tmp_path), oidc=oidc)),
+            base_url=origin,
+            client=("127.0.0.1", 41000),
+        ) as client,
+        patch("inky_bird_frame.web.authorization_url") as provider,
+    ):
+        response = client.post("/v1/owner/oidc/start", json={}, headers={"Origin": origin})
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "secure_access_required"
+    provider.assert_not_called()
+
+
 def test_oidc_confirmation_requires_a_session_and_csrf_before_contacting_provider(
     tmp_path: Path,
 ) -> None:
@@ -735,6 +758,16 @@ def _owner_headers(client: TestClient, config: ControllerConfig) -> dict[str, st
     return {"Origin": ORIGIN, "X-Inky-CSRF": _setup(client, config, ORIGIN)}
 
 
+def test_collection_actions_name_the_method_they_accept(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with TestClient(create_app(config), base_url=ORIGIN) as client:
+        _owner_headers(client, config)
+        response = client.get("/v1/owner/journal/collections/queue")
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+    assert response.headers["Allow"] == "POST"
+
+
 def _linked_sso(tmp_path: Path) -> tuple[ControllerConfig, AccessStore]:
     oidc = OIDCConfig(
         "https://id.example.test/",
@@ -1029,11 +1062,14 @@ def test_import_cleanup_warning_names_the_storage_problem(
     assert str(tmp_path) not in caplog.text
 
 
-def test_corrupt_screen_state_is_unavailable_not_a_request_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize("damaged", ['{"schema_version": 1}', "{bad"])
+def test_corrupt_screen_state_is_unavailable_not_a_request_error(
+    tmp_path: Path, damaged: str
+) -> None:
     config = _config(tmp_path)
     config.state_dir.mkdir(parents=True)
     state = config.state_dir / "presentation-access.json"
-    state.write_text('{"schema_version": 1}')
+    state.write_text(damaged)
     state.chmod(0o600)
     with TestClient(create_app(config), base_url=ORIGIN) as client:
         client.cookies.set("__Host-inky-screen", "s" * 43, domain="inky.example.test", path="/")
@@ -1046,8 +1082,41 @@ def test_corrupt_screen_state_is_unavailable_not_a_request_error(tmp_path: Path)
         ]
     for response in responses:
         assert response.status_code == 503, response.request.url
-        assert response.json()["error"]["code"] == "journal_unavailable"
-    assert state.read_text() == '{"schema_version": 1}'
+        assert response.json()["error"] == {
+            "code": "journal_unavailable",
+            # The specific recovery step survives, so the owner restores the right file.
+            "message": "Presentation access state is invalid. Restore its matching private backup.",
+        }
+    assert state.read_text() == damaged
+
+
+@pytest.mark.parametrize(
+    ("raised", "shown"),
+    [
+        ("Presentation access storage is full", "Presentation access storage is full"),
+        (
+            "Cannot read /srv/private/state/presentation-access.json",
+            "Screen access state cannot be read",
+        ),
+    ],
+)
+def test_screen_state_failures_keep_their_safe_message(
+    tmp_path: Path, raised: str, shown: str
+) -> None:
+    from inky_bird_frame.journal import JournalError
+
+    config = _config(tmp_path)
+    with (
+        patch(
+            "inky_bird_frame.web.PresentationAccess.authenticate",
+            side_effect=JournalError(raised),
+        ),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        client.cookies.set("__Host-inky-screen", "s" * 43, domain="inky.example.test", path="/")
+        response = client.get("/v1/screen/view")
+    assert response.status_code == 503
+    assert response.json()["error"] == {"code": "journal_unavailable", "message": shown}
 
 
 def test_missing_image_support_is_reported_as_unavailable(
@@ -1122,3 +1191,11 @@ def test_data_source_messages_never_show_a_path_or_address(
     ]
     assert "example" not in caplog.text.lower()
     assert str(tmp_path) not in caplog.text
+
+
+def test_storage_reason_stops_at_a_cycle_of_causes() -> None:
+    from inky_bird_frame.web import _storage_reason
+
+    first, second = RuntimeError("first"), RuntimeError("second")
+    first.__context__, second.__context__ = second, first
+    assert _storage_reason(first) == "unknown cause"
