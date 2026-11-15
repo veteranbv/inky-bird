@@ -880,6 +880,7 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   .journal-navigation .tab-count { border: 1px solid CanvasText; }
 }
 .candidate-references { margin-block: 4px 12px; padding-left: 1.2em; }
+
 /* ---- design-copy: Manage groups, Sources rows, notices beside a plate ---- */
 
 .manage-group > h2 {

@@ -176,7 +176,9 @@ export function plateCounts(management) {
     newPlates: ready,
     needsAHand: (management.work?.needs_attention || []).length + candidates.length - ready,
   };
-// ---- design-copy workstream ----
+}
+
+// --- design-copy: windows, notification events and moments ---
 
 const WINDOWS = {
   'last-day': 'Last day',
