@@ -17,6 +17,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from starlette._utils import get_route_path
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect, Request
@@ -63,6 +64,7 @@ from .journal import (
 )
 from .oidc import OIDCError, authorization_url, metadata, provider_id, verified_identity
 from .owner_operations import (
+    _PATH_OR_URL,
     OperationKind,
     OwnerOperationBusyError,
     OwnerOperationError,
@@ -143,7 +145,6 @@ PRIVATE_PREFIXES = ("/v1/owner/", "/v1/screen/", "/v1/integrations/", "/v1/dashb
 # Unknown paths here get the owner error envelope; all others keep the legacy one.
 APP_PREFIXES = ("/app/", *PRIVATE_PREFIXES)
 OIDC_CALLBACK = "/v1/owner/oidc/callback"
-DIRECT_TLS_HSTS = b"max-age=31536000"
 # Private browser cache only; the URL's revision is the plate checksum, so a
 # changed plate always has a different URL.
 IMMUTABLE_IMAGE = "private, max-age=31536000, immutable"
@@ -158,17 +159,14 @@ class FeatureUnavailableError(AccessError):
 
 def _route_path(scope: Scope) -> str:
     """The path the router matches: the request path without any root path."""
-    path = cast(str, scope["path"])
-    root = cast(str, scope.get("root_path", ""))
-    return path.removeprefix(root) if root and path.startswith(root) else path
-
-
-_ABSOLUTE_PATH = re.compile(r"(?<![\w:/.])(?:/[^/\s:]+)+/([^/\s:]+)")
+    # Starlette's own helper, so the boundary and the router agree by construction.
+    return get_route_path(scope)
 
 
 def _owner_message(exc: Exception, fallback: str) -> str:
-    """Keep an error's meaning but never a local directory."""
-    return _ABSOLUTE_PATH.sub(r"\1", str(exc)) or fallback
+    """An error's own text only when it names no path or address."""
+    message = str(exc)
+    return fallback if not message or _PATH_OR_URL.search(message) else message
 
 
 @contextmanager
@@ -336,24 +334,20 @@ class OwnerBoundary:
         request = Request(scope)
         private = path.startswith(PRIVATE_PREFIXES)
         owner_page = private or path.startswith("/app") or path in {"/v1/access", "/screen"}
-        hsts = self.config.tls_certificate is not None and scope.get("scheme") == "https"
 
         async def protected_send(message: Message) -> None:
-            if message["type"] == "http.response.start" and (owner_page or hsts):
+            if message["type"] == "http.response.start" and owner_page:
                 headers = cast(list[tuple[bytes, bytes]], message.setdefault("headers", []))
-                if hsts:
-                    headers.append((b"strict-transport-security", DIRECT_TLS_HSTS))
-                if owner_page:
-                    offered = [value for key, value in headers if key == b"cache-control"]
-                    headers[:] = [(key, value) for key, value in headers if key != b"cache-control"]
-                    headers.extend(
-                        [
-                            (b"cache-control", _cache_control(path, offered)),
-                            (b"referrer-policy", b"no-referrer"),
-                            (b"x-content-type-options", b"nosniff"),
-                            (b"content-security-policy", OWNER_CSP.encode()),
-                        ]
-                    )
+                offered = [value for key, value in headers if key == b"cache-control"]
+                headers[:] = [(key, value) for key, value in headers if key != b"cache-control"]
+                headers.extend(
+                    [
+                        (b"cache-control", _cache_control(path, offered)),
+                        (b"referrer-policy", b"no-referrer"),
+                        (b"x-content-type-options", b"nosniff"),
+                        (b"content-security-policy", OWNER_CSP.encode()),
+                    ]
+                )
                 if path == "/v1/dashboard/art":
                     # Only this minimal explicitly enabled document can be framed.
                     # Its own CSP is built from validated installer-owned origins.
@@ -1696,8 +1690,6 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
     routes.append(Route("/{path:path}", UnmatchedRequest(tuple(routes), catalog)))
 
     async def access_error(request: Request, exc: Exception) -> Response:
-        if isinstance(exc, (CatalogError, OSError)):
-            return await journal_error(request, exc)
         if isinstance(exc, FeatureUnavailableError):
             return _error(403, "feature_unavailable", str(exc))
         if isinstance(exc, AccessRateLimitError):
@@ -1728,6 +1720,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _error(400, "journal_error", str(exc))
 
     async def data_source_error(request: Request, exc: Exception) -> Response:
+        # Fixed text only: the exception can name local paths or request addresses.
+        logging.getLogger(__name__).warning("An owner request could not read a bird data source")
         return _error(
             503,
             "data_source_unavailable",
@@ -1735,6 +1729,9 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         )
 
     async def dependency_error(request: Request, exc: Exception) -> Response:
+        logging.getLogger(__name__).warning(
+            "An owner request needs a component that is not installed"
+        )
         return _error(
             503,
             "dependency_missing",

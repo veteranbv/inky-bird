@@ -921,7 +921,8 @@ def test_owner_boundary_classifies_the_path_the_router_matches(tmp_path: Path) -
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
 
 
-def test_direct_tls_asks_browsers_to_keep_using_https(tmp_path: Path) -> None:
+def test_direct_tls_sends_no_host_wide_https_policy(tmp_path: Path) -> None:
+    # HSTS binds every port on the hostname, including services that are not Inky.
     direct = replace(
         _config(tmp_path),
         tls_certificate=tmp_path / "cert.pem",
@@ -929,14 +930,47 @@ def test_direct_tls_asks_browsers_to_keep_using_https(tmp_path: Path) -> None:
     )
     with TestClient(create_app(direct), base_url=ORIGIN) as client:
         for path in ("/app", "/health", "/v1/access", "/v1/owner/journal", "/nope"):
-            assert client.get(path).headers["strict-transport-security"] == "max-age=31536000"
-    # Behind a proxy the proxy owns HSTS; plain HTTP never sends it.
-    with TestClient(create_app(_config(tmp_path)), base_url=ORIGIN) as client:
-        assert "strict-transport-security" not in client.get("/app").headers
-    with TestClient(
-        create_app(direct), base_url="http://127.0.0.1:8000", client=("127.0.0.1", 41000)
-    ) as client:
-        assert "strict-transport-security" not in client.get("/app").headers
+            assert "strict-transport-security" not in client.get(path).headers
+
+
+def test_owner_boundary_strips_a_root_path_only_at_a_segment(tmp_path: Path) -> None:
+    # The router keeps "/v1/owner/journal" whole under root "/v", so the boundary must too.
+    app = create_app(_config(tmp_path))
+    status, _, body = _asgi(
+        app,
+        _scope(
+            "GET",
+            "/v1/owner/journal",
+            root_path="/v",
+            scheme="http",
+            headers=[(b"host", b"inky.example.test")],
+        ),
+        [],
+    )
+    assert status == 403
+    assert json.loads(body)["error"]["code"] == "secure_access_required"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        b"inky.example.test@evil.test",
+        b"inky.example.test/x",
+        b"inky.example.test:abc",
+        b"[::1",
+        b"inky.example.test, evil.test",
+        b"evil.test#inky.example.test",
+    ],
+)
+def test_a_malformed_host_is_never_taken_for_the_owner_origin(tmp_path: Path, host: bytes) -> None:
+    app = create_app(_config(tmp_path))
+    status, _, body = _asgi(
+        app,
+        _scope("GET", "/v1/owner/journal", headers=[(b"host", host), (b"origin", ORIGIN.encode())]),
+        [],
+    )
+    assert status == 403
+    assert json.loads(body)["error"]["code"] == "secure_access_required"
 
 
 def test_manifest_lets_the_app_be_added_to_a_home_screen(tmp_path: Path) -> None:
@@ -1016,7 +1050,9 @@ def test_corrupt_screen_state_is_unavailable_not_a_request_error(tmp_path: Path)
     assert state.read_text() == '{"schema_version": 1}'
 
 
-def test_missing_image_support_is_reported_as_unavailable(tmp_path: Path) -> None:
+def test_missing_image_support_is_reported_as_unavailable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     from inky_bird_frame.errors import MissingDependencyError
 
     config = _config(tmp_path)
@@ -1032,6 +1068,7 @@ def test_missing_image_support_is_reported_as_unavailable(tmp_path: Path) -> Non
         "code": "dependency_missing",
         "message": "Install Pillow with JPEG support to make thumbnails",
     }
+    assert "An owner request needs a component that is not installed" in caplog.text
 
 
 def test_https_only_refuses_a_status_credential_over_plain_http(tmp_path: Path) -> None:
@@ -1050,15 +1087,23 @@ def test_https_only_refuses_a_status_credential_over_plain_http(tmp_path: Path) 
     authenticate.assert_not_called()
 
 
-def test_data_source_messages_never_show_a_local_directory(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid taxonomy crosswalk: {root}/state/crosswalk.json",
+        "Could not read /Users/Example Person/Library/Application Support/inky/x.json",
+        "/var/lib/inky/state/a b.json is bad",
+        "Request failed: https://birds.example.test/v2/obs?lat=1.0&lng=2.0",
+    ],
+)
+def test_data_source_messages_never_show_a_path_or_address(
+    tmp_path: Path, message: str, caplog: pytest.LogCaptureFixture
+) -> None:
     from inky_bird_frame.errors import DataSourceError
 
     app_config = _app_config(tmp_path)
     config = app_config.controller
-    failure = DataSourceError(
-        f"Invalid taxonomy crosswalk: {tmp_path}/state/crosswalk.json; "
-        "see https://birds.example.test/help/crosswalk"
-    )
+    failure = DataSourceError(message.format(root=tmp_path))
     with (
         patch("inky_bird_frame.web.HistoryImports.use_retained_history", side_effect=failure),
         TestClient(create_app(config, app_config=app_config), base_url=ORIGIN) as client,
@@ -1066,7 +1111,14 @@ def test_data_source_messages_never_show_a_local_directory(tmp_path: Path) -> No
         headers = _owner_headers(client, config)
         response = client.post("/v1/owner/imports/retained", json={}, headers=headers)
     assert response.status_code == 503
-    assert response.json()["error"]["message"] == (
-        "Invalid taxonomy crosswalk: crosswalk.json; see https://birds.example.test/help/crosswalk"
-    )
-    assert str(tmp_path) not in response.text
+    assert response.json()["error"] == {
+        "code": "data_source_unavailable",
+        "message": "A bird data source cannot be read right now",
+    }
+    # The operator's log says what happened, never the private text.
+    warnings = [r for r in caplog.records if r.name == "inky_bird_frame.web"]
+    assert [r.getMessage() for r in warnings] == [
+        "An owner request could not read a bird data source"
+    ]
+    assert "example" not in caplog.text.lower()
+    assert str(tmp_path) not in caplog.text
