@@ -729,8 +729,11 @@ for (const [label, journal, removed] of [
     main.append(section);
     findButton(section, 'Add to my frame').click();
     await settle(t);
-    assert(texts(section).includes('Brown Creeper will show on your frame from the next refresh.'));
-    // Adding needs no second look: a bird on the list is on the default view.
+    // A bird still being noted is already on the default view, so adding it
+    // promises nothing about the next refresh.
+    assert(texts(section).includes('Added to On my frame.'), texts(section).join(' | '));
+    assert(!texts(section).some((text) => text.includes('will show on your frame')));
+    // Adding needs no second look.
     assert.equal(requests.filter((request) => request.path === '/v1/owner/journal').length, 0);
     findButton(section, 'Undo').click();
     await settle(t);
@@ -868,6 +871,19 @@ for (const [kind, message] of Object.entries(serverMessages))
     assert(shown.includes(manage.outcomeSentence({ kind, status: 'succeeded' })));
     assert(!shown.includes(message));
   });
+
+// The server's condition for an early try is hidden once the page names the
+// request, so the page's own sentence must hold while plate making is off.
+test('an early try asked for while plate making is off promises no try', async (t) => {
+  const shown = await outcome(t, {
+    kind: 'retry-now',
+    status: 'succeeded',
+    result: { message: 'Inky will check as soon as it can; plate making must be on.', generation_enabled: false },
+  });
+  assert(shown.includes('These birds are first in line once plate making is on.'), shown.join(' | '));
+  assert(shown.includes('Plate making is off'), shown.join(' | '));
+  assert(!shown.some((text) => /as soon as/.test(text)), shown.join(' | '));
+});
 
 test('a request that did not finish keeps the controller’s reason', async (t) => {
   const message = 'Settings changed. Reload and try again.';

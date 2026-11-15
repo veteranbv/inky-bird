@@ -28,7 +28,7 @@ const outcomes = {
   'saved-collection': ['Change to your frame', 'On my frame was changed.'],
   refresh: ['Source check', 'Your sources were checked.'],
   retry: ['Trying plates again', 'These birds are back in the works.'],
-  'retry-now': ['Trying plates again', 'These birds will be tried as soon as Inky can.'],
+  'retry-now': ['Trying plates again', 'These birds are first in line once plate making is on.'],
   'notification-test': ['Test notification', 'Inky tried each destination.'],
   'notification-retry': ['Sending again', 'Inky tried the undelivered messages again.'],
   'import-preview': ['History file check', 'The file was checked. Nothing has changed yet.'],

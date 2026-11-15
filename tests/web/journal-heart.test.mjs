@@ -193,7 +193,7 @@ test('a source that needs the owner is still mentioned on Home, plainly', async 
   management.notifications = { dead_letters: 2 };
   const { main } = await open(t, { page: 'home' }, { state: withState({ management }) });
   assert.equal(params(linkTo(main, 'A source check failed.').href).page, 'sources');
-  assert.equal(params(linkTo(main, 'Alerts are not being delivered.').href).page, 'notifications');
+  assert.equal(params(linkTo(main, 'Some notifications did not get through.').href).page, 'notifications');
 });
 
 const nothingOnFrame = { active_taxon_ids: [], featured_taxon_id: null };

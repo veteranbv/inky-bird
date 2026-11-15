@@ -106,7 +106,7 @@ async function capture() {
     await image('journal-collection.png');
     await page.goto(origin + '/app?page=bird&bird=9083');
     await page.getByRole('button', { name: 'Add to my frame', exact: true }).click();
-    await page.getByText(/will show on your frame from the next refresh\./).waitFor({ timeout: 30000 });
+    await page.getByText('Added to On my frame.', { exact: true }).waitFor({ timeout: 30000 });
     await page.goto(origin + '/app');
     await page.getByRole('heading', { name: 'Your field journal', exact: true }).waitFor();
     await page.getByRole('link', { name: 'Play', exact: true }).waitFor();

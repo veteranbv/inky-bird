@@ -386,7 +386,7 @@ async function savedBirds(t) {
     assert.deepEqual(saved(), []);
     const url = page.url();
     await page.getByRole('button', { name: 'Add to my frame', exact: true }).click();
-    await shown(page, 'Northern Cardinal will show on your frame from the next refresh.');
+    await shown(page, 'Added to On my frame.');
     assert.equal(page.url(), url);
     assert.deepEqual(saved(), [cardinal.taxon_id]);
     await page.getByRole('button', { name: 'Remove from my frame', exact: true }).waitFor();
@@ -402,7 +402,7 @@ async function savedBirds(t) {
   await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
   await heading('Northern Cardinal');
   await page.getByRole('button', { name: 'Add to my frame', exact: true }).click();
-  await shown(page, 'Northern Cardinal will show on your frame from the next refresh.');
+  await shown(page, 'Added to On my frame.');
   assert.deepEqual(saved(), [cardinal.taxon_id]);
   await page.goto(origin + '/app?page=manage');
   await heading('Manage');

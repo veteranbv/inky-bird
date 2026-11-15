@@ -676,7 +676,8 @@ function toggleResult(name, saved, wall, stays) {
   if (!wallKnown(wall)) return done;
   const elsewhere = wallElsewhere(wall);
   if (elsewhere) return done + ' Your wall frame shows ' + elsewhere + ' for now.';
-  if (saved) return name + ' will show on your frame from the next refresh.';
+  // The default view already shows a bird that is being noted.
+  if (saved) return wall === 'saved' ? name + ' will show on your frame from the next refresh.' : done;
   if (wall === 'current' && stays === true)
     return done + ' ' + name + ' stays on your wall frame while it is still being noted.';
   if (wall === 'current' && stays !== false) return done;

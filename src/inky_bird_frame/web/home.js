@@ -78,7 +78,7 @@ export function renderHome(context) {
     if (management.sources.some((source) => source.enabled && source.status === 'error'))
       rail.append(link('A source check failed.', 'sources', {}, 'text-link home-alert'));
     if (management.notifications?.dead_letters)
-      rail.append(link('Alerts are not being delivered.', 'notifications', {}, 'text-link home-alert'));
+      rail.append(link('Some notifications did not get through.', 'notifications', {}, 'text-link home-alert'));
     if (management.last_confirmed_panel_update)
       rail.append(
         note(
