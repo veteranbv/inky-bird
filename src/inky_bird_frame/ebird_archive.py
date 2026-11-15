@@ -47,14 +47,13 @@ MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 # This is separate from the streamed CSV limit and needs no custom ZIP parser.
 MAX_ZIP_METADATA_BYTES = 46 + 3 * (2**16 - 1)
 # The byte ceiling alone still lets a hostile file of tiny rows or of distinct
-# names exhaust a small controller's memory. Rows and checklists come from a
-# measured budget (CPython 3.14, 64-bit, peak resident memory): an archive at
-# both limits takes about 160 MB to parse for import and 360 MB to preview
-# with long location labels. Reading back a retained history of that size
-# takes about 440 MB, so checking it against an equally large upload peaks
-# near 650 MB.
-MAX_ROWS = 1_000_000
-MAX_CHECKLISTS = 150_000
+# names exhaust a small controller's memory. These counts stop such a file but
+# never an export the byte ceiling admits: an official row carries every export
+# column and is longer than 64 bytes even with short values. Every checklist
+# needs a row, so the row count bounds checklists too.
+# Memory still grows with the export; see the measured shapes in the import guide.
+MAX_ROWS = MAX_UNCOMPRESSED_BYTES // 64
+# Every eBird taxon, including hybrids, forms and "spuhs", fits well within this.
 MAX_SPECIES = 50_000
 MAX_COLUMNS = 256
 MAX_LINE_CHARACTERS = 256 * 1024
@@ -477,7 +476,10 @@ def _parse_archive(
                     raise DataSourceError(f"Malformed eBird archive row {line}")
                 rows += 1
                 if rows > MAX_ROWS:
-                    raise DataSourceError(f"eBird archive has more than {MAX_ROWS:,} rows")
+                    raise DataSourceError(
+                        f"eBird archive has more than {MAX_ROWS:,} rows; check that this "
+                        "is the CSV from your eBird data download"
+                    )
                 submission_id = _required_text(row, "Submission ID", line)
                 common_name = _species_name(row, "Common Name", line)
                 scientific_name = _species_name(row, "Scientific Name", line)
@@ -493,10 +495,6 @@ def _parse_archive(
                     locations[fingerprint] = location
                 checklist = builders.get(fingerprint)
                 if checklist is None:
-                    if len(builders) >= MAX_CHECKLISTS:
-                        raise DataSourceError(
-                            f"eBird archive has more than {MAX_CHECKLISTS:,} checklists"
-                        )
                     species_by_name: dict[str, _StoredSpecies] = {}
                     builders[fingerprint] = (observed_on, species_by_name)
                 else:
@@ -509,7 +507,8 @@ def _parse_archive(
                 if species not in known_species:
                     if len(known_species) >= MAX_SPECIES:
                         raise DataSourceError(
-                            f"eBird archive has more than {MAX_SPECIES:,} species"
+                            f"eBird archive has more than {MAX_SPECIES:,} species; check "
+                            "that this is the CSV from your eBird data download"
                         )
                     known_species[species] = species
                 species = known_species[species]

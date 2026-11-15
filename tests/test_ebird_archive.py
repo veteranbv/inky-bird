@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import stat
 import tracemalloc
@@ -19,6 +20,8 @@ from inky_bird_frame.ebird_archive import (
     MAX_COLUMNS,
     MAX_LINE_CHARACTERS,
     MAX_NAME_LENGTH,
+    MAX_ROWS,
+    MAX_UNCOMPRESSED_BYTES,
     MAX_ZIP_METADATA_BYTES,
     REQUIRED_COLUMNS,
     _parse_archive,
@@ -518,11 +521,10 @@ class EbirdArchiveBoundsTests(unittest.TestCase):
             for index in range(count)
         ]
 
-    def test_rows_checklists_and_species_are_capped(self) -> None:
+    def test_rows_and_species_are_capped(self) -> None:
         cases = (
-            ("MAX_ROWS", self._rows(5, checklists=5, species=5), "more than 4 rows"),
-            ("MAX_CHECKLISTS", self._rows(5, checklists=5, species=1), "more than 4 checklists"),
-            ("MAX_SPECIES", self._rows(5, checklists=1, species=5), "more than 4 species"),
+            ("MAX_ROWS", self._rows(5, checklists=5, species=5), "more than 4 rows; check"),
+            ("MAX_SPECIES", self._rows(5, checklists=1, species=5), "more than 4 species; check"),
         )
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -538,6 +540,46 @@ class EbirdArchiveBoundsTests(unittest.TestCase):
                     with patch(f"inky_bird_frame.ebird_archive.{limit}", 5):
                         import_ebird_archive(csv_path, root / "state", dry_run=True)
             self.assertFalse((root / "state/ebird-archive-observations.json").exists())
+
+    def test_row_limit_admits_every_official_export_within_the_byte_limit(self) -> None:
+        # The shortest plausible official row: every export column present,
+        # optional ones empty, required ones as short as real values get.
+        shortest = {
+            **dict.fromkeys(EXPORT_COLUMNS, ""),
+            "Submission ID": "S1000000",
+            "Common Name": "Ruff",
+            "Scientific Name": "Pica pica",
+            "Taxonomic Order": "1",
+            "Count": "X",
+            "State/Province": "US-NY",
+            "Location ID": "L1",
+            "Location": "A",
+            "Latitude": "1.0",
+            "Longitude": "2.0",
+            "Date": "2026-08-08",
+            "Protocol": "Incidental",
+            "All Obs Reported": "0",
+        }
+        buffer = io.StringIO()
+        csv.DictWriter(buffer, fieldnames=EXPORT_COLUMNS).writerow(shortest)
+        row_bytes = len(buffer.getvalue().encode())
+        self.assertGreaterEqual(MAX_ROWS * row_bytes, MAX_UNCOMPRESSED_BYTES)
+
+    def test_an_account_of_many_single_species_checklists_is_accepted(self) -> None:
+        # More checklists than any count limit main never had: the byte limit
+        # admitted this export, so a count limit must not refuse it.
+        checklists = 150_001
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "MyEBirdData.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(REQUIRED_COLUMNS)
+                writer.writerows(
+                    (f"S{index}", "Ruff", "Calidris pugnax", "2026-08-08", "A")
+                    for index in range(checklists)
+                )
+            parsed, rows, _, _, _ = _parse_archive(path)
+        self.assertEqual((len(parsed), rows), (checklists, checklists))
 
     def _peak_parse_bytes(self, path: Path) -> int:
         tracemalloc.start()
