@@ -47,8 +47,27 @@ MAX_LABEL_CHARACTERS = 128
 COLLECTION_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
-def failure_guidance(error_type: object) -> dict[str, str]:
+# Why automatic work stopped for the owner, as saved in failure.json; the
+# error type alone describes a failure that would still be retried.
+STOPPED_GUIDANCE = {
+    "retry_limit": (
+        "retry_limit",
+        "Automatic retries have stopped after repeated failed tries. "
+        "Choose this bird for retry to try again.",
+    ),
+    "research_limit": (
+        "research_limit",
+        "This bird used its research allowance. Automatic retries have stopped; "
+        "choose it for retry to try again.",
+    ),
+}
+
+
+def failure_guidance(error_type: object, stop_reason: object = None) -> dict[str, str]:
     """Stable, useful categories; never echo an upstream exception or type name."""
+    if isinstance(stop_reason, str) and stop_reason in STOPPED_GUIDANCE:
+        code, message = STOPPED_GUIDANCE[stop_reason]
+        return {"failure_kind": code, "failure_message": message}
     messages = {
         "QualityReviewError": (
             "quality_review",
@@ -107,7 +126,9 @@ def terminal_failure(paths: tuple[Path, ...], taxon_id: int) -> dict[str, object
         rounds = attempts if isinstance(attempts, list) and len(attempts) <= 100 else []
         last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
         outcome = last.get("outcome")
-        error_type = failure.get("error_type") if failure.get("taxon_id") == taxon_id else None
+        own = failure.get("taxon_id") == taxon_id
+        error_type = failure.get("error_type") if own else None
+        stop_reason = failure.get("stop_reason") if own else None
         if error_type is None and outcome in {"correction_required", "profile_conflict"}:
             error_type = "QualityReviewError"
         if error_type is None and outcome in {"generation_error", "review_error"}:
@@ -116,7 +137,7 @@ def terminal_failure(paths: tuple[Path, ...], taxon_id: int) -> dict[str, object
             review = last.get("quality_review")
             axes = {"species_accuracy", "anatomy_accuracy", "text_accuracy", "composition_quality"}
             return {
-                **failure_guidance(error_type),
+                **failure_guidance(error_type, stop_reason),
                 "recorded_attempts": len(rounds),
                 "last_attempt_at": last.get("started_at")
                 if parse_utc_timestamp(last.get("started_at"))

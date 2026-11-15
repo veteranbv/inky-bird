@@ -3204,24 +3204,35 @@ def read_generation_queue_partition(
     )
 
 
-def record_failure(state_dir: Path, species: BirdSpecies, error: InkyBirdFrameError) -> Path:
+def record_failure(
+    state_dir: Path,
+    species: BirdSpecies,
+    error: InkyBirdFrameError,
+    *,
+    stop_reason: str | None = None,
+) -> Path:
+    """Save a failure that waits for the owner.
+
+    stop_reason says why automatic work stopped when the error type alone
+    describes something that would otherwise be retried.
+    """
     existing = sorted((state_dir / "failed").glob(f"{species.taxon_id}-*"))
     if existing:
         return existing[-1]
     destination = state_dir / "failed" / f"{species.taxon_id}-{_timestamp()}"
-    write_json_atomic(
-        destination / "failure.json",
-        {
-            "schema_version": 1,
-            "status": "failed",
-            "failed_at": utc_now(),
-            "taxon_id": species.taxon_id,
-            "common_name": species.common_name,
-            "scientific_name": species.scientific_name,
-            "error_type": type(error).__name__,
-            "error": str(error),
-        },
-    )
+    failure: dict[str, object] = {
+        "schema_version": 1,
+        "status": "failed",
+        "failed_at": utc_now(),
+        "taxon_id": species.taxon_id,
+        "common_name": species.common_name,
+        "scientific_name": species.scientific_name,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    if stop_reason is not None:
+        failure["stop_reason"] = stop_reason
+    write_json_atomic(destination / "failure.json", failure)
     return destination
 
 
@@ -3362,6 +3373,7 @@ def _retry_or_stop(
         retry_store,
         species,
         DataSourceError(text) if isinstance(error, DataSourceError) else GenerationError(text),
+        stop_reason="retry_limit",
     )
 
 
@@ -3370,9 +3382,13 @@ def _stop_for_owner(
     retry_store: RetryStore,
     species: BirdSpecies,
     stopped: InkyBirdFrameError,
+    *,
+    stop_reason: str,
 ) -> dict[str, object]:
     with catalog_state_lock(config.controller.state_dir):
-        failure_path = record_failure(config.controller.state_dir, species, stopped)
+        failure_path = record_failure(
+            config.controller.state_dir, species, stopped, stop_reason=stop_reason
+        )
         retry_store.clear(species.taxon_id)
     return {
         "taxon_id": species.taxon_id,
@@ -3616,6 +3632,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                                 "retry this bird to try again.",
                                 retry_at=exc.retry_at,
                             ),
+                            stop_reason="research_limit",
                         )
                     )
                 else:

@@ -42,7 +42,7 @@ from inky_bird_frame.installation import (
     GENERATION_UNIT_MARGIN_SECONDS,
     generation_cycle_timeout_seconds,
 )
-from inky_bird_frame.journal import terminal_failure
+from inky_bird_frame.journal import JournalService, terminal_failure
 from inky_bird_frame.models import ProfileConflict, QualityReview, SpeciesProfileData
 from inky_bird_frame.research import ResearchBudget
 from inky_bird_frame.retry import RetryStore
@@ -145,6 +145,16 @@ def seed_failures(config: AppConfig, taxon_id: int, count: int) -> None:
         store.record_failure(
             taxon_id, DataSourceError("earlier"), now=past, initial_minutes=1, maximum_minutes=1
         )
+
+
+def owner_view(config: AppConfig) -> dict[str, str]:
+    """What the owner's generation page shows for the one held bird."""
+    management = JournalService(config.controller, app_config=config).management(approved=set())
+    work = management["work"]
+    assert isinstance(work, dict)
+    details = work["terminal_details"]
+    assert isinstance(details, list) and len(details) == 1 and isinstance(details[0], dict)
+    return {key: str(value) for key, value in details[0].items()}
 
 
 def first_failure(result: dict[str, object]) -> dict[str, object]:
@@ -534,6 +544,8 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIn("retry this bird", str(failure["error"]))
         self.assertIsNone(record)
         self.assertEqual(guidance["failure_kind"], "research_limit")
+        self.assertIn("Automatic retries have stopped", guidance["failure_message"])
+        self.assertNotIn("waits until", guidance["failure_message"])
 
     def test_a_bird_out_of_research_is_told_so_when_the_daily_limit_was_hit_too(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -561,15 +573,42 @@ class RetryCeilingTests(unittest.TestCase):
             f"research limit of {config.research.max_searches_per_species}", str(failure["error"])
         )
 
-    def test_ceiling_after_source_outages_keeps_the_source_guidance(self) -> None:
-        config, result = self.cycle_with(
-            DataSourceError("source down"), MAX_AUTOMATIC_GENERATION_TRIES - 1
-        )
-        saved = list((config.controller.state_dir / "failed").glob("1-*"))
-        guidance = terminal_failure(tuple(saved), FIRST.taxon_id)
+    def test_owner_is_told_automatic_retries_stopped_at_the_ceiling(self) -> None:
+        for error in (DataSourceError("source down"), GenerationError("model failed")):
+            with self.subTest(error=type(error).__name__):
+                config, result = self.cycle_with(error, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+                shown = owner_view(config)
 
-        self.assertIs(first_failure(result)["terminal"], True)
-        self.assertEqual(guidance["failure_kind"], "source")
+                self.assertIs(first_failure(result)["terminal"], True)
+                self.assertEqual(shown["failure_kind"], "retry_limit")
+                self.assertIn("Automatic retries have stopped", shown["failure_message"])
+                self.assertIn("Choose this bird for retry", shown["failure_message"])
+                self.assertNotIn("backoff", shown["failure_message"])
+
+    def test_owner_is_told_a_bird_out_of_research_has_stopped(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 1)
+            budget = ResearchBudget(
+                config.controller.state_dir / "research-budget.json",
+                daily_limit=config.research.max_searches_per_day,
+                species_limit=config.research.max_searches_per_species,
+            )
+            for _ in range(config.research.max_searches_per_species):
+                budget.consume(FIRST.taxon_id)
+
+            def research(_config: object, species: BirdSpecies, *_a: object, **_k: object) -> Path:
+                budget.consume(species.taxon_id)
+                raise AssertionError("the research limit was not applied")
+
+            with generation(research):
+                run_generation_cycle(config)
+            shown = owner_view(config)
+
+        self.assertEqual(shown["failure_kind"], "research_limit")
+        self.assertIn("Automatic retries have stopped", shown["failure_message"])
+        self.assertNotIn("temporarily", shown["failure_message"])
 
 
 class ResearchAllowanceTests(unittest.TestCase):
