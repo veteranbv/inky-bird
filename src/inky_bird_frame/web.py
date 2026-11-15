@@ -288,8 +288,10 @@ def _adds_outbound_access(current: dict[str, object], changes: object) -> bool:
                 cast(dict[str, object], current.get("notifications", {})).get("destinations", []),
             )
         }
+        # A malformed name needs no confirmation: the save itself refuses it.
         return any(
-            isinstance(item, dict) and ("url" in item or item.get("name") not in known)
+            isinstance(item, dict)
+            and ("url" in item or (isinstance(item.get("name"), str) and item["name"] not in known))
             for item in destinations
         )
     return False
@@ -854,17 +856,21 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         if type(consent) is not bool:
             raise SettingsError("Generation confirmation must be true or false")
         current = await run_in_threadpool(settings_status, app_config)
-        # The save itself refuses any other revision, so this check always
-        # judges the exact file the save would change.
-        if current["revision"] != body["revision"]:
-            raise SettingsConflictError("Settings changed in another tab. Reload before saving.")
-        if _adds_outbound_access(current, body["changes"]):
-            try:
-                await run_in_threadpool(store.require_recent, secret)
-            except AccessConfirmationRequiredError as exc:
-                raise AccessConfirmationRequiredError(
-                    "Confirm your sign-in before saving keys or delivery addresses"
-                ) from exc
+        # Only an editable file can be saved; any other installation falls
+        # through so the save reports its own reason. An editable save refuses
+        # any other revision, so this check judges the exact file it changes.
+        if current.get("editable"):
+            if current["revision"] != body["revision"]:
+                raise SettingsConflictError(
+                    "Settings changed in another tab. Reload before saving."
+                )
+            if _adds_outbound_access(current, body["changes"]):
+                try:
+                    await run_in_threadpool(store.require_recent, secret)
+                except AccessConfirmationRequiredError as exc:
+                    raise AccessConfirmationRequiredError(
+                        "Confirm your sign-in before saving keys or delivery addresses"
+                    ) from exc
         return _result(
             await run_in_threadpool(
                 save_settings,

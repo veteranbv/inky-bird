@@ -1357,6 +1357,12 @@ def test_saving_keys_or_delivery_addresses_needs_a_recent_sign_in(tmp_path: Path
         for changes in sensitive:
             assert save(changes) == (403, "confirmation_required")
             assert path.read_bytes() == before
+        # A malformed destination is a request mistake, not a server failure.
+        assert save({"notifications": {"destinations": [{"name": ["x"]}]}}) == (
+            400,
+            "journal_error",
+        )
+        assert path.read_bytes() == before
         # Everything else saves as before, so an older page keeps working.
         assert save({"discovery": {"radius_km": 9}}) == (200, "")
         stale = client.post(
@@ -1367,3 +1373,54 @@ def test_saving_keys_or_delivery_addresses_needs_a_recent_sign_in(tmp_path: Path
         assert (stale.status_code, stale.json()["error"]["code"]) == (409, "journal_changed")
         client.post("/v1/owner/confirm-password", json={"passphrase": PASSPHRASE}, headers=headers)
         assert save({"discovery": {"ebird_api_key": "synthetic-key"}}) == (200, "")
+
+
+@pytest.mark.parametrize(
+    ("installation", "message"),
+    [
+        ("no-file", "This installation has no editable configuration file"),
+        ("managed", "These settings are managed by the installer, not the browser"),
+    ],
+)
+def test_a_settings_save_the_installation_refuses_keeps_its_own_reason(
+    tmp_path: Path, installation: str, message: str
+) -> None:
+    from test_config import CONFIG
+
+    origin = "https://inky.example.test"
+    path = tmp_path / "config.toml"
+    path.write_text(
+        CONFIG.replace("[controller]\n", f'[controller]\nowner_allowed_origins = ["{origin}"]\n')
+    )
+    path.chmod(0o600)
+    config = load_config(path, load_secrets=False)
+    if installation == "no-file":
+        config = replace(config, configuration_path=None)
+    store = AccessStore(config.controller.state_dir)
+    store.setup_owner("fixture-owner", PASSPHRASE)
+    with TestClient(create_app(config.controller, app_config=config), base_url=origin) as client:
+        signed = client.post(
+            "/v1/owner/login",
+            json={"username": "fixture-owner", "passphrase": PASSPHRASE},
+            headers={"Origin": origin},
+        )
+        headers = {"Origin": origin, "X-Inky-CSRF": signed.json()["data"]["csrf"]}
+        raw = json.loads(store.path.read_text())
+        raw["sessions"][0]["authenticated_at"] -= 601
+        store.path.write_text(json.dumps(raw))
+        revision = client.get("/v1/owner/settings").json()["data"]["revision"]
+        before = path.read_bytes()
+        for changes in (
+            {"discovery": {"radius_km": 9}},
+            {"discovery": {"ebird_api_key": "synthetic-key"}},
+        ):
+            response = client.post(
+                "/v1/owner/settings",
+                json={"revision": revision or "x", "changes": changes},
+                headers=headers,
+            )
+            assert (response.status_code, response.json()["error"]) == (
+                400,
+                {"code": "journal_error", "message": message},
+            )
+            assert path.read_bytes() == before
