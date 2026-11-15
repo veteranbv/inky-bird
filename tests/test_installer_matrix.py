@@ -432,7 +432,9 @@ class Machine(Host):
             assert (Path(active) / "deploy" / installed_script(self, scenario).name).is_file()
         if state.startswith("shared"):
             other = view(self, "display" if scenario.role == "controller" else "controller")
-            assert other.tag == "other", (state, other.tag)
+            # In the single-directory layout both roles share one source copy.
+            tags = ("old", "other") if state == "shared-single" else ("other",)
+            assert other.tag in tags, (state, other.tag)
 
     def reset_run(self) -> None:
         for name in ("steps", "inject", "sudo-expired", "sudo-validations", "fail"):
@@ -848,7 +850,7 @@ def check_install(
     if claims_new(outcome):
         check_previous_kept(machine, scenario, before, report, output)
     if not failed:
-        check_success(machine, scenario, before, after, report, output)
+        check_success(machine, scenario, case, before, after, report, output)
         return
     if completed(outcome):
         # A late step failed after the new version was installed and started.
@@ -941,6 +943,7 @@ def removal_failed(case: Case, path: str) -> bool:
 def check_success(
     machine: Machine,
     scenario: Scenario,
+    case: Case,
     before: Snapshot,
     after: RoleView,
     report: list[str],
@@ -957,7 +960,15 @@ def check_success(
     expected = 1 if before.role.tag is None or before.role.tag == "regular" else 2
     if scenario.role == "display" and before.role.tag is not None and not before.role.runtimes:
         expected = 1
-    if len(after.runtimes) != expected:
+    # An older runtime may stay only when its removal was the injected failure
+    # and the output names it to remove by hand.
+    by_hand = [line for line in output.splitlines() if "by hand: " in line]
+    named = {
+        path
+        for path in after.runtimes
+        if removal_failed(case, os.path.realpath(path)) and any(path in line for line in by_hand)
+    }
+    if len(after.runtimes - named) != expected:
         report.append(f"I10: after success {len(after.runtimes)} runtimes remain, not {expected}")
     for path in sorted(stray_paths(machine) - before.stray):
         if path not in output:
