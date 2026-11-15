@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from png_fixtures import write_png
 
-from inky_bird_frame.birds import BirdSpecies
+from inky_bird_frame.birds import BirdSpecies, TaxonContext
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
     MAX_AUTOMATIC_GENERATION_TRIES,
@@ -33,11 +33,13 @@ from inky_bird_frame.controller import (
 from inky_bird_frame.errors import (
     DataSourceError,
     GenerationError,
+    InsufficientReferencesError,
     ResearchLimitError,
     SpeciesStateError,
 )
+from inky_bird_frame.journal import terminal_failure
 from inky_bird_frame.models import QualityReview, SpeciesProfileData
-from inky_bird_frame.research import ResearchBudget, SpeciesResearchLimitError
+from inky_bird_frame.research import ResearchBudget
 from inky_bird_frame.retry import RetryStore
 
 CONFIG = """
@@ -137,10 +139,12 @@ def first_failure(result: dict[str, object]) -> dict[str, object]:
 
 
 class Clock:
-    def __init__(self) -> None:
+    def __init__(self, tick: float = 0.0) -> None:
         self.now = 1000.0
+        self.tick = tick
 
     def __call__(self) -> float:
+        self.now += self.tick
         return self.now
 
 
@@ -192,6 +196,68 @@ class GenerationBudgetTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             species_seconds = generation_species_seconds(load(temporary))
         attempted, result = self.run_two_birds(3 * species_seconds)
+
+        self.assertEqual(attempted, [FIRST.taxon_id, SECOND.taxon_id])
+        self.assertIs(result["stopped_for_time"], False)
+
+    def test_first_bird_starts_after_slow_preparation_with_one_bird_per_cycle(self) -> None:
+        clock = Clock(tick=1.0)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text(
+                CONFIG.replace(
+                    "max_generation_attempts = 3",
+                    "max_generation_attempts = 3\nmax_species_attempts_per_cycle = 1",
+                )
+            )
+            config = load_config(path)
+            config.controller.workspace_dir.mkdir()
+            refresh(config, [FIRST])
+            species_seconds = generation_species_seconds(config)
+
+            def slow_sweep(_config: object) -> None:
+                clock.now += species_seconds
+
+            with (
+                patch("inky_bird_frame.controller.monotonic", clock),
+                patch(
+                    "inky_bird_frame.controller._sweep_abandoned_generation_work",
+                    side_effect=slow_sweep,
+                ),
+                generation(DataSourceError("temporary")) as call,
+            ):
+                result = run_generation_cycle(config)
+
+        self.assertEqual(call.call_count, 1)
+        self.assertIs(result["stopped_for_time"], False)
+
+    def test_time_before_the_first_bird_does_not_use_a_later_slot(self) -> None:
+        clock = Clock()
+        attempted: list[int] = []
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST, SECOND])
+            species_seconds = generation_species_seconds(config)
+
+            def slow_sweep(_config: object) -> None:
+                clock.now += 4.5 * species_seconds
+
+            def quick_failure(
+                _config: object, species: BirdSpecies, *_args: object, **_kw: object
+            ) -> Path:
+                attempted.append(species.taxon_id)
+                clock.now += 1
+                raise DataSourceError("temporary")
+
+            with (
+                patch("inky_bird_frame.controller.monotonic", clock),
+                patch(
+                    "inky_bird_frame.controller._sweep_abandoned_generation_work",
+                    side_effect=slow_sweep,
+                ),
+                generation(quick_failure),
+            ):
+                result = run_generation_cycle(config)
 
         self.assertEqual(attempted, [FIRST.taxon_id, SECOND.taxon_id])
         self.assertIs(result["stopped_for_time"], False)
@@ -293,14 +359,108 @@ class RetryCeilingTests(unittest.TestCase):
         self.assertIs(first_failure(result)["terminal"], False)
         self.assertIsNotNone(retries(config).get(FIRST.taxon_id))
 
-    def test_a_bird_out_of_research_stops_at_the_ceiling(self) -> None:
-        retry_at = datetime.now(UTC) + timedelta(hours=3)
+    def test_daily_research_waits_leave_every_counted_try(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            already_due = datetime.now(UTC) - timedelta(minutes=1)
+            for _ in range(MAX_AUTOMATIC_GENERATION_TRIES - 1):
+                with generation(ResearchLimitError("Daily research limit", retry_at=already_due)):
+                    waited = run_generation_cycle(config)
+                self.assertIs(first_failure(waited)["terminal"], False)
+            with generation(DataSourceError("one short outage")):
+                result = run_generation_cycle(config)
+            record = retries(config).get(FIRST.taxon_id)
+
+        self.assertIs(first_failure(result)["terminal"], False)
+        self.assertIsNotNone(record)
+        if record is not None:
+            self.assertEqual(record.attempts, MAX_AUTOMATIC_GENERATION_TRIES)
+            self.assertEqual(record.counted_failures, 1)
+
+    def test_photo_waits_do_not_count_toward_the_ceiling(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+            path = retries(config).path
+            raw = json.loads(path.read_text())
+            raw["records"][0]["next_attempt_at"] = "2000-01-01T00:00:00+00:00"
+            path.write_text(json.dumps(raw))
+            with generation(InsufficientReferencesError("not enough photos")):
+                result = run_generation_cycle(config)
+            record = retries(config).get(FIRST.taxon_id)
+
+        self.assertIs(first_failure(result)["terminal"], False)
+        self.assertIsNotNone(record)
+        if record is not None:
+            self.assertEqual(record.counted_failures, MAX_AUTOMATIC_GENERATION_TRIES - 1)
+
+    def test_long_photo_wait_from_an_earlier_release_starts_the_count_fresh(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            retries(config).path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "records": [
+                            {
+                                "taxon_id": FIRST.taxon_id,
+                                "attempts": 20,
+                                "error_type": "InsufficientReferencesError",
+                                "error": "not enough photos",
+                                "first_failed_at": "2026-01-01T00:00:00+00:00",
+                                "last_failed_at": "2026-05-01T00:00:00+00:00",
+                                "next_attempt_at": "2026-05-08T00:00:00+00:00",
+                            }
+                        ],
+                    }
+                )
+            )
+            with generation(DataSourceError("one short outage")):
+                result = run_generation_cycle(config)
+
+        self.assertIs(first_failure(result)["terminal"], False)
+
+    def test_a_bird_out_of_research_stops_for_the_owner_at_once(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 1)
+            budget = ResearchBudget(
+                config.controller.state_dir / "research-budget.json",
+                daily_limit=config.research.max_searches_per_day,
+                species_limit=config.research.max_searches_per_species,
+            )
+            for _ in range(config.research.max_searches_per_species):
+                budget.consume(FIRST.taxon_id)
+
+            def research(_config: object, species: BirdSpecies, *_a: object, **_k: object) -> Path:
+                budget.consume(species.taxon_id)
+                raise AssertionError("the research limit was not applied")
+
+            with generation(research):
+                result = run_generation_cycle(config)
+            failure = first_failure(result)
+            saved = list((config.controller.state_dir / "failed").glob("1-*"))
+            guidance = terminal_failure(tuple(saved), FIRST.taxon_id)
+            record = retries(config).get(FIRST.taxon_id)
+
+        self.assertIs(failure["terminal"], True)
+        self.assertIn("retry this bird", str(failure["error"]))
+        self.assertIsNone(record)
+        self.assertEqual(guidance["failure_kind"], "research_limit")
+
+    def test_ceiling_after_source_outages_keeps_the_source_guidance(self) -> None:
         config, result = self.cycle_with(
-            SpeciesResearchLimitError("Taxon research limit", retry_at=retry_at),
-            MAX_AUTOMATIC_GENERATION_TRIES - 1,
+            DataSourceError("source down"), MAX_AUTOMATIC_GENERATION_TRIES - 1
         )
+        saved = list((config.controller.state_dir / "failed").glob("1-*"))
+        guidance = terminal_failure(tuple(saved), FIRST.taxon_id)
 
         self.assertIs(first_failure(result)["terminal"], True)
+        self.assertEqual(guidance["failure_kind"], "source")
 
 
 class ResearchAllowanceTests(unittest.TestCase):
@@ -327,7 +487,7 @@ class ResearchAllowanceTests(unittest.TestCase):
             seed_failures(config, FIRST.taxon_id, 1)
             with generation(DataSourceError("temporary")):
                 run_generation_cycle(config)
-            with self.assertRaises(SpeciesResearchLimitError):
+            with self.assertRaises(ResearchLimitError):
                 self.budget(config).consume(FIRST.taxon_id)
 
 
@@ -474,6 +634,17 @@ class KeptAttemptTests(unittest.TestCase):
             self.assertIsNone(guidance.source_plate)
 
 
+def live_names(common_name: str) -> TaxonContext:
+    return TaxonContext(
+        9083,
+        common_name,
+        "Cardinalis cardinalis",
+        "Cardinalidae",
+        "Summary",
+        "https://example.test",
+    )
+
+
 class RenamedProfileTests(unittest.TestCase):
     def write_cached(self, config: AppConfig, common_name: str) -> Path:
         path = config.controller.state_dir / "profiles" / "9083" / "profile.json"
@@ -487,7 +658,10 @@ class RenamedProfileTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             config = load(temporary)
             cached = self.write_cached(config, "Old Cardinal Name")
-            with patch("inky_bird_frame.controller.fetch_taxon_context"):
+            with patch(
+                "inky_bird_frame.controller.fetch_taxon_context",
+                return_value=live_names("Northern Cardinal"),
+            ) as fetch:
                 profile, _ = load_or_create_profile(
                     config,
                     CARDINAL,
@@ -502,9 +676,39 @@ class RenamedProfileTests(unittest.TestCase):
             refreshed = json.loads(cached.read_text())
 
         runner.create_profile.assert_called_once()
+        fetch.assert_called_once()
         self.assertEqual(profile["common_name"], "Northern Cardinal")
         self.assertEqual(archived_name, "Old Cardinal Name")
         self.assertEqual(refreshed["common_name"], "Northern Cardinal")
+
+    def test_a_stale_discovery_name_keeps_the_researched_profile(self) -> None:
+        runner = MagicMock()
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            cached = self.write_cached(config, "Old Cardinal Name")
+            with (
+                patch(
+                    "inky_bird_frame.controller.fetch_taxon_context",
+                    return_value=live_names("Old Cardinal Name"),
+                ),
+                self.assertRaises(SpeciesStateError),
+            ):
+                load_or_create_profile(
+                    config,
+                    CARDINAL,
+                    [],
+                    [],
+                    runner,
+                    Path(temporary) / "profile.json",
+                    Path(temporary) / "profile.log",
+                )
+            kept = json.loads(cached.read_text())["common_name"]
+            archive = config.controller.state_dir / "archive"
+            archived = list(archive.glob("*")) if archive.exists() else []
+
+        runner.create_profile.assert_not_called()
+        self.assertEqual(kept, "Old Cardinal Name")
+        self.assertEqual(archived, [])
 
     def test_renamed_bird_without_research_still_stops(self) -> None:
         runner = MagicMock()
@@ -527,10 +731,6 @@ class RenamedProfileTests(unittest.TestCase):
 
         runner.create_profile.assert_not_called()
         self.assertTrue(kept)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class StopSignalCommandTests(unittest.TestCase):
@@ -572,3 +772,7 @@ class StopSignalCommandTests(unittest.TestCase):
         self.assertEqual(kill.call_args.args[1], signal.SIGTERM)
         self.assertEqual(code, 128 + signal.SIGTERM)
         degradation.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

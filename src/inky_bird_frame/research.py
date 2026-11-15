@@ -10,10 +10,6 @@ from .errors import CatalogError, ResearchLimitError
 from .http import write_json_atomic
 
 
-class SpeciesResearchLimitError(ResearchLimitError):
-    """Raised when one species has used its total research allowance."""
-
-
 class ResearchBudget:
     """A daily search total plus a per-species total that does not reset by day.
 
@@ -39,13 +35,17 @@ class ResearchBudget:
                 retry_at=retry_at,
             )
         if totals.get(taxon_id, 0) >= self.species_limit:
-            raise SpeciesResearchLimitError(
+            raise ResearchLimitError(
                 f"Taxon {taxon_id} reached its research limit of {self.species_limit} searches",
                 retry_at=retry_at,
             )
         species[taxon_id] = species.get(taxon_id, 0) + 1
         totals[taxon_id] = totals.get(taxon_id, 0) + 1
         self._write(current.date(), total + 1, species, totals)
+
+    def species_exhausted(self, taxon_id: int) -> bool:
+        """Whether this species has used its whole allowance, which only a reset returns."""
+        return self._read()[3].get(taxon_id, 0) >= self.species_limit
 
     def reset_species(self, taxon_id: int) -> None:
         if not self.path.exists():

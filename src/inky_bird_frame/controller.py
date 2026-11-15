@@ -36,6 +36,7 @@ from .birds import (
     EbirdArchiveSpecies,
     EbirdSpecies,
     ObservationWindow,
+    TaxonContext,
     fetch_birdnet_go_species,
     fetch_birdweather_species,
     fetch_ebird_observations,
@@ -103,7 +104,7 @@ from .models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from .notifications import safe_notify, safe_record_degradation, safe_record_recovery
 from .prompts import PROMPT_VERSION
 from .references import download_references, fetch_reference_candidates
-from .research import ResearchBudget, SpeciesResearchLimitError
+from .research import ResearchBudget
 from .retry import RetryRecord, RetryStore, parse_retry_profile_conflicts
 from .retry_requests import prepare_retry_requests, retry_requests
 from .timeutil import parse_utc_timestamp
@@ -2436,6 +2437,7 @@ def load_or_create_profile(
 ) -> tuple[SpeciesProfileData, Path]:
     cache_path = config.controller.state_dir / "profiles" / str(species.taxon_id) / "profile.json"
     cached = cache_path.is_file()
+    context: TaxonContext | None = None
     if cached:
         try:
             raw = json.loads(cache_path.read_text())
@@ -2453,16 +2455,22 @@ def load_or_create_profile(
                 or profile["scientific_name"] != species.scientific_name
             )
         ):
-            # iNaturalist renamed the bird since this profile was researched.
-            # Keep the old profile in the archive and research the new name.
-            _archive_controller_paths(config.controller.state_dir, [cache_path.parent])
-            cached = False
+            # Archive the researched profile only when iNaturalist itself now uses
+            # the new name; a stale discovery name must not cost a new search.
+            context = fetch_taxon_context(species.taxon_id)
+            if (context.common_name, context.scientific_name) == (
+                species.common_name,
+                species.scientific_name,
+            ):
+                _archive_controller_paths(config.controller.state_dir, [cache_path.parent])
+                cached = False
     if not cached:
         if not config.research.enabled:
             raise GenerationError(
                 f"Taxon {species.taxon_id} has no cached profile and research is disabled"
             )
-        context = fetch_taxon_context(species.taxon_id)
+        if context is None:
+            context = fetch_taxon_context(species.taxon_id)
         _research_budget(config).consume(species.taxon_id)
         profile = runner.create_profile(
             species,
@@ -3308,17 +3316,19 @@ def _retry_or_stop(
     counts_toward_limit: bool = True,
 ) -> dict[str, object]:
     """Schedule a bird's next try, or stop it for the owner after too many."""
+    now = datetime.now(UTC)
     retry = retry_store.record_failure(
         species.taxon_id,
         error,
-        now=datetime.now(UTC),
+        now=now,
         initial_minutes=config.controller.retry_initial_minutes,
         maximum_minutes=config.controller.retry_max_minutes,
-        retry_at=retry_at,
+        retry_at=None if retry_at is None else max(retry_at, now),
         species=species,
         message=message,
+        counts_toward_limit=counts_toward_limit,
     )
-    if not counts_toward_limit or retry.attempts < MAX_AUTOMATIC_GENERATION_TRIES:
+    if not counts_toward_limit or retry.counted_failures < MAX_AUTOMATIC_GENERATION_TRIES:
         return {
             "taxon_id": species.taxon_id,
             "common_name": species.common_name,
@@ -3326,10 +3336,25 @@ def _retry_or_stop(
             "retry_at": retry.next_attempt_at.isoformat(),
             "terminal": False,
         }
-    stopped = GenerationError(
-        f"Stopped after {retry.attempts} failed tries; retry this bird to try again. "
+    text = (
+        f"Stopped after {retry.counted_failures} failed tries; retry this bird to try again. "
         f"Last error: {retry.error}"
     )
+    # Keep the owner's guidance about the cause: a source outage stays a source problem.
+    return _stop_for_owner(
+        config,
+        retry_store,
+        species,
+        DataSourceError(text) if isinstance(error, DataSourceError) else GenerationError(text),
+    )
+
+
+def _stop_for_owner(
+    config: AppConfig,
+    retry_store: RetryStore,
+    species: BirdSpecies,
+    stopped: InkyBirdFrameError,
+) -> dict[str, object]:
     with catalog_state_lock(config.controller.state_dir):
         failure_path = record_failure(config.controller.state_dir, species, stopped)
         retry_store.clear(species.taxon_id)
@@ -3347,7 +3372,6 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
     # Disabled mode must not approve, migrate, dequeue or start a model process.
     if not config.controller.generation_enabled:
         return {"generation_enabled": False, "generated": [], "published": []}
-    cycle_started = monotonic()
     with (
         exclusive_cycle_lock(config.controller.state_dir),
         activity_run(config.controller.state_dir, "generation"),
@@ -3436,6 +3460,8 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         stopped_for_time = False
         species_seconds = generation_species_seconds(config)
         cycle_seconds = species_seconds * config.controller.max_species_attempts_per_cycle
+        # Time before the first bird is covered by the service timeout's margin.
+        loop_started = monotonic()
         for species in eligible:
             if len(generated) >= config.controller.generations_per_cycle:
                 break
@@ -3443,9 +3469,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 break
             if not retry_store.due(species.taxon_id, datetime.now(UTC)):
                 continue
-            # Start a bird only when its longest possible run still fits, so
-            # a service timeout sized from the same budget never cuts one off.
-            if monotonic() - cycle_started + species_seconds > cycle_seconds:
+            # Start a later bird only when its longest possible run still fits,
+            # so a service timeout sized from the same budget never cuts one off.
+            if attempted_count and monotonic() - loop_started + species_seconds > cycle_seconds:
                 stopped_for_time = True
                 break
             attempted_count += 1
@@ -3546,6 +3572,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     maximum_minutes=config.controller.retry_max_minutes,
                     fixed_minutes=config.controller.insufficient_references_retry_minutes,
                     species=species,
+                    counts_toward_limit=False,
                 )
                 failures.append(
                     {
@@ -3559,18 +3586,30 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
             except DataSourceError as exc:
                 failures.append(_retry_or_stop(config, retry_store, species, exc))
             except ResearchLimitError as exc:
-                now = datetime.now(UTC)
-                failures.append(
-                    _retry_or_stop(
-                        config,
-                        retry_store,
-                        species,
-                        exc,
-                        retry_at=max(exc.retry_at, now),
-                        # The shared daily allowance is not this bird's failure.
-                        counts_toward_limit=isinstance(exc, SpeciesResearchLimitError),
+                if _research_budget(config).species_exhausted(species.taxon_id):
+                    # Only the owner's retry returns this bird's allowance.
+                    failures.append(
+                        _stop_for_owner(
+                            config,
+                            retry_store,
+                            species,
+                            ResearchLimitError(
+                                f"{exc}; retry this bird to try again.", retry_at=exc.retry_at
+                            ),
+                        )
                     )
-                )
+                else:
+                    failures.append(
+                        _retry_or_stop(
+                            config,
+                            retry_store,
+                            species,
+                            exc,
+                            retry_at=exc.retry_at,
+                            # The shared daily allowance is not this bird's failure.
+                            counts_toward_limit=False,
+                        )
+                    )
             except GenerationStopRequested:
                 failures.append(
                     _retry_or_stop(

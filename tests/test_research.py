@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from inky_bird_frame.errors import CatalogError, ResearchLimitError
-from inky_bird_frame.research import ResearchBudget, SpeciesResearchLimitError
+from inky_bird_frame.research import ResearchBudget
 
 
 class ResearchBudgetTests(unittest.TestCase):
@@ -19,12 +19,14 @@ class ResearchBudgetTests(unittest.TestCase):
             budget.consume(1, now)
             with self.assertRaisesRegex(ResearchLimitError, "research limit") as species_limit:
                 budget.consume(1, now)
-            self.assertIsInstance(species_limit.exception, SpeciesResearchLimitError)
+            # Journal guidance reads the saved class name, so it stays the plain type.
+            self.assertIs(type(species_limit.exception), ResearchLimitError)
+            self.assertTrue(budget.species_exhausted(1))
             self.assertEqual(species_limit.exception.retry_at, now + timedelta(days=1))
             budget.consume(2, now)
             with self.assertRaisesRegex(ResearchLimitError, "Daily research limit") as daily_limit:
                 budget.consume(3, now)
-            self.assertNotIsInstance(daily_limit.exception, SpeciesResearchLimitError)
+            self.assertFalse(budget.species_exhausted(3))
             self.assertEqual(daily_limit.exception.retry_at, now + timedelta(days=1))
 
     def test_new_utc_day_resets_the_daily_total(self) -> None:
@@ -40,9 +42,9 @@ class ResearchBudgetTests(unittest.TestCase):
             budget = ResearchBudget(Path(temporary) / "budget.json", daily_limit=9, species_limit=2)
             budget.consume(1, now)
             budget.consume(1, now + timedelta(days=1))
-            with self.assertRaises(SpeciesResearchLimitError):
+            with self.assertRaises(ResearchLimitError):
                 budget.consume(1, now + timedelta(days=2))
-            with self.assertRaises(SpeciesResearchLimitError):
+            with self.assertRaises(ResearchLimitError):
                 budget.consume(1, now + timedelta(days=30))
             budget.consume(2, now + timedelta(days=2))
 
@@ -55,8 +57,17 @@ class ResearchBudgetTests(unittest.TestCase):
             budget.consume(2, now)
             budget.reset_species(1)
             budget.consume(1, now + timedelta(days=1))
-            with self.assertRaises(SpeciesResearchLimitError):
+            with self.assertRaises(ResearchLimitError):
                 budget.consume(2, now + timedelta(days=1))
+
+    def test_reset_returns_an_exhausted_allowance(self) -> None:
+        with TemporaryDirectory() as temporary:
+            budget = ResearchBudget(Path(temporary) / "budget.json", daily_limit=9, species_limit=1)
+            self.assertFalse(budget.species_exhausted(1))
+            budget.consume(1, datetime(2026, 7, 10, tzinfo=UTC))
+            self.assertTrue(budget.species_exhausted(1))
+            budget.reset_species(1)
+            self.assertFalse(budget.species_exhausted(1))
 
     def test_reset_without_a_record_writes_nothing(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -80,7 +91,7 @@ class ResearchBudgetTests(unittest.TestCase):
             )
             budget = ResearchBudget(path, daily_limit=9, species_limit=2)
             budget.consume(1, now)
-            with self.assertRaises(SpeciesResearchLimitError):
+            with self.assertRaises(ResearchLimitError):
                 budget.consume(1, now + timedelta(days=1))
 
     def test_file_keeps_the_daily_fields_earlier_releases_read(self) -> None:
