@@ -399,7 +399,7 @@ class ControllerTests(unittest.TestCase):
             cache_path.parent.mkdir(parents=True)
             cache_path.write_text("{}")
 
-            with self.assertRaisesRegex(CatalogError, "Invalid cached species profile"):
+            with self.assertRaisesRegex(SpeciesStateError, "Invalid cached species profile"):
                 load_or_create_profile(
                     config,
                     species,
@@ -1754,7 +1754,9 @@ class ControllerTests(unittest.TestCase):
             )
             attempted: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
@@ -1812,7 +1814,9 @@ class ControllerTests(unittest.TestCase):
             )
             attempted: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
@@ -1905,7 +1909,9 @@ class ControllerTests(unittest.TestCase):
             attempted: list[int] = []
             due_checks: list[int] = []
 
-            def fail_generation(_config: object, species: BirdSpecies, _workspace: object) -> Path:
+            def fail_generation(
+                _config: object, species: BirdSpecies, _workspace: object, **_options: object
+            ) -> Path:
                 attempted.append(species.taxon_id)
                 raise DataSourceError("temporary")
 
