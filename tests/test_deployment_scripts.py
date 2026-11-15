@@ -159,34 +159,22 @@ def test_controller_installers_use_provider_lists_for_managed_credentials() -> N
         assert "config.discovery.source." not in script
 
 
-def test_controller_installer_restores_schedule_without_run_at_load_on_failure() -> None:
-    script = (Path(__file__).resolve().parents[1] / "deploy" / "install-controller.sh").read_text()
-
-    validation = script.index('"${app_dir}/.venv/bin/inky-bird" catalog-publish')
-    unload = script.rindex(
-        'launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"',
-        0,
-        validation,
-    )
-    restore_guard = script.index('if [ "${publisher_was_loaded}" = true ]; then', validation)
-    restore = script.index('restore_catalog_publisher_schedule "${uid}"', restore_guard)
-    runtime_update = script.index('rsync -a --delete "${root}/src/"')
-
-    assert runtime_update < unload < validation < restore_guard < restore
-    assert "publisher_was_loaded=false" in script[unload - 250 : unload]
-    assert "publisher_was_loaded=true" in script[unload:validation]
-    assert "/usr/bin/plutil -replace RunAtLoad -bool false" in script
-    assert 'if [ "${root}" != "${app_dir}" ]; then' in script
-    assert 'rsync -a "${root}/catalog/" "${app_dir}/catalog/"' not in script
-    assert "retain_independent_approvals=True" in script
-    assert "allow_replacements=True" in script
-    assert "managed_catalog.resolve() != config.controller.catalog_dir.resolve()" in script
-    assert "cannot use {names}" in script
-    assert 'environment_credentials.append("ebird_api_key_env")' in script
-    assert 'environment_credentials.append("birdweather_token_env")' in script
-    assert "config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)" in script
-    assert "config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)" in script
-    assert "rebuild_catalog_index" not in script
+def test_controller_installers_sync_catalogs_with_reviewed_replacements() -> None:
+    # Failure and restore order is exercised in tests/test_installer_behaviour.py.
+    for script in _controller_installers():
+        assert 'if [ "${root}" != "${app_dir}" ]; then' in script
+        assert 'rsync -a "${root}/catalog/" "${app_dir}/catalog/"' not in script
+        assert "retain_independent_approvals=True" in script
+        assert "allow_replacements=True" in script
+        assert "managed_catalog.resolve() != config.controller.catalog_dir.resolve()" in script
+        assert "cannot use {names}" in script
+        assert 'environment_credentials.append("ebird_api_key_env")' in script
+        assert 'environment_credentials.append("birdweather_token_env")' in script
+        assert "config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)" in script
+        assert "config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)" in script
+        assert "rebuild_catalog_index" not in script
+    macos = (Path(__file__).resolve().parents[1] / "deploy" / "install-controller.sh").read_text()
+    assert "/usr/bin/plutil -replace RunAtLoad -bool false" in macos
 
 
 def test_macos_controller_installer_limits_log_retention_and_permissions() -> None:
@@ -238,33 +226,6 @@ def test_systemd_controller_installer_restarts_boot_persistent_services() -> Non
     assert "config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)" in script
     assert "config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)" in script
     assert "rebuild_catalog_index" not in script
-
-
-def test_macos_controller_installer_restores_previously_loaded_agents_on_failure() -> None:
-    script = (Path(__file__).resolve().parents[1] / "deploy" / "install-controller.sh").read_text()
-
-    backup = script.index('cp "${plist}" "${plist_backup_dir}/"')
-    plist_write = script.index("write_bytes_atomic(path, plistlib.dumps(payload, sort_keys=True)")
-    unconditional_bootout = script.index(
-        'launchctl bootout "gui/${uid}/com.${service_prefix}.serve"'
-    )
-    bootstrap = script.index('launchctl bootstrap "gui/${uid}" "${serve_plist}"')
-    completion = script.index("installation_complete=true")
-
-    assert backup < plist_write < unconditional_bootout < bootstrap < completion
-    assert "trap cleanup EXIT" in script
-    assert 'if [ "${installation_complete}" != true ]' in script
-    assert 'previously_loaded_labels+=("${label}")' in script
-    assert 'restore_previous_agent "${label}"' in script
-    assert 'was_previously_loaded "${label}"' in script
-    assert script.index('if was_previously_loaded "${label}"') < script.index(
-        "# Not running before this install: undo any half-installed agent."
-    )
-    assert (
-        "for label in serve refresh generate catalog-publish notifications scheduler; do" in script
-    )
-    assert 'restore_catalog_publisher_schedule "${uid}" || true' in script
-    assert 'rm -rf "${plist_backup_dir}"' in script
 
 
 def test_repository_has_no_actions_deployment_path() -> None:

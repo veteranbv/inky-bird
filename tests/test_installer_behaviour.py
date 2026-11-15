@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -636,3 +637,149 @@ def test_linux_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
     assert result.returncode == 0, result.stderr
     assert "cannot check for a plate being made" in result.stderr
     assert host.installed_version() == "new"
+
+
+# macOS LaunchAgent installer -------------------------------------------------
+
+
+def macos_host(tmp_path: Path, *agents: str) -> Host:
+    host = Host(tmp_path, "Darwin")
+    host.install_old_version()
+    host.load_agents(*agents)
+    return host
+
+
+def run_macos(host: Host, **extra: str) -> subprocess.CompletedProcess[str]:
+    return host.run("install-controller.sh", shell=MACOS_BASH, **extra)
+
+
+def test_macos_upgrade_stops_agents_only_between_plates(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert host.installed_version() == "new"
+    assert host.loaded_agents() == {
+        "serve": {"generation": "new", "runtime": "new", "run_at_load": True},
+        "refresh": {"generation": "new", "runtime": "new", "run_at_load": True},
+    }
+    assert [call[3] for call in bootouts(host)] == ["lock-held", "lock-held"]
+    calls = uv_calls(host)
+    assert len(calls) == 1 and calls[0][-1] == "False"
+
+
+def test_macos_fresh_install_starts_new_agents(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Darwin")
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert set(host.loaded_agents()) == {"serve", "refresh"}
+
+
+def test_macos_rejected_configuration_leaves_running_agents_alone(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("new:heredoc")
+    result = run_macos(host)
+    assert result.returncode == 1
+    assert not bootouts(host)
+    assert not bootstraps(host)
+    assert host.loaded_agents() == {
+        "serve": {"generation": "old", "runtime": "old"},
+        "refresh": {"generation": "old", "runtime": "old"},
+    }
+    assert host.plist_generation("serve") == "old"
+    assert host.plist_generation("refresh") == "old"
+
+
+def test_macos_failed_publisher_check_restores_only_the_publisher(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh", "catalog-publish")
+    host.fail("new:catalog-publish")
+    result = run_macos(host, FAKE_AGENTS="serve refresh catalog-publish")
+    assert result.returncode == 1
+    assert [call[2] for call in bootouts(host)] == [f"com.{host.family}.catalog-publish"]
+    agents = host.loaded_agents()
+    assert agents["serve"] == {"generation": "old", "runtime": "old"}
+    assert agents["refresh"] == {"generation": "old", "runtime": "old"}
+    # The publisher returns with its own schedule, without running at load.
+    assert agents["catalog-publish"]["generation"] == "old"
+    assert agents["catalog-publish"]["run_at_load"] is False
+    for label in ("serve", "refresh", "catalog-publish"):
+        assert host.plist_generation(label) == "old"
+
+
+def test_macos_failed_start_puts_back_the_agents_it_stopped(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("bootstrap-new:refresh")
+    result = run_macos(host)
+    assert result.returncode != 0
+    agents = host.loaded_agents()
+    assert agents["serve"]["generation"] == "old"
+    assert agents["refresh"]["generation"] == "old"
+    assert host.plist_generation("serve") == "old"
+    assert "the agents it stopped were started again" in result.stderr
+
+
+def test_macos_failed_upgrade_reports_agents_it_could_not_restart(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("bootstrap-new:serve", "bootstrap-old:serve")
+    result = run_macos(host)
+    assert result.returncode != 0
+    assert f"com.{host.family}.serve" in result.stderr
+    assert "launchctl bootstrap" in result.stderr
+    assert host.loaded_agents()["refresh"]["generation"] == "old"
+    assert "started again" not in result.stderr
+
+
+def test_macos_failed_stop_is_not_ignored(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail(f"bootout:com.{host.family}.refresh")
+    result = run_macos(host)
+    assert result.returncode != 0
+    assert not any(call[3] == "new" for call in bootstraps(host))
+    agents = host.loaded_agents()
+    assert agents["refresh"] == {"generation": "old", "runtime": "old"}
+    assert agents["serve"]["generation"] == "old"
+    assert host.plist_generation("refresh") == "old"
+
+
+def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    with running_generation(host, 60):
+        result = run_macos(host)
+    assert result.returncode == 3
+    assert "still being made" in result.stderr and "No changes made" in result.stderr
+    assert not bootouts(host)
+    assert not uv_calls(host)
+    assert host.installed_version() == "old"
+    assert (host.app / "src/runtime-tag").read_text() == "old\n"
+    assert host.plist_generation("serve") == "old"
+
+
+def test_macos_upgrade_waits_for_a_plate_to_finish(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    started = time.monotonic()
+    with running_generation(host, 1.5):
+        result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert "Waiting for the plate being made to finish" in result.stderr
+    assert time.monotonic() - started >= 1.5
+    assert [call[3] for call in bootouts(host)] == ["lock-held", "lock-held"]
+
+
+def test_macos_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
+    tmp_path: Path,
+) -> None:
+    host = macos_host(tmp_path, "serve", "refresh")
+    (host.app / "src/inky_bird_frame/config.py").write_text("raise ImportError('broken')\n")
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert "cannot check for a plate being made" in result.stderr
+    assert host.installed_version() == "new"
+
+
+def test_macos_failure_after_install_says_the_new_version_is_running(tmp_path: Path) -> None:
+    host = macos_host(tmp_path, "serve", "refresh", "controller-cycle")
+    host.fail(f"bootout:com.{host.family}.controller-cycle")
+    result = run_macos(host)
+    assert result.returncode != 0
+    assert host.loaded_agents()["serve"]["generation"] == "new"
+    assert "new version is installed and running" in result.stderr
+    assert "started again" not in result.stderr
