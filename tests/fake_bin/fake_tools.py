@@ -13,6 +13,7 @@ call fail (``expire``), or stops the installer once it completes: SIGTERM
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -94,8 +95,10 @@ def step(tool: str, arguments: list[str], *, action: bool) -> str:
     return ""
 
 
-def _installer_pid() -> int | None:
-    """The nearest installer script above this call, not one of its subshells."""
+def _installer_pid(*, outermost: bool = False) -> int | None:
+    """The nearest installer script above this call, not one of its subshells,
+    or with ``outermost`` the one the owner started (a remote display deploy
+    runs the local installer on the other end of ssh)."""
 
     import subprocess
 
@@ -112,14 +115,19 @@ def _installer_pid() -> int | None:
         return int(parent), command.strip()
 
     pid = os.getppid()
+    found = None
     while pid > 1:
         parent, command = parent_and_command(pid)
         if "/deploy/install-" in command or "/deploy/uninstall-" in command:
             while parent > 1 and parent_and_command(parent)[1] == command:
                 pid = parent
                 parent = parent_and_command(pid)[0]
-            return pid
+            if not outermost:
+                return pid
+            found = pid
         pid = parent
+    if found is not None:
+        return found
     return None
 
 
@@ -131,7 +139,7 @@ def kill_installer(mode: str = "kill") -> None:
     process group as Ctrl-C does. This call ignores the interrupt it sends."""
     import signal
 
-    pid = _installer_pid()
+    pid = _installer_pid(outermost=mode == "interrupt")
     if pid is None:
         return
     if mode == "interrupt":
@@ -515,28 +523,80 @@ def rsync(arguments: list[str]) -> int:
     return 0
 
 
+def _remote_installers(group: int) -> list[int]:
+    """The installer scripts running in ``group``, not their subshells."""
+    import subprocess
+
+    listing = subprocess.run(
+        ["/bin/ps", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    members: dict[int, tuple[int, str]] = {}
+    for line in listing.splitlines():
+        pid, parent, pgid, *command = line.split(None, 3)
+        if int(pgid) == group and command:
+            members[int(pid)] = (int(parent), command[0])
+    return [
+        pid
+        for pid, (parent, command) in members.items()
+        if "/deploy/install-" in command and members.get(parent, (0, ""))[1] != command
+    ]
+
+
 def ssh(arguments: list[str]) -> int:
+    """Run the command as the display would: in its own process group, which
+    a Ctrl-C on this side never reaches. Stopping this end drops the
+    connection: the installer running on the other end is told with a hangup,
+    finishes its own cleanup, and this end then fails as ssh does; any other
+    command there runs to its end."""
+    import signal
     import subprocess
 
     command = arguments[-1]
     _log("ssh", command)
-    result = subprocess.run(
+    group: list[int] = []
+    dropped: list[int] = []
+
+    def hang_up() -> None:
+        for pid in [installer for leader in group for installer in _remote_installers(leader)]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGHUP)
+
+    def drop(signum: int, frame: object) -> None:
+        dropped.append(signum)
+        hang_up()
+
+    # Caught signals return to their defaults in the command it starts.
+    for stop in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop, drop)
+    remote = subprocess.Popen(
         [os.environ["FAKE_BASH"], "-c", command],
         stdin=sys.stdin,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
+        process_group=0,
     )
-    sys.stderr.write(result.stderr)
-    output = result.stdout
+    group.append(remote.pid)
+    # The test run kills this group too if anything in it outlives the run.
+    with (FAKE / "groups").open("a") as handle:
+        handle.write(f"{remote.pid}\n")
+    if dropped:
+        hang_up()
+    stdout, stderr = remote.communicate()
+    sys.stderr.write(stderr)
+    if dropped:
+        return 255
     if (
         "ssh-stage-noise" in _rules()
         and command.startswith("bash -s --")
-        and result.returncode == 0
+        and remote.returncode == 0
     ):
-        output = "Welcome to the synthetic display\n" + output
-    sys.stdout.write(output)
-    return result.returncode
+        stdout = "Welcome to the synthetic display\n" + stdout
+    sys.stdout.write(stdout)
+    return remote.returncode
 
 
 def site_packages(venv: Path) -> Path:

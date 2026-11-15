@@ -132,18 +132,35 @@ def run_contained(
         text=True,
         start_new_session=True,
     )
+    # Commands the fake ssh ran on the "display", each in a group of its own.
+    remote_groups = Path(environment.get("FAKE", "/nonexistent")) / "groups"
+
+    def end_all() -> list[str]:
+        survivors = end_group(process.pid)
+        if remote_groups.exists():
+            for group in remote_groups.read_text().split():
+                # A group that has ended may have its number reused by another
+                # one; only a group still running this machine's commands is ours.
+                if any(
+                    str(remote_groups.parent.parent) in member
+                    for member in group_members(int(group))
+                ):
+                    survivors += end_group(int(group))
+            remote_groups.unlink()
+        return survivors
+
     with watch(process.pid) if watch is not None else contextlib.nullcontext():
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            end_group(process.pid)
+            end_all()
             process.communicate()
             raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-        survivors = end_group(process.pid)
+        survivors = end_all()
     assert not survivors, f"{command[-1]} left processes running: {survivors}"
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
