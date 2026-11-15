@@ -5,6 +5,10 @@ if [ "$(uname -s)" != "Linux" ] || ! command -v systemctl >/dev/null 2>&1; then
   echo "Controller installer requires Linux with systemd." >&2
   exit 1
 fi
+if [ "$(id -u)" = 0 ]; then
+  echo "Run the installer as the account that will own the controller, not as root. No changes made." >&2
+  exit 1
+fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
@@ -17,6 +21,52 @@ uv_bin=${UV_BIN:-}
 if [ -z "${uv_bin}" ]; then
   uv_bin=$(command -v uv || true)
 fi
+unit_root="/etc/systemd/system"
+user=$(id -un)
+
+# Run by the installed version's Python: hold its controller cycle lock so no
+# plate is being made while services stop. Exit 3 if a cycle is still running
+# at the deadline. If the installed code cannot be loaded or cannot read the
+# config, the lock cannot be found: say so and exit 0 without waiting, so a
+# broken or older install can still be upgraded or repaired.
+cycle_lock_program='
+import fcntl, os, sys, time
+from pathlib import Path
+config_path, ready, timeout = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+try:
+    from inky_bird_frame.config import load_config
+    try:
+        config = load_config(config_path, load_secrets=False)
+    except TypeError:
+        config = load_config(config_path)
+    state_dir = config.controller.state_dir
+except Exception:
+    print(
+        "The installed version cannot be loaded with this configuration, so the "
+        "upgrade cannot check for a plate being made.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+state_dir.mkdir(parents=True, exist_ok=True)
+handle = (state_dir / "controller.lock").open("a+")
+deadline = time.monotonic() + timeout
+announced = False
+while True:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(3)
+        if not announced:
+            print("Waiting for the plate being made to finish.", file=sys.stderr)
+            announced = True
+        time.sleep(2)
+ready.touch()
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(1)
+'
 
 if [ ! -f "${config_path}" ]; then
   echo "Controller configuration is missing: ${config_path}" >&2
@@ -26,40 +76,118 @@ if [ -z "${uv_bin}" ] || [ ! -x "${uv_bin}" ]; then
   echo "uv is not executable. Install uv or set UV_BIN." >&2
   exit 1
 fi
+for name in controller scheduler refresh generate catalog-publish notifications; do
+  unit="${unit_root}/${service_prefix}-${name}.service"
+  if [ -f "${unit}" ]; then
+    owner=$(sed -n 's/^User=//p' "${unit}" | tail -n 1)
+    owner=${owner:-root}
+    if [ "${owner}" != "${user}" ]; then
+      echo "${service_prefix}-${name}.service runs as ${owner}. Run the installer as ${owner}. No changes made." >&2
+      exit 1
+    fi
+  fi
+done
 if ! sudo -v; then
   echo "Administrator access is required to install system services." >&2
   exit 1
 fi
 
-unit_dir=$(mktemp -d)
+work_dir=$(mktemp -d)
+unit_dir="${work_dir}/units"
+mkdir "${unit_dir}"
 installation_complete=false
-active_timers=()
+cycle_lock_pid=""
+stopped_units=()
+not_restarted=()
+
+hold_cycle_lock() {
+  local python="${app_dir}/.venv/bin/python"
+  local ready="${work_dir}/cycle-lock-held"
+  local status=0
+  if [ ! -x "${python}" ]; then
+    return 0
+  fi
+  "${python}" -I -c "${cycle_lock_program}" "${config_path}" "${ready}" \
+    "${quiesce_timeout_seconds}" &
+  cycle_lock_pid=$!
+  until [ -e "${ready}" ]; do
+    if ! kill -0 "${cycle_lock_pid}" 2>/dev/null; then
+      wait "${cycle_lock_pid}" || status=$?
+      cycle_lock_pid=""
+      if [ "${status}" -eq 0 ]; then
+        return 0
+      fi
+      if [ "${status}" -eq 3 ]; then
+        echo "A plate is still being made. Run the upgrade again after it finishes. No changes made." >&2
+        exit 3
+      fi
+      echo "Could not check whether a plate is being made. No changes made." >&2
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+release_cycle_lock() {
+  if [ -n "${cycle_lock_pid}" ]; then
+    kill "${cycle_lock_pid}" 2>/dev/null || true
+    wait "${cycle_lock_pid}" 2>/dev/null || true
+    cycle_lock_pid=""
+  fi
+}
+
+# A unit this run removed on purpose is not one to start again on failure.
+forget_stopped() {
+  local kept=()
+  local unit
+  for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
+    if [ "${unit}" != "$1" ]; then
+      kept+=("${unit}")
+    fi
+  done
+  stopped_units=(${kept[@]+"${kept[@]}"})
+}
+
 cleanup() {
   status=$?
   trap - EXIT
+  release_cycle_lock
   if [ "${installation_complete}" != true ]; then
-    for timer in "${active_timers[@]}"; do
-      sudo systemctl start "${timer}" || true
+    for unit in ${stopped_units[@]+"${stopped_units[@]}"}; do
+      if ! sudo systemctl start "${unit}" && ! systemctl is-active --quiet "${unit}"; then
+        not_restarted+=("${unit}")
+      fi
     done
+    if [ "${#not_restarted[@]}" -gt 0 ]; then
+      echo "The upgrade failed and these services are stopped: ${not_restarted[*]}." >&2
+      echo "Start them with: sudo systemctl start ${not_restarted[*]}" >&2
+    elif [ "${#stopped_units[@]}" -gt 0 ]; then
+      echo "The upgrade failed; the services it stopped were started again." >&2
+    fi
   fi
-  rm -rf "${unit_dir}"
+  rm -rf "${work_dir}"
   exit "${status}"
 }
 trap cleanup EXIT
 
+hold_cycle_lock
+# Waiting for a plate can outlast cached sudo credentials; ask again before stopping anything.
+if ! sudo -v; then
+  echo "Administrator access is required to install system services. No changes made." >&2
+  exit 1
+fi
 # App-owned installations use the same dynamic scheduler as Docker. Stop it
 # before replacing its runtime; a managed installation removes it below.
 if systemctl is-active --quiet "${service_prefix}-scheduler.service"; then
-  active_timers+=("${service_prefix}-scheduler.service")
+  sudo systemctl stop "${service_prefix}-scheduler.service"
+  stopped_units+=("${service_prefix}-scheduler.service")
 fi
-sudo systemctl stop "${service_prefix}-scheduler.service" 2>/dev/null || true
-
 for name in refresh generate catalog-publish notifications; do
   timer="${service_prefix}-${name}.timer"
   if systemctl is-active --quiet "${timer}"; then
-    active_timers+=("${timer}")
+    sudo systemctl stop "${timer}"
+    stopped_units+=("${timer}")
   fi
-  sudo systemctl stop "${timer}" 2>/dev/null || true
 done
 deadline=$((SECONDS + quiesce_timeout_seconds))
 for name in refresh generate catalog-publish notifications; do
@@ -77,6 +205,12 @@ for name in refresh generate catalog-publish notifications; do
     sleep 2
   done
 done
+release_cycle_lock
+# The wait above can also outlast cached credentials; the steps below need them.
+if ! sudo -v; then
+  echo "Administrator access is required to install system services." >&2
+  exit 1
+fi
 
 chmod 600 "${config_path}"
 mkdir -p "${app_dir}/src" "${app_dir}/catalog" "${app_dir}/deploy" "${support_dir}"
@@ -89,10 +223,12 @@ if [ "${root}" != "${app_dir}" ]; then
   done
 fi
 
-"${uv_bin}" sync --project "${app_dir}" --python "${python_version}" --extra controller --locked
+# A stray UV_PROJECT_ENVIRONMENT would build the venv somewhere the units do not run.
+env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${app_dir}" \
+  --python "${python_version}" --extra controller --locked
 
 "${app_dir}/.venv/bin/python" - \
-  "${unit_dir}" "${root}" "${app_dir}" "${config_path}" "${HOME}" "$(id -un)" <<'PY'
+  "${unit_dir}" "${root}" "${app_dir}" "${config_path}" "${HOME}" "${user}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -169,7 +305,26 @@ for name, content in units.items():
     (unit_dir / name).write_text(content)
 PY
 
-"${app_dir}/.venv/bin/inky-bird" refresh --config "${config_path}"
+# Only an unreachable bird source may wait for the scheduled refresh; any other
+# failure means the new version does not work here.
+refresh_status=0
+refresh_output=$("${app_dir}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
+  refresh_status=$?
+printf '%s\n' "${refresh_output}"
+if [ "${refresh_status}" -ne 0 ]; then
+  if ! python3 -I -c '
+import json, sys
+try:
+    envelope = json.loads(sys.argv[1])
+    sys.exit(0 if envelope["ok"] is False and envelope["error"]["type"] == "data_source" else 1)
+except (ValueError, KeyError, TypeError):
+    sys.exit(1)
+' "${refresh_output}"; then
+    echo "The new version could not refresh bird observations; see the error above." >&2
+    exit 1
+  fi
+  echo "Could not fetch bird observations yet. The scheduled refresh will try again." >&2
+fi
 
 if [ -f "${unit_dir}/${service_prefix}-catalog-publish.timer" ]; then
   "${app_dir}/.venv/bin/inky-bird" catalog-publish \
@@ -181,14 +336,20 @@ for unit in "${unit_dir}"/*; do
 done
 for optional in refresh generate catalog-publish notifications; do
   if [ ! -f "${unit_dir}/${service_prefix}-${optional}.timer" ]; then
-    sudo systemctl disable --now "${service_prefix}-${optional}.timer" 2>/dev/null || true
+    if [ -e "/etc/systemd/system/${service_prefix}-${optional}.timer" ]; then
+      sudo systemctl disable --now "${service_prefix}-${optional}.timer"
+    fi
+    forget_stopped "${service_prefix}-${optional}.timer"
     sudo rm -f \
       "/etc/systemd/system/${service_prefix}-${optional}.service" \
       "/etc/systemd/system/${service_prefix}-${optional}.timer"
   fi
 done
 if [ ! -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
-  sudo systemctl disable --now "${service_prefix}-scheduler.service" 2>/dev/null || true
+  if [ -e "/etc/systemd/system/${service_prefix}-scheduler.service" ]; then
+    sudo systemctl disable --now "${service_prefix}-scheduler.service"
+  fi
+  forget_stopped "${service_prefix}-scheduler.service"
   sudo rm -f "/etc/systemd/system/${service_prefix}-scheduler.service"
 fi
 

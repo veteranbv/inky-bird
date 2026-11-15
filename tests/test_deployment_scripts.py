@@ -224,7 +224,7 @@ def test_systemd_controller_installer_restarts_boot_persistent_services() -> Non
     assert 'systemctl show --property=ActiveState --value "${service}"' in script
     assert "active | activating | deactivating | reloading" in script
     assert 'if [ "${installation_complete}" != true ]; then' in script
-    assert 'sudo systemctl start "${timer}" || true' in script
+    # Restart reporting on failure is exercised in tests/test_installer_behaviour.py.
     assert 'systemctl is-enabled --quiet "${service_prefix}-catalog-publish.timer"' in script
     assert 'systemctl is-active --quiet "${service_prefix}-notifications.timer"' in script
     assert 'if [ "${root}" != "${app_dir}" ]; then' in script

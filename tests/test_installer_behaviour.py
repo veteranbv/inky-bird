@@ -437,3 +437,202 @@ def test_deploy_scripts_parse_with_the_bundled_macos_shell(script: str) -> None:
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+# Linux systemd controller installer ------------------------------------------
+
+
+def linux_host(tmp_path: Path, mode: str = "timers") -> Host:
+    host = Host(tmp_path, "Linux")
+    host.install_old_version()
+    if mode == "timers":
+        host.install_units(
+            controller_service="active",
+            refresh_service="inactive",
+            refresh_timer="active",
+            generate_service="inactive",
+            generate_timer="active",
+        )
+    else:
+        host.install_units(controller_service="active", scheduler_service="active")
+    return host
+
+
+TIMER_UNITS = "controller.service refresh.service refresh.timer generate.service generate.timer"
+APP_UNITS = "controller.service scheduler.service"
+
+
+def run_linux(
+    host: Host, units: str = TIMER_UNITS, quiesce_timeout: int = 3, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    return host.run(
+        "install-controller-systemd.sh", quiesce_timeout=quiesce_timeout, FAKE_UNITS=units, **extra
+    )
+
+
+def uv_calls(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] == "uv"]
+
+
+def test_linux_upgrade_restarts_services_and_builds_the_managed_venv(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    result = run_linux(host)
+    assert result.returncode == 0, result.stderr
+    assert host.installed_version() == "new"
+    assert "# new" in host.unit_text("controller.service")
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit) == {"active": True, "enabled": True}
+    # A stray UV_PROJECT_ENVIRONMENT never reaches uv, so the units' venv is the one built.
+    calls = uv_calls(host)
+    assert len(calls) == 1 and calls[0][-1] == "False"
+
+
+def test_linux_installer_refuses_root(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    result = run_linux(host, FAKE_UID="0")
+    assert result.returncode == 1
+    assert "not as root" in result.stderr and "No changes made" in result.stderr
+    assert not any(call[0] in ("sudo", "uv", "systemctl") for call in host.calls())
+
+
+def test_linux_installer_refuses_units_owned_by_another_account(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    unit = host.units / f"{host.family}-controller.service"
+    unit.write_text(unit.read_text().replace("User=fixture", "User=someone-else"))
+    result = run_linux(host)
+    assert result.returncode == 1
+    assert "someone-else" in result.stderr and "No changes made" in result.stderr
+    assert not any(call[0] in ("sudo", "uv", "systemctl") for call in host.calls())
+    assert "User=someone-else" in unit.read_text()
+
+
+def test_linux_failed_stop_aborts_before_the_runtime_changes(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail(f"systemctl:stop:{host.family}-generate.timer")
+    result = run_linux(host)
+    assert result.returncode == 1
+    assert not uv_calls(host)
+    assert host.installed_version() == "old"
+    assert host.unit_state("refresh.timer")["active"] is True
+    assert "started again" in result.stderr
+
+
+def test_linux_expired_sudo_restarts_stopped_timers_and_says_so(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("sudo:install")
+    result = run_linux(host)
+    assert result.returncode != 0
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit)["active"] is True
+    assert "the services it stopped were started again" in result.stderr
+
+
+def test_linux_reports_timers_it_could_not_restart(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("sudo-expires-at-install")
+    result = run_linux(host)
+    assert result.returncode != 0
+    assert host.unit_state("refresh.timer")["active"] is False
+    assert f"{host.family}-refresh.timer" in result.stderr
+    assert f"{host.family}-generate.timer" in result.stderr
+    assert "sudo systemctl start" in result.stderr
+
+
+def test_linux_asks_for_sudo_again_before_stopping_anything(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("sudo-v-expires-after:1")
+    result = run_linux(host)
+    assert result.returncode == 1
+    assert "No changes made" in result.stderr
+    assert not any(call[:3] == ["sudo", "systemctl", "stop"] for call in host.calls())
+    assert not uv_calls(host)
+    assert host.unit_state("generate.timer")["active"] is True
+
+
+def test_linux_asks_for_sudo_again_after_waiting_for_jobs(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("sudo-v-expires-after:2")
+    result = run_linux(host)
+    assert result.returncode == 1
+    # Nothing in the managed directory changed; the stopped timers are named.
+    assert not uv_calls(host)
+    assert host.installed_version() == "old"
+    assert f"{host.family}-generate.timer" in result.stderr
+    assert "sudo systemctl start" in result.stderr
+
+
+def test_linux_unreachable_bird_source_does_not_block_install(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail("new:refresh:data_source")
+    result = run_linux(host)
+    assert result.returncode == 0, result.stderr
+    assert "will try again" in result.stderr
+    assert host.unit_state("refresh.timer") == {"active": True, "enabled": True}
+    assert "# new" in host.unit_text("refresh.timer")
+
+
+@pytest.mark.parametrize(
+    "failure", ["new:refresh", "new:refresh:storage", "new:refresh:unreadable"]
+)
+def test_linux_other_refresh_failures_abort_the_install(tmp_path: Path, failure: str) -> None:
+    host = linux_host(tmp_path)
+    host.fail(failure)
+    result = run_linux(host)
+    assert result.returncode == 1
+    assert "will try again" not in result.stderr
+    assert "# old" in host.unit_text("controller.service")
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit)["active"] is True
+
+
+def test_linux_keeps_an_optional_timer_it_could_not_disable(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    timer = f"{host.family}-generate.timer"
+    host.fail(f"systemctl:disable:{timer}")
+    result = run_linux(host, "controller.service refresh.service refresh.timer")
+    assert result.returncode != 0
+    assert (host.units / timer).exists()
+
+
+def test_linux_failure_does_not_restart_a_timer_it_removed_on_purpose(tmp_path: Path) -> None:
+    host = linux_host(tmp_path)
+    host.fail(f"systemctl:restart:{host.family}-refresh.timer")
+    result = run_linux(host, "controller.service refresh.service refresh.timer")
+    assert result.returncode != 0
+    assert not (host.units / f"{host.family}-generate.timer").exists()
+    starts = [call for call in host.calls() if call[:2] == ["systemctl", "start"]]
+    assert starts == [["systemctl", "start", f"{host.family}-refresh.timer"]]
+    assert host.unit_state("refresh.timer")["active"] is True
+    assert "are stopped" not in result.stderr
+
+
+def test_linux_app_owned_upgrade_stops_scheduler_only_between_plates(tmp_path: Path) -> None:
+    host = linux_host(tmp_path, mode="app")
+    result = run_linux(host, APP_UNITS)
+    assert result.returncode == 0, result.stderr
+    stops = [call for call in host.calls() if call[0] == "lock-at-stop"]
+    assert stops == [["lock-at-stop", f"{host.family}-scheduler.service", "lock-held"]]
+    assert host.unit_state("scheduler.service")["active"] is True
+
+
+def test_linux_app_owned_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> None:
+    host = linux_host(tmp_path, mode="app")
+    with running_generation(host, 60):
+        result = run_linux(host, APP_UNITS)
+    assert result.returncode == 3
+    assert "still being made" in result.stderr and "No changes made" in result.stderr
+    assert host.unit_state("scheduler.service")["active"] is True
+    assert not any(call[:2] == ["systemctl", "stop"] for call in host.calls())
+    assert not uv_calls(host)
+    assert host.installed_version() == "old"
+
+
+def test_linux_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
+    tmp_path: Path,
+) -> None:
+    host = linux_host(tmp_path, mode="app")
+    (host.app / "src/inky_bird_frame/config.py").write_text("raise ImportError('broken')\n")
+    result = run_linux(host, APP_UNITS)
+    assert result.returncode == 0, result.stderr
+    assert "cannot check for a plate being made" in result.stderr
+    assert host.installed_version() == "new"

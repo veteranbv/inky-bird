@@ -246,11 +246,18 @@ def sudo(arguments: list[str]) -> int:
     rules = _rules()
     expired = FAKE / "sudo-expired"
     if arguments == ["-v"]:
-        validated = FAKE / "sudo-validated"
-        if "sudo-v-expires-after-first" in rules and validated.exists():
+        # ``sudo-v-expires-after:N`` lets the first N validations succeed.
+        counter = FAKE / "sudo-validations"
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count + 1))
+        limits = [
+            int(rule.rpartition(":")[2])
+            for rule in rules
+            if rule.startswith("sudo-v-expires-after:")
+        ]
+        if limits and count >= limits[0]:
             expired.touch()
             return 1
-        validated.touch()
         return 1 if "sudo:-v" in rules else 0
     expires_at = ":".join(arguments) in {
         rule.removeprefix("sudo-expires-at:")
