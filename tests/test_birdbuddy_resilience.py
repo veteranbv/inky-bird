@@ -1426,6 +1426,81 @@ class ConfirmedHistoryCadenceTests(unittest.TestCase):
         )
         self.assertEqual([item.common_name for item in withdrawn.species], ["Eastern Bluebird"])
 
+    def test_a_confirmation_that_matches_the_feed_survives_a_later_feed_change(self) -> None:
+        hummingbird: dict[str, object] = {
+            "__typename": "SpeciesBird",
+            "id": HUMMINGBIRD.species_id,
+            "name": HUMMINGBIRD.common_name,
+            "scientificName": HUMMINGBIRD.scientific_name,
+        }
+        feed: dict[str, dict[str, object]] = {"species": hummingbird}
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _CONFIRMED_HISTORY:
+                return {"data": confirmed_page(confirmed_record("media-p1"))}
+            if query == _FEED_QUERIES[1]:
+                return {"data": page(node("p1", variant="SightingRecognizedBirdUnlocked"))}
+            if query in _FEED_QUERIES:
+                return {"data": page(node("p1", species=feed["species"]))}
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        names: list[list[str]] = []
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            for hours, species in ((0, hummingbird), (1, BLUEBIRD), (25, BLUEBIRD)):
+                feed["species"] = species
+                result = sync_at(state_dir, NOW + timedelta(hours=hours), transport)
+                names.append([item.common_name for item in result.species])
+
+        self.assertEqual(transport.count(_CONFIRMED_HISTORY), 2)
+        self.assertEqual(names, [[HUMMINGBIRD.common_name]] * 3)
+
+    def test_a_correction_saved_by_the_earlier_release_survives_a_later_feed_change(
+        self,
+    ) -> None:
+        feed: dict[str, dict[str, object]] = {"species": BLUEBIRD}
+
+        def answer(query: str, variables: dict[str, object], token: str | None) -> object:
+            if query == _CONFIRMED_HISTORY:
+                return {"data": confirmed_page(confirmed_record("media-p1"))}
+            if query == _FEED_QUERIES[1]:
+                return {"data": page(node("p1", variant="SightingRecognizedBirdUnlocked"))}
+            if query in _FEED_QUERIES:
+                return {"data": page(node("p1", species=feed["species"]))}
+            return feed_and_history(query, variables, token)
+
+        transport = ScriptedTransport(answer)
+        with TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            logged_in_with_token(state_dir, signed_token(NOW + timedelta(days=3)))
+            sync_at(state_dir, NOW, transport)
+            # The earlier release stored the corrected species with no marker
+            # and no record of when it last read the confirmed history.
+            path = state_dir / "birdbuddy-detections.json"
+            stored = json.loads(path.read_text())
+            feeder = stored["feeders"]["feeder-1"]
+            for key in [key for key in feeder if key.startswith("confirmed_history_")]:
+                del feeder[key]
+            for postcard in feeder["postcards"]:
+                postcard.pop("owner_confirmed")
+            path.write_text(json.dumps(stored))
+            # The feed now agrees with the correction on the first full read.
+            feed["species"] = {
+                "__typename": "SpeciesBird",
+                "id": HUMMINGBIRD.species_id,
+                "name": HUMMINGBIRD.common_name,
+                "scientificName": HUMMINGBIRD.scientific_name,
+            }
+            upgraded = sync_at(state_dir, NOW + timedelta(hours=1), transport)
+            feed["species"] = BLUEBIRD
+            later = sync_at(state_dir, NOW + timedelta(hours=2), transport)
+
+        self.assertIs(upgraded.stats.confirmed_history_checked, True)
+        self.assertIs(later.stats.confirmed_history_checked, False)
+        self.assertEqual([item.common_name for item in later.species], [HUMMINGBIRD.common_name])
+
     def test_a_withdrawn_correction_follows_the_feed_on_incomplete_full_reads(self) -> None:
         confirms = {"media": True}
 

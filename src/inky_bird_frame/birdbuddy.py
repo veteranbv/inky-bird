@@ -2043,16 +2043,15 @@ def _update_history(
                 postcard.media_ids,
                 confirmed_species_by_media,
             )
-            if confirmed_species is None or confirmed_species == postcard.species:
+            if confirmed_species is None or (
+                confirmed_species == postcard.species and postcard.owner_confirmed
+            ):
                 continue
-            history.postcards[postcard_id] = BirdBuddyPostcard(
-                postcard.postcard_id,
-                postcard.observed_at,
-                confirmed_species,
-                media_ids=postcard.media_ids,
-                owner_confirmed=True,
+            history.postcards[postcard_id] = replace(
+                postcard, species=confirmed_species, owner_confirmed=True
             )
-            reclassified_postcard_ids.add(postcard_id)
+            if confirmed_species != postcard.species:
+                reclassified_postcard_ids.add(postcard_id)
         archived_reclassifications = _reconcile_archived_postcards(
             history,
             confirmed_species_by_media,
