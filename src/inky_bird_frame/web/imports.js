@@ -84,6 +84,7 @@ export async function renderImports(ui, { base, link, note, kind }) {
       const control = event.currentTarget;
       control.disabled = true;
       error.textContent = '';
+      let accepted = false;
       try {
         if (!request) {
           const settings = await api('/v1/owner/settings');
@@ -96,11 +97,12 @@ export async function renderImports(ui, { base, link, note, kind }) {
           };
         }
         const receipt = await api('/v1/owner/imports/' + action, request);
+        accepted = true;
         if (!stopped) await watch(receipt.operation_id, onSuccess);
       } catch (failure) {
-        // Only a reply that may have been lost is sent again unchanged, so the
-        // controller can recognise it. A refusal is rebuilt from current choices.
-        if (!unknownOutcome.includes(failure.code)) {
+        // An accepted step or a possibly lost reply is sent again unchanged, so
+        // the controller can recognise it. A refusal is rebuilt from current choices.
+        if (!accepted && !unknownOutcome.includes(failure.code)) {
           request = null;
           key = randomId();
         }

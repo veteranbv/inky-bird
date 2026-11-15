@@ -196,3 +196,25 @@ test('a step error stays visible after the step was replaced', async () => {
   const alerts = findAll(env.main, (node) => node.getAttribute('role') === 'alert');
   assert.ok(alerts.some((node) => text(node) === 'Saved state could not be read.'));
 });
+
+test('a step the controller accepted keeps its key when its status cannot be read', async () => {
+  const env = setup({
+    '/v1/owner/operations': { operations: [] },
+    '/v1/owner/imports': uploaded(),
+    '/v1/owner/settings': { revision: 'r1' },
+    '/v1/owner/imports/import-preview': { operation_id: 'op-1' },
+    '/v1/owner/operations/op-1': new RequestError(
+      'Inky could not complete this request.',
+      'internal',
+    ),
+  });
+  await renderImports(env.ui, env.helpers);
+  await click(findButton(env.main, 'Check this file'));
+  await click(findButton(env.main, 'Check this file'));
+  await settled(env.actions);
+  const [first, second] = env.calls
+    .filter(({ path }) => path === '/v1/owner/imports/import-preview')
+    .map(({ body }) => body);
+  assert.ok(second, 'the step can be pressed again');
+  assert.deepEqual(second, first, 'the accepted request is sent again unchanged');
+});
