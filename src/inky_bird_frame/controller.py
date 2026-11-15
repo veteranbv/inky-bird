@@ -1311,14 +1311,18 @@ def _write_active_catalog(
 def refresh_observations(config: AppConfig) -> dict[str, object]:
     try:
         result = run_refresh_cycle(config)
-    except (InkyBirdFrameError, OSError) as exc:
-        safe_record_degradation(
-            config,
-            key="observation-refresh",
-            title="Bird discovery is degraded",
-            body=f"Observation refresh failed ({type(exc).__name__}). "
-            "Check controller logs for details.",
-        )
+    except Exception as exc:
+        from .cli import _is_busy
+
+        # Another refresh already running is not a failure of discovery.
+        if not _is_busy(exc):
+            safe_record_degradation(
+                config,
+                key="observation-refresh",
+                title="Bird discovery is degraded",
+                body=f"Observation refresh failed ({type(exc).__name__}). "
+                "Check controller logs for details.",
+            )
         raise
     safe_record_recovery(
         config,
@@ -1639,10 +1643,12 @@ def run_refresh_cycle(config: AppConfig) -> dict[str, object]:
                 },
             )
             active_count = _write_active_catalog(config, species_list)
+    # Scheduled runs print this result to service logs; the place stays only in
+    # private controller state. The keys stay for 1.x output compatibility.
     return {
         "refreshed_at": refreshed_at.isoformat(),
-        "place_name": place_name,
-        "state": state,
+        "place_name": "",
+        "state": "",
         "window": config.discovery.observation_window.value,
         "radius_km": config.discovery.radius_km,
         "source": discovery_source_label(config.discovery.sources),
@@ -3658,8 +3664,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
         return {
             "discovery": {
                 "refreshed_at": snapshot.refreshed_at.isoformat(),
-                "place_name": snapshot.place_name,
-                "state": snapshot.state,
+                # Printed to service logs; the place stays in private state.
+                "place_name": "",
+                "state": "",
                 "window": config.discovery.observation_window.value,
                 "radius_km": config.discovery.radius_km,
                 "species_count": len(species_list),
