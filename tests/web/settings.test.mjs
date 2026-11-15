@@ -236,6 +236,10 @@ test('changing the form after a review withdraws that review', async (t) => {
   assert.ok(findButton(main, 'Save settings'));
   findButton(main, 'Add destination').fire('click');
   assert.equal(findButton(main, 'Save settings'), null);
+  submit(main);
+  field(main, 'radius_km').value = '12';
+  field(main, 'radius_km').fire('input');
+  assert.equal(findButton(main, 'Save settings'), null, 'typing in a field withdraws the review');
   assert.equal(calls.filter(({ body }) => body).length, 0);
 });
 
@@ -280,11 +284,14 @@ test('a save that needs a recent sign-in asks for the password and saves the sam
   assert.deepEqual(problems, []);
   const password = walk(main).find((node) => node.id === 'settings-confirm-password');
   assert.ok(password, 'the page asks for the password in place');
+  // Typing in the confirmation is not a change to the reviewed choices.
   password.value = 'wrong';
+  password.fire('input');
   findButton(main, 'Confirm and save').fire('click');
   await flush();
   assert.deepEqual(alerts(main), ['That password is not correct.']);
   password.value = 'synthetic passphrase';
+  password.fire('input');
   findButton(main, 'Confirm and save').fire('click');
   await flush();
   const saves = calls.filter(({ path, body }) => path === '/v1/owner/settings' && body);

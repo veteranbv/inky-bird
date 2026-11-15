@@ -400,8 +400,10 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   review.hidden = true;
   const submit = el('button', 'Review changes');
   submit.type = 'submit';
-  form.append(submit, problem, review);
-  main.append(form);
+  form.append(submit, problem);
+  // Outside the form, so typing or pressing Enter in its sign-in confirmation
+  // neither withdraws the review nor submits the form again.
+  main.append(form, review);
   // A review describes one set of choices; any later change withdraws it.
   function withdrawReview() {
     review.hidden = true;

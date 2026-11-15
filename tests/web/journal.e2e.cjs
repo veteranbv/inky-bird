@@ -203,6 +203,7 @@ async function finish(t) {
         accessibility: !!process.env.INKY_QA_AXE,
         checks: [
           'owner setup',
+          'password confirmation for a key saved from an older sign-in',
           'HTTP and HTTPS cookie-host trust guidance (HTTPS rendering synthetic)',
           'Favorites separate from sightings',
           'complete archive upload',
@@ -239,6 +240,7 @@ async function finish(t) {
 run(async (t) => {
   await ownerSetup(t);
   await manage.birdBuddySettings(t);
+  await manage.recentSignIn(t);
   await save.historyAndCollections(t);
   await manage.candidates(t);
   await birds.unreadableNotice(t);
