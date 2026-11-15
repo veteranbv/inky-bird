@@ -256,7 +256,7 @@ for (const [name, change] of [
   test('a journal with ' + name + ' and no birds is not shown as new', async (t) => {
     const { main } = await open(t, { page: 'home' }, { state: withState({ ...empty, ...change }) });
     assert(!main.textContent.includes(welcome));
-    assert(main.textContent.includes(start));
+    assert.equal(main.textContent.includes(start), !change.notices);
   });
 
 for (const [plateReady, oneTap] of [

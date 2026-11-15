@@ -22,7 +22,7 @@ function checks(review) {
 
 export async function renderCandidate(context) {
   const { ui, el, button, api, main, query, href, link, note, base, byId } = context;
-  base('A new page for your journal');
+  base('Review candidate');
   main.append(link('Back to ' + WORDS.inTheWorks, 'work'));
   const candidate = await api(
     '/v1/owner/candidates/' + encodeURIComponent(query.get('bird') || ''),
@@ -30,14 +30,11 @@ export async function renderCandidate(context) {
   const noted = notedClause(byId?.get(candidate.taxon_id)?.retained_evidence);
   const intro = main.querySelector('.intro');
   if (intro)
-    intro.textContent =
-      candidate.common_name +
-      (noted ? ' — ' + noted : '') +
-      (candidate.can_approve ? '. Keep it, or send it back.' : '.');
+    intro.textContent = candidate.common_name + (noted ? ' — ' + noted : '') + '.';
   const content = el('section', '', 'journal-card');
   const image = el('img', '', 'detail-art');
   image.src = candidate.portrait_url;
-  image.alt = 'New plate, not kept yet: ' + candidate.common_name;
+  image.alt = 'New plate, not approved yet: ' + candidate.common_name;
   content.append(image, el('h2', candidate.common_name), note(candidate.scientific_name));
   // A plate that cannot be kept carries the reason from the controller.
   if (!candidate.can_approve && candidate.notice) content.append(note(candidate.notice));
@@ -93,11 +90,11 @@ export async function renderCandidate(context) {
   function decision(approve, reason = '') {
     let key = randomHex(16),
       request = null;
-    return button(approve ? 'Keep this plate' : 'Send this plate back', async (event) => {
+    return button(approve ? 'Confirm local approval' : 'Confirm rejection', async (event) => {
       const control = event.currentTarget;
       control.disabled = true;
       try {
-        if (approve && !loaded) throw new Error('Wait for the whole plate to load before keeping it.');
+        if (approve && !loaded) throw new Error('Wait for the whole plate to load before approving it.');
         if (!request) {
           const settings = await api('/v1/owner/settings');
           request = {
@@ -123,7 +120,7 @@ export async function renderCandidate(context) {
           problem.textContent = error.message;
         } else
           // The decision may have been saved: send exactly the same one again.
-          problem.textContent = error.message + ' Trying again is safe.';
+          problem.textContent = error.message + ' Trying again is safe. Check recent operations if the response was lost.';
       }
     });
   }
@@ -134,7 +131,7 @@ export async function renderCandidate(context) {
     label.append(
       consent,
       document.createTextNode(
-        'I looked at the whole plate: the bird, its lettering and the references.',
+        'I inspected the full plate, its text, anatomy and cited review. Make this artwork approved locally and eligible for existing publication.',
       ),
     );
     const approve = decision(true);
@@ -145,11 +142,11 @@ export async function renderCandidate(context) {
     content.append(
       label,
       approve,
-      note('Kept plates join your journal. If you publish plates, a published copy cannot be taken back.'),
+      note('Approved plates join your journal. If you publish plates, a published copy cannot be taken back.'),
     );
   }
   const form = el('form'),
-    label = el('label', 'Why send it back?');
+    label = el('label', 'Why reject this candidate?');
   label.htmlFor = 'candidate-reason';
   const reason = el('textarea');
   reason.id = label.htmlFor;
@@ -159,13 +156,13 @@ export async function renderCandidate(context) {
   hint.id = 'candidate-reason-hint';
   reason.setAttribute('aria-describedby', hint.id);
   const reject = decision(false, () => {
-    if (!reason.value.trim()) throw new Error('Say why you are sending it back.');
+    if (!reason.value.trim()) throw new Error('Give a rejection reason.');
     return reason.value;
   });
   form.append(label, reason, hint, reject);
   content.append(
     form,
-    note('Sending it back keeps a private copy. No new plate starts until you ask for one.'),
+    note('Rejecting keeps a private copy. No new plate starts until you ask for one.'),
     problem,
   );
   main.append(content);
