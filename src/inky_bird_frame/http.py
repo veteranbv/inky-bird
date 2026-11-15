@@ -260,8 +260,9 @@ def _fetch(
             raise
         except (URLError, HTTPException, OSError) as exc:
             # A spent deadline shuts the socket down or refuses to connect;
-            # whatever the interrupted step raised, it is the timeout.
-            if deadline.spent:
+            # whatever the interrupted step raised, it is the timeout. A status
+            # the server already sent is its answer, however late.
+            if deadline.spent and not isinstance(exc, HTTPError):
                 raise DataSourceError(f"Timed out reading {display_url}") from exc
             raise _transport_error(exc, display_url) from exc
         if deadline.expired:

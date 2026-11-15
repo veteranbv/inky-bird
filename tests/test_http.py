@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -53,6 +53,11 @@ class _RedirectingHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path == "/unavailable":
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self.path == "/ftp-redirect":
             self.send_response(302)
@@ -346,6 +351,20 @@ class DeadlineAndLimitTests(unittest.TestCase):
             self.assertRaisesRegex(DataSourceError, "^Timed out reading "),
         ):
             get_bytes(f"http://127.0.0.1:{port}/payload", deadline_seconds=60)
+
+    def test_a_status_that_arrives_after_the_deadline_is_still_reported(self) -> None:
+        # A complete status line is an answer, not an interrupted read.
+        with (
+            _serving() as port,
+            patch.object(
+                inky_bird_frame.http._Deadline,
+                "spent",
+                new_callable=PropertyMock,
+                return_value=True,
+            ),
+            self.assertRaisesRegex(DataSourceError, "^HTTP 503 from "),
+        ):
+            get_bytes(f"http://127.0.0.1:{port}/unavailable", deadline_seconds=60)
 
     def test_requests_identify_this_release(self) -> None:
         expected = f"inky-bird/{__version__}"
