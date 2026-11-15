@@ -31,6 +31,13 @@ case "${noninteractive_sudo}" in
 esac
 
 failures=()
+not_stopped() {
+  local failed
+  for failed in "${failures[@]+"${failures[@]}"}"; do
+    [ "${failed}" = "$1" ] && return 0
+  done
+  return 1
+}
 installed() {
   [ "$(systemctl show --property=LoadState --value "$1" 2>/dev/null || true)" != "not-found" ] || \
     [ -e "/etc/systemd/system/$1" ]
@@ -51,6 +58,10 @@ if installed "${service_prefix}-display.service"; then
 fi
 
 for unit in "${service_prefix}-display.service" "${service_prefix}-display.timer"; do
+  # Keep the file of a unit that may still run so a rerun finds and stops it.
+  if not_stopped "${unit}"; then
+    continue
+  fi
   if [ -f "/etc/systemd/system/${unit}" ]; then
     if "${sudo_command[@]}" rm -f "/etc/systemd/system/${unit}"; then
       echo "Removed /etc/systemd/system/${unit}."
@@ -66,7 +77,7 @@ else
 fi
 
 if [ "${#failures[@]}" -gt 0 ]; then
-  echo "Uninstall did not finish. Could not remove: ${failures[*]}." >&2
+  echo "Uninstall did not finish. Could not stop or remove: ${failures[*]}." >&2
   echo "Fix the cause shown above and run the uninstaller again." >&2
   exit 1
 fi

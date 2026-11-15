@@ -145,7 +145,11 @@ restore_units() {
     if [ ! -e "${unit_backup_dir}/${name}" ] && [ -e "${unit_root}/${name}" ]; then
       changed=true
       if systemctl is-active --quiet "${name}" || systemctl is-enabled --quiet "${name}"; then
-        "${sudo_command[@]}" systemctl disable --now "${name}" || restored=false
+        if ! "${sudo_command[@]}" systemctl disable --now "${name}"; then
+          restored=false
+          # Keep its file so a rerun or the uninstaller can still find and stop it.
+          continue
+        fi
       fi
       "${sudo_command[@]}" rm -f "${unit_root}/${name}" || restored=false
     fi

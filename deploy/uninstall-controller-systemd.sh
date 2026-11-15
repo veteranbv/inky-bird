@@ -42,6 +42,14 @@ stop_unit() {
   fi
 }
 
+not_stopped() {
+  local failed
+  for failed in "${failures[@]+"${failures[@]}"}"; do
+    [ "${failed}" = "$1" ] && return 0
+  done
+  return 1
+}
+
 for name in refresh generate catalog-publish notifications; do
   disable_unit "${service_prefix}-${name}.timer"
   stop_unit "${service_prefix}-${name}.service"
@@ -51,6 +59,10 @@ disable_unit "${service_prefix}-scheduler.service"
 
 for name in controller scheduler refresh generate catalog-publish notifications; do
   for unit in "${service_prefix}-${name}.service" "${service_prefix}-${name}.timer"; do
+    # Keep the file of a unit that may still run so a rerun finds and stops it.
+    if not_stopped "${unit}"; then
+      continue
+    fi
     if [ -f "/etc/systemd/system/${unit}" ]; then
       if sudo rm -f "/etc/systemd/system/${unit}"; then
         echo "Removed /etc/systemd/system/${unit}."
@@ -67,7 +79,7 @@ else
 fi
 
 if [ "${#failures[@]}" -gt 0 ]; then
-  echo "Uninstall did not finish. Could not remove: ${failures[*]}." >&2
+  echo "Uninstall did not finish. Could not stop or remove: ${failures[*]}." >&2
   echo "Fix the cause shown above and run the uninstaller again." >&2
   exit 1
 fi
