@@ -20,7 +20,9 @@ also start from **Collections → Make a trip from your eBird checklists**.
    species name longer than 200 characters, or one with control or invisible
    characters, is refused with its row number. A damaged file is reported
    plainly, for example "This file is not an eBird export: it is not UTF-8
-   text" or "This eBird export is damaged near row N; download it again".
+   text" or "This eBird export is damaged near row N; download it again". A
+   ZIP that was cut short in download reports "This eBird export is damaged;
+   download it again".
 3. Review the history changes and generation policy. Confirm the history update
    separately. An unchanged archive needs no history write. Removing records or
    invalidating a trip's evidence requires explicit acknowledgment.
@@ -57,7 +59,9 @@ date windows. Review new, changed, duplicate, dated and undated records before
 confirming. Each species listed for a segment is kept as its own record.
 Re-importing an analysis replaces the species list of each segment in the
 upload, so a re-analysis can add, change or remove detections; the review step
-counts removals. Imports do not control the detector or download recordings.
+counts removals, and an import that removes detections asks you to tick a box
+confirming them first. Imports do not control the detector or download
+recordings.
 
 ## Interrupted work
 
@@ -89,6 +93,10 @@ The browser wire limit is 512 MiB. eBird ZIP contents have a separate existing
 ceiling, the ZIP format's maximum size for one entry's header, name, extra data
 and comment. Inky bounds these reads before allocating member objects; ZIP64
 remains supported. Large CSV contents still stream under the decoded limit.
+An export is also refused when it has more than 8,388,608 rows, more than 256
+columns, more than 50,000 distinct species names, or a line longer than 256 KiB.
+Each refusal names the limit it hit. An official export within the 512 MiB
+limit stays within these counts.
 These are rejection bounds, not measured promises
 that every maximum-size archive is practical on every controller. An offline
 synthetic test checked 900,000 rows in 90,000 checklists: 509.7 MiB decoded CSV,
@@ -110,6 +118,7 @@ Preview retention defaults to 24 hours. Set `owner_import_retention_hours` in
 `[controller]` to 1–168 hours; restart after changing it. The maximum matches the
 seven-day receipt recovery period. While the service runs, cleanup removes
 expired temporary files within one minute, unless an operation is using them.
+Until then, an expired preview can still be shown, but it cannot be confirmed.
 An upload still receiving after an hour, or a raw file with no preview record,
 is removed at startup and by that cleanup.
 It retries after that operation. If the service is stopped, cleanup runs at its

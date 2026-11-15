@@ -26,10 +26,14 @@ often, review and raise `max_searches_per_day` to match. Cached profiles do not
 consume the budget again. Use `seed` for a broad historical catalog instead of
 making the active observation window permanently broad.
 
-Research counters reset at midnight UTC. When a daily or per-species limit is
-reached, the controller records the next attempt at that reset instead of
-running backoff retries that cannot succeed. An explicit `retry` never bypasses
-the configured research budget.
+The daily research limit resets at midnight UTC. When it is reached, the
+controller records the next attempt at that reset instead of running backoff
+retries that cannot succeed. `max_searches_per_species` is a total for each
+bird, not a daily count. It resets only when a bird starts fresh: its first
+try, your `retry` or replacement, or after it stopped for you. Automatic retries
+do not reset it. A bird that uses its whole allowance stops and waits for
+`retry TAXON_ID`. `research-budget.json` keeps these totals in
+`species_totals`. An explicit `retry` never bypasses the daily limit.
 
 The controller's `workspace_dir` must be writable because the Codex image tool
 copies its final image there. Keep it separate from configuration, catalog, and
@@ -45,7 +49,8 @@ Codex runs with a short allowlist of environment variables: executable lookup,
 home and user, locale and time zone, temporary directories, TLS trust
 (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`,
 `CODEX_CA_CERTIFICATE`), proxy settings, and Codex's own configuration
-locations (`CODEX_HOME`, `XDG_*` and, on Linux, `DBUS_SESSION_BUS_ADDRESS`).
+locations (`CODEX_HOME`, `XDG_*` and `DBUS_SESSION_BUS_ADDRESS`, which only
+matters for a keyring-backed Codex sign-in on Linux).
 Provider keys, notification URLs, sign-in secrets and API-key variables are not
 passed to it. If Codex was authenticated only through an environment variable,
 sign in with `codex login` as the account that runs the services. When a Codex
@@ -122,6 +127,22 @@ availability changes slowly. The retry record also retains species identity so
 an explicit retry can requeue work that failed before profile creation. Later
 birds continue through the queue. Exhausted factual or visual review remains
 terminal and requires `retry TAXON_ID`.
+
+After 12 failed automatic tries (about a week with the default backoff), a bird
+stops as a terminal failure, the `terminal_error` notice is sent, and the bird
+waits for `retry TAXON_ID`. Waits for missing reference photos and for the
+shared daily research limit do not count toward the 12. A bird that was already
+past 12 tries before an upgrade stops at its next failure.
+
+A stop signal during generation (a systemd timeout, `docker stop`, or the
+scheduler shutting down) saves the running bird's try with a backoff retry
+before the job ends. A cycle does not start a bird whose longest possible run
+would not fit the time left in the cycle; the result then reports
+`stopped_for_time: true`. When a later step fails after a reviewed attempt, the
+attempts are kept under `state_dir/archive/<taxon>-<time>-interrupted/` and the
+next try starts from their corrections. When iNaturalist renames a bird, its
+cached profile is archived and, with research enabled, researched again under
+the new name; that uses research budget.
 
 Discovery requests and validates species-rank iNaturalist results so genera,
 families, and other aggregate taxa never enter generation. Species context uses
@@ -390,8 +411,10 @@ persistent storage; see the
 ## Catalog publication
 
 Clone this project repository into a controller-only checkout. Install GitHub
-CLI and authenticate it as the repository owner. The owner must have pull
-request bypass permission on the base-branch ruleset. GitHub CLI stores its
+CLI and authenticate it as the repository owner or, for a repository owned by
+an organization, as an administrator of that repository. That account must have
+pull request bypass permission on the base-branch ruleset. Stale publication
+pull requests are matched by the signed-in account. GitHub CLI stores its
 credential outside application configuration; do not use a deploy key because a
 deploy key cannot exercise the owner's pull request bypass.
 
@@ -427,6 +450,21 @@ byte-for-byte identical to their local approved versions. It never publishes
 the private discovery snapshot, downloaded reference bitmaps, run logs, failed
 attempts, or display state. The macOS installer creates the publication
 LaunchAgent only when `[public_catalog].enabled` is true.
+
+A run with nothing new to publish reuses the last full check while the remote
+catalog, the local catalog's file listing and file details, the privacy
+settings, the app version and the repository settings are all unchanged. Its
+output then shows `verification_reused: true`. The record is
+`state_dir/catalog-publish-verified.json` (mode `0600`); it is safe to delete,
+and the next full run writes it again. Damage to a local plate that leaves its
+file size and times unchanged is not rechecked by such runs; the catalog
+readers still check every plate's checksum.
+
+The publisher works from a snapshot of the catalog. It uses hard links when
+the catalog and state directories are on one filesystem and copies otherwise.
+Finder `.DS_Store` files in the catalog are ignored and never published.
+Catalog readers remember plate checksums while a file's details are unchanged;
+a file changed in the last two seconds is always checked again.
 
 ## Maintainer deployment
 
@@ -571,7 +609,7 @@ display size, is `internal` with exit code `1` and keeps its message.
 | `publication` | Public catalog publication failed. |
 | `installation` | Setup, a required program or a dependency failed. |
 | `access` | Owner access or sign-in state refused the request. |
-| `storage` | A file could not be read or written, or owner-operation storage is full. |
+| `storage` | A file could not be read or written, or owner-operation storage is full. Any other operating-system error, such as an unreadable `--image` file or a network error a provider did not report itself, also uses this type. |
 | `internal` | An error with no more specific type. A readable project error or value error keeps its message. Any other unexpected error gets fixed text, and one diagnostic line goes to standard error, which is the service log. |
 
 `busy` means, for example, that a cycle, refresh, publication, display cycle,
@@ -586,6 +624,8 @@ not use is still accepted in 1.x. `config validate` lists it under
 `unknown_keys`, and the controller doctor warns with check `config_unknown_keys`
 (names only, never values). Version 2.0 will reject unknown keys. Fix typos and
 remove settings you no longer need now, so the upgrade does not stop on them.
+The `deprecations` list in `config validate` output is kept for compatibility
+and is always empty; read `unknown_keys` instead.
 
 ## Inspect or override a candidate
 

@@ -20,8 +20,8 @@ preview record, is removed at startup and by the regular cleanup instead of
 waiting for the full period.
 
 Imported eBird checklists are linked by an unsalted SHA-256 of each submission
-ID. That keeps raw IDs out of the files, but submission IDs are short numbers
-and can be recovered by trying every one. Treat those files as private, not
+ID. That keeps raw IDs out of the files, but submission IDs are short
+sequential identifiers and can be recovered by trying every one. Treat those files as private, not
 anonymous.
 
 For Bird Buddy, a dedicated guest account is the recommended least-privilege
@@ -29,6 +29,16 @@ choice. An operator can explicitly accept the broader permissions of an owner
 account instead. Its refresh token retains that account's permissions; choosing
 one feeder in Inky does not make the token read-only or reduce its scope. See
 [Bird Buddy setup](discovery.md#bird-buddy-setup) for authorization and token custody.
+
+The output of scheduled `refresh` and `generate` runs keeps the `place_name`
+and `state` fields but leaves them empty, so service logs do not record where
+you live. The place stays only in private controller state. `discover`, which
+you run by hand, still prints the location so you can check it. Service logs
+are private; an unexpected provider error can still write its own text there.
+
+A plate whose text contains your postal code, coordinates, discovered place
+with its state, your home directory or the controller's own paths cannot be
+approved from the app, even with publication off.
 
 ## What can leave the controller
 
