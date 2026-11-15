@@ -905,7 +905,7 @@ def check_install(
     for path in sorted(before.role.runtimes - after.runtimes) if not completed(outcome) else ():
         report.append(f"I10: runtime {path} existed before and was removed by a failed run")
     for path in sorted(stray_paths(machine) - before.stray):
-        if path not in output and not removal_failed(case, path):
+        if path not in output and not removal_failed(case, path, machine.root):
             report.append(f"I10: {path} was left behind")
 
 
@@ -956,10 +956,11 @@ def active_runtime(machine: Machine, role: str) -> str | None:
     return None
 
 
-def removal_failed(case: Case, path: str) -> bool:
+def removal_failed(case: Case, path: str, root: Path) -> bool:
     """A failed ``rm`` of exactly that path is the one thing allowed to leave it."""
-    targets = {os.path.normpath(argument) for argument in case.arguments}
-    return case.tool == "rm" and case.mode == "fail" and os.path.normpath(path) in targets
+    # Either spelling of a path through a symlinked directory names the same path.
+    targets = {os.path.realpath(on_machine(argument, root)) for argument in case.arguments}
+    return case.tool == "rm" and case.mode == "fail" and os.path.realpath(path) in targets
 
 
 def check_success(
@@ -988,7 +989,7 @@ def check_success(
     named = {
         path
         for path in after.runtimes
-        if removal_failed(case, os.path.realpath(path)) and any(path in line for line in by_hand)
+        if removal_failed(case, path, machine.root) and any(path in line for line in by_hand)
     }
     if len(after.runtimes - named) != expected:
         report.append(f"I10: after success {len(after.runtimes)} runtimes remain, not {expected}")
@@ -1265,6 +1266,20 @@ def thaw(template: Template, target: Path) -> None:
 
 # Running cases ----------------------------------------------------------------
 
+MACHINE_TOKEN = "{machine}"
+
+
+def off_machine(text: str, root: Path) -> str:
+    """A recorded argument with the machine's own path, in either form, as a token."""
+    for form in (os.path.realpath(root), str(root)):
+        text = text.replace(form, MACHINE_TOKEN)
+    return text
+
+
+def on_machine(text: str, root: Path) -> str:
+    """A recorded argument as it reads on the machine at ``root``."""
+    return text.replace(MACHINE_TOKEN, str(root))
+
 
 def fix_inodes(machine: Machine) -> None:
     """A copy is the same machine; processes keep running from the same places."""
@@ -1315,7 +1330,8 @@ class Group:
         else:
             assert outcome.returncode != 0 and not outcome.violations, outcome
         assert not machine.survivors()
-        return steps
+        # Recordings are made in any worker's directory and used in every other.
+        return [[off_machine(part, slot) for part in step] for step in steps]
 
     def rerun(self, machine: Machine, outcome: Outcome) -> None:
         try:
