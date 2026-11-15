@@ -6,6 +6,7 @@ import base64
 import errno
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime
 from html import escape
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
     from .config import AppConfig
 
+_LOG = logging.getLogger(__name__)
 CATALOG_SCHEMA_VERSION = 1
 # Scope key set when a HEAD request is answered as GET; the wire body is dropped.
 HEAD_REQUEST = "inky_bird_frame.head"
@@ -496,14 +498,17 @@ class CatalogService:
                         413,
                         {"ok": False, "error": "request body too large", "schema_version": 1},
                     )
-        except ClientDisconnect:
+        except ClientDisconnect as exc:
+            _LOG.info("A display report ended before its body arrived", exc_info=exc)
             return self._json(
                 request, 400, {"ok": False, "error": "request incomplete", "schema_version": 1}
             )
         try:
             payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-            # Python 3.11 raises RecursionError for deeply nested arrays.
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            if isinstance(exc, RecursionError):
+                # Python 3.11 raises this for deeply nested arrays.
+                _LOG.info("A display report was nested too deeply to read", exc_info=exc)
             return self._json(
                 request, 400, {"ok": False, "error": "invalid JSON", "schema_version": 1}
             )

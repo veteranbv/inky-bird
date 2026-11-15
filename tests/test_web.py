@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,6 +24,7 @@ from inky_bird_frame.config import (
     OwnerAccessMode,
     load_config,
 )
+from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.oidc import VerifiedIdentity, provider_id
 from inky_bird_frame.settings import initialize_config
 from inky_bird_frame.web import LOCAL_OWNER_COOKIE, OWNER_COOKIE, create_app
@@ -851,9 +853,12 @@ def test_unreadable_retained_history_keeps_its_owner_message(tmp_path: Path) -> 
     assert retained.read_bytes() == b"not json"
 
 
-def test_owner_json_survives_deep_nesting(tmp_path: Path) -> None:
+def test_owner_json_survives_deep_nesting(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     config = _config(tmp_path)
-    with TestClient(create_app(config), base_url=ORIGIN) as client:
+    with (
+        caplog.at_level("INFO", logger="inky_bird_frame.web"),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
         headers = _owner_headers(client, config)
         # Python 3.11 raises RecursionError for nesting far below this body cap.
         with patch("inky_bird_frame.web.json.loads", side_effect=RecursionError):
@@ -874,6 +879,8 @@ def test_owner_json_survives_deep_nesting(tmp_path: Path) -> None:
             "code": "access_error",
             "message": "Owner request contains invalid JSON",
         }
+    # Before 1.0 this was a logged server error; the log still records it.
+    assert len(_logged_failures(caplog, RecursionError)) >= 1
 
 
 async def _complete(call: Awaitable[None]) -> None:
@@ -919,19 +926,42 @@ def _scope(method: str, path: str, **overrides: object) -> Scope:
     return scope
 
 
+def _logged_failures(
+    caplog: pytest.LogCaptureFixture, failure: BaseException | type[BaseException]
+) -> list[logging.LogRecord]:
+    """Web log records that carry ``failure`` (or one of its type) with a traceback."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "inky_bird_frame.web"
+        and record.exc_info is not None
+        and record.exc_info[2] is not None
+        and (
+            record.exc_info[1] is failure
+            if isinstance(failure, BaseException)
+            else isinstance(record.exc_info[1], failure)
+        )
+    ]
+
+
 def test_a_client_that_disconnects_mid_body_gets_a_clean_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
+    from starlette.requests import ClientDisconnect
+
     app = create_app(_config(tmp_path))
-    status, _, body = _asgi(
-        app,
-        _scope("POST", "/v1/owner/login"),
-        [{"type": "http.request", "body": b'{"pass', "more_body": True}],
-    )
+    with caplog.at_level("INFO", logger="inky_bird_frame.web"):
+        status, _, body = _asgi(
+            app,
+            _scope("POST", "/v1/owner/login"),
+            [{"type": "http.request", "body": b'{"pass', "more_body": True}],
+        )
     assert status == 400
     assert json.loads(body)["error"]["code"] == "request_incomplete"
+    # No unhandled server error, but the private log still records what happened.
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out + captured.err
+    assert [r.levelname for r in _logged_failures(caplog, ClientDisconnect)] == ["INFO"]
 
 
 def test_owner_boundary_classifies_the_path_the_router_matches(tmp_path: Path) -> None:
@@ -1101,22 +1131,47 @@ def test_corrupt_screen_state_is_unavailable_not_a_request_error(
     ],
 )
 def test_screen_state_failures_keep_their_safe_message(
-    tmp_path: Path, raised: str, shown: str
+    tmp_path: Path, raised: str, shown: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     from inky_bird_frame.journal import JournalError
 
     config = _config(tmp_path)
+    failure = JournalError(raised)
     with (
-        patch(
-            "inky_bird_frame.web.PresentationAccess.authenticate",
-            side_effect=JournalError(raised),
-        ),
+        patch("inky_bird_frame.web.PresentationAccess.authenticate", side_effect=failure),
         TestClient(create_app(config), base_url=ORIGIN) as client,
     ):
         client.cookies.set("__Host-inky-screen", "s" * 43, domain="inky.example.test", path="/")
         response = client.get("/v1/screen/view")
     assert response.status_code == 503
     assert response.json()["error"] == {"code": "journal_unavailable", "message": shown}
+    # Whatever the owner is shown, the private log keeps the original error.
+    logged = _logged_failures(caplog, CatalogError)
+    assert [r.levelname for r in logged] == ["WARNING"]
+    assert logged[0].exc_info is not None and logged[0].exc_info[1] is not None
+    assert logged[0].exc_info[1].__cause__ is failure
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(5, "Input/output error", "/srv/example/state/journal.json"),
+        CatalogError("Invalid catalog index: /srv/example/catalog/index.json"),
+    ],
+)
+def test_unreadable_local_state_is_logged_with_its_cause(
+    tmp_path: Path, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _config(tmp_path)
+    with (
+        patch("inky_bird_frame.web.JournalService.catalog", side_effect=failure),
+        TestClient(create_app(config), base_url=ORIGIN) as client,
+    ):
+        response = client.get("/wall/health")
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "journal_unavailable"
+    assert "/srv/example" not in response.text
+    assert [r.levelname for r in _logged_failures(caplog, failure)] == ["WARNING"]
 
 
 def test_missing_image_support_is_reported_as_unavailable(
@@ -1137,7 +1192,9 @@ def test_missing_image_support_is_reported_as_unavailable(
         "code": "dependency_missing",
         "message": "Install Pillow with JPEG support to make thumbnails",
     }
-    assert "An owner request needs a component that is not installed" in caplog.text
+    assert [r.getMessage() for r in _logged_failures(caplog, missing)] == [
+        "An owner request needs a component that is not installed"
+    ]
 
 
 def test_https_only_refuses_a_status_credential_over_plain_http(tmp_path: Path) -> None:
@@ -1184,13 +1241,10 @@ def test_data_source_messages_never_show_a_path_or_address(
         "code": "data_source_unavailable",
         "message": "A bird data source cannot be read right now",
     }
-    # The operator's log says what happened, never the private text.
-    warnings = [r for r in caplog.records if r.name == "inky_bird_frame.web"]
-    assert [r.getMessage() for r in warnings] == [
+    # The owner sees safe text; the private log keeps the cause and traceback.
+    assert [r.getMessage() for r in _logged_failures(caplog, failure)] == [
         "An owner request could not read a bird data source"
     ]
-    assert "example" not in caplog.text.lower()
-    assert str(tmp_path) not in caplog.text
 
 
 def test_storage_reason_stops_at_a_cycle_of_causes() -> None:

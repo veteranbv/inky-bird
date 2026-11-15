@@ -22,6 +22,7 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import pytest
 import uvicorn
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -1564,7 +1565,12 @@ def test_telemetry_rejects_an_invalid_content_length_itself(tmp_path: Path) -> N
     assert not (config.state_dir / "display-last-success.json").exists()
 
 
-def test_telemetry_survives_deep_nesting_and_a_dropped_client(tmp_path: Path) -> None:
+def test_telemetry_survives_deep_nesting_and_a_dropped_client(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from starlette.requests import ClientDisconnect
+
+    caplog.set_level("INFO", logger="inky_bird_frame.server")
     config = _plain_config(tmp_path)
     # Python 3.11 raises RecursionError past 1000 levels; this body fits the cap.
     nested = b"[" * MAX_TELEMETRY_REQUEST_BYTES
@@ -1599,6 +1605,15 @@ def test_telemetry_survives_deep_nesting_and_a_dropped_client(tmp_path: Path) ->
         {"ok": False, "error": "request incomplete", "schema_version": 1},
     )
     assert not (config.state_dir / "display-last-fetch.json").exists()
+    # These were logged server errors before 1.0; the log keeps each cause.
+    logged = [
+        type(record.exc_info[1])
+        for record in caplog.records
+        if record.name == "inky_bird_frame.server"
+        and record.exc_info is not None
+        and record.exc_info[2] is not None
+    ]
+    assert logged.count(RecursionError) >= 1 and logged.count(ClientDisconnect) == 1
 
 
 def test_asset_path_checks_hold_even_when_the_allowlist_names_an_escape(tmp_path: Path) -> None:

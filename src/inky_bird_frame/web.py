@@ -119,6 +119,7 @@ STATIC_PAGES = {
     "/screen": "screen.html",
     "/app/access-guide": "access-guide.txt",
 }
+_LOG = logging.getLogger(__name__)
 REVALIDATE = "no-cache"
 # Every code an error response can carry; part of the 1.x HTTP contract.
 HTTP_ERROR_CODES = (
@@ -302,7 +303,9 @@ async def _json_body(
     try:
         value: object = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        # Python 3.11 raises RecursionError for deeply nested arrays.
+        if isinstance(exc, RecursionError):
+            # Python 3.11 raises this for deeply nested arrays.
+            _LOG.info("An owner request was nested too deeply to read", exc_info=exc)
         raise AccessError("Owner request contains invalid JSON") from exc
     if (
         not isinstance(value, dict)
@@ -1718,7 +1721,10 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _error(400, "access_error", str(exc))
 
     async def journal_error(request: Request, exc: Exception) -> Response:
-        # Damaged local state is one 503, whichever module read it.
+        # Damaged local state is one 503, whichever module read it. The owner
+        # gets safe text; the private log keeps the cause, paths included.
+        if isinstance(exc, (CatalogError, OSError)):
+            _LOG.warning("An owner request could not read local state", exc_info=exc)
         if isinstance(exc, LocalStateUnavailableError):
             return _error(503, "journal_unavailable", str(exc))
         if isinstance(exc, (CatalogError, OSError)):
@@ -1737,8 +1743,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         return _error(400, "journal_error", str(exc))
 
     async def data_source_error(request: Request, exc: Exception) -> Response:
-        # Fixed text only: the exception can name local paths or request addresses.
-        logging.getLogger(__name__).warning("An owner request could not read a bird data source")
+        # The response never shows a path or address; the private log keeps them.
+        _LOG.warning("An owner request could not read a bird data source", exc_info=exc)
         return _error(
             503,
             "data_source_unavailable",
@@ -1746,9 +1752,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         )
 
     async def dependency_error(request: Request, exc: Exception) -> Response:
-        logging.getLogger(__name__).warning(
-            "An owner request needs a component that is not installed"
-        )
+        _LOG.warning("An owner request needs a component that is not installed", exc_info=exc)
         return _error(
             503,
             "dependency_missing",
@@ -1756,7 +1760,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         )
 
     async def incomplete_request(request: Request, exc: Exception) -> Response:
-        # The client has gone; this answer only keeps the failure out of the log.
+        # The client has gone, so this is not a server error, but keep a record.
+        _LOG.info("An owner request ended before its body arrived", exc_info=exc)
         return _error(400, "request_incomplete", "The request ended before it was complete")
 
     @asynccontextmanager
@@ -1775,7 +1780,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                     pass  # Never evict an upload or history operation in progress.
                 except OwnerOperationError as exc:
                     if not warned:
-                        logging.getLogger(__name__).warning(
+                        _LOG.warning(
                             "Private import cleanup needs attention (%s); "
                             "inspect imports in the owner app",
                             _storage_reason(exc),
