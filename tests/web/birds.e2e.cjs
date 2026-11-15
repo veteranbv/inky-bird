@@ -78,6 +78,206 @@ async function artDelivery(t) {
       new URL(route.request().url()).origin === origin ? route.continue() : route.abort(),
     );
   }
+  await startUp(t);
+  await listReturn(t);
+  await layout(t);
+}
+
+// Every file the owner page names loads, and a start that never comes says so.
+async function startUp(t) {
+  const { page, origin, heading } = t;
+  t.phase = 'owner-page-start';
+  const failed = [];
+  const own = (url) => new URL(url).pathname.startsWith('/app');
+  const answered = (response) => {
+    if (response.status() >= 400 && own(response.url())) failed.push(response.status() + ' ' + response.url());
+  };
+  const lost = (request) => {
+    if (own(request.url())) failed.push('failed ' + request.url());
+  };
+  page.on('response', answered);
+  page.on('requestfailed', lost);
+  await page.goto(origin + '/app');
+  await heading('Your field journal');
+  page.off('response', answered);
+  page.off('requestfailed', lost);
+  assert.deepEqual(failed, []);
+  assert.equal(await page.locator('.start-stalled').count(), 0, 'the started app replaces the message');
+  // A module that never loads stands in for an old browser or a lost connection.
+  await page.route('**/app/app.js', (route) => route.abort());
+  await page.goto(origin + '/app');
+  const stalled = page.locator('.start-stalled');
+  assert.equal(await stalled.isVisible(), false, 'no message while the page may still start');
+  await page.evaluate(() => document.getAnimations().forEach((animation) => animation.finish()));
+  await stalled.waitFor({ state: 'visible' });
+  await page.unroute('**/app/app.js');
+}
+
+// Every control a tap can reach, with its box, for the layout checks below.
+// Links inside running text are exempt from the target size, as in WCAG 2.5.8.
+function controls(page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll('header a, main a, main button, main input, main select, main summary, nav a')]
+      .filter((node) => node.getClientRects().length && !node.closest('p, li, dd'))
+      .map((node) => {
+        const box = node.getBoundingClientRect();
+        return {
+          name: (node.getAttribute('aria-label') || node.textContent || node.id || node.tagName).trim().slice(0, 60),
+          fixed: !!node.closest('.journal-navigation'),
+          box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+        };
+      }),
+  );
+}
+
+async function checkLayout(page, label) {
+  // Problems are collected so a failure lists every one of them.
+  const problems = [];
+  if (!(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)))
+    problems.push(label + ': sideways scrolling');
+  const found = await controls(page);
+  for (const { name, box } of found)
+    if (box.right - box.left < 44 - 0.5 || box.bottom - box.top < 44 - 0.5)
+      problems.push(label + ': ' + name + ' is smaller than 44 px');
+  // The bottom navigation floats over the page, so each layer is checked on its own.
+  for (const [n, a] of found.entries())
+    for (const b of found.slice(n + 1))
+      if (
+        a.fixed === b.fixed &&
+        a.box.right > b.box.left + 0.5 &&
+        b.box.right > a.box.left + 0.5 &&
+        a.box.bottom > b.box.top + 0.5 &&
+        b.box.bottom > a.box.top + 0.5
+      )
+        problems.push(label + ': ' + a.name + ' overlaps ' + b.name);
+  // A word split across lines means its button is too narrow for the label.
+  const split = await page.evaluate(() =>
+    [...document.querySelectorAll('main button, main .primary-link')]
+      .filter((node) => node.getClientRects().length)
+      .filter((node) => {
+        const step = parseFloat(getComputedStyle(node).fontSize) * 0.5;
+        const texts = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        while (texts.nextNode()) {
+          const text = texts.currentNode, range = document.createRange();
+          let previous = null;
+          for (let index = 0; index < text.length; index += 1) {
+            range.setStart(text, index);
+            range.setEnd(text, index + 1);
+            const top = range.getBoundingClientRect().top;
+            const inWord = /\S/.test(text.data[index]) && index > 0 && /\S/.test(text.data[index - 1]);
+            if (inWord && previous !== null && top > previous + step) return true;
+            previous = top;
+          }
+        }
+        return false;
+      })
+      .map((node) => (node.getAttribute('aria-label') || node.textContent).trim().slice(0, 60)),
+  );
+  for (const name of split) problems.push(label + ': ' + name + ' splits a word over two lines');
+  assert.deepEqual(problems, []);
+}
+
+const box = (locator) => locator.evaluate((node) => node.getBoundingClientRect().toJSON());
+
+// Birds list, bird page and Home at phone, small-phone and desktop sizes.
+async function layout(t) {
+  const { page, origin, heading, cardinal } = t;
+  for (const [width, height] of [
+    [375, 812],
+    [320, 568],
+    [1280, 800],
+  ]) {
+    const size = width + 'x' + height;
+    await page.setViewportSize({ width, height });
+    t.phase = 'birds-layout-' + size;
+    await page.goto(origin + '/app?page=birds');
+    await heading('Your birds');
+    await checkLayout(page, 'Birds ' + size);
+    const cards = page.locator('.bird-grid a.bird-card');
+    assert(await cards.count() >= 2, 'the list has at least two birds to lay out');
+    const [first, second] = [await box(cards.nth(0)), await box(cards.nth(1))];
+    if (width < 560) {
+      assert.equal(Math.round(first.top), Math.round(second.top), size + ': two cards side by side');
+      assert(second.left > first.right, size + ': two columns');
+    }
+    const plate = await box(page.locator('.bird-grid img').first());
+    const room = await page.locator('.bird-grid img').first().evaluate((image) => {
+      const card = image.parentElement, style = getComputedStyle(card);
+      return card.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    });
+    assert(plate.width >= room - 0.5, size + ': the plate fills its card');
+    if (width === 375) assert(plate.top < height, size + ': the first plate starts on the first screen');
+    if (width >= 820)
+      assert((await box(page.locator('#bird-search'))).width <= 420.5, size + ': search keeps a readable width');
+
+    t.phase = 'bird-layout-' + size;
+    await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
+    await heading('Northern Cardinal');
+    await page.locator('.detail-art').evaluate((image) => image.decode());
+    await checkLayout(page, 'Bird ' + size);
+    const back = await box(page.getByRole('link', { name: 'Back to birds', exact: true }));
+    const title = await box(page.getByRole('heading', { name: 'Northern Cardinal', exact: true }));
+    assert(back.bottom <= title.top + 0.5, size + ': Back comes before the title');
+    const [left, right] = [await box(page.locator('.bird-plate')), await box(page.locator('.bird-notes'))];
+    if (width >= 960) {
+      assert(left.right <= right.left, size + ': notes sit beside the plate');
+      assert(
+        (await box(page.getByRole('button', { name: /Favorites$/ }))).width <= 420.5,
+        size + ': buttons keep a readable width',
+      );
+    } else assert(right.top >= left.bottom - 0.5, size + ': notes follow the plate');
+
+    // Collections keep one card to a row on phones; only bird lists pair up.
+    t.phase = 'collections-layout-' + size;
+    await page.goto(origin + '/app?page=collections');
+    await heading('Collections');
+    await checkLayout(page, 'Collections ' + size);
+    if (width < 560) {
+      const groups = page.locator('.bird-grid > .journal-card');
+      assert(await groups.count() >= 2, 'Collections lists at least two groups');
+      const [one, two] = [await box(groups.nth(0)), await box(groups.nth(1))];
+      assert(two.top >= one.bottom, size + ': one collection to a row');
+    }
+
+    t.phase = 'home-layout-' + size;
+    await page.goto(origin + '/app');
+    await heading('Your field journal');
+    await checkLayout(page, 'Home ' + size);
+    if (width >= 960) {
+      const [hero, rail] = [await box(page.locator('.featured-art')), await box(page.locator('.home-rail'))];
+      assert(hero.right <= rail.left, size + ': the caption sits beside the plate');
+    }
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+}
+
+// Search, sort and the opened card come back with Back; the bird page steps
+// through the same list.
+async function listReturn(t) {
+  const { page, origin, heading, cardinal } = t;
+  t.phase = 'birds-list-return';
+  await page.goto(origin + '/app?page=birds&scope=art');
+  await heading('Available artwork');
+  await page.getByLabel('Sort by', { exact: true }).selectOption('scientific');
+  await page.getByLabel('Find a bird', { exact: true }).fill('cardinal');
+  const address = new URLSearchParams(await page.evaluate(() => location.search));
+  assert.equal(address.get('q'), 'cardinal', address.toString());
+  assert.equal(address.get('sort'), 'scientific');
+  await page.locator('.bird-grid a.bird-card:visible').first().click();
+  await heading('Northern Cardinal');
+  await page.goBack();
+  await heading('Available artwork');
+  assert.equal(await page.getByLabel('Find a bird', { exact: true }).inputValue(), 'cardinal');
+  assert.equal(await page.getByLabel('Sort by', { exact: true }).inputValue(), 'scientific');
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.getAttribute('href')),
+    '/app?page=bird&bird=' + cardinal.taxon_id + '&scope=art&q=cardinal&sort=scientific',
+  );
+  await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id + '&scope=art');
+  await heading('Northern Cardinal');
+  const steps = await page.locator('.bird-nav a').evaluateAll((links) => links.map((node) => node.textContent));
+  assert.equal(steps[0], 'Back to birds');
+  assert.equal(await page.locator('.plate-link').getAttribute('href'), await page.locator('.detail-art').getAttribute('src'));
 }
 
 module.exports = { unreadableNotice, artDelivery };

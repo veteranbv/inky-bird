@@ -7,6 +7,8 @@ export function renderHome(context) {
   base('Your field journal', 'Birds worth keeping close.');
   problems();
   const featured = byId.get(data.featured_taxon_id);
+  // Later notes join the plate's caption, which sits beside it on wide screens.
+  let rail = main;
   if (featured) {
     const hero = link('', 'bird', { bird: featured.taxon_id }, 'featured-art');
     hero.append(art(featured));
@@ -18,9 +20,19 @@ export function renderHome(context) {
     );
     const actions = el('div', '', 'home-actions');
     actions.append(playLink('current'), link('Browse your birds', 'birds'));
-    main.append(hero, caption, actions);
+    const feature = el('div', '', 'home-feature');
+    rail = el('div', '', 'home-rail');
+    rail.append(caption, actions);
+    feature.append(hero, rail);
+    main.append(feature);
   } else {
+    // A journal with parts it could not read is not a new one.
+    const unreadable =
+      management.reason === 'unreadable' ||
+      (data.notices || []).length > 0 ||
+      (data.history_coverage || []).some((source) => source.status === 'unavailable');
     const fresh =
+      !unreadable &&
       !data.birds.some((bird) => bird.known) &&
       (!management.available || !management.sources.some((source) => source.enabled));
     if (fresh) {
@@ -65,11 +77,11 @@ export function renderHome(context) {
   }
   if (management.available) {
     if (!management.sources.some((source) => source.enabled))
-      main.append(
+      rail.append(
         note('No sources selected for refresh. Artwork and saved collections still work.'),
       );
     else if (!management.work.complete)
-      main.append(
+      rail.append(
         note(
           'Discovery is ' +
             management.work.discovery_status +
@@ -77,7 +89,7 @@ export function renderHome(context) {
         ),
       );
     if (management.last_confirmed_panel_update)
-      main.append(
+      rail.append(
         note(
           'Last confirmed panel update: ' +
             new Date(management.last_confirmed_panel_update).toLocaleString(),

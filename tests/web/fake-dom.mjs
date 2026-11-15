@@ -155,6 +155,9 @@ export class Element {
   focus() {
     globalThis.document.activeElement = this;
   }
+  scrollIntoView(options) {
+    this.scrolledIntoView = options ?? true;
+  }
   blur() {
     if (globalThis.document.activeElement === this)
       globalThis.document.activeElement = globalThis.document.body;
