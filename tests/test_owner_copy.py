@@ -107,3 +107,39 @@ def test_health_reads_in_plain_words(tmp_path: Path) -> None:
         "status": "ok",
         "detail": "0 plates read. Each one shown is checked against its saved fingerprint.",
     }
+
+
+def test_plate_making_health_does_not_promise_the_owner_keeps_each_plate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plate that passes its checks joins the journal on its own; only one
+    # that fails them waits for the owner's Keep or Send back.
+    controller = ControllerConfig(
+        tmp_path / "work",
+        tmp_path / "catalog",
+        tmp_path / "state",
+        Path("codex"),
+        None,
+        "127.0.0.1",
+        8000,
+        3,
+        1,
+        3,
+    )
+    (tmp_path / "state").mkdir()
+    rebuild_catalog_index(controller.catalog_dir)
+    service = JournalService(controller)
+    management = {
+        "available": True,
+        "work": {"complete": True},
+        "sources": [],
+        "notifications": {"pending": 0, "dead_letters": 0},
+        "generation_enabled": True,
+    }
+    monkeypatch.setattr(service, "management", lambda approved: management)
+    checks = cast(list[dict[str, str]], service.health()["checks"])
+    plate_making = next(check for check in checks if check["name"] == "Plate making")
+    assert plate_making["detail"] == (
+        "On, with your own image-generation account. "
+        "Every new plate must pass its checks before it joins your journal."
+    )

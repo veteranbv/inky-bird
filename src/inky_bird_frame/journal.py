@@ -886,7 +886,7 @@ class JournalService:
                         "name": "Plate making",
                         "status": "info",
                         "detail": "On, with your own image-generation account. "
-                        "Every new plate is checked before you keep it."
+                        "Every new plate must pass its checks before it joins your journal."
                         if management["generation_enabled"]
                         else "Off. No new plates are drawn.",
                     },

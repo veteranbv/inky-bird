@@ -60,7 +60,13 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
             ),
             ...(settings.adoption_notice ? [note(settings.adoption_notice)] : []),
             note(
-              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. To undo adoption, stop Inky and restore the matching previous file, then run setup again.',
+              'You must re-run native setup and restart the service after this change. Docker will preserve this app-managed file on restart. Host, HTTPS and identity settings remain installer-owned. ' +
+                // Before adoption the copy exists only when an earlier adoption made it.
+                (settings.original_backup && settings.original_backup_available === false
+                  ? 'To undo adoption, stop Inky, put ' +
+                    settings.original_backup +
+                    ' back in place of your configuration file, then run setup again.'
+                  : 'To undo adoption, stop Inky and restore the matching previous file, then run setup again.'),
             ),
             button('Confirm switch', async (event) => {
               const control = event.currentTarget;
@@ -262,8 +268,8 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
         changes.discovery.geoapify_api_key = null;
     });
     const selection = section(
-      'Shared live selection',
-      'These choices set what your regular checks look for. Collections keep their own birds. eBird nearby looks back at most 30 days and 50 km.',
+      'What your regular checks look for',
+      'Collections keep their own birds. eBird nearby looks back at most 30 days and 50 km.',
     );
     const window = el('select');
     window.setAttribute('aria-label', 'Observation window');
@@ -280,11 +286,11 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     input(selection, 'radius_km', 'Radius in kilometers', fields.radius_km, { type: 'number' });
     input(selection, 'species_limit', 'Live species limit', fields.species_limit, {
       type: 'number',
-      hint: 'This limits live discovery, not the membership of a saved trip. BirdWeather supports at most 100.',
+      hint: 'The most birds your regular checks bring in. Saved trips keep all their birds. BirdWeather supports at most 100.',
     });
     const generation = section(
       'Plate making',
-      'Browsing your plates is free. New plates are drawn with your own image-generation account, and that provider’s charges apply. Set the account up on the controller first, then run the controller doctor. Every new plate is checked before you keep it. Turning this off keeps your history and waiting requests; a plate already being drawn can finish.',
+      'Browsing your plates is free. New plates are drawn with your own image-generation account, and that provider’s charges apply. Set the account up on the controller first, then run the controller doctor. Every new plate must pass its checks before it joins your journal. Turning this off keeps your history and waiting requests; a plate already being drawn can finish.',
     );
     checkbox(
       generation,
