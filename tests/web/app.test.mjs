@@ -174,7 +174,7 @@ test('first setup over a home-network connection puts the form before the long w
     if (node.tagName === 'FORM') order.push('form');
     else if (node.tagName === 'DETAILS' && node.children[0]?.textContent === 'About this home-network connection')
       order.push('details');
-    else if (node.textContent === 'This connection is not encrypted. Use a unique password and keep Inky on your home network.')
+    else if (node.textContent === 'This connection is not encrypted. Use a unique password and do not expose Inky to the internet.')
       order.push('note');
     for (const child of node.children || []) walk(child);
   })(main);
@@ -182,7 +182,7 @@ test('first setup over a home-network connection puts the form before the long w
   const text = main.textContent;
   // Every fact the long warning carried is still on the page.
   for (const fact of [
-    'Do not expose Inky to the internet.',
+    'do not expose Inky to the internet.',
     'A different port does not keep sign-in cookies separate.',
     'HTTPS encrypts that traffic.',
   ])

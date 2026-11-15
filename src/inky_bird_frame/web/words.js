@@ -5,6 +5,8 @@ export const WORDS = Object.freeze({
   plate: 'Plate',
   newPlate: 'New plate',
   onMyFrame: 'On my frame',
+  addedByYou: 'On my frame · added by you',
+  allBirds: 'All birds',
   favorite: 'Favorite',
   favorites: 'Favorites',
   collections: 'Collections',

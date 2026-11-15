@@ -1,7 +1,7 @@
 // Owner-only controls. Screen cookies and status credentials are not owner logins.
 import { inlineProblem, clearProblem } from '/app/ui.js';
 import { confirmAction } from '/app/frame-tools.js';
-import { when } from '/app/words.js';
+import { WORDS, when } from '/app/words.js';
 
 export async function renderPresentation(ui, { base, link, note, data, area }) {
   const { api, element: el, button } = ui,
@@ -22,13 +22,13 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   }
   const label = (key) =>
     key === 'current'
-      ? 'On my frame'
+      ? WORDS.onMyFrame
       : key === 'saved'
-        ? 'On my frame · added by you'
+        ? WORDS.addedByYou
         : key === 'all'
-          ? 'All plates'
+          ? WORDS.allBirds
           : key === 'favorites'
-            ? 'Favorites'
+            ? WORDS.favorites
             : data.collections.find((group) => group.collection_id === key)?.label ||
               'Removed collection';
   const views = [

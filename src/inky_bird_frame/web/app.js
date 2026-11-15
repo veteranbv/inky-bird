@@ -332,7 +332,7 @@ function connectionNotice(access) {
   main.append(
     element(
       'p',
-      'This connection is not encrypted. Use a unique password and keep Inky on your home network.',
+      'This connection is not encrypted. Use a unique password and do not expose Inky to the internet.',
       'hint',
     ),
   );
@@ -340,7 +340,7 @@ function connectionNotice(access) {
   more.append(
     hostTrust,
     help('About this home-network connection', [
-      'Do not expose Inky to the internet. People who can inspect your network traffic could read passwords, session credentials and private data. HTTPS encrypts that traffic. You can add it later, but Inky does not require it for trusted home-network use.',
+      'People who can inspect your network traffic could read passwords, session credentials and private data. HTTPS encrypts that traffic. You can add it later, but Inky does not require it for trusted home-network use.',
       'Other web apps on this same hostname or IP address can receive your Inky sign-in cookie, even on a different port. If you do not trust those apps, use a separate device or an isolated address. A new HTTP hostname alone does not isolate them. See the access guide for HTTPS isolation.',
     ]),
   );
@@ -450,7 +450,7 @@ function signIn(access, notice = '') {
     main.append(
       element(
         'p',
-        'Browser sign-in is unavailable. Ask the installer to restore the provider or enable local sign-in. Your data stays in place.',
+        'Browser sign-in is unavailable. Ask whoever runs Inky to restore the provider or turn on the Inky password. Your data stays in place.',
         'notice',
       ),
     );
@@ -796,7 +796,7 @@ async function accountAccess(access, session, message = '') {
         advanced.append(
           element(
             'p',
-            p.error || 'The provider is unavailable. Ask the installer to check its settings.',
+            p.error || 'The provider is unavailable. Ask whoever runs Inky to check its settings.',
             'error',
           ),
         );
@@ -942,7 +942,7 @@ window.addEventListener('popstate', () => {
 });
 await load(
   ssoResult === 'failed'
-    ? 'Single sign-on could not finish. Your existing access stays in place. Try again, or use local sign-in if available. If this continues, ask the installer to check the provider.'
+    ? 'Single sign-on could not finish. Your existing access stays in place. Try again, or use local sign-in if available. If this continues, ask whoever runs Inky to check the provider.'
     : ssoResult === 'linked'
       ? 'Single sign-on linked and verified.'
       : ssoResult === 'confirmed'

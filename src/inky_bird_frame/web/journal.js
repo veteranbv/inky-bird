@@ -151,10 +151,12 @@ export async function openJournal(ui, message = '') {
     return key === 'favorites'
       ? WORDS.favorites
       : key === 'all'
-        ? 'All birds'
-        : key === 'saved' || key === 'current'
-          ? WORDS.onMyFrame
-          : data.collections.find((group) => group.collection_id === key)?.label || 'Collection';
+        ? WORDS.allBirds
+        : key === 'saved'
+          ? WORDS.addedByYou
+          : key === 'current'
+            ? WORDS.onMyFrame
+            : data.collections.find((group) => group.collection_id === key)?.label || 'Collection';
   }
   function base(title, description = '') {
     screen(title, description);

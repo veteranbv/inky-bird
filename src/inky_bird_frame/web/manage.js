@@ -26,9 +26,9 @@ const shortStatus = {
 // What each request is called, and what happened once it was done.
 const outcomes = {
   'saved-collection': ['Change to your frame', 'On my frame was changed.'],
-  refresh: ['Source check', 'Your sources were checked.'],
+  refresh: ['Source check', 'The source check finished.'],
   retry: ['Trying plates again', 'These birds are back in the works.'],
-  'retry-now': ['Trying plates again', 'These birds are first in line once plate making is on.'],
+  'retry-now': ['Trying plates again', 'Inky was asked to try these birds early.'],
   'notification-test': ['Test notification', 'Inky tried each destination.'],
   'notification-retry': ['Sending again', 'Inky tried the undelivered messages again.'],
   'import-preview': ['History file check', 'The file was checked. Nothing has changed yet.'],
@@ -44,11 +44,17 @@ const outcomes = {
 export function outcomeTitle(kind) {
   return outcomes[kind]?.[0] || 'Your request';
 }
+// A frame change whose counts are all zero; a result without them is not one.
+function unchangedFrame(result) {
+  const keys = ['added_count', 'removed_count', 'migrated_legacy_queue_count'];
+  return keys.some((key) => key in (result || {})) && keys.every((key) => !result[key]);
+}
 export function outcomeSentence(receipt) {
   if (receipt.status !== 'succeeded') return statusText(receipt.status);
   // A history file with nothing new returns no counts.
   if (receipt.kind === 'import-commit' && !('rows' in (receipt.result || {})))
     return 'Your history had no changes.';
+  if (receipt.kind === 'saved-collection' && unchangedFrame(receipt.result)) return 'Nothing changed.';
   return outcomes[receipt.kind]?.[1] || 'Done.';
 }
 
@@ -207,7 +213,8 @@ export async function renderOperation(context) {
               plural(provider.species_count, 'species', 'species'),
           ),
         );
-      for (const line of resultLines(result)) content.append(note(line));
+      if (!(receipt.kind === 'saved-collection' && unchangedFrame(result)))
+        for (const line of resultLines(result)) content.append(note(line));
       if (['pending', 'running'].includes(receipt.status))
         timer = setTimeout(update, document.hidden ? 5000 : 1000);
       else {
@@ -296,7 +303,7 @@ export async function renderGuides(context) {
     guide(
       'Installation and services',
       'installation.md',
-      'Addresses, services, certificates and package updates are set by the installer, not from this page.',
+      'Addresses, services, certificates and package updates are set by whoever runs Inky, not from this page.',
     );
     guide(
       'HTTPS and Authentik',
@@ -637,7 +644,7 @@ export async function renderStatus(context) {
     const selected = new Set(), controls = el('section', '', 'journal-card'), choices = el('div'), inputs = new Map();
     const charges = 'Plates are drawn with your own image-generation account, and its charges apply.';
     const retryNow = operationAction('Try as soon as possible', 'retry-now',
-      'Inky checks sources and draws these next, after anything already being drawn. ' + charges, () => [...selected]);
+      'Inky checks your sources and tries these birds early, once any plate in progress is finished. ' + charges, () => [...selected]);
     const noWake = note('“Try as soon as possible” needs plate making on and Inky’s own scheduler running.');
     retryNow.hidden = true;
     const queueAction = operationAction('Try at the next check', 'retry',

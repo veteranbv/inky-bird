@@ -33,6 +33,15 @@ test('collection covers use the small plate', async (t) => {
   for (const image of covers) assert.match(image.src, /\/thumbnail\?revision=[a-f]{64}$/);
 });
 
+test('every collection card has its own title', async (t) => {
+  const { main } = await open(t, { page: 'collections' });
+  const titles = nodes(main)
+    .filter((node) => node.className === 'collection-title')
+    .map((node) => node.textContent);
+  assert(titles.length >= 4, titles.join(' | '));
+  assert.equal(new Set(titles).size, titles.length, titles.join(' | '));
+});
+
 test('search hides cards instead of rebuilding them', async (t) => {
   const { main } = await open(t, { page: 'birds' });
   const grid = main.querySelector('.bird-grid');

@@ -15,7 +15,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     source ? sourceNames[source][0] : 'Settings and backups',
     source
       ? sourceNames[source][1]
-      : 'Choose how Inky runs. Installation and network settings stay with the installer.',
+      : 'Choose how Inky runs. Installation and network settings stay with whoever runs Inky.',
   );
   if (source) main.append(link('Back to Sources', 'sources'));
   main.append(link('Back to Manage', 'manage'));
@@ -44,7 +44,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
   }
   if (!settings.editable) {
     main.append(
-      el('h2', 'Managed by your installer'),
+      el('h2', 'Managed by whoever runs Inky'),
       note(
         'Your TOML file and environment remain authoritative. Change the file, validate it, then re-run native setup or restart Docker. This page never edits a temporary copy that startup will replace.',
       ),
@@ -121,7 +121,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (type === 'number') {
       field.step = ['latitude', 'longitude'].includes(key) ? 'any' : '1';
     }
-    if (external) field.placeholder = 'Managed by the installer environment';
+    if (external) field.placeholder = 'Set by whoever runs Inky';
     else if (secret)
       field.placeholder = settings.credentials[key]?.configured
         ? 'Already set. Leave empty to keep it.'
@@ -384,7 +384,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     if (external)
       notifications.append(
         note(
-          'Destination credentials are managed by the environment. Change them through the installer.',
+          'Destination credentials are managed by the environment. Ask whoever runs Inky to change them.',
         ),
       );
     else {

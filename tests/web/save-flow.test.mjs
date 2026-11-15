@@ -686,9 +686,9 @@ test('an interrupted change says to check On my frame before trying again', asyn
 // What the wall frame shows is its own choice: a change to On my frame reaches
 // it only while it shows On my frame.
 for (const [wall, added, removed] of [
-  ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Brown Creeper will leave your frame at the next refresh.'],
+  ['saved', 'Brown Creeper will show on your frame from the next refresh.', 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
   ['favorites', 'Added to On my frame. Your wall frame shows Favorites for now.', 'Removed from On my frame. Your wall frame shows Favorites for now.'],
-  ['all', 'Added to On my frame. Your wall frame shows All plates for now.', 'Removed from On my frame. Your wall frame shows All plates for now.'],
+  ['all', 'Added to On my frame. Your wall frame shows All birds for now.', 'Removed from On my frame. Your wall frame shows All birds for now.'],
   ['a'.repeat(32), 'Added to On my frame. Your wall frame shows another collection for now.', 'Removed from On my frame. Your wall frame shows another collection for now.'],
 ])
   test('adding and removing a bird while the wall frame shows ' + (wall.length === 32 ? 'a collection' : wall), async (t) => {
@@ -741,6 +741,65 @@ for (const [label, journal, removed] of [
     assert(shown.includes(removed), shown.join(' | '));
     assert(!shown.some((text) => text.includes('will leave') && removed !== text), shown.join(' | '));
   });
+
+// A frame on the main catalog address shows the birds being noted plus On my
+// frame whatever the wall view is, so a removal is certain only once the
+// controller's list no longer holds the bird.
+for (const [label, journal, removed] of [
+  ['no longer listed', { active_taxon_ids: [8] }, 'Brown Creeper will leave your frame at the next refresh.'],
+  ['still being noted', { active_taxon_ids: [7, 8] }, 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
+  ['unreadable', null, 'Removed from On my frame. Brown Creeper leaves your wall frame at its next refresh if it uses the /wall address.'],
+])
+  test('removing a bird while the wall frame shows only On my frame, when it is ' + label, async (t) => {
+    const server = savedServer();
+    const { context, main } = page(t, (path, body) => {
+      if (path === '/v1/owner/presentation') return { wall_view: 'saved' };
+      if (path === '/v1/owner/journal') {
+        if (!journal) throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+        return journal;
+      }
+      return server.respond(path, body);
+    });
+    context.byId.set(7, { taxon_id: 7, common_name: 'Brown Creeper' });
+    const section = collections.savedToggle(context, { taxon_id: 7, saved: true, plate_ready: true });
+    main.append(section);
+    findButton(section, 'Remove from my frame').click();
+    await settle(t);
+    const shown = texts(section);
+    assert(shown.includes(removed), shown.join(' | '));
+  });
+
+test('a review that changes nothing offers nothing to confirm', async (t) => {
+  const server = savedServer({ added_count: 0 });
+  const { context, main } = page(t, (path, body) =>
+    path === '/v1/owner/presentation' ? { wall_view: 'current' } : server.respond(path, body),
+  );
+  const section = collections.savedChange(context, 'Add every bird with a plate', 'import-approved');
+  main.append(section);
+  findButton(section, 'Add every bird with a plate').click();
+  await settle(t);
+  const shown = texts(section);
+  assert(shown.includes('Nothing changes.'), shown.join(' | '));
+  assert.equal(findButton(section, 'Change my frame'), null);
+  assert(!shown.some((text) => /next refresh/.test(text)), shown.join(' | '));
+  assert(findButton(section, 'Close'));
+  assert.equal(server.changes.length, 0);
+});
+
+test('a finished change that changed nothing says so', async (t) => {
+  const { context, main } = page(t, () => ({
+    operation_id: 'op1',
+    kind: 'saved-collection',
+    status: 'succeeded',
+    result: { added_count: 0, removed_count: 0, migrated_legacy_queue_count: 0 },
+  }));
+  context.query = new URLSearchParams({ operation: 'op1' });
+  await manage.renderOperation(context);
+  const shown = texts(main);
+  assert(shown.includes('Nothing changed.'), shown.join(' | '));
+  assert(!shown.includes('On my frame was changed.'), shown.join(' | '));
+  assert(!shown.some((text) => /^0 /.test(text)), shown.join(' | '));
+});
 
 test('a review of many birds says whether the wall frame follows', async (t) => {
   const server = savedServer({ added_count: 3 });
@@ -880,7 +939,7 @@ test('an early try asked for while plate making is off promises no try', async (
     status: 'succeeded',
     result: { message: 'Inky will check as soon as it can; plate making must be on.', generation_enabled: false },
   });
-  assert(shown.includes('These birds are first in line once plate making is on.'), shown.join(' | '));
+  assert(shown.includes('Inky was asked to try these birds early.'), shown.join(' | '));
   assert(shown.includes('Plate making is off'), shown.join(' | '));
   assert(!shown.some((text) => /as soon as/.test(text)), shown.join(' | '));
 });

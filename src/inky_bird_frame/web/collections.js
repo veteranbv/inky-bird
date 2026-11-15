@@ -1,6 +1,6 @@
 import { randomHex } from '/app/keys.js';
 import { waitForOperation } from '/app/manage.js';
-import { plural, plainDate, when } from '/app/words.js';
+import { WORDS, plural, plainDate, when } from '/app/words.js';
 import { inlineProblem } from '/app/ui.js';
 
 export function renderCollections(context) {
@@ -621,6 +621,9 @@ export function renderCollection(context) {
 }
 
 // "Adding 1 bird." Only the parts that change are named.
+const changesNothing = (counts) =>
+  !counts.added_count && !counts.removed_count && !counts.migrated_legacy_queue_count;
+
 function savedSummary(preview) {
   const parts = [];
   if (preview.added_count) parts.push('Adding ' + plural(preview.added_count, 'bird', 'birds') + '.');
@@ -652,7 +655,7 @@ function savedProblem(error, sent = true) {
 // name of what it shows. Null when that is On my frame or cannot be read.
 function wallElsewhere(wall) {
   if (!wall || ['current', 'saved'].includes(wall)) return null;
-  return wall === 'favorites' ? 'Favorites' : wall === 'all' ? 'All plates' : 'another collection';
+  return wall === 'favorites' ? WORDS.favorites : wall === 'all' ? WORDS.allBirds : 'another collection';
 }
 const wallKnown = (wall) => typeof wall === 'string' && wall !== '';
 
@@ -681,12 +684,21 @@ function toggleResult(name, saved, wall, stays) {
   if (wall === 'current' && stays === true)
     return done + ' ' + name + ' stays on your wall frame while it is still being noted.';
   if (wall === 'current' && stays !== false) return done;
+  // A frame on the main catalog address keeps showing a bird still being noted.
+  if (stays !== false)
+    return done + ' ' + name + ' leaves your wall frame at its next refresh if it uses the /wall address.';
   return name + ' will leave your frame at the next refresh.';
 }
 
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
 function confirmSaved(context, section, problem, body, preview, reason = '') {
   const { el, button, api, note, href } = context;
+  if (changesNothing(preview)) {
+    const close = button('Close', () => location.reload());
+    section.append(el('h2', 'Nothing to change'), note(savedSummary(preview)), close);
+    close.focus();
+    return;
+  }
   const key = randomHex(24);
   const confirm = button('Change my frame', async (event) => {
     const control = event.currentTarget;
@@ -838,7 +850,9 @@ export function savedToggle(context, bird) {
       if (saved) plateReady = true;
       label();
       const stays =
-        !saved && preview.wall === 'current' ? await stillShown(api, bird.taxon_id) : null;
+        !saved && ['current', 'saved'].includes(preview.wall)
+          ? await stillShown(api, bird.taxon_id)
+          : null;
       status.textContent = toggleResult(name, saved, preview.wall, stays);
       if (offerUndo) {
         undo = button('Undo', () => change(saved ? 'remove' : 'add', false));
