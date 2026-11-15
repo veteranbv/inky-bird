@@ -72,6 +72,10 @@ class CollectionState:
     legacy_seed_queue_migrated_at: str | None
 
 
+class CatalogBusyError(CatalogError, BusyError):
+    """Raised when the catalog state lock stays held past a caller's time limit."""
+
+
 def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
     deadline = monotonic() + timeout
     delay = 0.01
@@ -82,7 +86,7 @@ def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
         except BlockingIOError as exc:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise BusyError("The catalog is busy; try again in a moment") from exc
+                raise CatalogBusyError("The catalog is busy; try again in a moment") from exc
             sleep(min(delay, remaining))
             delay = min(delay * 2, 0.25)
 
@@ -91,7 +95,7 @@ def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
 def catalog_state_lock(
     state_dir: Path, *, shared: bool = False, timeout: float | None = None
 ) -> Iterator[None]:
-    """Hold the catalog state lock; ``shared`` is for pure reads, ``timeout`` raises BusyError."""
+    """Hold the catalog state lock; ``shared`` is for pure reads, ``timeout`` bounds the wait."""
     state_dir.mkdir(parents=True, exist_ok=True)
     operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     with (state_dir / "catalog-state.lock").open("a+") as handle:

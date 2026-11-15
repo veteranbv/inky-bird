@@ -549,6 +549,21 @@ def test_timed_catalog_lock_gives_up_while_a_writer_holds_it(tmp_path: Path) -> 
         pass
 
 
+def test_a_busy_catalog_is_a_catalog_error_for_callers_that_handle_those(tmp_path: Path) -> None:
+    release, worker = _hold_catalog_lock(tmp_path)
+    try:
+        with (
+            pytest.raises(CatalogError, match="busy") as raised,
+            catalog_module.catalog_state_lock(tmp_path, timeout=0.05),
+        ):
+            pass
+    finally:
+        release.set()
+        worker.join()
+
+    assert isinstance(raised.value, BusyError)
+
+
 def test_shared_catalog_locks_do_not_wait_for_each_other(tmp_path: Path) -> None:
     release, worker = _hold_catalog_lock(tmp_path, shared=True)
     try:
