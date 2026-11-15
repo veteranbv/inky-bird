@@ -8,6 +8,7 @@ export function sourceState(source, complete) {
   if (state === 'failed') return 'Last check failed · needs attention';
   if (state === 'succeeded') return complete ? 'Idle · last check succeeded' : 'Idle · saved results are stale';
   if (source.status === 'error') return 'Last saved check failed';
+  if (source.status === 'degraded') return 'Last check was incomplete';
   if (source.status === 'ok') return complete ? 'Last saved check succeeded · activity not yet recorded' : 'Saved results are stale';
   return 'No recorded check';
 }
@@ -31,6 +32,7 @@ export function requestState(request, work) {
   if (request.status === 'blocked') return request.outcome === 'interrupted'
     ? 'Preparation was interrupted. Inspect retained state before submitting a new request; it was not replayed.'
     : 'Preparation needs attention. A pending candidate, missing identity, or invalid correction evidence may need operator review. No review guard was bypassed.';
+  if (request.status !== 'eligible') return 'Status not recognised by this page: ' + request.status + '. Reload to update it.';
   if (work.needs_attention?.includes(request.taxon_id)) return 'Preparation completed; a later attempt is held. See its error below.';
   if (work.waiting?.includes(request.taxon_id)) return 'Preparation completed; automatic retry is waiting on backoff.';
   return 'Preparation completed · eligible under the current policy';

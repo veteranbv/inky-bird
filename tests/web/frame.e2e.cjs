@@ -225,7 +225,9 @@ async function pairedScreen(t) {
   assert(await screen.evaluate(() => document.body.classList.contains('presenting')));
   await screen.getByRole('button', { name: 'Forget this screen', exact: true }).waitFor();
   await screenContext.unroute('**/v1/screen/forget');
+  // Revoking asks first; the first press changes nothing.
   await page.getByRole('button', { name: 'Revoke screen', exact: true }).click();
+  await page.getByRole('button', { name: 'Revoke', exact: true }).click();
   await screen.clock.runFor(15100);
   await screen.getByRole('heading', { name: 'Screen access ended', exact: true }).waitFor();
   assert.equal(await screen.locator('img').count(), 0);
@@ -522,6 +524,33 @@ async function ownerFrame(t) {
   await page.setViewportSize({ width: 844, height: 390 });
   await captionClear(page);
   await page.setViewportSize({ width: 390, height: 844 });
+  t.phase = 'frame-plain-http';
+  // Over plain HTTP the page adds a note that the screen may sleep; the bar
+  // must still clear it, the bird name and the other note at every size.
+  const plain = await page.context().newPage();
+  try {
+    await plain.addInitScript(() =>
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, get: () => false }),
+    );
+    await plain.goto(origin + '/app?page=frame&view=' + imported.collection_id);
+    await plain.locator('.frame-art').waitFor();
+    const sleepNote = plain.locator('main > p.hint', { hasText: 'This screen may sleep' });
+    await sleepNote.waitFor();
+    for (const viewport of [
+      { width: 320, height: 568 },
+      { width: 375, height: 812 },
+      { width: 1280, height: 800 },
+    ]) {
+      await plain.setViewportSize(viewport);
+      await captionClear(plain);
+      const box = await sleepNote.boundingBox();
+      const bar = await plain.locator('.frame-controls').boundingBox();
+      assert(box && box.y + box.height <= bar.y + 0.5, 'the bar covers the sleep note');
+      assert(await plain.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    }
+  } finally {
+    await plain.close();
+  }
 }
 
 module.exports = { pairedScreen, ownerFrame };
