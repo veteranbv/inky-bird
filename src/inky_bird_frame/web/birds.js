@@ -144,10 +144,12 @@ export function renderBirds(context) {
     .filter((bird) => inScope(bird, state))
     .map((bird) => {
       const node = card(bird);
-      // Back to this list brings the opened card into view again.
-      node.addEventListener('click', () =>
-        replaceAddress({ ...savedState(), birdsAt: bird.taxon_id }, href('birds', listParams(state))),
-      );
+      // Back to this list brings the opened card into view again. A card
+      // opened in another tab or window leaves this list where it is.
+      node.addEventListener('click', (event) => {
+        if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+        replaceAddress({ ...savedState(), birdsAt: bird.taxon_id }, href('birds', listParams(state)));
+      });
       return { bird, node };
     });
   let sorted = null;
@@ -192,15 +194,17 @@ export function renderBirds(context) {
   sort.addEventListener('change', changed);
   show.addEventListener('change', changed);
   update();
-  // The list draws after the page loads, so the browser cannot restore it.
-  history.scrollRestoration = 'manual';
   const { birdsAt, ...rest } = savedState();
   const target = cards.find(
     ({ bird }) => bird.taxon_id === Number(birdsAt ?? query.get('at')),
   )?.node;
   if (birdsAt !== undefined || query.has('at'))
     replaceAddress(rest, href('birds', listParams(state)));
-  if (target && !target.hidden) {
+  const returning = target && !target.hidden;
+  // The list draws after the page loads, so the browser cannot bring the
+  // opened card back itself; otherwise it keeps its own restoration.
+  history.scrollRestoration = returning ? 'manual' : 'auto';
+  if (returning) {
     target.scrollIntoView({ block: 'center' });
     target.focus({ preventScroll: true });
   }
@@ -310,7 +314,6 @@ export async function renderBird(context) {
     zoom.href = plateURL(bird);
     zoom.append(art(bird, 'detail-art'));
     plate.append(zoom);
-    notes.append(fieldNotes);
   } else
     plate.append(
       empty(
@@ -358,6 +361,8 @@ export async function renderBird(context) {
       ),
     );
   if (!bird.plate_ready) return;
+  // Below the actions, so notes that arrive late move nothing under a finger.
+  notes.append(fieldNotes);
   // Field notes load last: if they fail, the rest of the page still works.
   let result;
   try {

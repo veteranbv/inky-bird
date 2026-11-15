@@ -136,6 +136,24 @@ test('the bird page starts with Back and steps through the same list', async (t)
   assert.equal(linkNamed(top, 'Next'), undefined, 'the last bird has no next');
 });
 
+test('previous and next follow the chosen sort, not the stored order', async (t) => {
+  const { main } = await open(t, { page: 'bird', bird: '2', sort: 'recent' }, { state: flock });
+  assert.equal(params(linkNamed(main, 'Previous').href).bird, '3');
+  assert.equal(params(linkNamed(main, 'Next').href).bird, '4');
+});
+
+test('opening a card in a new tab leaves this list where it is', async (t) => {
+  const { main, history } = await open(t, { page: 'birds' }, { state: flock, historyState: { kept: true } });
+  const card = grid(main).children.find((node) => node.textContent.includes('Test Heron'));
+  for (const key of ['metaKey', 'ctrlKey', 'shiftKey']) card.fire('click', { [key]: true });
+  assert.deepEqual(history.state, { kept: true });
+});
+
+test('a list with no card to return to keeps the browser scroll restoration', async (t) => {
+  const { history } = await open(t, { page: 'birds' }, { state: flock });
+  assert.equal(history.scrollRestoration, 'auto');
+});
+
 test('a bird outside the list has no previous or next', async (t) => {
   const { main } = await open(t, { page: 'bird', bird: '1', q: 'heron' }, { state: flock });
   assert(linkNamed(main.children[0], 'Back to birds'));
@@ -183,6 +201,19 @@ test('field notes that fail to load leave the rest of the bird page working', as
   assert(findButton(main, 'Add to Favorites'), 'Favorites still works');
   assert(findButton(main, 'Review adding to Saved birds'), 'Saved birds still works');
   assert(nodes(main).some((node) => node.textContent === 'Field notes are unavailable.'));
+});
+
+test('field notes arrive below the bird actions, so nothing moves under a finger', async (t) => {
+  const { main } = await open(t, { page: 'bird', bird: '2' }, {
+    profile: () => ({ profile: null, notice: 'No field notes.' }),
+  });
+  const notes = main.querySelector('.bird-notes');
+  const holding = (target) => notes.children.findIndex((child) => child === target || nodes(child).includes(target));
+  const fieldNotes = notes.children.findIndex((node) => node.classList.contains('field-notes'));
+  const favorites = holding(findButton(main, 'Add to Favorites'));
+  const saved = holding(findButton(main, 'Review adding to Saved birds'));
+  assert(favorites >= 0 && saved >= 0 && fieldNotes >= 0);
+  assert(fieldNotes > favorites && fieldNotes > saved, 'field notes come after the actions');
 });
 
 test('an ended session while loading field notes still asks to sign in', async (t) => {
