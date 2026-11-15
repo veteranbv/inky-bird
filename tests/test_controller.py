@@ -687,14 +687,21 @@ class ControllerTests(unittest.TestCase):
                     "inky_bird_frame.controller.current_discovery_species",
                     return_value=[observed],
                 ),
-                patch("inky_bird_frame.controller._write_active_catalog", return_value=1),
+                patch(
+                    "inky_bird_frame.controller.rebuild_catalog_index",
+                    return_value=[approved],
+                ),
             ):
                 result = remove_collection_member(config, 1)
+            active = json.loads((config.controller.state_dir / "active-catalog.json").read_text())
 
         self.assertEqual(result["removed_count"], 1)
         self.assertEqual(result["removed_taxon_ids"], [1])
         self.assertEqual(result["collection_count"], 0)
         self.assertEqual(result["active_approved_count"], 1)
+        # The bird leaves the collection but stays active because it is observed.
+        self.assertEqual([entry["taxon_id"] for entry in active["species"]], [1])
+        self.assertEqual(active["species"][0]["observation_count"], 3)
 
     def test_approved_replacement_requeues_historical_taxon_and_updates_active_catalog(
         self,
