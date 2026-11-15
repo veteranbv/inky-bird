@@ -158,7 +158,7 @@ async function finish(t) {
       ['manage', 'Manage'],
       ['health', 'Health and help'],
       ['integrations', 'Integrations'],
-      ['displays', 'Displays'],
+      ['displays', 'Wall frame'],
       ['settings', 'Settings and backups'],
     ]) {
       t.phase = 'accessibility-' + area;

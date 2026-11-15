@@ -59,3 +59,45 @@ export function icon(name, className = 'icon') {
   svg.innerHTML = PATHS[name];
   return svg;
 }
+
+// A status notice beside a plate shows at most two lines; the rest is behind
+// More, which goes right after it. The status element always holds the whole
+// text, so assistive technology reads all of it. `button(text, action)` makes
+// the control.
+let notices = 0;
+export function clampedNotice(status, button) {
+  status.classList.add('clamped');
+  if (!status.id) status.id = 'notice-' + ++notices;
+  const more = button('More', () => show(!status.classList.contains('open')));
+  more.className = 'notice-more';
+  more.setAttribute('aria-controls', status.id);
+  function show(open) {
+    status.classList.toggle('open', open);
+    more.textContent = open ? 'Less' : 'More';
+    more.setAttribute('aria-label', open ? 'Less of this notice' : 'More of this notice');
+    more.setAttribute('aria-expanded', String(open));
+  }
+  function measure() {
+    more.hidden =
+      !status.textContent ||
+      (!status.classList.contains('open') && status.scrollHeight <= status.clientHeight + 1);
+  }
+  show(false);
+  more.hidden = true;
+  const watchers = [];
+  if (typeof MutationObserver === 'function') {
+    // New text starts folded again.
+    const changed = new MutationObserver(() => {
+      show(false);
+      measure();
+    });
+    changed.observe(status, { childList: true, characterData: true, subtree: true });
+    watchers.push(changed);
+  }
+  if (typeof ResizeObserver === 'function') {
+    const resized = new ResizeObserver(measure);
+    resized.observe(status);
+    watchers.push(resized);
+  }
+  return { control: more, stop: () => watchers.forEach((watcher) => watcher.disconnect()) };
+}

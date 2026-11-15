@@ -7,7 +7,7 @@ import { Element, fakeDocument, findButton } from './fake-dom.mjs';
 const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 let source = await readFile(new URL('presentation.js', web), 'utf8');
-for (const name of ['ui.js', 'frame-tools.js'])
+for (const name of ['ui.js', 'frame-tools.js', 'words.js'])
   source = source.replace(
     `'/app/${name}'`,
     JSON.stringify(moduleURL(await readFile(new URL(name, web), 'utf8'))),
@@ -103,7 +103,7 @@ const changes = (calls) => calls.filter(({ body }) => body);
 
 test('presentation state that cannot load keeps the page and offers a retry', async (t) => {
   const { main, reloads } = await open(t, 'displays', () => failure('Displays could not be read.', 'journal_error'));
-  assert.equal(main.children[0].textContent, 'Displays');
+  assert.equal(main.children[0].textContent, 'Wall frame');
   assert.deepEqual(alerts(main), ['Displays could not be read.']);
   findButton(main, 'Try again').fire('click');
   assert.equal(reloads.length, 1);
@@ -128,15 +128,15 @@ test('repeated failures in one place replace each other', async (t) => {
   const { main } = await open(t, 'displays', (path, body) =>
     body ? failure('The wall could not be changed.') : state(),
   );
-  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'Physical wall panel');
+  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'What your wall frame shows');
   for (let n = 0; n < 3; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
-  assert.deepEqual(alerts(wall), ['Confirm the wall change first.']);
+  assert.deepEqual(alerts(wall), ['Tick the box first.']);
   walk(wall).find((node) => node.tagName === 'INPUT' && node.type === 'checkbox').checked = true;
   for (let n = 0; n < 3; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
   assert.deepEqual(alerts(wall), ['The wall could not be changed.']);
@@ -149,10 +149,10 @@ test('a second confirmation request does not stack another panel', async (t) => 
     (path, body) => (body ? failure('Confirm it is you.', 'confirmation_required') : state()),
     { localPasswordAllowed: true },
   );
-  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'Physical wall panel');
+  const wall = walk(main).find((node) => node.tagName === 'SECTION' && node.children[0]?.textContent === 'What your wall frame shows');
   walk(wall).find((node) => node.tagName === 'INPUT' && node.type === 'checkbox').checked = true;
   for (let n = 0; n < 2; n++) {
-    findButton(wall, 'Confirm wall selection').fire('click');
+    findButton(wall, 'Show on my wall frame').fire('click');
     await flush();
   }
   assert.equal(walk(wall).filter((node) => node.textContent === 'Confirm and retry').length, 1);

@@ -816,3 +816,93 @@ a.journal-card:hover h2, a.bird-card:hover h2 { color: var(--accent); }
   .bird-card:hover, a.journal-card:hover { box-shadow: var(--shadow); }
   .frame-controls { transition: opacity 0.3s; }
 }
+
+/* ---- design-copy: Manage groups, Sources rows, notices beside a plate ---- */
+
+.manage-group > h2 { margin: 28px 0 0; font-size: 1.0588rem; }
+.manage-group .manage-grid { margin-block: 12px 0; }
+.manage-grid .journal-card h3 { margin: 2px 0 0; }
+a.journal-card:hover h3 { color: var(--accent); }
+.manage-notes { list-style: none; margin: 6px 0 0; padding: 0; }
+.manage-notes a { display: inline-flex; align-items: center; min-height: 44px; font-weight: 600; }
+
+.source-row .source-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.source-row .source-top h2 { margin: 0; }
+.source-row .chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--paper-sunken);
+  color: var(--ink);
+  font-size: 0.8235rem;
+}
+.source-row .primary-link { margin-top: 12px; }
+
+/* A notice beside a plate shows two lines; More shows the rest. */
+.frame-dock .clamped:not(.open) {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+.notice-more { width: auto; min-height: 44px; margin: 0; padding: 6px 14px; }
+.presenting .notice-more {
+  background: transparent;
+  border: 0;
+  color: #e9e2d2;
+  font-size: 0.8235rem;
+  text-decoration: underline;
+}
+.frame-side { display: contents; }
+
+/* A short landscape screen (a phone on its side, a wall tablet): the plate
+   fills the left column at full height and keeps its 3:4 shape; the title,
+   bird name, notes, notice and controls sit in the right column, controls
+   at the bottom. Everything stays in normal flow. */
+@media (orientation: landscape) and (max-height: 520px) {
+  :root:not(:fullscreen) .presenting main {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+    column-gap: 16px;
+    padding-top: max(10px, env(safe-area-inset-top));
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  :root:not(:fullscreen) .presenting main > * { grid-column: 2; min-width: 0; }
+  :root:not(:fullscreen) .presenting main > h1 { grid-row: 1; padding-top: 4px; }
+  :root:not(:fullscreen) .presenting main > .intro { grid-row: 2; }
+  :root:not(:fullscreen) .presenting main > .frame-viewport {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    flex: none;
+    height: calc(100vh - 2 * max(10px, env(safe-area-inset-bottom)));
+    height: calc(100svh - 2 * max(10px, env(safe-area-inset-bottom)));
+    max-height: none;
+    width: auto;
+    aspect-ratio: 3 / 4;
+  }
+  :root:not(:fullscreen) .presenting main > .frame-side {
+    grid-row: 4;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  :root:not(:fullscreen) .presenting .frame-side .frame-caption { margin-top: 4px; }
+  :root:not(:fullscreen) .presenting .frame-side .hint { margin: 4px 0; }
+  :root:not(:fullscreen) .presenting main > .frame-dock {
+    grid-row: 6;
+    margin-top: 0;
+    padding-top: 6px;
+    justify-self: center;
+  }
+  /* More opens above the bar inside the right column, never past its edge. */
+  :root:not(:fullscreen) .presenting .frame-controls.expanded .frame-more {
+    left: 0;
+    right: 0;
+    width: auto;
+    max-width: none;
+    transform: none;
+  }
+}

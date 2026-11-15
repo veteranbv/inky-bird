@@ -1,4 +1,4 @@
-// Frame, Displays and paired screens.
+// Play, the wall frame and paired screens.
 // Run through journal.e2e.cjs only: phases run in its order and hand state
 // to later phases through t. pairedScreen leaves t.screenContext and
 // t.replacement, which save and manage phases read.
@@ -53,7 +53,7 @@ const captionClear = async (target) => {
   await target.keyboard.press('Shift');
   await target.locator('.frame-controls:not(.quiet)').waitFor();
   assert.equal(await target.locator('.frame-controls.expanded').count(), 0);
-  const note = target.locator('main > p.hint', { hasText: 'Plates change once a minute' });
+  const note = target.locator('.frame-side > p.hint', { hasText: 'Plates change once a minute' });
   const found = await boxes({
     caption: target.locator('.frame-caption'),
     bar: target.locator('.frame-controls'),
@@ -146,7 +146,7 @@ async function noticeClear(t, stressed) {
     await page.keyboard.press('Shift');
     await page.locator('.frame-controls:not(.quiet)').waitFor();
     await page.getByRole('button', { name: 'Next', exact: true }).click();
-    await page.getByText(/Plate unavailable\. Keeping the last approved plate\./).waitFor();
+    await page.getByText(/This plate did not load\. Keeping the last one/).waitFor();
     const notice = page.locator('.frame-dock [role="status"]');
     const words = (await notice.innerText()).split(/\s+/);
     for (const lines of [1, 2, 3]) {
@@ -155,7 +155,7 @@ async function noticeClear(t, stressed) {
       const found = await settledBoxes(page, {
         notice,
         name: page.locator('.frame-caption'),
-        note: page.locator('main > p.hint', { hasText: 'Plates change once a minute' }),
+        note: page.locator('.frame-side > p.hint', { hasText: 'Plates change once a minute' }),
         bar: page.locator('.frame-controls'),
       });
       const where = size + ', ' + lines + '-line notice: ';
@@ -197,7 +197,7 @@ async function pairedScreen(t) {
   const { page, context, browser, origin, fixture, root, engine, heading, cardinal, robin, publicCatalog, errors, trip } = t;
   t.phase = 'pair-readonly-screen';
   await page.goto(origin + '/app?page=displays');
-  await heading('Displays');
+  await heading('Wall frame');
   const screenContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
     isMobile: engine !== 'firefox',
@@ -230,7 +230,7 @@ async function pairedScreen(t) {
   assert.equal(await screen.locator('.pairing-code').innerText(), pairCode);
   await screenContext.unroute('**/v1/screen/forget');
   await page.reload();
-  await page.getByRole('heading', { name: 'Pairing request · ' + pairCode, exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Screen waiting to pair · ' + pairCode, exact: true }).waitFor();
   await page.getByLabel('Screen name', { exact: true }).fill('Synthetic tablet');
   await page.getByLabel('Permitted view', { exact: true }).first().selectOption(trip.collection_id);
   await page
@@ -311,8 +311,8 @@ async function pairedScreen(t) {
     200,
   );
   await screen.clock.runFor(15100);
-  await screen.getByText(/temporarily unavailable/).waitFor();
-  if (screenAmbient) await screenInside(screen.getByText(/temporarily unavailable/), 'the plate notice');
+  await screen.getByText(/not available right now/).waitFor();
+  if (screenAmbient) await screenInside(screen.getByText(/not available right now/), 'the plate notice');
   assert.equal(await screen.locator('img[src]').count(), 0);
   currentJournal = (await (await context.request.get(origin + '/v1/owner/journal')).json()).data;
   assert.equal(
@@ -326,7 +326,7 @@ async function pairedScreen(t) {
   );
   await screen.clock.runFor(15100);
   const emptyNotice = screen.getByText(
-    'No approved plates in the permitted view. Inky will not switch views.',
+    'This view has no plates now. The screen waits here and starts again when it has some.',
     { exact: true },
   );
   await emptyNotice.waitFor();
@@ -448,7 +448,7 @@ async function ownerFrame(t) {
     await page.route(plateRoute, (route) => route.abort());
     await page.keyboard.press('Shift');
     await page.getByRole('button', { name: 'Next', exact: true }).click();
-    const notice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
+    const notice = page.getByText(/This plate did not load\. Keeping the last one/);
     await notice.waitFor();
     await inside(notice, 'the notice');
     await page.unroute(plateRoute);
@@ -498,7 +498,7 @@ async function ownerFrame(t) {
   await captionClearSmall(page);
   const previousControl = page.getByRole('button', { name: 'Previous', exact: true });
   await previousControl.click();
-  const clearanceNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
+  const clearanceNotice = page.getByText(/This plate did not load\. Keeping the last one/);
   await clearanceNotice.waitFor();
   const clearance = await boxes({ notice: clearanceNotice, bar: page.locator('.frame-controls') });
   await layout(
@@ -570,7 +570,7 @@ async function ownerFrame(t) {
   await page.route('**/v1/owner/journal', (route) => route.abort());
   await page.route(plateRoute, (route) => route.abort());
   await page.clock.runFor(60100);
-  await page.getByText(/Keeping the last approved plate\./).waitFor();
+  await page.getByText(/Keeping the last plate; Inky keeps checking\./).waitFor();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   await page.unroute('**/v1/owner/journal');
   await page.route('**/v1/owner/journal', async (route) => {
@@ -580,7 +580,7 @@ async function ownerFrame(t) {
     await route.fulfill({ response, json: body });
   });
   await page.clock.runFor(60100);
-  await page.getByText(/This view has no approved plates or was removed\./).waitFor();
+  await page.getByText(/This view has no plates now\./).waitFor();
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
   // Playback stays on, but an emptied view has nothing left to step to.
   const emptiedSteps = [];
@@ -692,7 +692,7 @@ async function ownerFrame(t) {
     );
     await plain.goto(origin + '/app?page=frame&view=' + imported.collection_id);
     await plain.locator('.frame-art').waitFor();
-    const sleepNote = plain.locator('main > p.hint', { hasText: 'This screen may sleep' });
+    const sleepNote = plain.locator('.frame-side > p.hint', { hasText: 'This screen may sleep' });
     await sleepNote.waitFor();
     for (const viewport of [
       { width: 320, height: 568 },

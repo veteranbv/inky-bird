@@ -132,7 +132,7 @@ const status = (main) => main.querySelector('.frame-dock')?.children[0].textCont
 test('Frame opened on an empty view keeps checking and starts when plates arrive', async (t) => {
   let state = journal([]);
   const { main, requests, reloads } = await open(t, { state: () => state });
-  assert.match(main.textContent, /No approved plates in this view/);
+  assert.match(main.textContent, /No plates here yet/);
   t.mock.timers.tick(60000);
   await flush();
   assert.equal(checks(requests), 2, 'the empty view is checked again');
@@ -215,7 +215,7 @@ test('a hung plate request ends at its deadline and says so', async (t) => {
   t.mock.timers.tick(1);
   await flush();
   assert.equal(first.options.signal.aborted, true, 'the request is ended');
-  assert.match(status(main), /^Plate unavailable\./);
+  assert.match(status(main), /^This plate did not load\./);
 });
 
 test('a plate that arrives in time is shown as before', async (t) => {
