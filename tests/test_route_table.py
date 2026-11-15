@@ -183,6 +183,8 @@ def test_every_route_refuses_an_unsupported_method_with_an_envelope(tmp_path: Pa
                 if candidate.path_regex.match(path)
                 for method in candidate.methods or ()
             }
+            if path == "/v1/owner/oidc/callback":
+                allowed.discard("HEAD")  # A HEAD must never spend the single-use callback.
             for method in sorted({"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"} - allowed):
                 response = client.request(method, path, headers={"Origin": ORIGIN})
                 assert response.status_code == 405, (method, path, response.text)

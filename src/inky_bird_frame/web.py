@@ -402,14 +402,15 @@ class UnmatchedRequest:
         self.routes, self.catalog = routes, catalog
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        allowed = sorted(
-            {
-                method
-                for route in self.routes
-                if isinstance(route, Route) and route.matches(scope)[0] == Match.PARTIAL
-                for method in route.methods or ()
-            }
-        )
+        methods = {
+            method
+            for route in self.routes
+            if isinstance(route, Route) and route.matches(scope)[0] == Match.PARTIAL
+            for method in route.methods or ()
+        }
+        if _route_path(scope) == OIDC_CALLBACK:
+            methods.discard("HEAD")  # The single-use callback refuses HEAD.
+        allowed = sorted(methods)
         response: Response
         if allowed:
             response = _error(405, "method_not_allowed", "Use a supported method for this address")
