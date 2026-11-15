@@ -1158,9 +1158,7 @@ def trip_with_unresolved(controller: ControllerConfig) -> JournalCollection:
         "b" * 32,
         "A trip",
         (
-            JournalMember(
-                None, "Robin", "Turdus migratorius", MemberOrigin.EBIRD, (link,)
-            ),
+            JournalMember(None, "Robin", "Turdus migratorius", MemberOrigin.EBIRD, (link,)),
             JournalMember(None, "", "Unmatched species", MemberOrigin.EBIRD, ()),
         ),
         CollectionKind.TRIP,

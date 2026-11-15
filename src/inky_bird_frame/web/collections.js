@@ -1,4 +1,5 @@
 import { randomHex } from '/app/keys.js';
+import { plural, waitForOperation } from '/app/manage.js';
 
 export function renderCollections(context) {
   const { el, main, data, link, note, art, members, viewLabel, base, playLink } = context;
@@ -171,7 +172,7 @@ export function renderEditCollection(context) {
   if (group?.kind === 'personal-trip')
     main.append(
       note(
-        'Existing checklist links stay with retained members. Any bird you add here is a manual selection, not a new personal sighting. Unresolved source names remain until a reviewed history selection replaces them.',
+        'Existing checklist links stay with retained members. Any bird you add here is a manual selection, not a new personal sighting. Unresolved source names stay until you remove or resolve them below.',
       ),
     );
   const form = el('form');
@@ -226,17 +227,55 @@ export function renderEditCollection(context) {
       : '';
   }
   finder.addEventListener('input', filterRows);
+  // Unresolved names stay unless the owner unticks them. Choosing the bird
+  // with the same scientific name and unticking its name resolves it.
+  const unresolved = group?.unresolved || [];
+  const kept = new Set(unresolved);
+  const pending = el('fieldset');
+  if (unresolved.length) {
+    pending.append(
+      el('legend', 'Unresolved species'),
+      note('Untick a name to remove it. To resolve one, choose its bird above, then untick its name.'),
+    );
+    for (const member of unresolved) {
+      const row = el('label', '', 'check-label'),
+        input = el('input'),
+        match = data.birds.find(
+          (bird) =>
+            member.scientific_name &&
+            bird.scientific_name.toLocaleLowerCase() === member.scientific_name.toLocaleLowerCase(),
+        );
+      input.type = 'checkbox';
+      input.checked = true;
+      input.addEventListener('change', () =>
+        input.checked ? kept.add(member) : kept.delete(member),
+      );
+      row.append(
+        input,
+        document.createTextNode(
+          (member.scientific_name || member.common_name) +
+            (match ? ' · matches ' + match.common_name : ''),
+        ),
+      );
+      pending.append(row);
+    }
+  }
   const problem = el('p', '', 'error');
   problem.setAttribute('role', 'alert');
   const save = el('button', 'Save collection');
   save.type = 'submit';
-  form.append(label, name, fields, save, problem);
+  form.append(label, name, fields, ...(unresolved.length ? [pending] : []), save, problem);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     save.disabled = true;
     try {
       const body = { revision: data.revision, label: name.value, taxon_ids: [...selected] };
       if (group) body.collection_id = group.collection_id;
+      // Sent only when something was unticked, so plain edits keep their 1.0 shape.
+      if (kept.size !== unresolved.length)
+        body.unresolved = unresolved
+          .filter((member) => kept.has(member))
+          .map(({ common_name, scientific_name }) => ({ common_name, scientific_name }));
       await api('/v1/owner/journal/collections/save', body);
       if (form.isConnected) location.assign(href('collections'));
     } catch (error) {
@@ -336,7 +375,7 @@ export function renderImportCollection(context) {
 export function renderCollection(context) {
   const {
     ui, el, button, api, main, view, data, byId, management, href, link, note, card, members,
-    viewLabel, base, empty, playLink, savedAction,
+    viewLabel, base, empty, playLink,
   } = context;
   const birds = members(view);
   base(
@@ -348,7 +387,7 @@ export function renderCollection(context) {
   main.append(playLink(view));
   const tools = el('section', '', 'collection-tools');
   if (view === 'saved')
-    tools.append(savedAction('Review adding all available approved art', 'import-approved'));
+    tools.append(savedReview(context, 'Review adding all available approved art', 'import-approved'));
   const group = data.collections.find((item) => item.collection_id === view);
   if (group) {
     main.append(
@@ -374,6 +413,8 @@ export function renderCollection(context) {
             ' · no generation requested',
         ),
       );
+    if (group.unresolved.length && group.kind !== 'favorites')
+      main.append(note('Edit this collection to remove or resolve unresolved species.'));
     for (const member of group.evidence || [])
       if (member.status !== 'linked')
         main.append(
@@ -577,4 +618,152 @@ export function renderCollection(context) {
     );
   main.append(grid);
   if (tools.childElementCount) main.append(el('h2', 'Collection tools'), tools);
+}
+
+function savedSummary(preview) {
+  return (
+    plural(preview.added_count, 'addition', 'additions') +
+    ' · ' +
+    plural(preview.removed_count, 'removal', 'removals') +
+    ' · ' +
+    plural(
+      preview.migrated_legacy_queue_count,
+      'legacy seed member migrated',
+      'legacy seed members migrated',
+    )
+  );
+}
+
+// The confirm step for changes beyond one bird; its outcome opens on its own page.
+function confirmSaved(context, section, problem, body, preview) {
+  const { el, button, api, note, href } = context;
+  const key = randomHex(24);
+  const confirm = button('Confirm Saved birds change', async (event) => {
+    const control = event.currentTarget;
+    control.disabled = true;
+    try {
+      const receipt = await api('/v1/owner/saved/change', {
+        ...body,
+        key,
+        confirm: true,
+        collection_revision: preview.collection_revision,
+      });
+      location.assign(href('operation', { operation: receipt.operation_id }));
+    } catch (error) {
+      problem.textContent = error.message + ' Check Saved birds if the connection was lost.';
+      control.disabled = false;
+    }
+  });
+  section.append(
+    el('h2', 'Change Saved birds?'),
+    note(savedSummary(preview)),
+    note(
+      'Saved birds join the compatible current selection and can affect the existing wall immediately at its next refresh. This is curation, not a sighting. Other named collections and source history stay unchanged. No model starts.',
+    ),
+    confirm,
+    button('Cancel', () => location.reload()),
+  );
+  confirm.focus();
+}
+
+async function savedPreview(api, action, taxonId) {
+  const settings = await api('/v1/owner/settings');
+  const body = { action, configuration_revision: settings.revision };
+  if (taxonId) body.taxon_id = taxonId;
+  return [body, await api('/v1/owner/saved/preview', body)];
+}
+
+// Bulk Saved birds changes keep their review, confirmation and outcome page.
+export function savedReview(context, label, action, taxonId) {
+  const { el, button, api } = context;
+  const section = el('section', '', 'journal-card'),
+    problem = el('p', '', 'error');
+  problem.setAttribute('role', 'alert');
+  const start = button(label, async () => {
+    start.disabled = true;
+    try {
+      const [body, preview] = await savedPreview(api, action, taxonId);
+      confirmSaved(context, section, problem, body, preview);
+    } catch (error) {
+      problem.textContent = error.message;
+      start.disabled = false;
+    }
+  });
+  section.append(start, problem);
+  return section;
+}
+
+// One bird: a toggle with an inline result and Undo. A change that would touch
+// other birds (an old queue migration) still asks first.
+export function savedToggle(context, bird) {
+  const { ui, el, button, api } = context;
+  const section = el('section', '', 'journal-card'),
+    status = el('p', '', 'hint'),
+    problem = el('p', '', 'error');
+  status.setAttribute('role', 'status');
+  problem.setAttribute('role', 'alert');
+  let saved = Boolean(bird.saved),
+    undo = null;
+  const control = button('', () => change(saved ? 'remove' : 'add', true));
+  const label = () => {
+    control.textContent = saved ? 'Remove from Saved birds' : 'Add to Saved birds';
+  };
+  label();
+  async function change(action, offerUndo) {
+    control.disabled = true;
+    undo?.remove();
+    undo = null;
+    problem.textContent = '';
+    status.textContent = 'Updating Saved birds…';
+    try {
+      const [body, preview] = await savedPreview(api, action, bird.taxon_id);
+      const own = action === 'add' ? preview.added_count : preview.removed_count;
+      const other = action === 'add' ? preview.removed_count : preview.added_count;
+      if (own > 1 || other || preview.migrated_legacy_queue_count) {
+        status.textContent = '';
+        control.remove();
+        confirmSaved(context, section, problem, body, preview);
+        return;
+      }
+      const receipt = await waitForOperation(
+        api,
+        await api('/v1/owner/saved/change', {
+          ...body,
+          key: randomHex(24),
+          confirm: true,
+          collection_revision: preview.collection_revision,
+        }),
+        () => section.isConnected,
+      );
+      if (!receipt) return;
+      if (receipt.status !== 'succeeded')
+        throw new Error(receipt.result?.message || 'The operation did not finish.');
+      saved = action === 'add';
+      label();
+      status.textContent = saved ? 'Added to Saved birds.' : 'Removed from Saved birds.';
+      if (offerUndo) {
+        undo = button('Undo', () => change(saved ? 'remove' : 'add', false));
+        status.after(undo);
+      }
+    } catch (error) {
+      status.textContent = '';
+      if (error.code === 'sign_in_required') {
+        ui.showProblem(error);
+        return;
+      }
+      problem.textContent = error.message + ' Check Saved birds if the connection was lost.';
+    } finally {
+      control.disabled = false;
+    }
+    if (section.isConnected && !section.contains(document.activeElement)) control.focus();
+  }
+  section.append(control, status, problem);
+  return section;
+}
+
+// The journal's Saved birds action: one bird toggles, everything else is reviewed.
+export function savedChange(context, label, action, taxonId) {
+  return taxonId
+    ? savedToggle(context, { taxon_id: taxonId, saved: action === 'remove' })
+    : savedReview(context, label, action, taxonId);
 }

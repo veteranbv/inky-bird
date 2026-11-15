@@ -52,11 +52,11 @@ async function candidates(t) {
   await page.getByRole('button', { name: 'Confirm local approval', exact: true }).click();
   await heading('Operation outcome');
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('Finished', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('Finished', { exact: true }).waitFor();
   assert(
     fs.existsSync(
       path.join(fixture, 'catalog/species/9999991-synthetic-qa-candidate-9999991/manifest.json'),
@@ -71,11 +71,11 @@ async function candidates(t) {
   await page.getByRole('button', { name: 'Confirm rejection', exact: true }).click();
   await heading('Operation outcome');
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('Finished', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('Finished', { exact: true }).waitFor();
   assert(
     fs.existsSync(
       path.join(

@@ -1,11 +1,84 @@
 import { icon } from '/app/ui.js';
 import { sourceState, nextCheck, requestState } from '/app/work-status.js';
 
+// Operation outcomes in plain words: no identifiers, hashes or raw status values.
+export function plural(count, one, many) {
+  return count + ' ' + (count === 1 ? one : many);
+}
+
+const statusWords = {
+  pending: 'Waiting to start',
+  running: 'Running',
+  succeeded: 'Finished',
+  failed: 'Did not finish',
+  interrupted: 'Stopped before it finished',
+};
+export function statusText(status) {
+  return statusWords[status] || 'Status unknown';
+}
+
+const countWords = {
+  added_count: ['bird added', 'birds added'],
+  removed_count: ['bird removed', 'birds removed'],
+  migrated_legacy_queue_count: ['legacy seed member migrated', 'legacy seed members migrated'],
+  species_count: ['species', 'species'],
+  skipped_count: ['species left out', 'species left out'],
+  delivered_count: ['destination reached', 'destinations reached'],
+  failed_count: ['destination failed', 'destinations failed'],
+  requeued: ['message returned to the outbox', 'messages returned to the outbox'],
+  attempted: ['delivery attempted', 'deliveries attempted'],
+  delivered: ['message delivered', 'messages delivered'],
+  failed: ['message failed', 'messages failed'],
+  pending: ['message waiting', 'messages waiting'],
+  dead_letters: ['dead letter', 'dead letters'],
+};
+const flagWords = {
+  generation_enabled: ['Generation enabled', 'Generation off'],
+  dispatcher_busy: ['Another delivery run was already busy', ''],
+  unchanged: ['No history changes', ''],
+};
+// Shown elsewhere on the page, or internal: identifiers, hashes and revisions.
+const shownElsewhere = new Set(['message', 'taxon_ids', 'providers', 'dry_run', 'error_type']);
+const internal = /(^|_)(id|ids|hash|sha256|revision|key)$/;
+
+// One plain line per result field the owner can act on.
+export function resultLines(result) {
+  const lines = [];
+  for (const [key, value] of Object.entries(result || {})) {
+    if (shownElsewhere.has(key) || internal.test(key)) continue;
+    if (typeof value === 'number' && countWords[key])
+      lines.push(plural(value, ...countWords[key]));
+    else if (typeof value === 'boolean' && flagWords[key]) {
+      const text = flagWords[key][value ? 0 : 1];
+      if (text) lines.push(text);
+    } else if (typeof value === 'number' || typeof value === 'boolean')
+      lines.push(key.replaceAll('_', ' ') + ': ' + (value === true ? 'yes' : value === false ? 'no' : value));
+    else if (typeof value === 'string' && !/^[0-9a-f]{16,}$/i.test(value))
+      lines.push(key.replaceAll('_', ' ') + ': ' + value);
+  }
+  return lines;
+}
+
+const finished = new Set(['succeeded', 'failed', 'interrupted']);
+// The receipt once it finishes, or null when `active()` turns false first.
+export async function waitForOperation(api, receipt, active) {
+  while (!finished.has(receipt.status)) {
+    await new Promise((resolve) => setTimeout(resolve, document.hidden ? 5000 : 1000));
+    if (!active()) return null;
+    receipt = await api('/v1/owner/operations/' + encodeURIComponent(receipt.operation_id));
+  }
+  return receipt;
+}
+
+// Owner operation kinds the journal page does not name itself.
+const extraNames = { 'saved-collection': 'Change Saved birds' };
+
 export async function renderOperation(context) {
   const {
     ui, el, button, api, main, query, byId, sourceNames, link, note, base, operationNames,
     setStopScreen,
   } = context;
+  const names = { ...extraNames, ...operationNames };
   base(
     'Operation outcome',
     'Inky saves this result on the controller. Reloading this page does not repeat the action.',
@@ -26,34 +99,26 @@ export async function renderOperation(context) {
       );
       if (stopped || !content.isConnected) return;
       content.replaceChildren(
-        el('h2', operationNames[receipt.kind] || 'Owner operation'),
-        el('p', receipt.status),
+        el('h2', names[receipt.kind] || 'Owner operation'),
+        el('p', statusText(receipt.status)),
       );
-      if (receipt.result) {
-        if (receipt.result.message) content.append(el('p', receipt.result.message));
-        for (const [key, value] of Object.entries(receipt.result)) {
-          if (key === 'message') continue;
-          if (key === 'taxon_ids') {
-            for (const id of value) content.append(link(byId.get(id)?.common_name || 'Taxon ' + id, 'work', { bird: id }));
-            continue;
-          }
-          if (key === 'providers') {
-            for (const provider of value)
-              content.append(
-                el(
-                  'p',
-                  (sourceNames[provider.name]?.[0] || provider.name) +
-                    ': ' +
-                    provider.status +
-                    ' · ' +
-                    provider.species_count +
-                    ' species',
-                ),
-              );
-          } else if (['string', 'number', 'boolean'].includes(typeof value))
-            content.append(note(key.replaceAll('_', ' ') + ': ' + value));
-        }
-      }
+      const result = receipt.result || {};
+      if (typeof result.message === 'string') content.append(el('p', result.message));
+      for (const id of Array.isArray(result.taxon_ids) ? result.taxon_ids : [])
+        content.append(link(byId.get(id)?.common_name || 'Taxon ' + id, 'work', { bird: id }));
+      for (const provider of Array.isArray(result.providers) ? result.providers : [])
+        content.append(
+          el(
+            'p',
+            (sourceNames[provider.name]?.[0] || provider.name) +
+              ': ' +
+              provider.status +
+              ' · ' +
+              provider.species_count +
+              ' species',
+          ),
+        );
+      for (const line of resultLines(result)) content.append(note(line));
       if (['pending', 'running'].includes(receipt.status))
         timer = setTimeout(update, document.hidden ? 5000 : 1000);
       else {
@@ -302,12 +367,17 @@ export async function renderStatus(context) {
     main.append(schedule);
     const cards = new Map();
     for (const source of management.sources) {
-      const [name, kind] = sourceNames[source.name], node = el('section', '', 'journal-card');
+      // A newer controller can report a source this page does not know yet.
+      const known = Boolean(sourceNames[source.name]);
+      const [name, kind] = sourceNames[source.name] || [source.name, ''];
+      const node = el('section', '', 'journal-card');
       const details = el('div');
-      node.append(el('h2', name), note(kind), details);
+      node.append(el('h2', name));
+      if (kind) node.append(note(kind));
+      node.append(details);
       if (['ebird-archive', 'birdnet-analyzer'].includes(source.name))
         node.append(note('Imported history · not a live connection.'), link('Import or review history', 'imports', { kind: source.name }));
-      node.append(link('Set up ' + name, 'settings', { source: source.name }, 'primary-link'));
+      if (known) node.append(link('Set up ' + name, 'settings', { source: source.name }, 'primary-link'));
       cards.set(source.name, details);
       main.append(node);
     }
@@ -320,6 +390,7 @@ export async function renderStatus(context) {
         note(unavailable ? 'Next check unknown while updates are unavailable.' : nextCheck(refresh)));
       for (const source of current.sources) {
         const node = cards.get(source.name), activity = source.activity || {};
+        if (!node) continue;
         node.replaceChildren(el('p', unavailable && source.enabled ? 'Current activity unknown' : sourceState(source, current.work.complete), 'connection'),
           stamp('First recorded run', activity.first_started_at),
           stamp('Last started', activity.started_at),
@@ -351,9 +422,19 @@ export async function renderStatus(context) {
       'Ask the existing scheduler to refresh sources and run next. This waits behind the active cycle, can use your AI allowance, and does not bypass generation settings or sourced review.', () => [...selected]);
     const noWake = note('An immediate check requires generation to be enabled and the Inky scheduler to be running. Use the scheduled queue with external timers.');
     retryNow.hidden = true;
+    const queueAction = operationAction('Queue selected for the next scheduled check', 'retry',
+      'Preserve correction guidance and mandatory sourced review. Preparation waits behind active work. Generation can use your AI allowance when enabled.', () => [...selected]);
+    // Checked here so a bad selection is a note beside the choices, not a page error.
+    const selectionHint = el('p', '', 'hint');
+    selectionHint.setAttribute('role', 'status');
+    function checkSelection() {
+      const valid = selected.size >= 1 && selected.size <= 32;
+      for (const action of [queueAction, retryNow]) action.querySelector('button').disabled = !valid;
+      selectionHint.textContent = valid ? '' : 'Select between 1 and 32 birds.';
+    }
     controls.append(el('h2', 'Choose birds for retry'), note('Select up to 32. Requests are durable and deduplicated; generation stays serial. Approved plates are never regenerated by this action.'), choices,
-      operationAction('Queue selected for the next scheduled check', 'retry',
-        'Preserve correction guidance and mandatory sourced review. Preparation waits behind active work. Generation can use your AI allowance when enabled.', () => [...selected]), retryNow, noWake);
+      selectionHint, queueAction, retryNow, noWake);
+    checkSelection();
     main.append(controls);
     const holds = el('section', '', 'journal-card'), requests = el('section', '', 'journal-card');
     main.append(holds, requests);
@@ -383,11 +464,16 @@ export async function renderStatus(context) {
       const explicit = Number(query.get('bird'));
       if (explicit && byId.has(explicit) && !byId.get(explicit).plate_ready && !work.approved_taxon_ids?.includes(explicit)) ids.add(explicit);
       for (const [id, row] of inputs) if (!ids.has(id)) { row.remove(); inputs.delete(id); selected.delete(id); }
+      checkSelection();
       for (const id of ids) if (!inputs.has(id)) {
         const detail = [...(work.retry_details || []), ...(work.terminal_details || []), ...(work.queue || [])].find((bird) => bird.taxon_id === id);
         const label = el('label', '', 'check-label'), input = el('input');
         input.type = 'checkbox';
-        input.addEventListener('change', () => input.checked ? selected.add(id) : selected.delete(id));
+        input.addEventListener('change', () => {
+          if (input.checked) selected.add(id);
+          else selected.delete(id);
+          checkSelection();
+        });
         label.append(input, document.createTextNode(byId.get(id)?.common_name || detail?.common_name || 'Taxon ' + id));
         choices.append(label); inputs.set(id, label);
       }
@@ -449,15 +535,24 @@ export async function renderStatus(context) {
       );
   }
   const recent = await api('/v1/owner/operations');
-  if (main.isConnected && recent.operations.length) {
-    main.append(el('h2', 'Recent owner operations'));
-    for (const receipt of recent.operations.slice().reverse())
-      main.append(
+  if (main.isConnected) main.append(...recentOperations(context, recent.operations));
+}
+
+function recentOperations(context, operations) {
+  const { el, link, operationNames } = context;
+  const names = { ...extraNames, ...operationNames };
+  if (!operations.length) return [];
+  return [
+    el('h2', 'Recent owner operations'),
+    ...operations
+      .slice()
+      .reverse()
+      .map((receipt) =>
         link(
-          (operationNames[receipt.kind] || 'Operation') + ' · ' + receipt.status,
+          (names[receipt.kind] || 'Operation') + ' · ' + statusText(receipt.status),
           'operation',
           { operation: receipt.operation_id },
         ),
-      );
-  }
+      ),
+  ];
 }
