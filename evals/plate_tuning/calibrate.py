@@ -223,15 +223,22 @@ def planted_items(
     run: Run, species: Sequence[tuple[PanelSpecies, FrozenReferences]]
 ) -> list[CalibrationItem]:
     items: list[CalibrationItem] = []
+    skipped = 0
     for entry, references in species:
         if not entry.portrait_path.is_file():
             raise HarnessError(f"The approved plate for {entry.key} is not checked out")
         for kind in PLANTED_KINDS:
             planted = run.path("calibration", "planted", entry.key, f"{kind}.png")
             if not planted.exists():
-                plant_defect(
-                    entry.portrait_path, planted, kind, entry.profile["measurements"]["length"]
-                )
+                try:
+                    plant_defect(
+                        entry.portrait_path, planted, kind, entry.profile["measurements"]["length"]
+                    )
+                except HarnessError:
+                    # This plate's layout leaves the defect's region blank, so nothing
+                    # visible can be planted there; the other kinds still apply.
+                    skipped += 1
+                    continue
             items.append(
                 CalibrationItem(
                     kind,
@@ -246,6 +253,10 @@ def planted_items(
                     ),
                 )
             )
+    if skipped * 3 > len(items) + skipped:
+        raise HarnessError(
+            "Too few planted defects could be made for these species; choose other species"
+        )
     return items
 
 
