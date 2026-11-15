@@ -51,6 +51,15 @@ export async function renderCandidate(context) {
   if (image.complete && image.naturalWidth) loaded = true;
   const problem = el('p', '', 'error');
   problem.setAttribute('role', 'alert');
+  // Answers that mean the controller kept nothing from this request.
+  const refusals = new Set([
+    'access_error',
+    'journal_changed',
+    'journal_error',
+    'journal_unavailable',
+    'operation_busy',
+    'operation_error',
+  ]);
   function decision(approve, reason = '') {
     let key = randomHex(16),
       request = null;
@@ -78,16 +87,15 @@ export async function renderCandidate(context) {
       } catch (error) {
         control.disabled = false;
         if (error.code === 'sign_in_required') ui.showProblem(error);
-        else if (request && ['offline', 'invalid_response'].includes(error.code))
-          // The decision may have been saved: send exactly the same one again.
-          problem.textContent =
-            error.message + ' Check recent operations if the response was lost.';
-        else {
+        else if (!request || refusals.has(error.code)) {
           // A refusal saved nothing, so the next try uses current settings and text.
           request = null;
           key = randomHex(16);
           problem.textContent = error.message;
-        }
+        } else
+          // The decision may have been saved: send exactly the same one again.
+          problem.textContent =
+            error.message + ' Check recent operations if the response was lost.';
       }
     });
   }
