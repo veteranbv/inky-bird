@@ -17,8 +17,6 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-# Private in Starlette, but it is what the router matches; an import failure is loud.
-from starlette._utils import get_route_path
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect, Request
@@ -165,8 +163,14 @@ class SecureAccessRequiredError(AccessError):
 
 def _route_path(scope: Scope) -> str:
     """The path the router matches: the request path without any root path."""
-    # Starlette's own helper, so the boundary and the router agree by construction.
-    return get_route_path(scope)
+    # Mirrors Starlette's private get_route_path; a test pins that they agree.
+    path: str = scope["path"]
+    root_path: str = scope.get("root_path", "")
+    if not root_path or not path.startswith(root_path):
+        return path
+    if path == root_path:
+        return ""
+    return path[len(root_path) :] if path[len(root_path)] == "/" else path
 
 
 def _owner_message(exc: Exception, fallback: str) -> str:

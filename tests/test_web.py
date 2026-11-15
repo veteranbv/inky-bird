@@ -984,6 +984,26 @@ def test_owner_boundary_classifies_the_path_the_router_matches(tmp_path: Path) -
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
 
 
+@pytest.mark.parametrize(
+    ("path", "root_path"),
+    [
+        ("/v1/owner/journal", ""),
+        ("/prefix/v1/owner/journal", "/prefix"),
+        ("/prefix", "/prefix"),
+        ("/prefixed/v1/owner", "/prefix"),
+        ("/other/v1/owner", "/prefix"),
+    ],
+)
+def test_route_path_matches_starlette(path: str, root_path: str) -> None:
+    # Starlette keeps this helper private; this pins the local copy to it.
+    from starlette._utils import get_route_path
+
+    from inky_bird_frame.web import _route_path
+
+    scope = _scope("GET", path, root_path=root_path)
+    assert _route_path(scope) == get_route_path(scope)
+
+
 def test_direct_tls_sends_no_host_wide_https_policy(tmp_path: Path) -> None:
     # HSTS binds every port on the hostname, including services that are not Inky.
     direct = replace(
