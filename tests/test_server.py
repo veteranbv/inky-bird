@@ -31,9 +31,10 @@ from cryptography.x509.oid import NameOID
 
 from inky_bird_frame import __version__
 from inky_bird_frame.cli import main
-from inky_bird_frame.config import ControllerConfig
+from inky_bird_frame.config import ControllerConfig, NotificationEvent
 from inky_bird_frame.http import USER_AGENT
 from inky_bird_frame.http import get_json as get_http_json
+from inky_bird_frame.notifications import NotificationItem
 from inky_bird_frame.oidc import _get_json as get_oidc_json
 from inky_bird_frame.server import (
     MAX_TELEMETRY_REQUEST_BYTES,
@@ -1432,19 +1433,30 @@ class ServerTests(unittest.TestCase):
     def test_health_reports_notification_dead_letters(self) -> None:
         with self._environment() as (_, catalog_dir, state_dir):
             notifications = state_dir / "notifications.json"
-            item = {"private": "never shown"}
-            notifications.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "pending": [item],
-                        "dead_letters": [item, item],
-                        "delivered_ids": [],
-                    }
-                )
-            )
+            item = NotificationItem(
+                "item-1",
+                NotificationEvent.DEGRADED,
+                "Synthetic title",
+                "never shown",
+                datetime(2026, 1, 1, tzinfo=UTC),
+                3,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                (),
+            ).as_dict()
+            state = {
+                "schema_version": 1,
+                "pending": [item],
+                "dead_letters": [item, item],
+                "delivered_ids": [],
+            }
+            notifications.write_text(json.dumps(state))
             with _serving(catalog_dir, state_dir / "active-catalog.json", state_dir) as port:
                 _, _, recorded = _get(port, "/health")
+                # Health reads exactly what delivery accepts, never more.
+                notifications.write_text(json.dumps({**state, "schema_version": 2}))
+                _, _, unsupported = _get(port, "/health")
+                notifications.write_text(json.dumps({**state, "dead_letters": [{"id": "x"}]}))
+                _, _, invalid_item = _get(port, "/health")
                 notifications.write_text("{not json")
                 _, _, unreadable = _get(port, "/health")
                 notifications.unlink()
@@ -1454,6 +1466,8 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(json.loads(recorded)["notification_dead_letters"], 2)
         self.assertNotIn(b"never shown", recorded)
+        self.assertIsNone(json.loads(unsupported)["notification_dead_letters"])
+        self.assertIsNone(json.loads(invalid_item)["notification_dead_letters"])
         self.assertIsNone(json.loads(unreadable)["notification_dead_letters"])
         self.assertIsNone(json.loads(denied)["notification_dead_letters"])
 

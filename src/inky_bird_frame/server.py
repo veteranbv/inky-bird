@@ -20,6 +20,7 @@ from .config import ControllerConfig
 from .errors import CatalogError
 from .http import write_json_atomic
 from .images import slugify
+from .notifications import _read_state
 from .timeutil import parse_utc_timestamp
 
 if TYPE_CHECKING:
@@ -185,14 +186,15 @@ def _species_count(path: Path) -> int:
 
 
 def dead_letter_count(state_dir: Path) -> int | None:
-    """Count notifications that stopped retrying; None when their state is unreadable."""
+    """Count notifications that stopped retrying; None when delivery could not read them.
+
+    No notification state (nothing ever queued, or a display-only install) is 0.
+    """
     # Delivery replaces this file atomically, so a read needs no delivery lock.
     try:
-        value = read_json(state_dir / "notifications.json")
-    except CatalogError as exc:
-        return 0 if isinstance(exc.__cause__, FileNotFoundError) else None
-    dead_letters = value.get("dead_letters") if isinstance(value, dict) else None
-    return len(dead_letters) if isinstance(dead_letters, list) else None
+        return len(_read_state(state_dir / "notifications.json").dead_letters)
+    except (CatalogError, OSError):
+        return None
 
 
 def featured_plate_entry(payload: dict[str, object]) -> dict[str, object] | None:
