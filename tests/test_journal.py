@@ -1283,3 +1283,41 @@ def test_new_collection_has_no_unresolved_members_to_keep(tmp_path: Path) -> Non
             remove_unresolved=[{"common_name": "", "scientific_name": "Unmatched species"}],
         )
     assert save_collection(tmp_path, revision=0, label="New", taxon_ids=[], remove_unresolved=[])
+
+
+def _owner_client(client: TestClient) -> dict[str, str]:
+    login = client.post(
+        "/v1/owner/login",
+        headers={"Origin": ORIGIN},
+        json={"username": "qa-owner", "passphrase": "a synthetic long passphrase"},
+    )
+    return {"Origin": ORIGIN, "X-Inky-CSRF": login.json()["data"]["csrf"]}
+
+
+def test_the_collection_route_removes_unresolved_members_and_old_pages_still_save(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    unresolved = cast(list[object], group.owner_dict()["unresolved"])
+    AccessStore(controller.state_dir).setup_owner("qa-owner", "a synthetic long passphrase")
+    with TestClient(create_app(controller), base_url=ORIGIN) as client:
+        headers = _owner_client(client)
+        route = "/v1/owner/journal/collections/save"
+        base = {"label": "A trip", "taxon_ids": [], "collection_id": group.collection_id}
+        # A page from before this field keeps every unresolved member.
+        old = client.post(route, json={**base, "revision": 1}, headers=headers)
+        assert old.status_code == 200, old.text
+        assert old.json()["data"]["collections"][0]["unresolved"] == unresolved
+        refused = client.post(
+            route, json={**base, "revision": 2, "remove_unresolved": "all"}, headers=headers
+        )
+        assert refused.status_code == 400
+        removed = client.post(
+            route,
+            json={**base, "revision": 2, "remove_unresolved": [unresolved[1]]},
+            headers=headers,
+        )
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["data"]["collections"][0]["unresolved"] == unresolved[:1]

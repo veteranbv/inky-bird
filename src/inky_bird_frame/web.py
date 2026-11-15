@@ -1614,8 +1614,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             body = await _json_body(
                 request,
                 {"revision", "label", "taxon_ids"},
-                optional={"collection_id"},
-                structured={"revision", "taxon_ids"},
+                optional={"collection_id", "remove_unresolved"},
+                structured={"revision", "taxon_ids", "remove_unresolved"},
             )
             result = await run_in_threadpool(journal.save_selection, **body)
         elif action == "remove":
