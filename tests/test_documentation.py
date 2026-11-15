@@ -833,3 +833,21 @@ def test_docs_say_head_answers_like_get() -> None:
         assert "`HEAD /health` returns 404" not in text, path.name
     reference = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
     assert "Every `GET` route answers `HEAD`" in reference
+
+
+def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    web = ROOT / "src/inky_bird_frame/web"
+    screen = " ".join(
+        path.read_text(encoding="utf-8").lower()
+        for path in sorted(web.iterdir())
+        if path.suffix in {".js", ".html"}
+    )
+    rows = _markdown_table(readme, "| Word | Meaning |")
+    assert rows
+    for word, meaning in rows:
+        term = word.strip("*").lower()
+        assert term in screen, word
+        # Describe controls the page really has.
+        heart = re.compile(r"\bheart\b")
+        assert not heart.search(meaning.lower()) or heart.search(screen), word

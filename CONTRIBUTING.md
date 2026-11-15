@@ -119,9 +119,13 @@ in that folder serve the settings, screen and viewer pages or are shared
 helpers.
 
 A new `/app` module must be added to `STATIC_PAGES` and the route list in
-`web.py`, and get a `modulepreload` line in `index.html`;
-`test_owner_page_preloads_every_module_it_imports` checks all three across the
-whole import graph. A node test that loads `journal.js` as a `data:` URL must
+`web.py`, and get a `modulepreload` line in `index.html`.
+`test_owner_page_preloads_every_module_it_imports` follows single-line
+`import ... from '/app/...'` statements from `app.js` and checks the preload
+line and the `STATIC_PAGES` entry of each module it finds. It does not follow
+an import split over several lines, so check those modules by hand.
+`test_static_map_matches_routes_and_shipped_files` checks that `STATIC_PAGES`
+matches the routes and the shipped files. A node test that loads `journal.js` as a `data:` URL must
 inline its whole `/app` import graph; `tests/web/journal-art.test.mjs` shows
 how.
 

@@ -126,7 +126,8 @@ enabled = true
 max_searches_per_day = 5
 # A total per bird, not per day: two allow one normal profile attempt and one conflict
 # refresh. It resets when a bird starts fresh (first try, your retry or replacement, or
-# after it stopped), not on automatic retries.
+# after it stopped) and when a run produces a plate, not on automatic retries. A search
+# that ends without an answer (timeout or failed start) is given back.
 max_searches_per_species = 2
 allowed_domains = [
     "allaboutbirds.org",

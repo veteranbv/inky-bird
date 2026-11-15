@@ -37,8 +37,9 @@ you run by hand, still prints the location so you can check it. Service logs
 are private; an unexpected provider error can still write its own text there.
 
 A plate whose text contains your postal code, coordinates, discovered place
-with its state, your home directory or the controller's own paths cannot be
-approved from the app, even with publication off.
+with its state, your home directory or the controller's own paths (paths at
+least two folders deep, so not `/root`) cannot be approved from the app, even
+with publication off.
 
 ## What can leave the controller
 

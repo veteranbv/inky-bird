@@ -30,8 +30,9 @@ The daily research limit resets at midnight UTC. When it is reached, the
 controller records the next attempt at that reset instead of running backoff
 retries that cannot succeed. `max_searches_per_species` is a total for each
 bird, not a daily count. It resets only when a bird starts fresh: its first
-try, your `retry` or replacement, or after it stopped for you. Automatic retries
-do not reset it. A bird that uses its whole allowance stops and waits for
+try, your `retry` or replacement, or after it stopped for you, and when a run
+produces a plate. Automatic retries do not reset it. A search that ends without
+an answer (a timeout, an outage or a failed start) is given back. A bird that uses its whole allowance stops and waits for
 `retry TAXON_ID`. `research-budget.json` keeps these totals in
 `species_totals`. An explicit `retry` never bypasses the daily limit.
 

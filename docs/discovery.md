@@ -531,17 +531,19 @@ The new-postcard feed is read every cycle. The full confirmed history is read
 about once a day, and also on the first sync after upgrading, whenever
 `birdbuddy_include_manual_sightings` changes, and when history has no saved
 read time. A correction made in the Bird Buddy app can therefore take up to a
-day to show. On days when the full history is not read, the provider details
-report `confirmed_history_checked: false` and `confirmed_history_complete:
-false`; that does not mean records were skipped, and `confirmed_records_skipped`
-stays `0`. `confirmed_history_checked_at` gives the last full read.
+day to show. On syncs that do not read the full history, the provider details
+report `confirmed_history_checked: false`, which only means it was not re-read
+this time; `confirmed_records_skipped` stays `0`. `confirmed_history_complete`
+keeps the result of the last full read, and `confirmed_history_checked_at`
+gives its time.
 
 When Bird Buddy answers HTTP 429, Inky waits for the time it asks for (at least
 a minute, at most a day). Without one it waits 15 minutes, doubling up to 6
 hours. During the wait every sync and preview fails at once with "Bird Buddy
 asked Inky to slow down; Inky will try again after <time>" and sends no
 request. The wait is kept in `birdbuddy-backoff.json` (mode `0600`, safe to
-delete) and cleared after the next successful read.
+delete) and cleared after the next successful sync; a successful preview leaves
+it in place.
 
 The provider reads high-confidence species metadata and media identifiers from
 new postcards. It also reads the species, capture time, origin, feeder ID, and

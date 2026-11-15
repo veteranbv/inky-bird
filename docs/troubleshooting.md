@@ -214,9 +214,11 @@ window. A failed provider's last birds stay in the active catalog for three
 refresh intervals (see [Multiple providers](discovery.md#multiple-providers)),
 and their return after recovery does not produce a duplicate discovery notice.
 
-Every outbound request, redirects included, also ends after four times its
-per-read timeout: for example 40 seconds for a default 10-second request, and
-240 seconds for the display's 60-second plate download. A response shorter than
+Unless a caller sets its own deadline, an outbound request, redirects
+included, also ends after four times its per-read timeout: for example 40
+seconds for a default 10-second request, and 240 seconds for the display's
+60-second plate download. The trip preview's name lookups share one 60-second
+deadline. A response shorter than
 the length it declared is an error, not a truncated result.
 
 If Bird Buddy reports "Bird Buddy asked Inky to slow down; Inky will try again

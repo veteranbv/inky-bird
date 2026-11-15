@@ -122,12 +122,14 @@ reliable comparison without a discovery notice.
 
 Each species is announced as new at most once per calendar year (UTC). One
 notice counts every new species and names the first ten, so the first refresh
-of a new installation, or a widened observation window, can send one long
-notice. A species that returns next year is announced again. Inky remembers
-this year's announced species in `new-species-notices.json` under `state_dir`
-(mode `0600`). Deleting it can repeat this year's notices. Nothing is recorded
-while notifications are off or no destination subscribes to `discovery`, so
-turning notifications on later still announces those species.
+of a new installation, or a widened observation window, sends a single notice
+with a count rather than one per species. A species that returns next year is
+announced again. Inky remembers this year's announced species in
+`new-species-notices.json` under `state_dir` (mode `0600`). Deleting it can
+repeat this year's notices. Each refresh still compares against the species
+the previous refresh found, even while notifications are off or no destination
+subscribes to `discovery`. Species found during that time are not announced
+when notifications are turned on later, unless they leave the list and return.
 
 A plate approval notifies once per approved plate, so a replacement plate for
 the same bird is announced too. A notice that matches one still queued or

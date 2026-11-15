@@ -106,14 +106,15 @@ plate yet.
 
 | Word | Meaning |
 | --- | --- |
-| **Your journal** | Everything you keep in Inky: your birds, their plates and your collections. |
+| **Your field journal** | Everything you keep in Inky: your birds, their plates and your collections. |
 | **Plate** | One illustrated bird, checked against references and approved before it is shown. |
 | **Noted** | When a bird was recorded: a feeder photo, a microphone detection or a checklist. "Last noted" is the most recent. |
-| **Favorite** | A bird you marked with the heart. |
+| **Favorite** | A bird you saved with **Add to Favorites** on its page. |
 | **Collections** | Named groups of birds, such as a trip. |
 | **Sources** | Where birds come from: nearby sightings, a station, a feeder or an import. |
-| **Play** | The full-screen slideshow in your browser. It does not change the wall frame. |
-| **Wall frame** | The optional color e-paper display on your wall. |
+| **Frame** | The full-screen plate view in your browser. It does not change the wall panel. |
+| **Play** | Starts a slideshow in Frame. |
+| **Wall panel** | The optional color e-paper display on your wall. |
 
 The shared plates are AI-generated illustrations checked against references
 and reviewed separately before approval. You can reuse the public catalog
