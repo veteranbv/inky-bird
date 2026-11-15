@@ -98,6 +98,23 @@ down. Home Assistant and Homepage can show selected art on your trusted
 network and use a separate credential for status. See
 [screens and dashboards](docs/presentation.md).
 
+In the journal, search your birds, sort them by name or by when they were last
+noted, and show only favorites, birds from your history, or birds that have no
+plate yet.
+
+## Words Inky uses
+
+| Word | Meaning |
+| --- | --- |
+| **Your journal** | Everything you keep in Inky: your birds, their plates and your collections. |
+| **Plate** | One illustrated bird, checked against references and approved before it is shown. |
+| **Noted** | When a bird was recorded: a feeder photo, a microphone detection or a checklist. "Last noted" is the most recent. |
+| **Favorite** | A bird you marked with the heart. |
+| **Collections** | Named groups of birds, such as a trip. |
+| **Sources** | Where birds come from: nearby sightings, a station, a feeder or an import. |
+| **Play** | The full-screen slideshow in your browser. It does not change the wall frame. |
+| **Wall frame** | The optional color e-paper display on your wall. |
+
 The shared plates are AI-generated illustrations checked against references
 and reviewed separately before approval. You can reuse the public catalog
 under the [MIT license](LICENSE). If a species is missing, you can
