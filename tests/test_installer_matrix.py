@@ -5,14 +5,26 @@ makes: the synthetic service managers, sudo, uv, pip, rsync, ssh, the Python
 helpers, the inky-bird command and the file commands that build, switch and
 remove runtimes. Each case then starts from the same machine state, makes the
 call with one number fail (for sudo also: every later sudo call), or stops the
-installer with SIGTERM once that call completes, and checks the invariants in
+installer once that call completes (SIGTERM or SIGHUP to the script, or SIGINT
+to its whole process group as Ctrl-C does), and checks the invariants in
 ``check_install`` and ``check_uninstall``. Status queries are numbered but
 never failed: a failed query is indistinguishable from a different answer.
 
+A second pass fails an upgrade twice: first right after the switch to the new
+version, or at its last service start, then at each step of the cleanup that
+follows, or stops it there. Rollback commands appear only in these runs.
+
+With one fault every rollback command works, so every unit must be exactly as
+it was; only when the rollback itself fails (sudo expired, or a second fault)
+may the output name a unit instead.
+
 The default run executes every case for the macOS and both Linux controller
-upgrades from the single-directory layout and for the display upgrade on a Pi
-that also runs the controller, plus every eighth step of every other scenario
-and start state. Run every case with::
+upgrades from the single-directory layout, the Linux upgrade with a disabled
+timer and the display upgrade on a Pi that also runs the controller, and every
+fourth cleanup step of their second pass plus every cleanup step that moves,
+links or removes a runtime; plus every eighth step of every other
+scenario and start state. Run every case, and the second pass of every
+upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
 
@@ -54,13 +66,27 @@ FULL = os.environ.get("INKY_INSTALLER_MATRIX") == "full"
 SAMPLE = os.environ.get("INKY_INSTALLER_MATRIX") == "sample"
 # Narrow a run to some groups while working on one, e.g. "install:macos:single".
 ONLY = set(filter(None, os.environ.get("INKY_INSTALLER_MATRIX_ONLY", "").split(",")))
+# The single-directory installers as of 5ded22f, the last commit before the
+# staged layout; they build the starting state every upgrade is tested from.
 SINGLE_DIRECTORY = ROOT / "tests/fake_bin/single_directory"
+SINGLE_DIRECTORY_SHA256 = {
+    "install-controller-systemd.sh": (
+        "2dfdd0552c2fd28595997ed0652c22f04a1a42cb6f7dcd49972e9af15862fc6a"
+    ),
+    "install-controller.sh": "c2075bfa1440a8722a66cd62fd41bd634b777e8bf91c726c871ce722869e1580",
+    "install-display-local.sh": (
+        "36ea22ef7d35f0f5b8bcc137d02551054c58a919397e747f7d35c0d56ee5b0da"
+    ),
+}
 TIMER_UNITS = "controller.service refresh.service refresh.timer generate.service generate.timer"
 APP_UNITS = "controller.service scheduler.service"
 AGENTS = "serve refresh catalog-publish"
 SECRET = "synthetic-matrix-secret"
 DEFAULT_STRIDE = 8
+# Every fourth step of a failed run's cleanup in the default subset.
+DEFAULT_SECOND_STRIDE = 4
 KILL_STRIDE = 3
+STOP_MODES = ("kill", "interrupt", "hangup")
 
 
 @dataclass(frozen=True)
@@ -72,6 +98,9 @@ class Scenario:
     environment: tuple[tuple[str, str], ...]
     states: tuple[str, ...]
     uninstall: str = ""
+    # The scenario whose installer built the starting state, when it differs:
+    # switching between timers and the app-managed scheduler.
+    start: str = ""
 
     @property
     def shell(self) -> str:
@@ -88,7 +117,7 @@ SCENARIOS = {
             "controller",
             "Darwin",
             (("FAKE_AGENTS", AGENTS),),
-            ("fresh", "single", "staged", "disabled"),
+            ("fresh", "single", "staged", "disabled", "rolled-back"),
             "uninstall-controller.sh",
         ),
         Scenario(
@@ -97,7 +126,16 @@ SCENARIOS = {
             "controller",
             "Linux",
             (("FAKE_UNITS", TIMER_UNITS),),
-            ("fresh", "single", "staged", "disabled", "shared-single", "shared-staged"),
+            (
+                "fresh",
+                "single",
+                "staged",
+                "disabled",
+                "rolled-back",
+                "shared-single",
+                "shared-staged",
+                "shared-both",
+            ),
             "uninstall-controller-systemd.sh",
         ),
         Scenario(
@@ -106,7 +144,34 @@ SCENARIOS = {
             "controller",
             "Linux",
             (("FAKE_UNITS", APP_UNITS),),
-            ("fresh", "single", "staged", "shared-single"),
+            (
+                "fresh",
+                "single",
+                "staged",
+                "disabled",
+                "rolled-back",
+                "shared-single",
+                "shared-staged",
+            ),
+            "uninstall-controller-systemd.sh",
+        ),
+        Scenario(
+            "linux-timers-to-app",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            (("FAKE_UNITS", APP_UNITS),),
+            ("single", "staged"),
+            start="linux-timers",
+        ),
+        Scenario(
+            "linux-app-to-timers",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            (("FAKE_UNITS", TIMER_UNITS),),
+            ("staged",),
+            start="linux-app",
         ),
         Scenario(
             "display",
@@ -120,8 +185,10 @@ SCENARIOS = {
                 "staged",
                 "disabled",
                 "renamed",
+                "rolled-back",
                 "shared-single",
                 "shared-staged",
+                "shared-both",
             ),
             "uninstall-display-local.sh",
         ),
@@ -131,7 +198,7 @@ SCENARIOS = {
             "display",
             "Linux",
             (),
-            ("fresh", "single", "staged"),
+            ("fresh", "single", "staged", "disabled", "shared-staged"),
         ),
     )
 }
@@ -139,12 +206,13 @@ SCENARIOS = {
 DEFAULT_FULL = {
     ("install", "macos", "single"),
     ("install", "linux-timers", "single"),
+    ("install", "linux-timers", "disabled"),
     ("install", "linux-app", "single"),
     ("install", "display", "shared-single"),
 }
 UNINSTALL_STATES = ("single", "staged", "shared")
 # States in which this role is already installed, so an upgrade checks for a plate.
-UPGRADE_STATES = ("single", "staged", "disabled", "shared-single")
+UPGRADE_STATES = ("single", "staged", "disabled", "rolled-back", "shared-single", "shared-both")
 
 
 # Machine state -----------------------------------------------------------------
@@ -275,6 +343,7 @@ class Machine(Host):
 
     def build(self, scenario: Scenario, state: str) -> None:
         other = SCENARIOS["display"] if scenario.role == "controller" else SCENARIOS["linux-timers"]
+        scenario = SCENARIOS[scenario.start] if scenario.start else scenario
         if state == "fresh":
             pass
         elif state in ("single", "staged"):
@@ -288,22 +357,82 @@ class Machine(Host):
                 processes = self.state_of("processes")
                 processes.pop(f"com.{self.family}.refresh", None)
                 self.save_state("processes", processes)
+            elif scenario.name == "linux-app":
+                self.set_unit(f"{self.family}-scheduler.service", active=False, enabled=False)
             elif scenario.role == "controller":
                 self.set_unit(f"{self.family}-generate.timer", active=False, enabled=False)
             else:
                 self.set_unit(f"{self.family}-display.timer", active=False, enabled=False)
         elif state == "renamed":
             self.install_renamed_display()
+        elif state == "rolled-back":
+            self.install_rolled_back(scenario)
         elif state == "shared-single":
             self.install(other, "single", "other")
             self.install(scenario, "single", "old")
         elif state == "shared-staged":
             self.install(other, "staged", "other")
-        elif state == "shared":
+        elif state in ("shared-both", "shared"):
             self.install(other, "staged", "other")
             self.install(scenario, "staged", "old")
         else:
             raise AssertionError(state)
+        self.check_built(scenario, state)
+
+    def install_rolled_back(self, scenario: Scenario) -> None:
+        """An upgrade the owner undid by hand by switching back to the kept version.
+
+        The controller comes from the single-directory layout, so the version
+        it switches back to is the environment that upgrade moved into a
+        runtime of its own; the display switches back to a kept runtime.
+        """
+        if scenario.role == "controller":
+            self.install(scenario, "single", "old")
+            self.install(scenario, "staged", "mid")
+            runtimes = self.app / ".runtimes"
+            active = Path(os.path.realpath(self.app / ".venv")).parent
+            (kept,) = (path for path in runtimes.iterdir() if path.resolve() != active.resolve())
+            link = self.app / ".venv"
+            link.unlink()
+            link.symlink_to(kept / ".venv")
+        else:
+            self.install(scenario, "staged", "old")
+            first = display_runtime(self).source
+            assert first is not None
+            self.install(scenario, "staged", "mid")
+            # pip install -e <kept runtime>: the venv imports its source again.
+            site = self.venv / "lib/python3/site-packages"
+            (site / "_inky_bird.pth").write_text(f"{first}\n")
+            self.save_state("pip", {"inky-bird": {"source": str(first.parent)}})
+        self.restart_running()
+
+    def restart_running(self) -> None:
+        """Restart every running service so it runs what its executable now resolves to."""
+        processes = self.state_of("processes")
+        for unit in list(processes):
+            executable = executable_of(self, unit)
+            assert executable is not None, unit
+            processes[unit] = fake_tools.resolve_runtime(str(executable))
+        self.save_state("processes", processes)
+
+    def check_built(self, scenario: Scenario, state: str) -> None:
+        """A starting state is what it claims to be, whichever installer built it."""
+        role = view(self, scenario.role)
+        expected = {
+            "fresh": None,
+            "shared-staged": None,
+            "renamed": "regular",
+        }.get(state, "old")
+        assert role.tag == expected, (state, role.tag)
+        for name, process in role.processes.items():
+            assert process["runtime"] == expected, (state, name, process)
+        if state in ("staged", "shared-both", "shared"):
+            active = active_runtime(self, scenario.role)
+            assert active is not None and (Path(active) / "src").is_dir(), state
+            assert (Path(active) / "deploy" / installed_script(self, scenario).name).is_file()
+        if state.startswith("shared"):
+            other = view(self, "display" if scenario.role == "controller" else "controller")
+            assert other.tag == "other", (state, other.tag)
 
     def reset_run(self) -> None:
         for name in ("steps", "inject", "sudo-expired", "sudo-validations", "fail"):
@@ -330,6 +459,11 @@ class RoleView:
     files: dict[str, str]
     processes: dict[str, dict[str, object]]
     runtimes: frozenset[str]
+    # Where the active version's environment and source are, and their hashes.
+    venv_path: Path | None = None
+    venv_code: str = "absent"
+    source_path: Path | None = None
+    source_code: str = "absent"
 
 
 def runtime_of(executable: Path) -> tuple[str, Path] | None:
@@ -339,6 +473,10 @@ def runtime_of(executable: Path) -> tuple[str, Path] | None:
     venv = executable.parent.parent
     site = venv / "lib/python3/site-packages"
     pth = site / "_inky_bird.pth"
+    real = Path(os.path.realpath(venv))
+    # A controller venv runs from where it is; a deleted or moved one is missing.
+    if (real / "tag").exists():
+        return (real / "tag").read_text().strip(), real
     # A regular install in site-packages is imported before any editable one.
     if (site / "inky_bird_frame").is_dir():
         return "regular", site
@@ -350,26 +488,51 @@ def runtime_of(executable: Path) -> tuple[str, Path] | None:
     return (tag.read_text().strip() if tag.exists() else "missing"), Path(os.path.realpath(venv))
 
 
-def controller_code(machine: Machine) -> tuple[str | None, str]:
+@dataclass(frozen=True)
+class Code:
+    tag: str | None
+    venv: Path | None = None
+    source: Path | None = None
+
+
+def controller_runtime(machine: Machine) -> Code:
     venv = machine.app / ".venv"
     if not venv.exists():
-        return None, "absent"
+        return Code(None)
     real = Path(os.path.realpath(venv))
-    source = real.parent / "src" if (real.parent / "src").is_dir() else machine.app / "src"
     tag = real / "tag"
-    return (tag.read_text().strip() if tag.exists() else "missing"), (digest(real) + digest(source))
+    return Code(tag.read_text().strip() if tag.exists() else "missing", real, imported_source(real))
 
 
-def display_code(machine: Machine) -> tuple[str | None, str]:
+def imported_source(venv: Path) -> Path:
+    """The source tree a controller venv imports, as its editable install names it."""
+    pth = venv / "lib/python3/site-packages/_inky_bird.pth"
+    return Path(pth.read_text().split()[0]) if pth.exists() else venv.parent / "src"
+
+
+def display_runtime(machine: Machine) -> Code:
     site = machine.venv / "lib/python3/site-packages"
     found = runtime_of(machine.venv / "bin/inky-bird")
     if found is None or not site.exists() or not any(site.iterdir()):
-        return None, "absent"
+        return Code(None)
     tag, directory = found
-    code = digest(site)
-    if tag != "regular":
-        code += digest(directory / "src")
-    return tag, code
+    return Code(tag, site, directory / "src" if tag != "regular" else None)
+
+
+def controller_code(machine: Machine) -> tuple[str | None, str]:
+    code = controller_runtime(machine)
+    return code.tag, code_digest(code)
+
+
+def display_code(machine: Machine) -> tuple[str | None, str]:
+    code = display_runtime(machine)
+    return code.tag, code_digest(code)
+
+
+def code_digest(code: Code) -> str:
+    if code.tag is None:
+        return "absent"
+    return (digest(code.venv) if code.venv else "") + (digest(code.source) if code.source else "")
 
 
 def unit_names(machine: Machine, role: str) -> list[str]:
@@ -419,8 +582,19 @@ def view(machine: Machine, role: str) -> RoleView:
     runtimes = (
         frozenset(str(path) for path in directory.iterdir()) if directory.is_dir() else frozenset()
     )
-    tag, code = controller_code(machine) if role == "controller" else display_code(machine)
-    return RoleView(tag, code, units, files, processes, runtimes)
+    active = controller_runtime(machine) if role == "controller" else display_runtime(machine)
+    return RoleView(
+        active.tag,
+        code_digest(active),
+        units,
+        files,
+        processes,
+        runtimes,
+        active.venv,
+        digest(active.venv) if active.venv else "absent",
+        active.source,
+        digest(active.source) if active.source else "absent",
+    )
 
 
 def long_running(unit: str) -> bool:
@@ -493,10 +667,15 @@ class Case:
     step: int
     mode: str
     tool: str
+    arguments: tuple[str, ...] = ()
+    # A first failure whose cleanup this case fails or stops at ``step``.
+    first: int | None = None
 
     @property
     def id(self) -> str:
-        return f"{self.kind}-{self.scenario}-{self.state}-{self.mode}-{self.step:03d}-{self.tool}"
+        after = "" if self.first is None else f"after{self.first:03d}-"
+        name = f"{self.kind}-{self.scenario}-{self.state}-{after}{self.mode}"
+        return f"{name}-{self.step:03d}-{self.tool}"
 
 
 @dataclass
@@ -581,8 +760,40 @@ def claims_new(outcome: Outcome) -> bool:
             "new version is installed",
             "uses the new version",
             "the new one stays active",
+            "the new one is kept in",
         )
     )
+
+
+def completed(outcome: Outcome) -> bool:
+    """The run finished installing the new version; only a step after that failed."""
+    return outcome.returncode == 0 or any(
+        phrase in outcome.output
+        for phrase in (
+            "is installed and running, but a final step failed",
+            "new version is installed, but a final step failed",
+            "Stopped while finishing",
+        )
+    )
+
+
+def claims_previous(outcome: Outcome) -> bool:
+    return any(
+        phrase in outcome.output
+        for phrase in (
+            "previous version is running again",
+            "started again on the previous version",
+            "previous version is unchanged",
+        )
+    )
+
+
+def single_fault(case: Case) -> bool:
+    """Only the injected call failed, so every rollback command works and the
+    run must put everything back; naming what it left is no excuse. When sudo
+    expires, or a second failure lands in the cleanup, the rollback itself
+    fails, and a unit it names is accepted."""
+    return case.mode != "expire" and case.first is None
 
 
 def check_install(
@@ -598,36 +809,53 @@ def check_install(
     after = view(machine, scenario.role)
     failed = outcome.returncode != 0
     # I8: an injected failure never reports success, and a kill is never silent.
-    if case.mode in ("fail", "expire", "kill") and outcome.returncode == 0:
+    stopped = case.mode in STOP_MODES
+    if outcome.returncode == 0:
         # The new version runs; only owner setup, or a leftover the output names, remains.
         tolerated = (case.tool == "inky-bird" and "owner setup is incomplete" in output) or (
             case.tool in ("rm", "ssh")
             and ("by hand: " in output or "after reconnecting: " in output)
         )
-        if case.mode == "kill" or not tolerated:
+        if stopped or not tolerated:
             report.append("I8: the run reported success although it was failed or stopped")
-    # I2: what is said to run is what runs; anything else is named.
+    strict = single_fault(case)
+    # I2: what is said to run is what runs; anything else is named. A claim
+    # that the previous version runs is checked whatever else is named.
+    previous = claims_previous(outcome)
+    if previous and before.role.tag is None:
+        report.append("I2: the output says the previous version runs, but there was none")
+    if previous and claims_new(outcome):
+        report.append("I2: the output says both the previous and the new version run")
     expected = "new" if claims_new(outcome) else before.role.tag
     for unit, process in after.processes.items():
-        if process["runtime"] != expected and unit not in output:
+        if process["runtime"] == expected:
+            continue
+        if previous or strict or unit not in output:
             report.append(
-                f"I2: {unit} runs {process['runtime']}, the output implies {expected}, "
-                "and it is not named"
+                f"I2: {unit} runs {process['runtime']}, the output implies {expected}"
+                + ("" if unit in output else ", and it is not named")
             )
     for unit, (_, active) in after.units.items():
         if active and unit.endswith(".timer"):
             executable = executable_of(machine, unit)
             found = runtime_of(executable) if executable is not None else None
-            if found is not None and found[0] != expected and unit not in output:
-                report.append(f"I2: {unit} would run {found[0]}, not {expected}, unnamed")
+            if (
+                found is not None
+                and found[0] != expected
+                and (previous or strict or unit not in output)
+            ):
+                report.append(f"I2: {unit} would run {found[0]}, not {expected}")
+    if claims_new(outcome):
+        check_previous_kept(machine, scenario, before, report, output)
     if not failed:
         check_success(machine, scenario, before, after, report, output)
         return
-    if claims_new(outcome):
+    if completed(outcome):
         # A late step failed after the new version was installed and started.
-        check_final_units(machine, scenario, after, report, output)
-    # I4: every unit is back as it was, or named.
-    for unit, state in before.role.units.items() if not claims_new(outcome) else ():
+        check_final_units(machine, scenario, after, report, "" if strict else output)
+    # I4: every unit is back as it was; only a failed rollback may name one instead.
+    # That holds even when the new version could not be taken back out.
+    for unit, state in before.role.units.items() if not completed(outcome) else ():
         now = after.units[unit]
         if (
             unit.endswith(".service")
@@ -636,14 +864,10 @@ def check_install(
             and not now[1]
         ):
             continue
-        if now != state and unit not in output:
-            report.append(f"I4: {unit} was {state} and is now {now}, not named")
-        if (
-            after.files[unit] != before.role.files[unit]
-            and unit not in output
-            and not claims_new(outcome)
-        ):
-            report.append(f"I4: {unit} definition changed and it is not named")
+        if now != state and (strict or unit not in output):
+            report.append(f"I4: {unit} was {state} and is now {now}")
+        if after.files[unit] != before.role.files[unit] and (strict or unit not in output):
+            report.append(f"I4: {unit} definition changed")
     # I6: until the output says the new version is in use, the previous one is intact.
     if before.role.tag is not None and after.code != before.role.code and not claims_new(outcome):
         report.append("I6: the previous version's runtime, environment or source changed")
@@ -653,11 +877,40 @@ def check_install(
     for path in sorted(after.runtimes - before.role.runtimes):
         if path not in output and path != in_use:
             report.append(f"I10: runtime {path} was left behind without being named")
-    for path in sorted(before.role.runtimes - after.runtimes):
+    # Once the new version is in use, versions older than the one it replaced go.
+    for path in sorted(before.role.runtimes - after.runtimes) if not completed(outcome) else ():
         report.append(f"I10: runtime {path} existed before and was removed by a failed run")
     for path in sorted(stray_paths(machine) - before.stray):
         if path not in output and not removal_failed(case, path):
             report.append(f"I10: {path} was left behind")
+
+
+KEPT = re.compile(
+    r"(?:Previous version kept for rollback: |The previous version is kept in )(\S+?)\.?$",
+    re.MULTILINE,
+)
+
+
+def check_previous_kept(
+    machine: Machine, scenario: Scenario, before: Snapshot, report: list[str], output: str
+) -> None:
+    """I6 once the new version is in use: the version it replaced is still
+    byte-for-byte what ran before, wherever its environment now lives."""
+    previous = before.role
+    if previous.tag is None or previous.tag == "regular":
+        return
+    if previous.source_path is not None and digest(previous.source_path) != previous.source_code:
+        report.append("I6: the previous version's source changed after the upgrade")
+    if scenario.role != "controller" or previous.venv_path is None:
+        # The display's environment is shared and is the one the new version uses.
+        return
+    venv = previous.venv_path
+    kept = KEPT.search(output)
+    if (not venv.is_dir() or Path(os.path.realpath(venv)) != venv) and kept is not None:
+        # A single-directory environment moves into a runtime of its own.
+        venv = Path(kept.group(1)) / ".venv"
+    if digest(venv) != previous.venv_code:
+        report.append("I6: the previous version's environment changed after the upgrade")
 
 
 def active_runtime(machine: Machine, role: str) -> str | None:
@@ -680,8 +933,9 @@ def active_runtime(machine: Machine, role: str) -> str | None:
 
 
 def removal_failed(case: Case, path: str) -> bool:
-    """A failed ``rm`` of exactly that directory is the one thing allowed to leave it."""
-    return case.tool == "rm" and case.mode == "fail"
+    """A failed ``rm`` of exactly that path is the one thing allowed to leave it."""
+    targets = {os.path.normpath(argument) for argument in case.arguments}
+    return case.tool == "rm" and case.mode == "fail" and os.path.normpath(path) in targets
 
 
 def check_success(
@@ -799,11 +1053,10 @@ def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
 def installed_script(machine: Machine, scenario: Scenario) -> Path:
     name = "install-display-local.sh" if scenario.role == "display" else scenario.script
     if scenario.role == "controller":
+        # setup picks the checkout of the source the installed command imports.
         venv = machine.app / ".venv"
-        if venv.is_symlink():
-            return Path(os.path.realpath(venv)).parent / "deploy" / name
         if venv.exists():
-            return machine.app / "deploy" / name
+            return imported_source(Path(os.path.realpath(venv))).parent / "deploy" / name
     else:
         found = runtime_of(machine.venv / "bin/inky-bird")
         if found is not None and found[0] not in ("regular", "missing"):
@@ -886,7 +1139,10 @@ class Group:
     def evaluate(self, case: Case, recorded: list[list[str]]) -> Outcome:
         self.restore()
         before = snapshot(self.machine, self.scenario)
-        outcome, steps = self.run(f"{case.step} {case.mode}")
+        injection = f"{case.step} {case.mode}"
+        if case.first is not None:
+            injection = f"{case.first} fail\n{injection}"
+        outcome, steps = self.run(injection)
         survivors = self.machine.survivors()
         if survivors:
             outcome.violations.append(f"processes outlived the run: {survivors}")
@@ -931,6 +1187,48 @@ def selected(kind: str, scenario: str, state: str, position: int) -> bool:
     return position % DEFAULT_STRIDE == 0
 
 
+def second_pass(kind: str, scenario: str, state: str) -> bool:
+    """Groups whose cleanup is failed a second time: every upgrade when the
+    whole matrix runs, otherwise the groups that run every step."""
+    if kind != "install" or SAMPLE:
+        return False
+    return FULL or (kind, scenario, state) in DEFAULT_FULL
+
+
+def first_failures(steps: list[list[str]]) -> list[int]:
+    """Two failures with the most to undo: the call right after the switch to
+    the new version, and the last service start before the run completes."""
+    actions = [int(index) for index, kind_of_call, *_ in steps if kind_of_call == "action"]
+    switch = [
+        int(index)
+        for index, kind_of_call, tool, *arguments in steps
+        if kind_of_call == "action"
+        and (
+            (tool == "python3" and any(item.endswith(".venv.next") for item in arguments))
+            or (tool == "venv-python" and arguments[:3] == ["-m", "pip", "install"])
+        )
+    ]
+    starts = [
+        int(index)
+        for index, kind_of_call, tool, *arguments in steps
+        if kind_of_call == "action" and ("restart" in arguments or "bootstrap" in arguments)
+    ]
+    found = set()
+    if switch:
+        after = [index for index in actions if index > switch[-1]]
+        found.update(after[:1])
+    found.update(starts[-1:])
+    return sorted(found)
+
+
+def switches_back(tool: str, arguments: list[str]) -> bool:
+    """A cleanup file command that moves, links or removes a runtime: these
+    always run in the second pass, where earlier rollback defects were found."""
+    return tool in ("mv", "ln", "rm", "rmdir") and any(
+        ".venv" in argument or "/runtime." in argument for argument in arguments
+    )
+
+
 def busy_checked(scenario: str, state: str) -> bool:
     return SCENARIOS[scenario].role == "controller" and state in UPGRADE_STATES
 
@@ -962,25 +1260,54 @@ class Matrix:
             key = (kind, scenario.name, state)
             self.groups[key] = group
             self.recordings[key] = group.record()
+        # The steps a failed run takes after its failure, mostly its cleanup.
+        self.cleanups: dict[tuple[str, str, str, int], list[list[str]]] = {}
+        for key, steps in self.recordings.items():
+            if not second_pass(*key):
+                continue
+            group = self.groups[key]
+            for first in first_failures(steps):
+                outcome, failed = group.run(f"{first} fail")
+                assert outcome.returncode != 0 and not group.machine.survivors(), outcome
+                self.cleanups[(*key, first)] = failed
 
     def cases(self) -> list[Case]:
         found: list[Case] = []
         for (kind, scenario, state), steps in self.recordings.items():
             position = 0
-            for index, (_, kind_of_call, tool, *_rest) in enumerate(steps):
+            for index, (_, kind_of_call, tool, *arguments) in enumerate(steps):
                 if kind_of_call != "action":
                     continue
                 if selected(kind, scenario, state, position):
-                    found.append(Case(kind, scenario, state, index, "fail", tool))
+                    call = (kind, scenario, state, index)
+                    found.append(Case(*call, "fail", tool, tuple(arguments)))
                     if tool == "sudo":
-                        found.append(Case(kind, scenario, state, index, "expire", tool))
+                        found.append(Case(*call, "expire", tool))
                     if position % KILL_STRIDE == 0:
-                        found.append(Case(kind, scenario, state, index, "kill", tool))
+                        # Alternate a stop of the installer, an interrupt of its
+                        # whole process group (Ctrl-C) and a hangup.
+                        signal_mode = STOP_MODES[(position // KILL_STRIDE) % len(STOP_MODES)]
+                        found.append(Case(*call, signal_mode, tool))
+                position += 1
+        for (kind, scenario, state, first), steps in self.cleanups.items():
+            position = 0
+            for index, (_, kind_of_call, tool, *arguments) in enumerate(steps):
+                if index <= first or kind_of_call != "action":
+                    continue
+                if FULL or position % DEFAULT_SECOND_STRIDE == 0 or switches_back(tool, arguments):
+                    call = (kind, scenario, state, index)
+                    found.append(Case(*call, "fail", tool, tuple(arguments), first))
+                    if position % KILL_STRIDE == 0:
+                        # A stop during cleanup must not cut it short.
+                        signal_mode = STOP_MODES[(position // KILL_STRIDE) % len(STOP_MODES)]
+                        found.append(Case(*call, signal_mode, tool, (), first))
                 position += 1
         return found
 
     def evaluate(self, case: Case) -> Outcome:
         key = (case.kind, case.scenario, case.state)
+        if case.first is not None:
+            return self.groups[key].evaluate(case, self.cleanups[(*key, case.first)])
         return self.groups[key].evaluate(case, self.recordings[key])
 
     def busy(self, scenario: str, state: str) -> Outcome:
@@ -1053,3 +1380,12 @@ def test_matrix_covers_every_action_step(executed: Matrix) -> None:
         tools |= {tool for _, kind_of_call, tool, *_ in steps if kind_of_call == "action"}
     assert {"mv", "ln", "rm", "mktemp", "sudo", "uv", "rsync", "ssh", "inky-bird"} <= tools
     assert {"launchctl", "systemctl", "venv-python", "python3"} <= tools
+
+
+def test_single_directory_installers_are_the_pinned_copies() -> None:
+    """Upgrades are tested from exactly these installers; a change must be deliberate."""
+    found = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(SINGLE_DIRECTORY.glob("*.sh"))
+    }
+    assert found == SINGLE_DIRECTORY_SHA256

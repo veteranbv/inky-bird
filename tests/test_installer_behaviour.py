@@ -174,20 +174,23 @@ fi
 {rmdir} "$lock"
 mode=""
 if [ -f "$FAKE/inject" ]; then
-  read -r at injected < "$FAKE/inject"
-  if [ "$at" = "$index" ]; then
-    mode=$injected
-  fi
+  while read -r at injected; do
+    if [ "$at" = "$index" ]; then
+      mode=$injected
+    fi
+  done < "$FAKE/inject"
 fi
 case "$mode" in
   fail | expire)
     echo "{name}: synthetic failure" >&2
     exit 1
     ;;
-  kill)
+  kill | interrupt | hangup)
     status=0
     {shlex.quote(real)} "$@" || status=$?
-    {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} kill-installer
+    # The interrupt goes to the whole process group; this call has completed.
+    trap '' INT
+    {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} kill-installer "$mode"
     exit "$status"
     ;;
 esac

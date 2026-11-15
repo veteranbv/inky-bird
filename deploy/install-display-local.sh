@@ -295,6 +295,8 @@ report_units() {
 cleanup() {
   status=$?
   trap - EXIT
+  # One failed step must not cut the rest of the cleanup short.
+  set +e
   # Finish cleaning up even if a stop signal arrives, then report it.
   cleanup_stop=""
   trap 'cleanup_stop=129' HUP
@@ -311,8 +313,9 @@ cleanup() {
     fi
     units_restored=true
     report_units || units_restored=false
-    if [ -n "${new_runtime}" ] && [ "${new_runtime_in_use}" != true ]; then
-      rm -rf "${new_runtime}"
+    if [ -n "${new_runtime}" ] && [ "${new_runtime_in_use}" != true ] && \
+        ! rm -rf "${new_runtime}"; then
+      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${new_runtime}" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
       rmdir "${runtimes_dir}" 2>/dev/null || true

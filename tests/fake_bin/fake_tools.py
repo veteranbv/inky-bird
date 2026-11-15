@@ -4,10 +4,11 @@ Every tool records its call in ``$FAKE/log`` and keeps its state under
 ``$FAKE``. Lines in ``$FAKE/fail`` name the calls that should fail. Nothing
 here contacts a network, a real service manager or a real package index.
 
-Every call is also numbered in ``$FAKE/steps``. ``$FAKE/inject`` (``<step>
-<mode>``) makes the call with that number fail, makes it and every later sudo
-call fail (``expire``), or stops the installer with SIGTERM once it completes
-(``kill``). Status queries are numbered but never injected.
+Every call is also numbered in ``$FAKE/steps``. Each line of ``$FAKE/inject``
+(``<step> <mode>``) makes the call with that number fail, makes it and every later sudo
+call fail (``expire``), or stops the installer once it completes: SIGTERM
+(``kill``), SIGHUP (``hangup``) or SIGINT to its whole process group
+(``interrupt``). Status queries are numbered but never injected.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ def _save(name: str, value: dict[str, object]) -> None:
 
 STEP_LOCK_TIMEOUT_SECONDS = 30.0
 KILL = False
+# Which stop ``KILL`` sends once the call completes.
+STOP = "kill"
 
 
 def _step_lock() -> Path:
@@ -81,14 +84,16 @@ def step(tool: str, arguments: list[str], *, action: bool) -> str:
     inject = FAKE / "inject"
     if not action or not inject.exists():
         return ""
-    at_text, mode = inject.read_text().split()
-    at = int(at_text)
-    if mode == "expire" and tool == "sudo" and index >= at:
-        (FAKE / "sudo-expired").touch()
-        return "fail"
-    if index != at:
-        return ""
-    return "fail" if mode == "expire" else mode
+    # One line per injected fault; a second one lands in the first one's cleanup.
+    for line in inject.read_text().splitlines():
+        at_text, mode = line.split()
+        at = int(at_text)
+        if mode == "expire" and tool == "sudo" and index >= at:
+            (FAKE / "sudo-expired").touch()
+            return "fail"
+        if index == at:
+            return "fail" if mode == "expire" else mode
+    return ""
 
 
 def _installer_pid() -> int | None:
@@ -118,10 +123,20 @@ def _installer_pid() -> int | None:
     return None
 
 
-def kill_installer() -> None:
+STOP_SIGNALS = {"kill": signal.SIGTERM, "hangup": signal.SIGHUP, "interrupt": signal.SIGINT}
+
+
+def kill_installer(mode: str = "kill") -> None:
+    """Stop the installer: TERM or HUP to the script itself, or INT to its whole
+    process group as Ctrl-C does. This call ignores the interrupt it sends."""
     pid = _installer_pid()
-    if pid is not None:
-        os.kill(pid, signal.SIGTERM)
+    if pid is None:
+        return
+    if mode == "interrupt":
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        os.killpg(os.getpgid(pid), signal.SIGINT)
+    else:
+        os.kill(pid, STOP_SIGNALS[mode])
 
 
 def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> int:
@@ -149,7 +164,7 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
         deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
         while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
             time.sleep(0.01)
-        kill_installer()
+        kill_installer(STOP)
         return helper.wait()
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -186,8 +201,11 @@ def resolve_runtime(executable: str) -> dict[str, object]:
     venv = Path(executable).parent.parent
     site = site_packages(venv)
     pth = site / "_inky_bird.pth"
+    # A controller venv carries its tag; it runs from the venv directory itself.
+    if (Path(os.path.realpath(venv)) / "tag").exists():
+        tag, directory = runtime_tag(executable), Path(os.path.realpath(venv))
     # A regular install in site-packages is imported before any editable one.
-    if (site / "inky_bird_frame").is_dir():
+    elif (site / "inky_bird_frame").is_dir():
         tag, directory = "regular", site / "inky_bird_frame"
     elif pth.exists():
         source = Path(pth.read_text().split()[0])
@@ -231,6 +249,11 @@ def build_venv(project: Path) -> None:
         path.chmod(0o755)
     tag = project / "src/runtime-tag"
     (project / ".venv/tag").write_text(tag.read_text() if tag.exists() else "missing\n")
+    # uv installs the project editable: the venv imports this source tree by
+    # absolute path, wherever the venv itself is later moved.
+    site = site_packages(project / ".venv")
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "_inky_bird.pth").write_text(f"{os.path.abspath(project)}/src\n")
 
 
 def uname(arguments: list[str]) -> int:
@@ -674,19 +697,20 @@ def _injected_failure(tool: str, arguments: list[str]) -> int:
 
 
 def main() -> int:
-    global KILL
+    global KILL, STOP
     tool, arguments = sys.argv[1], sys.argv[2:]
     if tool == "build-venv":
         build_venv(Path(arguments[0]))
         return 0
     if tool == "kill-installer":
-        kill_installer()
+        kill_installer(*arguments)
         return 0
     recorded = arguments[1:] if tool in ("venv-python", "inky-bird") else arguments
     injected = step(tool, recorded, action=not _is_query(tool, arguments))
     if injected == "fail":
         return _injected_failure(tool, arguments)
-    KILL = injected == "kill"
+    KILL = injected in STOP_SIGNALS
+    STOP = injected if KILL else "kill"
     if tool == "venv-python":
         status = venv_python(arguments[0], arguments[1:])
     elif tool == "inky-bird":
@@ -706,7 +730,7 @@ def main() -> int:
         }
         status = handlers[tool](arguments)
     if KILL:
-        kill_installer()
+        kill_installer(STOP)
     return status
 
 

@@ -8,8 +8,13 @@ fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The managed directory's copy of this script reinstalls the active runtime.
+# An environment moved out of the single-directory layout has no source of its
+# own; it still imports ${root}/src, so reinstall from there.
 if [ -L "${root}/.venv" ]; then
-  root=$(cd -P "${root}/.venv/.." && pwd)
+  active_root=$(cd -P "${root}/.venv/.." 2>/dev/null && pwd || true)
+  if [ -n "${active_root}" ] && [ -d "${active_root}/src" ]; then
+    root=${active_root}
+  fi
 fi
 # Check both families before even starting Python (macOS may initialize its
 # interpreter cache under HOME). A user installer must not touch system jobs.
@@ -101,24 +106,14 @@ restore_catalog_publisher_schedule() {
   local uid=$1
   local recovery_dir
   local recovery_plist
-  recovery_dir=$(mktemp -d "${support_dir}/catalog-publish-recovery.XXXXXX")
+  local status=0
+  recovery_dir=$(mktemp -d "${support_dir}/catalog-publish-recovery.XXXXXX") || return 1
   recovery_plist="${recovery_dir}/catalog-publish.plist"
-  if ! cp "${catalog_publish_plist}" "${recovery_plist}"; then
-    rmdir "${recovery_dir}"
-    return 1
-  fi
-  if ! /usr/bin/plutil -replace RunAtLoad -bool false "${recovery_plist}"; then
-    rm -f "${recovery_plist}"
-    rmdir "${recovery_dir}"
-    return 1
-  fi
-  if ! launchctl bootstrap "gui/${uid}" "${recovery_plist}"; then
-    rm -f "${recovery_plist}"
-    rmdir "${recovery_dir}"
-    return 1
-  fi
-  rm -f "${recovery_plist}"
-  rmdir "${recovery_dir}"
+  cp "${catalog_publish_plist}" "${recovery_plist}" && \
+    /usr/bin/plutil -replace RunAtLoad -bool false "${recovery_plist}" && \
+    launchctl bootstrap "gui/${uid}" "${recovery_plist}" || status=1
+  rm -rf "${recovery_dir}" || leftovers+=("${recovery_dir}")
+  return "${status}"
 }
 
 # mktemp -d into the variable named $1. A stop signal that arrives after the
@@ -200,6 +195,8 @@ previously_loaded_labels=()
 stopped_labels=()
 unrestored=()
 still_running=()
+leftovers=()
+new_runtime_linked=false
 
 hold_cycle_lock() {
   local python="${app_dir}/.venv/bin/python"
@@ -254,24 +251,46 @@ activate_runtime() {
   replace_venv_link "${new_runtime}/.venv"
 }
 
-# Put ${app_dir}/.venv back exactly as it was before this run.
+# Put ${app_dir}/.venv back exactly as it was before this run. Fails only if
+# it is not back; a leftover that is not in use is named instead.
 restore_venv() {
   case "${venv_before}" in
-    link:*) replace_venv_link "${venv_before#link:}" ;;
+    link:*)
+      if ! replace_venv_link "${venv_before#link:}"; then
+        remove_next_link
+        return 1
+      fi
+      ;;
     directory)
       if [ -n "${legacy_runtime}" ] && [ -d "${legacy_runtime}/.venv" ]; then
         if [ -L "${app_dir}/.venv" ]; then
           rm -f "${app_dir}/.venv" || return 1
         fi
-        mv "${legacy_runtime}/.venv" "${app_dir}/.venv" || return 1
+        if ! mv "${legacy_runtime}/.venv" "${app_dir}/.venv"; then
+          # Leave the services the new version rather than nothing at all.
+          replace_venv_link "${new_runtime}/.venv"
+          return 1
+        fi
       fi
-      if [ -n "${legacy_runtime}" ]; then
-        rmdir "${legacy_runtime}" || return 1
+      if [ -n "${legacy_runtime}" ] && ! rmdir "${legacy_runtime}"; then
+        leftovers+=("${legacy_runtime}")
       fi
       ;;
-    *) rm -f "${app_dir}/.venv" || return 1 ;;
+    *)
+      # Nothing ran before this run, so nothing uses the link it made.
+      if ! rm -f "${app_dir}/.venv"; then
+        leftovers+=("${app_dir}/.venv" "${new_runtime}")
+        new_runtime_linked=true
+      fi
+      ;;
   esac
-  rm -f "${app_dir}/.venv.next"
+  remove_next_link
+}
+
+remove_next_link() {
+  if [ -e "${app_dir}/.venv.next" ] || [ -L "${app_dir}/.venv.next" ]; then
+    rm -f "${app_dir}/.venv.next" || leftovers+=("${app_dir}/.venv.next")
+  fi
 }
 
 release_cycle_lock() {
@@ -311,8 +330,9 @@ restore_agent() {
       unrestored+=("${agent}")
       return 0
     fi
-  else
-    rm -f "${plist}"
+  elif [ -e "${plist}" ] && ! rm -f "${plist}"; then
+    unrestored+=("${agent}")
+    return 0
   fi
   if ! contains "${label}" ${stopped_labels[@]+"${stopped_labels[@]}"}; then
     return 0
@@ -329,6 +349,8 @@ restore_agent() {
 cleanup() {
   status=$?
   trap - EXIT
+  # One failed step must not cut the rest of the cleanup short.
+  set +e
   # Finish cleaning up even if a stop signal arrives, then report it.
   cleanup_stop=""
   trap 'cleanup_stop=129' HUP
@@ -350,6 +372,9 @@ cleanup() {
     elif [ "${runtime_activated}" = true ] && ! restore_venv; then
       runtime_restored=false
       echo "Could not switch back to the previous version; the new one is kept in ${new_runtime}." >&2
+      if [ "${venv_before}" = directory ] && [ -d "${legacy_runtime}/.venv" ]; then
+        echo "The previous version is kept in ${legacy_runtime}." >&2
+      fi
     fi
     if [ "${agents_recorded}" = true ]; then
       for label in serve refresh generate catalog-publish notifications scheduler; do
@@ -358,8 +383,12 @@ cleanup() {
     fi
     # An agent this run started and could not stop still uses the new runtime.
     if [ -n "${new_runtime}" ] && [ "${runtime_restored}" = true ] && \
-        [ "${#still_running[@]}" -eq 0 ]; then
-      rm -rf "${new_runtime}"
+        [ "${#still_running[@]}" -eq 0 ] && [ "${new_runtime_linked}" != true ] && \
+        ! rm -rf "${new_runtime}"; then
+      leftovers+=("${new_runtime}")
+    fi
+    if [ "${#leftovers[@]}" -gt 0 ]; then
+      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${leftovers[*]}" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
       rmdir "${runtimes_dir}" 2>/dev/null || true

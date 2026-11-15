@@ -12,8 +12,13 @@ fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The managed directory's copy of this script reinstalls the active runtime.
+# An environment moved out of the single-directory layout has no source of its
+# own; it still imports ${root}/src, so reinstall from there.
 if [ -L "${root}/.venv" ]; then
-  root=$(cd -P "${root}/.venv/.." && pwd)
+  active_root=$(cd -P "${root}/.venv/.." 2>/dev/null && pwd || true)
+  if [ -n "${active_root}" ] && [ -d "${active_root}/src" ]; then
+    root=${active_root}
+  fi
 fi
 native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
 service_prefix="" app_dir="" support_dir="" config_path=""
@@ -129,6 +134,8 @@ stopped_units=()
 started_units=()
 stuck_units=()
 venv_restored=true
+leftovers=()
+new_runtime_linked=false
 
 # mktemp -d into the variable named $1. A stop signal that arrives after the
 # directory exists but before its name is recorded waits until it is, so
@@ -262,24 +269,66 @@ activate_runtime() {
   replace_venv_link "${new_runtime}/.venv"
 }
 
-# Put ${app_dir}/.venv back exactly as it was before this run.
+# Put ${app_dir}/.venv back exactly as it was before this run. Fails only if
+# it is not back; a leftover that is not in use is named instead.
 restore_venv() {
   case "${venv_before}" in
-    link:*) replace_venv_link "${venv_before#link:}" ;;
+    link:*)
+      if ! replace_venv_link "${venv_before#link:}"; then
+        remove_next_link
+        return 1
+      fi
+      ;;
     directory)
       if [ -n "${legacy_runtime}" ] && [ -d "${legacy_runtime}/.venv" ]; then
         if [ -L "${app_dir}/.venv" ]; then
           rm -f "${app_dir}/.venv" || return 1
         fi
-        mv "${legacy_runtime}/.venv" "${app_dir}/.venv" || return 1
+        if ! mv "${legacy_runtime}/.venv" "${app_dir}/.venv"; then
+          # Leave the services the new version rather than nothing at all.
+          replace_venv_link "${new_runtime}/.venv"
+          return 1
+        fi
       fi
-      if [ -n "${legacy_runtime}" ]; then
-        rmdir "${legacy_runtime}" || return 1
+      if [ -n "${legacy_runtime}" ] && ! rmdir "${legacy_runtime}"; then
+        leftovers+=("${legacy_runtime}")
       fi
       ;;
-    *) rm -f "${app_dir}/.venv" || return 1 ;;
+    *)
+      # Nothing ran before this run, so nothing uses the link it made.
+      if ! rm -f "${app_dir}/.venv"; then
+        leftovers+=("${app_dir}/.venv" "${new_runtime}")
+        new_runtime_linked=true
+      fi
+      ;;
   esac
-  rm -f "${app_dir}/.venv.next"
+  remove_next_link
+}
+
+remove_next_link() {
+  if [ -e "${app_dir}/.venv.next" ] || [ -L "${app_dir}/.venv.next" ]; then
+    rm -f "${app_dir}/.venv.next" || leftovers+=("${app_dir}/.venv.next")
+  fi
+}
+
+# The previous version cannot run from ${app_dir}/.venv any more: restart what
+# still runs it so every service uses the version that is there, and say so.
+restart_on_new_runtime() {
+  local unit
+  local restarted=()
+  for unit in ${active_before[@]+"${active_before[@]}"}; do
+    if [ -e "${unit_root}/${unit}" ] && systemctl is-active --quiet "${unit}" && \
+        ! contains "${unit}" ${started_units[@]+"${started_units[@]}"}; then
+      if sudo systemctl restart "${unit}"; then
+        restarted+=("${unit}")
+      else
+        stuck_units+=("${unit}")
+      fi
+    fi
+  done
+  if [ "${#restarted[@]}" -gt 0 ]; then
+    echo "These services were restarted on the new version: ${restarted[*]}." >&2
+  fi
 }
 
 # Return every managed unit to the file and state recorded before the run.
@@ -328,6 +377,10 @@ restore_units() {
     elif ! restore_venv; then
       venv_restored=false
       echo "Could not switch back to the previous version; the new one stays active, kept in ${new_runtime}." >&2
+      if [ "${venv_before}" = directory ] && [ -d "${legacy_runtime}/.venv" ]; then
+        echo "The previous version is kept in ${legacy_runtime}." >&2
+      fi
+      restart_on_new_runtime
     fi
   fi
   if [ "${units_recorded}" != true ]; then
@@ -409,6 +462,8 @@ report_restore() {
 cleanup() {
   status=$?
   trap - EXIT
+  # One failed step must not cut the rest of the cleanup short.
+  set +e
   # Finish cleaning up even if a stop signal arrives, then report it.
   cleanup_stop=""
   trap 'cleanup_stop=129' HUP
@@ -418,8 +473,13 @@ cleanup() {
   if [ "${installation_complete}" != true ]; then
     restore_units
     report_restore
-    if [ -n "${new_runtime}" ] && [ "${#stuck_units[@]}" -eq 0 ] && [ "${venv_restored}" = true ]; then
-      rm -rf "${new_runtime}"
+    if [ -n "${new_runtime}" ] && [ "${#stuck_units[@]}" -eq 0 ] && \
+        [ "${venv_restored}" = true ] && [ "${new_runtime_linked}" != true ] && \
+        ! rm -rf "${new_runtime}"; then
+      leftovers+=("${new_runtime}")
+    fi
+    if [ "${#leftovers[@]}" -gt 0 ]; then
+      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${leftovers[*]}" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
       rmdir "${runtimes_dir}" 2>/dev/null || true
