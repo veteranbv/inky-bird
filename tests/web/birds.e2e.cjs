@@ -150,6 +150,30 @@ async function checkLayout(page, label) {
         b.box.bottom > a.box.top + 0.5
       )
         problems.push(label + ': ' + a.name + ' overlaps ' + b.name);
+  // A word split across lines means its button is too narrow for the label.
+  const split = await page.evaluate(() =>
+    [...document.querySelectorAll('main button, main .primary-link')]
+      .filter((node) => node.getClientRects().length)
+      .filter((node) => {
+        const step = parseFloat(getComputedStyle(node).fontSize) * 0.5;
+        const texts = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        while (texts.nextNode()) {
+          const text = texts.currentNode, range = document.createRange();
+          let previous = null;
+          for (let index = 0; index < text.length; index += 1) {
+            range.setStart(text, index);
+            range.setEnd(text, index + 1);
+            const top = range.getBoundingClientRect().top;
+            const inWord = /\S/.test(text.data[index]) && index > 0 && /\S/.test(text.data[index - 1]);
+            if (inWord && previous !== null && top > previous + step) return true;
+            previous = top;
+          }
+        }
+        return false;
+      })
+      .map((node) => (node.getAttribute('aria-label') || node.textContent).trim().slice(0, 60)),
+  );
+  for (const name of split) problems.push(label + ': ' + name + ' splits a word over two lines');
   assert.deepEqual(problems, []);
 }
 
@@ -202,6 +226,18 @@ async function layout(t) {
         size + ': buttons keep a readable width',
       );
     } else assert(right.top >= left.bottom - 0.5, size + ': notes follow the plate');
+
+    // Collections keep one card to a row on phones; only bird lists pair up.
+    t.phase = 'collections-layout-' + size;
+    await page.goto(origin + '/app?page=collections');
+    await heading('Collections');
+    await checkLayout(page, 'Collections ' + size);
+    if (width < 560) {
+      const groups = page.locator('.bird-grid > .journal-card');
+      assert(await groups.count() >= 2, 'Collections lists at least two groups');
+      const [one, two] = [await box(groups.nth(0)), await box(groups.nth(1))];
+      assert(two.top >= one.bottom, size + ': one collection to a row');
+    }
 
     t.phase = 'home-layout-' + size;
     await page.goto(origin + '/app');

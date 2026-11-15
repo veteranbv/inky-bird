@@ -135,7 +135,7 @@ export function renderBirds(context) {
   const count = el('p', '', 'hint');
   count.id = 'bird-count';
   count.setAttribute('role', 'status');
-  const grid = el('div', '', 'bird-grid');
+  const grid = el('div', '', 'bird-grid bird-list');
   main.append(tools, count, grid);
   const sets = memberSets(data);
   // Cards are built once; searching only hides them and sorting only moves
