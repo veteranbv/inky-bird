@@ -24,8 +24,22 @@ async function historyAndCollections(t) {
   await page
     .getByLabel('History file', { exact: true })
     .setInputFiles(path.join(fixture, 'archive.csv'));
+  // The next step replaces the upload status at once, so record each text it shows.
+  await page.locator('form [role="status"]').evaluate((status) => {
+    window.uploadStatuses = [];
+    new MutationObserver(() => window.uploadStatuses.push(status.textContent)).observe(status, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+  });
   await page.getByRole('button', { name: 'Upload for checking', exact: true }).click();
   await step('2. Check the file');
+  assert(
+    (await page.evaluate(() => window.uploadStatuses)).some((text) =>
+      /^Uploading privately: 100% \(\d+ of \d+ KiB\)/.test(text),
+    ),
+  );
   assert(!fs.existsSync(path.join(fixture, 'var/controller/ebird-archive-observations.json')));
   t.phase = 'preview';
   await page.getByRole('button', { name: 'Check this file', exact: true }).click();

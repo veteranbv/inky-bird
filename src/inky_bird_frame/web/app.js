@@ -33,13 +33,42 @@ async function api(path, body) {
   });
 }
 
-async function upload(path, file, signal) {
-  return request(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Inky-CSRF': csrf },
-    body: file,
-    signal,
+function unreachable() {
+  return new RequestError('Inky cannot be reached. Check your connection and try again.', 'offline');
+}
+
+// fetch cannot report how much of a request body has been sent.
+async function upload(path, file, signal, onProgress) {
+  const response = await new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(unreachable());
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    const stop = () => xhr.abort();
+    const settle = (finish) => {
+      signal?.removeEventListener('abort', stop);
+      finish();
+    };
+    xhr.onload = () =>
+      settle(() =>
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          status: xhr.status,
+          json: async () => JSON.parse(xhr.responseText),
+        }),
+      );
+    xhr.onerror = xhr.ontimeout = xhr.onabort = () => settle(() => reject(unreachable()));
+    if (onProgress)
+      xhr.upload.onprogress = (event) =>
+        onProgress(event.loaded, event.lengthComputable ? event.total : 0);
+    xhr.open('POST', path);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Inky-CSRF', csrf);
+    signal?.addEventListener('abort', stop);
+    xhr.send(file);
   });
+  return reply(response);
 }
 
 async function request(path, options) {
@@ -51,11 +80,12 @@ async function request(path, options) {
       cache: 'no-store',
     });
   } catch {
-    throw new RequestError(
-      'Inky cannot be reached. Check your connection and try again.',
-      'offline',
-    );
+    throw unreachable();
   }
+  return reply(response);
+}
+
+async function reply(response) {
   let result;
   try {
     result = await response.json();
