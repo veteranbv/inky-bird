@@ -14,6 +14,8 @@ from plate_tuning.judges import (
     JudgeError,
     JudgeRequest,
     claude_command,
+    claude_usage,
+    codex_usage,
     parse_claude_output,
     parse_verdict,
 )
@@ -111,8 +113,9 @@ def test_claude_command_allows_only_reading_inside_the_pair_folder() -> None:
     assert command[command.index("--tools") + 1] == "Read"
     assert command[command.index("--allowedTools") + 1] == "Read(//scratch/pair/**)"
     assert "WebFetch" in command[command.index("--disallowedTools") + 1]
-    assert "--strict-mcp-config" in command
-    assert command[command.index("--setting-sources") + 1] == "project"
+    for flag in ("--restricted", "--safe-mode", "--strict-mcp-config", "--no-session-persistence"):
+        assert flag in command
+    assert command[command.index("--permission-prompts") + 1] == "none"
     assert json.loads(command[command.index("--json-schema") + 1]) == VERDICT_SCHEMA
     assert "--model" not in claude_command(Path("/opt/claude"), None, VERDICT_SCHEMA, folder)
 
@@ -208,6 +211,47 @@ def test_codex_judge_attaches_images_and_reads_its_output_file(tmp_path: Path) -
     assert not schema.is_relative_to(request.blind_dir)
 
 
+def test_token_usage_is_read_from_each_tools_output(tmp_path: Path) -> None:
+    assert codex_usage("working\ntokens used\n12,345\n") == {"total_tokens": 12345}
+    assert codex_usage("[2026-11-14] tokens used: 900") == {"total_tokens": 900}
+    assert codex_usage("no count here") is None
+    envelope = {
+        "usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 5},
+        "total_cost_usd": 0.25,
+    }
+    assert claude_usage(envelope) == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 5,
+        "total_tokens": 125,
+        "cost_usd": 0.25,
+    }
+    assert claude_usage({}) is None
+
+    request = _request(tmp_path)
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"structured_output": _verdict(), **envelope}))
+    claude = ClaudeCliJudge(
+        "fable-1", None, _stub(tmp_path, f"cat {shlex.quote(str(payload))}"), 30
+    )
+    assert claude.judge(request).usage == claude_usage(envelope)
+
+    verdict_file = tmp_path / "verdict.json"
+    verdict_file.write_text(json.dumps(_verdict()))
+    codex = CodexCliJudge(
+        "codex-1",
+        None,
+        _stub(
+            tmp_path,
+            'while [ "$1" != "-o" ]; do shift; done\n'
+            f'cp {shlex.quote(str(verdict_file))} "$2"\n'
+            "printf 'tokens used\\n4,321\\n' >&2",
+        ),
+        30,
+    )
+    assert codex.judge(request).usage == {"total_tokens": 4321}
+
+
 def test_judge_failures_raise_judge_errors(tmp_path: Path) -> None:
     request = _request(tmp_path)
     with pytest.raises(JudgeError, match="failed"):
@@ -280,8 +324,7 @@ def test_claude_judge_sees_only_an_isolated_copy_scoped_to_its_folder(tmp_path: 
     cwd = _assert_isolated(captured, tmp_path / "run")
     args = Path(f"{captured}.args").read_text().splitlines()
     assert args[args.index("--allowedTools") + 1] == f"Read(/{cwd}/**)"
-    assert args[args.index("--setting-sources") + 1] == "project"
-    assert "--strict-mcp-config" in args
+    assert "--restricted" in args and "--strict-mcp-config" in args
     assert (request.work_dir / "judge.log").is_file()
 
 
@@ -308,6 +351,7 @@ def test_codex_judge_sees_only_an_isolated_copy_and_writes_outside_it(tmp_path: 
         assert not written.is_relative_to(cwd)
         assert not written.is_relative_to((tmp_path / "run").resolve())
         assert not written.exists()
+    assert "--ignore-user-config" in args and "--ignore-rules" in args
     overrides = [args[i + 1] for i, value in enumerate(args) if value == "-c"]
     assert 'web_search="disabled"' in overrides
     assert "mcp_servers={}" in overrides

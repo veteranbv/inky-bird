@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import functools
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -17,20 +17,61 @@ from typing import Final
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from .blind import JudgedPair, PairSpec, PlateRef, Vote, expected_text, judge_pairs, other
-from .compare import judged_with
 from .config import EvalConfig, HarnessError
-from .judges import ANATOMY_CATEGORIES, Judge, PlateAssessment, Side
+from .gate import judged_with, thresholds
+from .judges import ANATOMY_CATEGORIES, Defect, Judge, PlateAssessment, Side
 from .panel import FrozenReferences, PanelSpecies
 from .rundir import Run, write_json
+from .stats import position_bias
 
 PLANTED_KINDS: Final = ("stretch", "duplicate", "lettering")
 # The categories a judge may use to report each planted defect. A defect is
 # found only when one of them is reported more often on the planted plate than
-# on the untouched original in the same verdict.
+# on the untouched original in the same verdict, a defect of that category on
+# the planted plate names the altered region, and the planted plate loses the
+# comparison on the axis the defect damages.
 EXPECTED_CATEGORIES: Final[dict[str, frozenset[str]]] = {
     "stretch": frozenset({"proportions", "legs", "tail"}),
     "duplicate": frozenset(ANATOMY_CATEGORIES),
     "lettering": frozenset({"lettering"}),
+}
+# Words that place a reported defect in the altered region: the lower body,
+# legs and tail for the two drawing defects, the Length line for the lettering one.
+REGION_WORDS: Final[dict[str, tuple[str, ...]]] = {
+    "stretch": (
+        "leg",
+        "foot",
+        "feet",
+        "toe",
+        "tarsus",
+        "tail",
+        "lower",
+        "belly",
+        "stretch",
+        "elongat",
+        "long",
+    ),
+    "duplicate": (
+        "leg",
+        "foot",
+        "feet",
+        "toe",
+        "tarsus",
+        "lower",
+        "belly",
+        "duplicat",
+        "extra",
+        "copied",
+        "repeat",
+        "double",
+        "second",
+    ),
+    "lettering": ("length",),
+}
+DAMAGED_AXIS: Final[dict[str, str]] = {
+    "stretch": "anatomy",
+    "duplicate": "anatomy",
+    "lettering": "lettering",
 }
 # Fractions of the page (left, top, right, bottom). The bird sits large in the
 # middle with its legs and tail in the lower half; the left margin carries the
@@ -129,17 +170,35 @@ class CalibrationItem:
     spec: PairSpec
 
 
+def anchor_taxa(anchors: Path) -> list[int]:
+    """The taxon ids an anchor folder holds plates for."""
+    if not anchors.is_dir():
+        raise HarnessError(f"The anchor folder {anchors.name} does not exist")
+    taxa: list[int] = []
+    for directory in sorted(path for path in anchors.iterdir() if path.is_dir()):
+        if not directory.name.isdigit():
+            raise HarnessError(f"Anchor folder {directory.name} is not a taxon id")
+        taxa.append(int(directory.name))
+    return taxa
+
+
 def anchor_items(
     anchors: Path,
     species: Sequence[tuple[PanelSpecies, FrozenReferences]],
 ) -> list[CalibrationItem]:
-    """Anchors are ANCHORS/<taxon_id>/<name>.png, each a known-worse plate for that species."""
+    """Anchors are ANCHORS/<taxon_id>/<name>.png, each a known-worse plate for that species.
+
+    The species may be any approved catalog species, on the panel or not, so
+    pairs made from the owner's past decisions can be used; species lists
+    each one with its frozen references.
+    """
     by_taxon = {entry.taxon_id: (entry, references) for entry, references in species}
     items: list[CalibrationItem] = []
-    for directory in sorted(path for path in anchors.iterdir() if path.is_dir()):
-        if not directory.name.isdigit() or int(directory.name) not in by_taxon:
-            raise HarnessError(f"Anchor folder {directory.name} is not a panel taxon id")
-        entry, references = by_taxon[int(directory.name)]
+    for taxon in anchor_taxa(anchors):
+        if taxon not in by_taxon:
+            raise HarnessError(f"Anchor folder {taxon} names a species without its catalog entry")
+        entry, references = by_taxon[taxon]
+        directory = anchors / str(taxon)
         for worse in sorted(directory.glob("*.png")):
             items.append(
                 CalibrationItem(
@@ -190,7 +249,8 @@ def planted_items(
     return items
 
 
-def swapped(spec: PairSpec, first_side: Side) -> PairSpec:
+def swapped(spec: PairSpec, first_sides: Mapping[str, Side]) -> PairSpec:
+    """The same pair again, with every judge seeing the sides it saw the first time swapped."""
     return PairSpec(
         identity=f"{spec.identity}|swapped",
         taxon_id=spec.taxon_id,
@@ -198,7 +258,7 @@ def swapped(spec: PairSpec, first_side: Side) -> PairSpec:
         second=spec.second,
         references=spec.references,
         expected_text=spec.expected_text,
-        first_side=other(first_side),
+        first_sides={judge: other(side) for judge, side in first_sides.items()},
     )
 
 
@@ -212,16 +272,29 @@ def _count(plate: PlateAssessment, category: str) -> int:
     return sum(1 for defect in plate.defects if defect.category == category)
 
 
-def flags_planted(vote: Vote, kind: str) -> bool:
-    """True when the judge reported an expected category more on the planted plate.
+def _names_region(defect: Defect, kind: str) -> bool:
+    text = f"{defect.location} {defect.description}".casefold()
+    return any(word in text for word in REGION_WORDS[kind])
 
-    A complaint the judge also makes about the untouched original says nothing
-    about the planted defect, so it does not count.
+
+def flags_planted(vote: Vote, kind: str) -> bool:
+    """True when the judge found the planted defect where it was planted.
+
+    It must report an expected category more often on the planted plate than
+    on the untouched original (a complaint it makes about both says nothing),
+    place one such defect in the altered region, and prefer the original on
+    the axis the defect damages.
     """
-    return any(
-        _count(vote.second, category) > _count(vote.first, category)
+    rising = {
+        category
         for category in EXPECTED_CATEGORIES[kind]
+        if _count(vote.second, category) > _count(vote.first, category)
+    }
+    located = any(
+        defect.category in rising and _names_region(defect, kind) for defect in vote.second.defects
     )
+    damaged = vote.anatomy if DAMAGED_AXIS[kind] == "anatomy" else vote.lettering
+    return located and damaged == "first"
 
 
 @dataclass(frozen=True)
@@ -306,15 +379,21 @@ def calibrate(
     species: Sequence[tuple[PanelSpecies, FrozenReferences]],
     *,
     anchors: Path | None,
+    anchor_species: Sequence[tuple[PanelSpecies, FrozenReferences]] = (),
     parallel: int = 1,
 ) -> list[JudgeCalibration]:
+    """Judge every known pair in both orders and score each judge.
+
+    species are the planted-defect species; anchor_species are the approved
+    catalog species the anchor folder names (planted species count too).
+    """
     items = planted_items(run, species)
     if anchors is not None:
-        items = anchor_items(anchors, species) + items
+        items = anchor_items(anchors, [*species, *anchor_species]) + items
     originals = judge_pairs(run, [item.spec for item in items], judges, config, parallel=parallel)
     repeats = judge_pairs(
         run,
-        [swapped(item.spec, pair.first_side) for item, pair in zip(items, originals, strict=True)],
+        [swapped(item.spec, pair.first_sides) for item, pair in zip(items, originals, strict=True)],
         judges,
         config,
         parallel=parallel,
@@ -325,6 +404,8 @@ def calibrate(
         run.path("calibration", "summary.json"),
         {
             "judged_with": judged_with(config),
+            "thresholds": thresholds(config),
+            "position_bias": position_bias([*originals, *repeats], [j.name for j in judges]),
             "anchors_supplied": anchors is not None,
             "items": [{"kind": item.kind, "taxon_id": item.taxon_id} for item in items],
             "judges": [result.as_dict() for result in results],

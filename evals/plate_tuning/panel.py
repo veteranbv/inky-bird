@@ -17,7 +17,9 @@ from inky_bird_frame.references import ReferenceCandidate, download_references
 from .config import PACKAGE_DIR, HarnessError
 from .rundir import Run, read_object, sha256_file, staging_directory, write_json
 
-Split = Literal["dev", "holdout"]
+# "catalog" marks an approved catalog species loaded only for calibration anchors.
+Split = Literal["dev", "holdout", "catalog"]
+CATALOG_STRATUM: Final = "catalog"
 STRATA: Final = (
     "perching-songbird",
     "swimmer",
@@ -90,8 +92,7 @@ def _reference(raw: object) -> ReferencePhoto:
         raise HarnessError("A catalog reference entry is incomplete") from exc
 
 
-def load_panel(catalog: Path, panel_path: Path = DEFAULT_PANEL) -> tuple[PanelSpecies, ...]:
-    """Load the panel and check every entry against the committed catalog."""
+def _approved_index(catalog: Path) -> dict[int, dict[str, object]]:
     index = read_object(catalog / "index.json")
     listed = index.get("species")
     if not isinstance(listed, list):
@@ -102,6 +103,54 @@ def load_panel(catalog: Path, panel_path: Path = DEFAULT_PANEL) -> tuple[PanelSp
             indexed_id = item.get("taxon_id")
             if isinstance(indexed_id, int):
                 approved[indexed_id] = item
+    return approved
+
+
+def _catalog_species(
+    catalog: Path,
+    approved: dict[int, dict[str, object]],
+    taxon_id: int,
+    stratum: str,
+    split: Split,
+    name: object = None,
+) -> PanelSpecies:
+    """One approved catalog species, checked against its manifest."""
+    indexed = approved.get(taxon_id)
+    if indexed is None:
+        raise HarnessError(f"Species {taxon_id} is not in the approved catalog")
+    if name is not None and indexed.get("common_name") != name:
+        raise HarnessError(f"Panel species {taxon_id} name does not match the catalog")
+    portrait = indexed.get("portrait_path")
+    if not isinstance(portrait, str):
+        raise HarnessError(f"Catalog entry {taxon_id} has no portrait path")
+    species_dir = (catalog / portrait).parent
+    manifest = read_object(species_dir / "manifest.json")
+    if manifest.get("status") != "approved":
+        raise HarnessError(f"Catalog species {taxon_id} is not approved")
+    try:
+        profile = parse_species_profile(manifest.get("profile"))
+    except GenerationError as exc:
+        raise HarnessError(f"Catalog profile {taxon_id} is not valid: {exc}") from exc
+    if profile["taxon_id"] != taxon_id:
+        raise HarnessError(f"Catalog profile {taxon_id} names a different taxon")
+    raw_references = manifest.get("references")
+    if not isinstance(raw_references, list) or len(raw_references) < MIN_REFERENCES:
+        raise HarnessError(f"Catalog species {taxon_id} has too few reference photos")
+    return PanelSpecies(
+        taxon_id=taxon_id,
+        common_name=str(indexed.get("common_name")),
+        scientific_name=str(indexed.get("scientific_name")),
+        stratum=stratum,
+        split=split,
+        catalog_dir=species_dir,
+        profile=profile,
+        catalog_references=tuple(_reference(item) for item in raw_references),
+    )
+
+
+def load_panel(catalog: Path, panel_path: Path = DEFAULT_PANEL) -> tuple[PanelSpecies, ...]:
+    """Load the panel and check every entry against the committed catalog."""
+    approved = _approved_index(catalog)
     entries = read_object(panel_path).get("species")
     if not isinstance(entries, list) or not entries:
         raise HarnessError("The panel lists no species")
@@ -119,41 +168,33 @@ def load_panel(catalog: Path, panel_path: Path = DEFAULT_PANEL) -> tuple[PanelSp
             raise HarnessError(f"Panel species {taxon_id} has an unknown stratum")
         if split not in ("dev", "holdout"):
             raise HarnessError(f"Panel species {taxon_id} must be split dev or holdout")
-        indexed = approved.get(taxon_id)
-        if indexed is None:
-            raise HarnessError(f"Panel species {taxon_id} is not in the approved catalog")
-        if indexed.get("common_name") != name:
-            raise HarnessError(f"Panel species {taxon_id} name does not match the catalog")
-        portrait = indexed.get("portrait_path")
-        if not isinstance(portrait, str):
-            raise HarnessError(f"Catalog entry {taxon_id} has no portrait path")
-        species_dir = (catalog / portrait).parent
-        manifest = read_object(species_dir / "manifest.json")
-        if manifest.get("status") != "approved":
-            raise HarnessError(f"Catalog species {taxon_id} is not approved")
-        try:
-            profile = parse_species_profile(manifest.get("profile"))
-        except GenerationError as exc:
-            raise HarnessError(f"Catalog profile {taxon_id} is not valid: {exc}") from exc
-        if profile["taxon_id"] != taxon_id:
-            raise HarnessError(f"Catalog profile {taxon_id} names a different taxon")
-        raw_references = manifest.get("references")
-        if not isinstance(raw_references, list) or len(raw_references) < MIN_REFERENCES:
-            raise HarnessError(f"Catalog species {taxon_id} has too few reference photos")
-        scientific = indexed.get("scientific_name")
         panel.append(
-            PanelSpecies(
-                taxon_id=taxon_id,
-                common_name=str(name),
-                scientific_name=str(scientific),
-                stratum=str(stratum),
-                split="dev" if split == "dev" else "holdout",
-                catalog_dir=species_dir,
-                profile=profile,
-                catalog_references=tuple(_reference(item) for item in raw_references),
+            _catalog_species(
+                catalog,
+                approved,
+                taxon_id,
+                str(stratum),
+                "dev" if split == "dev" else "holdout",
+                name,
             )
         )
     return tuple(panel)
+
+
+def resolve_species(
+    catalog: Path, panel: Sequence[PanelSpecies], taxa: Sequence[int]
+) -> tuple[PanelSpecies, ...]:
+    """Each taxon as its panel entry, or else as an approved catalog species off the panel."""
+    on_panel = {entry.taxon_id: entry for entry in panel}
+    approved: dict[int, dict[str, object]] | None = None
+    found: list[PanelSpecies] = []
+    for taxon in dict.fromkeys(taxa):
+        if taxon in on_panel:
+            found.append(on_panel[taxon])
+            continue
+        approved = _approved_index(catalog) if approved is None else approved
+        found.append(_catalog_species(catalog, approved, taxon, CATALOG_STRATUM, "catalog"))
+    return tuple(found)
 
 
 def select(

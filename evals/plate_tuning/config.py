@@ -13,6 +13,7 @@ from inky_bird_frame.errors import InkyBirdFrameError
 JudgeKind = Literal["claude", "codex"]
 JUDGE_KINDS: Final = ("claude", "codex")
 DEFAULT_CLAUDE_MODEL: Final = "claude-fable-5-2"
+DEFAULT_CODEX_MODEL: Final = "gpt-6-astra"
 DEFAULT_MAX_CANDIDATE_CHARACTERS: Final = 9000
 DEFAULT_MAX_MISSING_JUDGE_SHARE: Final = 0.1
 PACKAGE_DIR: Final = Path(__file__).resolve().parent
@@ -30,7 +31,8 @@ class BudgetExhaustedError(HarnessError):
 class JudgeSpec:
     name: str
     kind: JudgeKind
-    # None leaves the model choice to the command-line tool.
+    # None leaves the model choice to the command-line tool; configuration
+    # loading always names one (DEFAULT_CLAUDE_MODEL or DEFAULT_CODEX_MODEL).
     model: str | None = None
 
 
@@ -38,7 +40,7 @@ def _default_judges() -> tuple[JudgeSpec, ...]:
     return (
         JudgeSpec("fable-1", "claude", DEFAULT_CLAUDE_MODEL),
         JudgeSpec("fable-2", "claude", DEFAULT_CLAUDE_MODEL),
-        JudgeSpec("codex-1", "codex", None),
+        JudgeSpec("codex-1", "codex", DEFAULT_CODEX_MODEL),
     )
 
 
@@ -67,6 +69,10 @@ class EvalConfig:
     # A decision is refused when any judge is missing on more of its pairs than this.
     max_missing_judge_share: float = DEFAULT_MAX_MISSING_JUDGE_SHARE
     planted_species: int = 6
+    # A decision rests on at least this many judges that passed calibration,
+    # with at least one of each configured kind when require_each_provider is set.
+    min_calibrated_judges: int = 2
+    require_each_provider: bool = True
     max_candidate_characters: int = DEFAULT_MAX_CANDIDATE_CHARACTERS
     tune_minibatch_size: int = 3
     anatomy_weight: float = 0.5
@@ -102,6 +108,7 @@ class EvalConfig:
             "samples_per_species",
             "bootstrap_iterations",
             "planted_species",
+            "min_calibrated_judges",
             "max_candidate_characters",
             "tune_minibatch_size",
         ):
@@ -135,7 +142,9 @@ def _judge(raw: object) -> JudgeSpec:
         raise HarnessError("Each judge needs a name and a kind of claude or codex")
     if model is not None and not isinstance(model, str):
         raise HarnessError("A judge model must be a string")
-    return JudgeSpec(name, "claude" if kind == "claude" else "codex", model)
+    if kind == "claude":
+        return JudgeSpec(name, "claude", model or DEFAULT_CLAUDE_MODEL)
+    return JudgeSpec(name, "codex", model or DEFAULT_CODEX_MODEL)
 
 
 def _value(raw: dict[str, object], key: str, kind: type[object], default: object) -> object:
@@ -158,6 +167,12 @@ def _int(raw: dict[str, object], key: str, default: int) -> int:
 def _float(raw: dict[str, object], key: str, default: float) -> float:
     value = _value(raw, key, float, default)
     assert isinstance(value, float)
+    return value
+
+
+def _bool(raw: dict[str, object], key: str, default: bool) -> bool:
+    value = _value(raw, key, bool, default)
+    assert isinstance(value, bool)
     return value
 
 
@@ -232,6 +247,8 @@ def load_config(path: Path | None) -> EvalConfig:
         ),
         max_missing_judge_share=_float(raw, "max_missing_judge_share", d.max_missing_judge_share),
         planted_species=_int(raw, "planted_species", d.planted_species),
+        min_calibrated_judges=_int(raw, "min_calibrated_judges", d.min_calibrated_judges),
+        require_each_provider=_bool(raw, "require_each_provider", d.require_each_provider),
         max_candidate_characters=_int(raw, "max_candidate_characters", d.max_candidate_characters),
         tune_minibatch_size=_int(raw, "tune_minibatch_size", d.tune_minibatch_size),
         anatomy_weight=_float(raw, "anatomy_weight", d.anatomy_weight),

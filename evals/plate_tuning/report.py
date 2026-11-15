@@ -13,7 +13,7 @@ from typing import Final
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .config import HarnessError
-from .rundir import Run, read_json, read_object, resolve_recorded, write_json, write_text
+from .rundir import Ledger, Run, read_json, read_object, resolve_recorded, write_json, write_text
 
 THUMBNAIL: Final = (360, 480)
 MARGIN: Final = 16
@@ -21,6 +21,86 @@ HEADER: Final = 56
 WINNER: Final = (34, 139, 34)
 LOSER: Final = (200, 200, 200)
 TIE: Final = (218, 165, 32)
+# Each kind of paid call: its ledger and the event that marks one finished.
+PAID_CALLS: Final = {
+    "generations": ("generations.jsonl", "generation-finished"),
+    "judgments": ("judgments.jsonl", "judgment-finished"),
+    "reflections": ("reflections.jsonl", "reflection-finished"),
+    "reviews": ("reviews.jsonl", "review-finished"),
+}
+
+
+def _add_usage(totals: dict[str, object], usage: object) -> None:
+    totals["calls"] = int(str(totals["calls"])) + 1
+    if not isinstance(usage, dict):
+        return
+    totals["calls_with_usage"] = int(str(totals["calls_with_usage"])) + 1
+    for key, value in usage.items():
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            current = totals.get(key, 0)
+            totals[key] = (current if isinstance(current, int | float) else 0) + value
+
+
+def _per_call(totals: dict[str, object]) -> None:
+    measured, tokens = totals.get("calls_with_usage"), totals.get("total_tokens")
+    if isinstance(measured, int) and measured and isinstance(tokens, int | float):
+        totals["mean_total_tokens"] = tokens / measured
+
+
+def usage_totals(run: Run) -> dict[str, object]:
+    """Finished paid calls and the tokens (and cost) their tools reported, from the ledgers.
+
+    A call whose tool printed no usage counts as a call without usage, so a
+    total is a lower bound whenever calls_with_usage is below calls.
+    """
+    report: dict[str, object] = {}
+    for name, (ledger, event) in PAID_CALLS.items():
+        totals: dict[str, object] = {"calls": 0, "calls_with_usage": 0}
+        by_judge: dict[str, dict[str, object]] = {}
+        for entry in Ledger(run.path(ledger)).entries():
+            if entry.get("event") != event:
+                continue
+            _add_usage(totals, entry.get("usage"))
+            if name == "judgments":
+                judge = str(entry.get("judge"))
+                one = by_judge.setdefault(judge, {"calls": 0, "calls_with_usage": 0})
+                _add_usage(one, entry.get("usage"))
+        _per_call(totals)
+        for one in by_judge.values():
+            _per_call(one)
+        if by_judge:
+            totals["by_judge"] = dict(sorted(by_judge.items()))
+        report[name] = totals
+    return report
+
+
+def _usage_section(usage: dict[str, object]) -> list[str]:
+    lines = [
+        "## Paid calls",
+        "",
+        "Tokens are what each tool reported; a call it reported nothing for is counted as a"
+        " call but adds no tokens.",
+        "",
+        "| Calls | Finished | With usage | Total tokens | Tokens per call | Cost (USD) |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+
+    def row(name: str, totals: object) -> None:
+        if not isinstance(totals, dict):
+            return
+        lines.append(
+            f"| {name} | {totals.get('calls')} | {totals.get('calls_with_usage')}"
+            f" | {totals.get('total_tokens', '-')} | {_number(totals.get('mean_total_tokens'))}"
+            f" | {_number(totals.get('cost_usd'))} |"
+        )
+
+    for name, totals in usage.items():
+        row(name, totals)
+        by_judge = totals.get("by_judge") if isinstance(totals, dict) else None
+        if isinstance(by_judge, dict):
+            for judge, one in by_judge.items():
+                row(f"judge {judge}", one)
+    return [*lines, ""]
 
 
 def _records(path: Path) -> list[dict[str, object]]:
@@ -113,12 +193,18 @@ def _arm_lines(run: Run, summary: dict[str, object]) -> list[str]:
             continue
         path = run.path("arms", f"{name}.json")
         record = read_object(path) if path.exists() else {}
-        what = (
-            "the shipped plate instructions"
-            if record.get("is_default") is True
-            else "replacement instruction wording inside the current prompt template; only the"
-            " wording differs from the shipped prompt, not the data block or output lines"
-        )
+        if record.get("kind") == "release":
+            what = (
+                f"the whole plate prompt exactly as commit {str(record.get('commit'))[:12]}"
+                f" ({record.get('prompt_version')}) rendered it"
+            )
+        elif record.get("is_default") is True:
+            what = "the shipped plate instructions"
+        else:
+            what = (
+                "replacement instruction wording inside the current prompt template; only the"
+                " wording differs from the shipped prompt, not the data block or output lines"
+            )
         lines.append(f"- {role.capitalize()} arm `{name}` ({record.get('label', '-')}): {what}.")
     return [*lines, ""] if lines else []
 
@@ -177,25 +263,48 @@ def _comparison_section(run: Run, name: str, summary: dict[str, object]) -> list
                     f"| Verdicts from {judge} | {counts.get('votes')}"
                     f" (missing {counts.get('missing')}) |"
                 )
+    bias = stats.get("position_bias")
+    if isinstance(bias, dict):
+        for judge, shares in bias.items():
+            if isinstance(shares, dict):
+                lines.append(
+                    f"| Share of side A, {judge} (anatomy / lettering) |"
+                    f" {_number(shares.get('anatomy_a_share'))}"
+                    f" / {_number(shares.get('lettering_a_share'))} |"
+                )
+    dropped = summary.get("pairs_dropped")
+    if isinstance(dropped, list) and dropped:
+        lines.append(f"| Pairs not judged (a plate missing) | {len(dropped)} |")
     notes = _judge_notes(summary)
     if notes:
         lines.extend(["", *notes])
+    if summary.get("exploratory") is True:
+        lines.extend(
+            ["", "**Exploratory run: the judges were not calibrated; nothing is decided.**"]
+        )
     if isinstance(decision, dict):
         verdict = "replace the baseline" if decision.get("accept") else "keep the baseline"
-        on = "held-out species" if summary.get("decision_species") == "holdout" else "all species"
-        lines.extend(["", f"Decision on {on}: **{verdict}**."])
+        lines.extend(["", f"Decision on held-out species: **{verdict}**."])
         reasons = decision.get("reasons")
         if isinstance(reasons, list):
             lines.extend(f"- {reason}" for reason in reasons)
+    else:
+        lines.extend(["", f"No decision: {summary.get('decision_note') or 'not recorded'}."])
     return [*lines, ""]
 
 
+def _anatomy_a(shares: object) -> object:
+    return shares.get("anatomy_a_share") if isinstance(shares, dict) else None
+
+
 def _calibration_section(summary: dict[str, object]) -> list[str]:
+    bias = summary.get("position_bias")
+    shares = bias if isinstance(bias, dict) else {}
     lines = [
         "## Judge calibration",
         "",
-        "| Judge | Anchor accuracy | Planted recall | Swap consistency | Passed |",
-        "| --- | --- | --- | --- | --- |",
+        "| Judge | Anchor accuracy | Planted recall | Swap consistency | Side A share | Passed |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     judges = summary.get("judges")
     for judge in judges if isinstance(judges, list) else []:
@@ -204,6 +313,7 @@ def _calibration_section(summary: dict[str, object]) -> list[str]:
                 f"| {judge.get('judge')} | {_number(judge.get('anchor_accuracy'))}"
                 f" | {_number(judge.get('planted_recall'))}"
                 f" | {_number(judge.get('swap_consistency'))}"
+                f" | {_number(_anatomy_a(shares.get(judge.get('judge'))))}"
                 f" | {'yes' if judge.get('passed') else 'no'} |"
             )
     return [*lines, ""]
@@ -244,6 +354,9 @@ def write_report(run: Run) -> dict[str, object]:
         if path.exists():
             lines.extend([f"## {tuned} result", "", "```json", path.read_text().strip(), "```", ""])
             produced[tuned] = read_object(path)
+    usage = usage_totals(run)
+    lines.extend(_usage_section(usage))
+    produced["usage"] = usage
     produced["comparisons"] = comparisons
     produced["sheets"] = sheets
     write_text(out / "report.md", "\n".join(lines))

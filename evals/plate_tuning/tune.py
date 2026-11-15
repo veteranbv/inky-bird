@@ -12,7 +12,7 @@ import functools
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -28,11 +28,24 @@ from inky_bird_frame.prompts import (
 from .blind import JudgedPair, Vote, judge_pairs
 from .compare import compare, pair_specs
 from .config import BudgetExhaustedError, EvalConfig, HarnessError
-from .generate import Arm, Generator, InstructedCodexRunner, Sample, generate_samples
+from .gate import CalibrationGate
+from .generate import (
+    Arm,
+    Generator,
+    InstructedCodexRunner,
+    Sample,
+    generate_samples,
+    missing_samples,
+)
 from .judges import (
     CATEGORIES,
     CLAUDE_ISOLATION,
     Judge,
+    JudgeError,
+    Usage,
+    claude_envelope,
+    claude_usage,
+    codex_usage,
     find_executable,
     run_bounded,
     scratch_folder,
@@ -131,8 +144,9 @@ class ClaudeReflector:
         return [
             str(self.executable),
             "-p",
+            # The JSON result carries the token counts as well as the text.
             "--output-format",
-            "text",
+            "json",
             "--model",
             self.model,
             "--tools",
@@ -147,15 +161,19 @@ class ClaudeReflector:
         self.work.mkdir(parents=True, exist_ok=True)
         self.ledger.record("reflection-started", number=number)
         with scratch_folder("plate-reflect-") as folder:
-            text = run_bounded(
+            stdout = run_bounded(
                 self.executable,
                 folder,
                 self.timeout,
                 self.command(),
                 prompt,
                 self.work / f"reflection-{number:04d}.log",
-            )
-        self.ledger.record("reflection-finished", number=number)
+            ).stdout
+        envelope = claude_envelope(stdout)
+        text = envelope.get("result")
+        if not isinstance(text, str):
+            raise JudgeError("Claude printed no reflection text")
+        self.ledger.record("reflection-finished", number=number, usage=claude_usage(envelope))
         return text
 
 
@@ -338,7 +356,16 @@ class PlateTuningAdapter:
     def _generate(
         self, arm: Arm, species: list[tuple[PanelSpecies, FrozenReferences]]
     ) -> dict[tuple[str, int, int], Sample]:
-        """Both plates per species, retrying failures so flakiness is not read as quality."""
+        """Both plates per species, retrying failures so flakiness is not read as quality.
+
+        A batch the cap cannot pay for in full stops tuning before it starts,
+        so no candidate is left half evaluated.
+        """
+        needed = missing_samples(self.run, [arm, self.baseline], [e for e, _r in species], 1)
+        if needed > self.budget.available:
+            raise BudgetExhaustedError(
+                f"The generation cap of {self.budget.limit} leaves too little for this batch"
+            )
         done: dict[tuple[str, int, int], Sample] = {}
         for _attempt in range(self.config.generation_attempts):
             done, report = generate_samples(
@@ -396,8 +423,11 @@ class TuneResult:
     best_text: str
     best_dev_score: float | None
     stopped_early: str | None
+    holdout_reserved: int
     holdout: dict[str, object] | None
-    decision: dict[str, object]
+    decision: dict[str, object] | None
+    decision_note: str | None
+    exploratory: bool
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -405,9 +435,22 @@ class TuneResult:
             "best_sha256": sha256_text(self.best_text),
             "best_dev_score": self.best_dev_score,
             "stopped_early": self.stopped_early,
+            "holdout_generations_reserved": self.holdout_reserved,
             "holdout": self.holdout,
+            "exploratory": self.exploratory,
             "decision": self.decision,
+            "decision_note": self.decision_note,
         }
+
+
+def holdout_reservation(
+    run: Run, baseline: Arm, holdout: Sequence[PanelSpecies], samples: int
+) -> int:
+    """Generations the held-out test needs: every candidate plate, plus missing baselines.
+
+    The candidate is not known yet, so none of its plates can be cached.
+    """
+    return len(holdout) * samples + missing_samples(run, [baseline], holdout, samples)
 
 
 def tune_plate(
@@ -422,42 +465,60 @@ def tune_plate(
     budget: Budget,
     metric_calls: int,
     holdout_samples: int,
+    gate: CalibrationGate,
+    exploratory: bool = False,
     parallel: int = 1,
 ) -> TuneResult:
+    """Tune on the dev species within the cap, then test the best candidate on held-out ones.
+
+    The held-out test's generations are set aside before the optimiser starts,
+    so however the optimiser spends its share (GEPA can finish an iteration
+    past max_metric_calls), the held-out comparison runs in full. When the
+    optimiser's share runs out it stops, and the best candidate scored on
+    every dev species is tested.
+    """
     dev = [entry for entry in panel if entry.split == "dev"]
     holdout = [entry for entry in panel if entry.split == "holdout"]
     references = {entry.taxon_id: frozen_references(run, entry) for entry in panel}
     adapter = PlateTuningAdapter(
         run, config, generator, judges, references, budget=budget, parallel=parallel
     )
+    reserved = holdout_reservation(run, adapter.baseline, holdout, holdout_samples)
     stopped: str | None = None
-    try:
-        best = optimizer(
-            seed_candidate={PLATE_COMPONENT: PLATE_INSTRUCTIONS},
-            trainset=list(dev),
-            valset=list(dev),
-            adapter=adapter,
-            reflection_lm=reflection_lm,
-            max_metric_calls=metric_calls,
-            minibatch_size=config.tune_minibatch_size,
-            run_dir=run.path("gepa"),
-            seed=run.derived("gepa") % 2**31,
-        )
-        best_text = best.get(PLATE_COMPONENT, PLATE_INSTRUCTIONS)
-        best_score = adapter.scores.mean(best_text, [entry.key for entry in dev])
-    except BudgetExhaustedError as exc:
-        stopped = str(exc)
-        best_text, best_score = adapter.scores.best(
-            [entry.key for entry in dev], PLATE_INSTRUCTIONS
-        )
+    with budget.holding(reserved):
+        try:
+            best = optimizer(
+                seed_candidate={PLATE_COMPONENT: PLATE_INSTRUCTIONS},
+                trainset=list(dev),
+                valset=list(dev),
+                adapter=adapter,
+                reflection_lm=reflection_lm,
+                max_metric_calls=metric_calls,
+                minibatch_size=config.tune_minibatch_size,
+                run_dir=run.path("gepa"),
+                seed=run.derived("gepa") % 2**31,
+            )
+            best_text = best.get(PLATE_COMPONENT, PLATE_INSTRUCTIONS)
+            best_score = adapter.scores.mean(best_text, [entry.key for entry in dev])
+            if best_score is None:
+                # The optimiser's pick was never scored on every dev species here.
+                best_text, best_score = adapter.scores.best(
+                    [entry.key for entry in dev], PLATE_INSTRUCTIONS
+                )
+        except BudgetExhaustedError as exc:
+            stopped = str(exc)
+            best_text, best_score = adapter.scores.best(
+                [entry.key for entry in dev], PLATE_INSTRUCTIONS
+            )
     validate_candidate(best_text, target="plate", max_characters=config.max_candidate_characters)
     write_text(run.path("tune", "best-plate-instructions.txt"), best_text + "\n")
     holdout_result: dict[str, object] | None = None
+    decision: dict[str, object] | None = None
+    note: str | None = None
     if best_text == PLATE_INSTRUCTIONS:
-        decision: dict[str, object] = {
-            "accept": False,
-            "reasons": ["tuning found nothing better than the current prompt on the dev species"],
-        }
+        note = "tuning found nothing better than the current prompt on the dev species"
+        if not exploratory:
+            decision = {"accept": False, "reasons": [note]}
     else:
         digest = sha256_text(best_text)[:12]
         result = compare(
@@ -470,16 +531,17 @@ def tune_plate(
             holdout,
             samples=holdout_samples,
             budget=budget,
+            gate=gate,
+            exploratory=exploratory,
             parallel=parallel,
             scope="tune",
         )
         holdout_result = result.as_dict()
-        decision = (
-            result.decision.as_dict()
-            if result.decision is not None
-            else {"accept": False, "reasons": ["no held-out pair was judged"]}
-        )
-    outcome = TuneResult(best_text, best_score, stopped, holdout_result, decision)
+        decision = None if result.decision is None else result.decision.as_dict()
+        note = result.decision_note
+    outcome = TuneResult(
+        best_text, best_score, stopped, reserved, holdout_result, decision, note, exploratory
+    )
     write_json(run.path("tune", "summary.json"), outcome.as_dict())
     return outcome
 
@@ -529,15 +591,48 @@ class ReviewItem:
         }
 
 
-def build_labels(sources: Sequence[Path]) -> list[ReviewItem]:
-    """Label every plate judged in earlier runs' comparisons with the panel majority."""
+def label_judges(summary: dict[str, object], gate: CalibrationGate | None) -> set[str] | None:
+    """The judges whose votes in one earlier comparison may label plates.
+
+    With a gate, only calibrated judges count, and only where that comparison
+    used the same rubric, judging contract, kind and model; None means every
+    judge (an exploratory run).
+    """
+    if gate is None:
+        return None
+    judged = summary.get("judged_with")
+    if not isinstance(judged, dict):
+        return set()
+    if judged.get("rubric_sha256") != gate.rubric_sha256:
+        return set()
+    if judged.get("judge_contract_sha256") != gate.judge_contract_sha256:
+        return set()
+    listed = judged.get("judges")
+    allowed: set[str] = set()
+    for entry in listed if isinstance(listed, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name"))
+        if gate.specs.get(name) == (entry.get("kind"), entry.get("model")):
+            allowed.add(name)
+    return allowed
+
+
+def build_labels(sources: Sequence[Path], gate: CalibrationGate | None = None) -> list[ReviewItem]:
+    """Label every plate judged in earlier runs' comparisons with the panel majority.
+
+    Only votes label_judges admits count; a plate without one is unlabelled.
+    """
     items: dict[str, ReviewItem] = {}
     for source in sources:
         for records_path in sorted(source.glob("*/*/pairs.json")):
+            summary_path = records_path.parent / "summary.json"
+            summary = read_object(summary_path) if summary_path.exists() else {}
+            allowed = label_judges(summary, gate)
             records = read_object_list(records_path)
             for record in records:
                 for role in ("first", "second"):
-                    item = _label(source, record, role)
+                    item = _label(source, record, role, allowed)
                     if item is not None:
                         items.setdefault(item.plate_id, item)
     return sorted(items.values(), key=lambda item: (item.taxon_id, item.plate_id))
@@ -550,7 +645,9 @@ def read_object_list(path: Path) -> list[dict[str, object]]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def _label(source: Path, record: dict[str, object], role: str) -> ReviewItem | None:
+def _label(
+    source: Path, record: dict[str, object], role: str, allowed: set[str] | None
+) -> ReviewItem | None:
     plate, votes, taxon = record.get(role), record.get("votes"), record.get("taxon_id")
     if not isinstance(plate, dict) or not isinstance(votes, list) or not isinstance(taxon, int):
         return None
@@ -560,7 +657,11 @@ def _label(source: Path, record: dict[str, object], role: str) -> ReviewItem | N
     path = resolve_recorded(source, recorded)
     if not path.is_file():
         return None
-    assessments = [vote.get(role) for vote in votes if isinstance(vote, dict)]
+    assessments = [
+        vote.get(role)
+        for vote in votes
+        if isinstance(vote, dict) and (allowed is None or vote.get("judge") in allowed)
+    ]
     usable = [item for item in assessments if isinstance(item, dict)]
     if not usable:
         return None
@@ -589,6 +690,7 @@ def _label(source: Path, record: dict[str, object], role: str) -> ReviewItem | N
 class ReviewOutcome:
     passed: bool
     corrections: tuple[str, ...]
+    usage: Usage | None = field(default=None, compare=False)
 
     @property
     def categories(self) -> frozenset[str]:
@@ -624,16 +726,21 @@ class CodexReviewEvaluator:
     ) -> ReviewOutcome:
         work_dir.mkdir(parents=True, exist_ok=True)
         runner = InstructedCodexRunner(self.executable, work_dir, self.timeout, model=self.model)
+        log = work_dir / "review.log"
         review = runner.review_with_instructions(
             species,
             references,
             item.plate_path,
             work_dir / "review.json",
-            work_dir / "review.log",
+            log,
             allowed_domains=self.domains,
             instructions=instructions,
         )
-        return ReviewOutcome(review.passed, review.correction_findings)
+        try:
+            usage = codex_usage(log.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            usage = None
+        return ReviewOutcome(review.passed, review.correction_findings, usage)
 
 
 def review_score(outcome: ReviewOutcome | None, item: ReviewItem) -> float:
@@ -712,7 +819,8 @@ class ReviewTuningAdapter:
             self.ledger.record("review-failed", plate=item.plate_id, error=str(exc))
             write_json(cache, {"error": str(exc)})
             return None, str(exc)
-        self.ledger.record("review-finished", plate=item.plate_id)
+        usage = None if outcome.usage is None else dict(outcome.usage)
+        self.ledger.record("review-finished", plate=item.plate_id, usage=usage)
         write_json(cache, {"passed": outcome.passed, "corrections": list(outcome.corrections)})
         return outcome, None
 
@@ -770,8 +878,14 @@ def tune_review(
     reflection_lm: ReflectionLM,
     budget: Budget,
     metric_calls: int,
+    exploratory: bool = False,
     parallel: int = 1,
 ) -> dict[str, object]:
+    """Tune the review instructions on labelled plates, then test on held-out species.
+
+    The labels must come from calibrated judges (see build_labels); an
+    exploratory run reports what the rule would say but makes no decision.
+    """
     by_taxon = {entry.taxon_id: entry for entry in panel}
     usable = [item for item in labels if item.taxon_id in by_taxon]
     dev = [item for item in usable if by_taxon[item.taxon_id].split == "dev"]
@@ -810,12 +924,12 @@ def tune_review(
         "best_sha256": sha256_text(best_text),
         "stopped_early": stopped,
         "labelled_plates": {"dev": len(dev), "holdout": len(holdout)},
+        "exploratory": exploratory,
     }
     if best_text == REVIEW_INSTRUCTIONS:
-        summary["decision"] = {
-            "accept": False,
-            "reasons": ["tuning found nothing better than the current review prompt"],
-        }
+        note = "tuning found nothing better than the current review prompt"
+        summary["decision"] = None if exploratory else {"accept": False, "reasons": [note]}
+        summary["decision_note"] = note
     else:
         differences: dict[int, list[float]] = defaultdict(list)
         incomplete = 0
@@ -839,6 +953,15 @@ def tune_review(
         if incomplete:
             reasons.append(f"{incomplete} held-out plates were not reviewed within the cap")
         summary["holdout_score_difference"] = rate.as_dict()
-        summary["decision"] = {"accept": decision.accept and not incomplete, "reasons": reasons}
+        verdict = {"accept": decision.accept and not incomplete, "reasons": reasons}
+        if exploratory:
+            summary["decision"] = None
+            summary["exploratory_decision"] = verdict
+            summary["decision_note"] = (
+                "exploratory run without a passing calibration; no decision is made"
+            )
+        else:
+            summary["decision"] = verdict
+            summary["decision_note"] = None
     write_json(run.path("tune-review", "summary.json"), summary)
     return summary

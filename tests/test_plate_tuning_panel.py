@@ -134,7 +134,7 @@ def test_config_file_overrides_defaults_and_rejects_unknown_keys(tmp_path: Path)
     default = load_config(None)
     assert [judge.kind for judge in default.judges] == ["claude", "claude", "codex"]
     assert default.judges[0].model == "claude-fable-5-2"
-    assert default.judges[2].model is None
+    assert default.judges[2].model == "gpt-6-astra"
 
     path = tmp_path / "eval.toml"
     path.write_text(
@@ -144,6 +144,9 @@ def test_config_file_overrides_defaults_and_rejects_unknown_keys(tmp_path: Path)
     assert loaded.samples_per_species == 2
     assert loaded.confidence == 0.9
     assert [judge.name for judge in loaded.judges] == ["solo"]
+    assert loaded.judges[0].model == "gpt-6-astra"
+    path.write_text('[[judges]]\nname = "c"\nkind = "codex"\nmodel = "other-model"\n')
+    assert load_config(path).judges[0].model == "other-model"
 
     for text in ("surprise = 1\n", 'samples_per_species = "3"\n', "anatomy_weight = 0.9\n"):
         path.write_text(text)

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Final
 
-from .blind import JudgedPair, Outcome, Vote
+from .blind import JudgedPair, Outcome, Vote, blind_choice
 from .config import DEFAULT_MAX_MISSING_JUDGE_SHARE
 
 OUTCOMES: Final[tuple[Outcome, ...]] = ("first", "second", "tie")
@@ -126,6 +126,34 @@ def agreement(rows: Sequence[Mapping[str, Outcome]], judges: Sequence[str]) -> A
     return Agreement(pairwise, fleiss_kappa(table), len(complete))
 
 
+def _a_share(choices: Sequence[str]) -> float | None:
+    decided = [choice for choice in choices if choice != "tie"]
+    return decided.count("A") / len(decided) if decided else None
+
+
+def position_bias(
+    pairs: Sequence[JudgedPair], judges: Sequence[str]
+) -> dict[str, dict[str, float | int | None]]:
+    """Each judge's share of decided choices that went to letter A.
+
+    Sides are drawn at random per pair and judge, so an unbiased judge sits
+    near 0.5; a judge far from it is choosing by position.
+    """
+    report: dict[str, dict[str, float | int | None]] = {}
+    for judge in judges:
+        votes = [vote for pair in pairs for vote in pair.votes if vote.judge == judge]
+        anatomy = [blind_choice(vote.anatomy, vote.first_side) for vote in votes]
+        lettering = [blind_choice(vote.lettering, vote.first_side) for vote in votes]
+        report[judge] = {
+            "verdicts": len(votes),
+            "anatomy_a_share": _a_share(anatomy),
+            "lettering_a_share": _a_share(lettering),
+            "anatomy_ties": anatomy.count("tie"),
+            "lettering_ties": lettering.count("tie"),
+        }
+    return report
+
+
 @dataclass(frozen=True)
 class Rate:
     point: float
@@ -152,6 +180,7 @@ class Summary:
     per_species: dict[int, dict[str, float | int]]
     # Pairs (judged or not) each judge gave no verdict on.
     judge_missing: dict[str, int]
+    position_bias: dict[str, dict[str, float | int | None]]
 
     @property
     def total_pairs(self) -> int:
@@ -177,6 +206,7 @@ class Summary:
                 "lettering": self.lettering_agreement.as_dict(),
             },
             "per_species": {str(taxon): values for taxon, values in self.per_species.items()},
+            "position_bias": self.position_bias,
         }
 
 
@@ -267,6 +297,7 @@ def summarize(
             judge: sum(1 for pair in pairs if judge not in {vote.judge for vote in pair.votes})
             for judge in judges
         },
+        position_bias=position_bias(pairs, judges),
     )
 
 

@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final
 
@@ -14,9 +14,10 @@ from inky_bird_frame.errors import InkyBirdFrameError
 from inky_bird_frame.prompts import PLATE_INSTRUCTIONS, PROMPT_VERSION
 from inky_bird_frame.references import download_references
 
-from .calibrate import calibrate, calibration_plan
+from .calibrate import anchor_taxa, calibrate, calibration_plan
 from .compare import compare, plan
 from .config import EvalConfig, HarnessError, load_config
+from .gate import CalibrationGate, calibration_gate, load_calibration
 from .generate import (
     GENERATIONS_LEDGER,
     Arm,
@@ -33,10 +34,12 @@ from .panel import (
     freeze_references,
     frozen_references,
     load_panel,
+    resolve_species,
     select,
 )
 from .report import write_report
-from .rundir import Budget, Ledger, Run, locked
+from .rundir import Budget, Ledger, Run, locked, read_object
+from .smoke import judge_smoke
 from .tune import (
     BASELINE_ARM,
     REVIEWS_LEDGER,
@@ -46,6 +49,7 @@ from .tune import (
     ReflectionLM,
     ReviewEvaluator,
     build_labels,
+    holdout_reservation,
     tune_plate,
     tune_review,
 )
@@ -95,28 +99,55 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--seed", type=int, help="seed for a new run directory")
         return sub
 
+    def gated(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument(
+            "--calibration", type=Path, help="calibration/summary.json from another run directory"
+        )
+        sub.add_argument(
+            "--allow-uncalibrated",
+            action="store_true",
+            help="explore without a passing calibration; no decision is made",
+        )
+
     cache = command("cache-references", "Download and freeze each species' reference photos")
-    cache.add_argument("--species", type=int, nargs="*", default=[], help="taxon ids")
+    cache.add_argument(
+        "--species",
+        type=int,
+        nargs="*",
+        default=[],
+        help="taxon ids: panel species, or approved catalog species used as anchors",
+    )
 
     calibrate_command = command("calibrate", "Measure each judge against known answers")
     calibrate_command.add_argument("--anchors", type=Path, help="ANCHORS/<taxon>/<plate>.png")
     calibrate_command.add_argument("--planted-species", type=int, help="species for planting")
     calibrate_command.add_argument("--dry-run", action="store_true")
 
+    smoke = command("judge-smoke", "Send one known pair to each judge once and show the answers")
+    smoke.add_argument("--species", type=int, help="panel taxon id (default: the first)")
+    smoke.add_argument("--judge", action="append", default=[], help="only this judge")
+    smoke.add_argument("--dry-run", action="store_true")
+
     compare_command = command("compare", "Blind paired comparison of two arms")
-    compare_command.add_argument("first", help="candidate arm: NAME=default or NAME=PATH")
-    compare_command.add_argument("second", help="baseline arm: NAME=default or NAME=PATH")
+    compare_command.add_argument(
+        "first", help="candidate arm: NAME=default, NAME=ref:GITREF or NAME=PATH"
+    )
+    compare_command.add_argument(
+        "second", help="baseline arm: NAME=default, NAME=ref:GITREF or NAME=PATH"
+    )
     compare_command.add_argument("--max-generations", type=int, help="hard generation cap")
     compare_command.add_argument("--samples", type=int, help="plates per species per arm")
     compare_command.add_argument("--split", choices=("all", "dev", "holdout"), default="all")
     compare_command.add_argument("--species", type=int, nargs="*", default=[])
     compare_command.add_argument("--dry-run", action="store_true")
+    gated(compare_command)
 
     tune_command = command("tune", "Tune the plate instructions, then test on held-out species")
     tune_command.add_argument("--max-generations", type=int, help="hard generation cap")
     tune_command.add_argument("--budget", type=int, required=True, help="optimiser metric calls")
     tune_command.add_argument("--holdout-samples", type=int, help="plates per held-out species")
     tune_command.add_argument("--dry-run", action="store_true")
+    gated(tune_command)
 
     review_command = command("tune-review", "Tune the review instructions on labelled plates")
     review_command.add_argument(
@@ -125,6 +156,7 @@ def _parser() -> argparse.ArgumentParser:
     review_command.add_argument("--max-reviews", type=int, help="hard review cap")
     review_command.add_argument("--budget", type=int, required=True, help="optimiser metric calls")
     review_command.add_argument("--dry-run", action="store_true")
+    gated(review_command)
 
     command("report", "Write the markdown report and contact sheets")
     return parser
@@ -164,11 +196,40 @@ def _cap_report(budget: Budget) -> dict[str, int]:
     return {"cap": budget.limit, "used": budget.used, "remaining": budget.remaining}
 
 
+def _gate(args: argparse.Namespace, run: Run, config: EvalConfig) -> CalibrationGate:
+    record, source = load_calibration(run, args.calibration)
+    return calibration_gate(config, record, source=source)
+
+
+def _require_gate(args: argparse.Namespace, gate: CalibrationGate) -> bool:
+    """Whether this is an exploratory run; refuses a gated run without a passing calibration."""
+    if gate.passed:
+        return False
+    if args.allow_uncalibrated:
+        return True
+    raise HarnessError(
+        "No passing calibration for these judges and this rubric ("
+        + "; ".join(gate.reasons)
+        + "); run calibrate first, or pass --allow-uncalibrated to explore without a decision"
+    )
+
+
+def _calibrated_only(config: EvalConfig, gate: CalibrationGate) -> EvalConfig:
+    """The configuration with only the judges that passed, so no call is paid for the others."""
+    return replace(
+        config, judges=tuple(judge for judge in config.judges if judge.name in gate.calibrated)
+    )
+
+
 def _cache_references(
-    args: argparse.Namespace, run: Run, panel: Sequence[PanelSpecies], tools: Tools
+    args: argparse.Namespace,
+    run: Run,
+    panel: Sequence[PanelSpecies],
+    tools: Tools,
 ) -> dict[str, object]:
     frozen: dict[str, int] = {}
-    for entry in select(panel, taxa=args.species):
+    chosen = resolve_species(args.catalog, panel, args.species) if args.species else panel
+    for entry in chosen:
         references = freeze_references(run, entry, downloader=tools.downloader)
         frozen[entry.key] = len(references.photos)
     return {"frozen": frozen}
@@ -183,18 +244,53 @@ def _calibrate(
 ) -> dict[str, object]:
     chosen = spread(panel, args.planted_species or config.planted_species)
     anchors = sum(1 for _ in args.anchors.glob("*/*.png")) if args.anchors is not None else 0
+    anchor_species = (
+        resolve_species(args.catalog, panel, anchor_taxa(args.anchors))
+        if args.anchors is not None
+        else ()
+    )
     estimate = calibration_plan(len(chosen), anchors, len(config.judges))
     if args.dry_run:
-        return {"plan": estimate, "species": [entry.taxon_id for entry in chosen]}
+        return {
+            "plan": estimate,
+            "species": [entry.taxon_id for entry in chosen],
+            "anchor_species": [entry.taxon_id for entry in anchor_species],
+        }
     results = calibrate(
         run,
         config,
         tools.judges(config),
         [(entry, frozen_references(run, entry)) for entry in chosen],
         anchors=args.anchors,
+        anchor_species=[(entry, frozen_references(run, entry)) for entry in anchor_species],
         parallel=args.parallel,
     )
-    return {"plan": estimate, "judges": [result.as_dict() for result in results]}
+    summary = read_object(run.path("calibration", "summary.json"))
+    return {
+        "plan": estimate,
+        "judges": [result.as_dict() for result in results],
+        "position_bias": summary.get("position_bias"),
+        "gate": calibration_gate(config, summary, source="calibration/summary.json").as_dict(),
+    }
+
+
+def _judge_smoke(
+    args: argparse.Namespace,
+    run: Run,
+    config: EvalConfig,
+    panel: Sequence[PanelSpecies],
+    tools: Tools,
+) -> dict[str, object]:
+    entry = select(panel, taxa=[args.species])[0] if args.species is not None else panel[0]
+    names = args.judge or [judge.name for judge in config.judges]
+    unknown = set(names) - {judge.name for judge in config.judges}
+    if unknown:
+        raise HarnessError(f"Judge {sorted(unknown)[0]} is not in the configuration")
+    if args.dry_run:
+        return {"plan": {"judge_calls": len(names), "generations": 0}, "taxon_id": entry.taxon_id}
+    chosen = replace(config, judges=tuple(j for j in config.judges if j.name in names))
+    results = judge_smoke(run, chosen, tools.judges(chosen), entry, frozen_references(run, entry))
+    return {"taxon_id": entry.taxon_id, "judges": results}
 
 
 def _compare(
@@ -213,8 +309,10 @@ def _compare(
     samples = args.samples or config.samples_per_species
     estimate = plan(run, first, second, species, samples, len(config.judges)).as_dict()
     budget = _run_budget(run, cap, "generation")
+    gate = _gate(args, run, config)
+    exploratory = not gate.passed and args.allow_uncalibrated
     if args.dry_run:
-        return {"plan": estimate, **_cap_report(budget)}
+        return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
     result = compare(
         run,
         config,
@@ -225,6 +323,9 @@ def _compare(
         species,
         samples=samples,
         budget=budget,
+        gate=gate,
+        exploratory=exploratory,
+        required_holdout=[entry.taxon_id for entry in panel if entry.split == "holdout"],
         parallel=args.parallel,
     )
     return {"plan": estimate, **_cap_report(budget), **result.as_dict()}
@@ -244,45 +345,52 @@ def _tune(
     holdout = [entry for entry in panel if entry.split == "holdout"]
     holdout_samples = args.holdout_samples or config.samples_per_species
     baseline = Arm(BASELINE_ARM, PLATE_INSTRUCTIONS, PROMPT_VERSION)
-    # Worst case: every metric call generates one plate, plus the baseline
-    # plates for dev and both arms on the held-out species.
-    needed = (
-        args.budget
-        + missing_samples(run, [baseline], dev, 1)
-        + missing_samples(run, [baseline], holdout, holdout_samples)
-        + len(holdout) * holdout_samples
-    )
+    # The held-out test's plates are set aside first; the optimiser gets the rest.
+    # Its share is planned as one plate per metric call plus the dev baselines.
+    reserved = holdout_reservation(run, baseline, holdout, holdout_samples)
+    needed = args.budget + missing_samples(run, [baseline], dev, 1) + reserved
     estimate = {
         "generations_at_most": needed,
+        "holdout_generations_reserved": reserved,
         "metric_calls": args.budget,
         "dev_species": len(dev),
         "holdout_species": len(holdout),
     }
     budget = _run_budget(run, cap, "generation")
+    gate = _gate(args, run, config)
     if args.dry_run:
-        return {"plan": estimate, **_cap_report(budget)}
+        return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
     if budget.remaining < needed:
         raise HarnessError(
             f"--max-generations {cap} leaves {budget.remaining} for this run, below the"
             f" {needed} this tuning may need, so the held-out test could not finish;"
             " raise the cap or lower --budget"
         )
+    exploratory = _require_gate(args, gate)
     for entry in panel:
         frozen_references(run, entry)
+    judging = config if exploratory else _calibrated_only(config, gate)
     result = tune_plate(
         run,
-        config,
-        tools.generator(config),
-        tools.judges(config),
+        judging,
+        tools.generator(judging),
+        tools.judges(judging),
         panel,
         optimizer=tools.optimizer(),
-        reflection_lm=tools.reflector(run, config),
+        reflection_lm=tools.reflector(run, judging),
         budget=budget,
         metric_calls=args.budget,
         holdout_samples=holdout_samples,
+        gate=gate,
+        exploratory=exploratory,
         parallel=args.parallel,
     )
-    return {"plan": estimate, **_cap_report(budget), **result.as_dict()}
+    return {
+        "plan": estimate,
+        **_cap_report(budget),
+        "calibration": gate.as_dict(),
+        **result.as_dict(),
+    }
 
 
 def _tune_review(
@@ -295,14 +403,18 @@ def _tune_review(
     cap = _require_cap(args.max_reviews, "--max-reviews")
     if args.budget < 1:
         raise HarnessError("--budget must be at least 1")
-    labels = build_labels([path.resolve() for path in args.labels_from])
+    gate = _gate(args, run, config)
+    exploratory = not gate.passed and args.allow_uncalibrated
+    sources = [path.resolve() for path in args.labels_from]
+    labels = build_labels(sources, None if exploratory else gate)
     splits = {entry.taxon_id: entry.split for entry in panel}
     held_out = sum(1 for item in labels if splits.get(item.taxon_id) == "holdout")
     needed = args.budget + 2 * held_out
     estimate = {"labelled_plates": len(labels), "reviews_at_most": needed}
     budget = _run_budget(run, cap, "review")
     if args.dry_run:
-        return {"plan": estimate, **_cap_report(budget)}
+        return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
+    _require_gate(args, gate)
     if budget.remaining < needed:
         raise HarnessError(
             f"--max-reviews {cap} leaves {budget.remaining} for this run, below the"
@@ -318,9 +430,10 @@ def _tune_review(
         reflection_lm=tools.reflector(run, config),
         budget=budget,
         metric_calls=args.budget,
+        exploratory=exploratory,
         parallel=args.parallel,
     )
-    return {"plan": estimate, **_cap_report(budget), **summary}
+    return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict(), **summary}
 
 
 def _run(args: argparse.Namespace, tools: Tools) -> dict[str, object]:
@@ -336,6 +449,7 @@ def _run(args: argparse.Namespace, tools: Tools) -> dict[str, object]:
             return _cache_references(args, run, panel, tools)
         commands = {
             "calibrate": _calibrate,
+            "judge-smoke": _judge_smoke,
             "compare": _compare,
             "tune": _tune,
             "tune-review": _tune_review,

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from plate_tuning.blind import JudgedPair, Outcome, PairSpec, PlateRef, Vote
-from plate_tuning.judges import Defect, PlateAssessment
+from plate_tuning.judges import Defect, PlateAssessment, Side
 from plate_tuning.panel import FrozenReferences
 from plate_tuning.stats import (
     agreement,
@@ -15,6 +15,7 @@ from plate_tuning.stats import (
     fleiss_kappa,
     majority,
     majority_flag,
+    position_bias,
     summarize,
 )
 
@@ -59,7 +60,7 @@ def _pair(
         Vote(f"j{index}", outcome, (lettering or anatomy)[index], first, second)
         for index, outcome in enumerate(anatomy)
     )
-    return JudgedPair(spec, f"id{taxon}", "A", votes, ())
+    return JudgedPair(spec, f"id{taxon}", {}, votes, ())
 
 
 def test_majority_needs_more_than_half() -> None:
@@ -238,3 +239,44 @@ def test_decision_refuses_when_a_judge_is_missing_on_too_many_pairs() -> None:
     refused = decide(summarize(many_gaps, judges, iterations=200, seed=1), [], 0.1)
     assert not refused.accept
     assert refused.reasons == ("judge j2 gave no verdict on 6 of 24 pairs (above 10%)",)
+
+
+SIDES: tuple[Side, ...] = ("A", "B") * 4
+
+
+def test_position_bias_reports_each_judges_share_of_side_a() -> None:
+    def vote(judge: str, anatomy: Outcome, side: Side) -> Vote:
+        return Vote(judge, anatomy, "tie", GOOD, GOOD, side)
+
+    # "always-a" picks letter A every time, whichever plate sat there;
+    # "fair" picks the first plate wherever it landed.
+    pairs = [
+        JudgedPair(
+            replace(_pair(taxon, ["first"]).spec, identity=f"bias|{taxon}"),
+            f"b{taxon}",
+            {"always-a": side, "fair": side},
+            (
+                vote("always-a", "first" if side == "A" else "second", side),
+                vote("fair", "first", side),
+            ),
+            (),
+        )
+        for taxon, side in zip(range(1, 9), SIDES, strict=True)
+    ]
+
+    bias = position_bias(pairs, ["always-a", "fair", "silent"])
+
+    assert bias["always-a"] == {
+        "verdicts": 8,
+        "anatomy_a_share": 1.0,
+        "lettering_a_share": None,
+        "anatomy_ties": 0,
+        "lettering_ties": 8,
+    }
+    assert bias["fair"]["anatomy_a_share"] == 0.5
+    assert bias["silent"]["verdicts"] == 0
+    summary = summarize(pairs, ["always-a", "fair"], iterations=50, seed=1)
+    assert summary.as_dict()["position_bias"] == {
+        "always-a": bias["always-a"],
+        "fair": bias["fair"],
+    }

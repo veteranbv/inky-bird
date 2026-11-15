@@ -1,10 +1,11 @@
 """Blind pairs: anonymised folders, the hidden side key, judging and unblinding.
 
 A pair is two plates in a fixed order, "first" and "second". Each judge sees
-them only as plate-A.png and plate-B.png; which is which is drawn per pair and
-kept in a key file under unblinding/, named so it cannot be found from the
-folder's name. Judges never run inside the run directory at all: each gets a
-private copy of the folder (see judges.isolated_pair).
+them only as plate-A.png and plate-B.png in a blind folder of its own; which is
+which is drawn independently for every (pair, judge) and kept in a key file
+under unblinding/, named so it cannot be found from a folder's name. Judges
+never run inside the run directory at all: each gets a private copy of its
+folder (see judges.isolated_pair).
 
 A verdict is stamped with the rubric's digest and the judge's kind and model;
 a change to any of them makes the pair be judged again.
@@ -16,8 +17,8 @@ import functools
 import os
 import random
 import shutil
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
 
@@ -38,6 +39,7 @@ from .judges import (
     JudgeRequest,
     PlateAssessment,
     Side,
+    judge_contract_sha256,
     parse_verdict,
 )
 from .panel import FrozenReferences
@@ -97,8 +99,9 @@ class PairSpec:
     second: PlateRef
     references: FrozenReferences
     expected_text: dict[str, object]
-    # Forces which letter the first plate gets; None draws it from the run seed.
-    first_side: Side | None = None
+    # Forces which letter the first plate gets for a judge; any other judge's
+    # letter is drawn from the run seed.
+    first_sides: Mapping[str, Side] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -110,13 +113,15 @@ class Vote:
     lettering: Outcome
     first: PlateAssessment
     second: PlateAssessment
+    # The letter this judge saw the first plate under, for position-bias checks.
+    first_side: Side = "A"
 
 
 @dataclass(frozen=True)
 class JudgedPair:
     spec: PairSpec
     pair_id: str
-    first_side: Side
+    first_sides: Mapping[str, Side]
     votes: tuple[Vote, ...]
     errors: tuple[tuple[str, str], ...]
 
@@ -131,6 +136,13 @@ def unblind_choice(choice: Choice, first_side: Side) -> Outcome:
     return "first" if choice == first_side else "second"
 
 
+def blind_choice(outcome: Outcome, first_side: Side) -> Choice:
+    """The letter a judge chose, recovered from its unblinded outcome."""
+    if outcome == "tie":
+        return "tie"
+    return first_side if outcome == "first" else other(first_side)
+
+
 def unblind(judge: str, verdict: BlindVerdict, first_side: Side) -> Vote:
     return Vote(
         judge=judge,
@@ -138,19 +150,26 @@ def unblind(judge: str, verdict: BlindVerdict, first_side: Side) -> Vote:
         lettering=unblind_choice(verdict.lettering, first_side),
         first=verdict.plate(first_side),
         second=verdict.plate(other(first_side)),
+        first_side=first_side,
     )
 
 
 def _anonymised_copy(source: Path, destination: Path) -> None:
-    """Re-encode so no file name, timestamp or embedded text travels with the plate."""
+    """Re-encode from bare pixels, so only IHDR, IDAT and IEND reach the judge.
+
+    A copy of the decoded image would keep its info (an ICC profile, text,
+    resolution or EXIF), which can differ between how two arms' plates were made.
+    """
     try:
         with Image.open(source) as image:
-            image.convert("RGB").save(destination, format="PNG")
+            rgb = image.convert("RGB")
+            bare = Image.frombytes("RGB", rgb.size, rgb.tobytes())
+        bare.save(destination, format="PNG")
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise HarnessError(f"A plate could not be read: {source.name}") from exc
 
 
-def _reference_names(references: FrozenReferences) -> list[tuple[Path, str]]:
+def reference_names(references: FrozenReferences) -> list[tuple[Path, str]]:
     return [
         (path, f"reference-{index:02d}{path.suffix.lower() or '.jpg'}")
         for index, path in enumerate(references.paths, start=1)
@@ -161,16 +180,26 @@ def key_path(run: Run, identity: str) -> Path:
     return run.path(KEYS_DIR, f"{run.opaque_id(f'key|{identity}')}.json")
 
 
+def blind_folder(run: Run, identity: str, judge: str) -> Path:
+    """One judge's folder for one pair; its name says nothing about either."""
+    return run.path("blind", run.opaque_id(f"folder|{identity}|{judge}"))
+
+
+def draw_side(run: Run, identity: str, judge: str) -> Side:
+    draw = random.Random(run.derived(f"side|{identity}|{judge}")).random()
+    return "A" if draw < 0.5 else "B"
+
+
 def _build_folder(staging: Path, spec: PairSpec, first_side: Side, rubric: str) -> None:
     by_side = {first_side: spec.first.path, other(first_side): spec.second.path}
     # Written in A, B order with one fixed time, so file times say nothing about roles.
     for side in ("A", "B"):
         _anonymised_copy(by_side[side], staging / PLATE_FILES[side])
     (staging / REFERENCES_DIR).mkdir()
-    for source, name in _reference_names(spec.references):
+    for source, name in reference_names(spec.references):
         shutil.copyfile(source, staging / REFERENCES_DIR / name)
     write_text(staging / RUBRIC_FILE, rubric)
-    for path in sorted(staging.rglob("*")):
+    for path in [*sorted(staging.rglob("*")), staging]:
         os.utime(path, (FIXED_MTIME, FIXED_MTIME))
 
 
@@ -198,53 +227,60 @@ def _publish_folder(final: Path, spec: PairSpec, first_side: Side, rubric: str) 
     shutil.rmtree(retired, ignore_errors=True)
 
 
-def prepare_pair(run: Run, spec: PairSpec, rubric: str) -> tuple[str, Side]:
-    """Create (or reuse) the pair's key and blind folder; return its id and first side.
+def prepare_pair(
+    run: Run, spec: PairSpec, rubric: str, judges: Sequence[str]
+) -> tuple[str, dict[str, Side]]:
+    """Create (or reuse) the pair's key and each judge's blind folder.
 
-    The key is written before the folder; the folder is published by one
-    rename. A crash before the rename leaves a key and no folder, and the
-    next run rebuilds the folder from the key.
+    Returns the pair id and, per judge, the letter the first plate carries.
+    The key is written before any folder; each folder is published by one
+    rename. A crash before a rename leaves a key and no folder, and the next
+    run rebuilds the folder from the key. A judge added later gets its own
+    draw, added to the key before its folder is built.
     """
     pair_id = run.opaque_id(spec.identity)
     sealed = key_path(run, spec.identity)
     plates = {"first": spec.first, "second": spec.second}
+    sides: dict[str, Side] = {}
     if sealed.exists():
         key = read_object(sealed)
         if key.get("identity") != spec.identity or key.get("pair_id") != pair_id:
             raise HarnessError(f"Key {pair_id} belongs to another pair")
-        recorded = key.get("first_side")
-        if recorded not in ("A", "B"):
-            raise HarnessError(f"Key {pair_id} has no side")
-        first_side: Side = "A" if recorded == "A" else "B"
+        recorded = key.get("sides")
+        if not isinstance(recorded, dict):
+            raise HarnessError(
+                f"Key {pair_id} was written by an older harness; start a new run directory"
+            )
+        for judge, side in recorded.items():
+            if side not in ("A", "B"):
+                raise HarnessError(f"Key {pair_id} has no side for {judge}")
+            sides[str(judge)] = "A" if side == "A" else "B"
         for role, plate in plates.items():
             entry = key.get(role)
             if not isinstance(entry, dict) or entry.get("sha256") != sha256_file(plate.path):
                 raise HarnessError(f"The {role} plate of pair {pair_id} changed since it was keyed")
     else:
-        if spec.first_side is None:
-            draw = random.Random(run.derived(spec.identity)).random()
-            first_side = "A" if draw < 0.5 else "B"
-        else:
-            first_side = spec.first_side
-        write_json(
-            sealed,
-            {
-                "identity": spec.identity,
-                "pair_id": pair_id,
-                "taxon_id": spec.taxon_id,
-                "first_side": first_side,
-                **{
-                    role: {
-                        "label": plate.label,
-                        "path": run_relative(run, plate.path),
-                        "sha256": sha256_file(plate.path),
-                    }
-                    for role, plate in plates.items()
-                },
+        key = {
+            "identity": spec.identity,
+            "pair_id": pair_id,
+            "taxon_id": spec.taxon_id,
+            **{
+                role: {
+                    "label": plate.label,
+                    "path": run_relative(run, plate.path),
+                    "sha256": sha256_file(plate.path),
+                }
+                for role, plate in plates.items()
             },
-        )
-    _publish_folder(run.path("blind", pair_id), spec, first_side, rubric)
-    return pair_id, first_side
+        }
+    missing = [judge for judge in judges if judge not in sides]
+    if missing or not sealed.exists():
+        for judge in missing:
+            sides[judge] = spec.first_sides.get(judge) or draw_side(run, spec.identity, judge)
+        write_json(sealed, {**key, "sides": dict(sorted(sides.items()))})
+    for judge in judges:
+        _publish_folder(blind_folder(run, spec.identity, judge), spec, sides[judge], rubric)
+    return pair_id, {judge: sides[judge] for judge in judges}
 
 
 def _verdict_path(run: Run, pair_id: str, judge: str) -> Path:
@@ -259,10 +295,11 @@ def _judge_spec(config: EvalConfig, name: str) -> JudgeSpec:
 
 
 def verdict_stamp(config: EvalConfig, judge: str, rubric: str) -> dict[str, object]:
-    """What a verdict depends on besides the pair: the rubric and the judge's model."""
+    """What a verdict depends on besides the pair: the rubric, the judging prompt and model."""
     spec = _judge_spec(config, judge)
     return {
         "rubric_sha256": sha256_text(rubric),
+        "judge_contract_sha256": judge_contract_sha256(),
         "judge_kind": spec.kind,
         "judge_model": spec.model,
     }
@@ -285,8 +322,8 @@ def _judge_once(
     stamp: dict[str, object],
 ) -> None:
     request = JudgeRequest(
-        blind_dir=run.path("blind", pair_id),
-        reference_files=tuple(name for _path, name in _reference_names(spec.references)),
+        blind_dir=blind_folder(run, spec.identity, judge.name),
+        reference_files=tuple(name for _path, name in reference_names(spec.references)),
         expected_text=spec.expected_text,
         work_dir=run.path("verdicts", pair_id, f"{judge.name}-work"),
     )
@@ -300,9 +337,13 @@ def _judge_once(
             message = str(exc)
             ledger.record("judgment-failed", pair=pair_id, judge=judge.name, error=message)
             continue
-        write_json(_verdict_path(run, pair_id, judge.name), {"stamp": stamp, **verdict.as_dict()})
+        usage = None if verdict.usage is None else dict(verdict.usage)
+        write_json(
+            _verdict_path(run, pair_id, judge.name),
+            {"stamp": stamp, **verdict.as_dict(), "usage": usage},
+        )
         error_path.unlink(missing_ok=True)
-        ledger.record("judgment-finished", pair=pair_id, judge=judge.name)
+        ledger.record("judgment-finished", pair=pair_id, judge=judge.name, usage=usage)
         return
     write_json(error_path, {"error": message, "attempts": attempts})
 
@@ -318,7 +359,8 @@ def judge_pairs(
     """Judge every pair with every judge, skipping current verdicts already on disk."""
     rubric = config.rubric()
     stamps = {judge.name: verdict_stamp(config, judge.name, rubric) for judge in judges}
-    prepared = [(spec, *prepare_pair(run, spec, rubric)) for spec in specs]
+    names = [judge.name for judge in judges]
+    prepared = [(spec, *prepare_pair(run, spec, rubric, names)) for spec in specs]
     ledger = Ledger(run.path("judgments.jsonl"))
     run_tasks(
         [
@@ -347,7 +389,7 @@ def load_judged(
     run: Run,
     spec: PairSpec,
     pair_id: str,
-    first_side: Side,
+    first_sides: Mapping[str, Side],
     judges: Sequence[Judge],
     stamps: dict[str, dict[str, object]],
 ) -> JudgedPair:
@@ -356,12 +398,12 @@ def load_judged(
     for judge in judges:
         record = _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name])
         if record is not None:
-            votes.append(unblind(judge.name, parse_verdict(record), first_side))
+            votes.append(unblind(judge.name, parse_verdict(record), first_sides[judge.name]))
             continue
         error_path = run.path("verdicts", pair_id, f"{judge.name}.error.json")
         reason = read_object(error_path).get("error") if error_path.exists() else "missing"
         errors.append((judge.name, str(reason)))
-    return JudgedPair(spec, pair_id, first_side, tuple(votes), tuple(errors))
+    return JudgedPair(spec, pair_id, dict(first_sides), tuple(votes), tuple(errors))
 
 
 def pending_judgments(

@@ -5,13 +5,16 @@ from pathlib import Path
 
 import pytest
 from PIL import Image, ImageChops
+from plate_tuning.blind import Vote
 from plate_tuning.calibrate import (
     DUPLICATE_BOX,
     DUPLICATE_SHIFT,
     LETTERING_BOX,
     STRETCH_BOX,
     altered_digits,
+    anchor_items,
     calibrate,
+    flags_planted,
     plant_defect,
     planted_items,
     score_judge,
@@ -25,8 +28,9 @@ from plate_tuning.judges import (
     JudgeRequest,
     PlateAssessment,
 )
-from plate_tuning.panel import frozen_references
-from plate_tuning_fixtures import config, make_run
+from plate_tuning.panel import freeze_references, frozen_references, load_panel, resolve_species
+from plate_tuning.rundir import Run
+from plate_tuning_fixtures import FakeDownloader, config, make_run, write_catalog
 
 
 def _source(tmp_path: Path) -> Path:
@@ -110,7 +114,8 @@ class CalibrationJudge:
     """Answers from the plate pixels.
 
     Modes: good; blind (sees nothing); biased (always A); nitpick (lists the same
-    defects on every plate); contrary (finds the defect but prefers that plate).
+    defects on every plate); contrary (finds the defect but prefers that plate);
+    misplaced (reports the right categories at a part of the plate that was not changed).
     """
 
     def __init__(self, name: str, approved: dict[str, bytes], *, mode: str = "good") -> None:
@@ -126,11 +131,22 @@ class CalibrationJudge:
         winner: Choice = "tie" if self.mode in ("blind", "nitpick") else approved_side
         if self.mode == "contrary":
             winner = "B" if approved_side == "A" else "A"
+        where = {
+            "proportions": "primary bird, lower body stretched",
+            "legs": "primary bird, legs",
+            "lettering": "left margin, Length line",
+        }
         found = (
             ()
             if self.mode == "blind"
             else tuple(
-                Defect(category, "region", "reference-01.jpg", "major", "planted")
+                Defect(
+                    category,
+                    "primary bird, crown" if self.mode == "misplaced" else where[category],
+                    "reference-01.jpg",
+                    "major",
+                    "does not match the references",
+                )
                 for category in ("proportions", "legs", "lettering")
             )
         )
@@ -223,6 +239,84 @@ def test_a_judge_that_prefers_the_planted_plate_fails_calibration(tmp_path: Path
     }
 
     assert results["fake-1"].passed
-    assert results["fake-2"].planted_recall == 1.0
+    # It names the planted defect, but a plate it prefers was not found to be damaged.
+    assert results["fake-2"].planted_recall == 0.0
     assert results["fake-2"].planted_preference == 0.0
     assert any(failure.startswith("planted_preference") for failure in results["fake-2"].failures)
+
+
+def test_a_planted_defect_reported_elsewhere_on_the_plate_is_not_found(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    species = [(panel[0], frozen_references(run, panel[0]))]
+    reencoded = tmp_path / "reencoded.png"
+    with Image.open(panel[0].portrait_path) as image:
+        image.convert("RGB").save(reencoded, format="PNG")
+    approved = {"x": reencoded.read_bytes()}
+    judges = [
+        CalibrationJudge("fake-1", approved),
+        CalibrationJudge("fake-2", approved, mode="misplaced"),
+    ]
+
+    results = {r.judge: r for r in calibrate(run, config(), judges, species, anchors=None)}
+
+    assert results["fake-1"].planted_recall == 1.0
+    # More defects of the right category on the planted plate, but at the crown.
+    assert results["fake-2"].planted_recall == 0.0
+    assert results["fake-2"].planted_preference == 1.0
+
+
+def test_flags_planted_needs_the_category_rise_the_region_and_the_lost_comparison() -> None:
+    stretched = Defect("proportions", "primary bird, lower body", "reference-01.jpg", "major", "x")
+    crown = Defect("proportions", "primary bird, crown", "reference-01.jpg", "major", "x")
+    clean, planted = PlateAssessment((), True), PlateAssessment((stretched,), False)
+
+    assert flags_planted(Vote("j", "first", "tie", clean, planted), "stretch")
+    # The original wins nothing: the defect did not cost the planted plate the comparison.
+    assert not flags_planted(Vote("j", "tie", "first", clean, planted), "stretch")
+    # Reported in the wrong place.
+    wrong = PlateAssessment((crown,), False)
+    assert not flags_planted(Vote("j", "first", "tie", clean, wrong), "stretch")
+    # Reported on both plates alike.
+    assert not flags_planted(Vote("j", "first", "tie", planted, planted), "stretch")
+    length = Defect("lettering", "left margin, Length line", "expected text", "fatal", "x")
+    lettered = PlateAssessment((length,), False)
+    assert flags_planted(Vote("j", "tie", "first", clean, lettered), "lettering")
+    assert not flags_planted(Vote("j", "first", "tie", clean, lettered), "lettering")
+
+
+def test_anchors_may_name_any_approved_catalog_species(tmp_path: Path) -> None:
+    catalog, panel_path = write_catalog(tmp_path)
+    listed = json.loads(panel_path.read_text())
+    listed["species"] = [entry for entry in listed["species"] if entry["taxon_id"] != 104]
+    panel_path.write_text(json.dumps(listed))
+    panel = load_panel(catalog, panel_path)
+    run = Run.open(tmp_path / "run", seed=7)
+    (off_panel,) = resolve_species(catalog, panel, [104])
+    assert off_panel.split == "catalog" and off_panel.taxon_id not in {e.taxon_id for e in panel}
+    for entry in (*panel, off_panel):
+        freeze_references(run, entry, downloader=FakeDownloader())
+    anchors = tmp_path / "anchors"
+    (anchors / "104").mkdir(parents=True)
+    Image.new("RGB", (120, 160), (10, 10, 10)).save(anchors / "104" / "past-rejection.png")
+    reencoded = tmp_path / "reencoded.png"
+    with Image.open(off_panel.portrait_path) as image:
+        image.convert("RGB").save(reencoded, format="PNG")
+    judge = CalibrationJudge("fake-1", {"x": reencoded.read_bytes()})
+
+    (result,) = calibrate(
+        run,
+        config(),
+        [judge],
+        [(panel[0], frozen_references(run, panel[0]))],
+        anchors=anchors,
+        anchor_species=[(off_panel, frozen_references(run, off_panel))],
+    )
+
+    assert result.anchor_accuracy == 1.0
+    items = json.loads(run.path("calibration", "summary.json").read_text())["items"]
+    assert {"kind": "anchor", "taxon_id": 104} in items
+    with pytest.raises(HarnessError, match="approved catalog"):
+        resolve_species(catalog, panel, [999])
+    (anchors / "999").mkdir()
+    with pytest.raises(HarnessError, match="catalog entry"):
+        anchor_items(anchors, [(off_panel, frozen_references(run, off_panel))])

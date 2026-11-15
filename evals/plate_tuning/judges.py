@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, Literal, Protocol
 
@@ -82,6 +86,43 @@ class JudgeError(HarnessError):
     """A judge did not return a usable verdict."""
 
 
+# Token counts (and a cost, when the tool reports one) for one paid call.
+Usage = Mapping[str, int | float]
+# The Codex CLI ends its output with "tokens used" and the count.
+_CODEX_TOKENS: Final = re.compile(r"tokens used\W*([\d,]+)", re.IGNORECASE)
+_CLAUDE_USAGE_FIELDS: Final = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def codex_usage(output: str) -> dict[str, int | float] | None:
+    """The total the Codex CLI printed, or None when its output does not carry one."""
+    found = _CODEX_TOKENS.findall(output)
+    if not found:
+        return None
+    return {"total_tokens": int(found[-1].replace(",", ""))}
+
+
+def claude_usage(envelope: Mapping[str, object]) -> dict[str, int | float] | None:
+    """Token counts and cost from a `claude -p --output-format json` result, when present."""
+    usage: dict[str, int | float] = {}
+    raw = envelope.get("usage")
+    if isinstance(raw, dict):
+        for name in _CLAUDE_USAGE_FIELDS:
+            value = raw.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                usage[name] = value
+        if usage:
+            usage["total_tokens"] = sum(int(usage[name]) for name in list(usage))
+    cost = envelope.get("total_cost_usd")
+    if isinstance(cost, int | float) and not isinstance(cost, bool):
+        usage["cost_usd"] = float(cost)
+    return usage or None
+
+
 @dataclass(frozen=True)
 class Defect:
     category: str
@@ -128,6 +169,8 @@ class BlindVerdict:
     plate_b: PlateAssessment
     anatomy: Choice
     lettering: Choice
+    # What the call cost, when the tool reported it; not part of the verdict.
+    usage: Usage | None = field(default=None, compare=False)
 
     def plate(self, side: Side) -> PlateAssessment:
         return self.plate_a if side == "A" else self.plate_b
@@ -227,6 +270,18 @@ under "plate_a" and of plate B under "plate_b", and your two A, B or tie choices
 """
 
 
+@functools.cache
+def judge_contract_sha256() -> str:
+    """A digest of the instructions and schema every judge gets, besides the rubric.
+
+    Verdicts and calibration records carry it, so a change to the judging
+    prompt is never mixed with verdicts given under the old one.
+    """
+    sample = JudgeRequest(Path("."), ("reference-01.jpg",), {"common_name": "x"}, Path("."))
+    contract = f"{sample.prompt()}\n{json.dumps(VERDICT_SCHEMA, sort_keys=True)}"
+    return hashlib.sha256(contract.encode("utf-8")).hexdigest()
+
+
 class Judge(Protocol):
     name: str
 
@@ -241,7 +296,7 @@ def run_bounded(
     command: list[str],
     prompt: str,
     log_path: Path,
-) -> str:
+) -> subprocess.CompletedProcess[str]:
     """Run a command-line agent with the application's bounded, group-killing supervisor.
 
     The child gets the application's environment allowlist: no API keys, the
@@ -249,7 +304,7 @@ def run_bounded(
     """
     runner = CodexRunner(executable, cwd, timeout_seconds)
     try:
-        return runner._run(command, prompt, log_path).stdout
+        return runner._run(command, prompt, log_path)
     except GenerationError as exc:
         # The supervisor names Codex in its messages whichever tool it ran.
         raise JudgeError(f"{executable.name} failed: {exc}") from exc
@@ -308,13 +363,18 @@ def find_executable(name: str) -> Path:
     return Path(found)
 
 
-# Settings, hooks, plugins and guidance load only from the (empty) project: never
-# the user's own configuration.
+# Checked against `claude -p --help` (see the README for the version): no
+# settings files, no CLAUDE.md, skills, hooks, plugins or MCP servers, file
+# tools confined to the working folder, and anything that would ask for a
+# permission refused rather than prompted.
 CLAUDE_ISOLATION: Final = (
+    "--restricted",
+    "--safe-mode",
     "--strict-mcp-config",
-    "--setting-sources",
-    "project",
+    "--disable-slash-commands",
     "--no-session-persistence",
+    "--permission-prompts",
+    "none",
 )
 
 
@@ -341,8 +401,8 @@ def claude_command(
     return command
 
 
-def parse_claude_output(stdout: str) -> object:
-    """Read the structured result from `claude -p --output-format json`."""
+def claude_envelope(stdout: str) -> dict[str, object]:
+    """The single JSON result `claude -p --output-format json` prints."""
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -351,6 +411,12 @@ def parse_claude_output(stdout: str) -> object:
         raise JudgeError("Claude printed an unexpected result")
     if envelope.get("is_error") is True:
         raise JudgeError("Claude reported an error result")
+    return envelope
+
+
+def parse_claude_output(stdout: str) -> object:
+    """Read the structured result from `claude -p --output-format json`."""
+    envelope = claude_envelope(stdout)
     structured = envelope.get("structured_output")
     if isinstance(structured, dict):
         return structured
@@ -384,11 +450,13 @@ class ClaudeCliJudge:
                 claude_command(self.executable, self.model, VERDICT_SCHEMA, folder),
                 request.prompt(),
                 request.work_dir / "judge.log",
-            )
-        return parse_verdict(parse_claude_output(stdout))
+            ).stdout
+        verdict = parse_verdict(parse_claude_output(stdout))
+        return replace(verdict, usage=claude_usage(claude_envelope(stdout)))
 
 
-# No web search, no configured MCP servers and no AGENTS.md guidance for a judge.
+# No web search, no configured MCP servers and no AGENTS.md guidance for a
+# judge. These keys are not listed by `codex exec --help`; see the README.
 CODEX_JUDGE_OVERRIDES: Final = (
     'web_search="disabled"',
     "mcp_servers={}",
@@ -408,6 +476,11 @@ def codex_command(
         "exec",
         "--ephemeral",
         "--skip-git-repo-check",
+        # The user's config.toml and execpolicy rules stay out; the login still works.
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--color",
+        "never",
         "--sandbox",
         "read-only",
     ]
@@ -437,7 +510,7 @@ class CodexCliJudge:
             schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
             images = [folder / PLATE_FILES["A"], folder / PLATE_FILES["B"]]
             images.extend(folder / REFERENCES_DIR / name for name in request.reference_files)
-            run_bounded(
+            finished = run_bounded(
                 self.executable,
                 folder,
                 self.timeout,
@@ -449,7 +522,8 @@ class CodexCliJudge:
                 raw = json.loads(output_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise JudgeError("Codex did not write a JSON verdict") from exc
-        return parse_verdict(raw)
+        usage = codex_usage(f"{finished.stdout}\n{finished.stderr}")
+        return replace(parse_verdict(raw), usage=usage)
 
 
 def build_judges(config: EvalConfig) -> list[Judge]:

@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageStat
 from plate_tuning.blind import JudgedPair
 from plate_tuning.config import EvalConfig, JudgeSpec
+from plate_tuning.gate import CalibrationGate, calibration_gate, judged_with, thresholds
 from plate_tuning.generate import GenerationRequest
 from plate_tuning.judges import (
     PLATE_FILES,
@@ -243,3 +244,20 @@ def make_run(root: Path) -> tuple[Run, tuple[PanelSpecies, ...], FakeDownloader]
 
 def votes_of(pair: JudgedPair) -> list[str]:
     return [vote.anatomy for vote in pair.votes]
+
+
+def passing_gate(judges: EvalConfig | None = None) -> CalibrationGate:
+    """A calibration gate every configured judge passed, as a run with a calibration has."""
+    chosen = judges or config()
+    return calibration_gate(chosen, calibration_record(chosen), source="test")
+
+
+def calibration_record(chosen: EvalConfig, failed: tuple[str, ...] = ()) -> dict[str, object]:
+    """What calibrate writes when every judge but those named passed."""
+    return {
+        "judged_with": judged_with(chosen),
+        "thresholds": thresholds(chosen),
+        "judges": [
+            {"judge": judge.name, "passed": judge.name not in failed} for judge in chosen.judges
+        ],
+    }

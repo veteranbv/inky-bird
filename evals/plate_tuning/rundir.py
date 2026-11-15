@@ -36,6 +36,7 @@ RESERVED_NAMES: Final = frozenset(
         "report",
         "review-labels",
         "reviews",
+        "smoke",
         "tune",
         "tune-review",
         "unblinding",
@@ -226,6 +227,8 @@ class Budget:
         self.limit = limit
         self.what = what
         self._used = used
+        # Calls set aside for later work, which reserve() may not spend.
+        self._held = 0
         self._lock = threading.Lock()
 
     @classmethod
@@ -243,11 +246,33 @@ class Budget:
         with self._lock:
             return max(self.limit - self._used, 0)
 
-    def reserve(self) -> None:
+    @property
+    def available(self) -> int:
+        """What reserve() may still spend: the remainder less anything held back."""
         with self._lock:
-            if self._used >= self.limit:
+            return max(self.limit - self._used - self._held, 0)
+
+    def reserve(self, count: int = 1) -> None:
+        """Take count calls at once, or none of them."""
+        with self._lock:
+            if self._used + count > self.limit - self._held:
                 raise BudgetExhaustedError(f"The {self.what} cap of {self.limit} was reached")
-            self._used += 1
+            self._used += count
+
+    @contextmanager
+    def holding(self, count: int) -> Iterator[None]:
+        """Set count calls aside for later work; reserve() cannot spend them meanwhile."""
+        with self._lock:
+            if self._used + self._held + count > self.limit:
+                raise BudgetExhaustedError(
+                    f"The {self.what} cap of {self.limit} cannot set aside {count} more calls"
+                )
+            self._held += count
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._held -= count
 
 
 def run_tasks(tasks: Sequence[Callable[[], T]], parallel: int) -> list[T]:

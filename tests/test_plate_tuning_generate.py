@@ -14,6 +14,7 @@ from plate_tuning.generate import (
     GenerationRequest,
     completed_sample,
     generate_samples,
+    generation_order,
     missing_samples,
     parse_arm,
     register_arm,
@@ -27,8 +28,6 @@ from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.images import PORTRAIT_SIZE
 from inky_bird_frame.prompts import PLATE_INSTRUCTIONS, PROMPT_VERSION
 
-ARMS_DIR = Path(__file__).resolve().parents[1] / "evals" / "plate_tuning" / "arms"
-
 
 def test_arm_parsing_names_and_text(tmp_path: Path) -> None:
     default = parse_arm("current=default", base=tmp_path)
@@ -36,19 +35,16 @@ def test_arm_parsing_names_and_text(tmp_path: Path) -> None:
     assert default.label == PROMPT_VERSION
     assert default.is_default
 
-    v8 = parse_arm(f"v8={ARMS_DIR / 'v8.txt'}", base=tmp_path)
-    assert not v8.is_default
-    assert "natural perched posture" in v8.instructions
-    assert v8.label.startswith("v8-")
+    wording = tmp_path / "grey.txt"
+    wording.write_text(PLATE_INSTRUCTIONS.replace("warm aged cream", "pale grey") + "\n")
+    grey = parse_arm("grey=grey.txt", base=tmp_path)
+    assert not grey.is_default and grey.release is None
+    assert "pale grey" in grey.instructions and not grey.instructions.endswith("\n")
+    assert grey.label.startswith("grey-")
 
     for spec in ("noequals", "Bad_Name=default", "blind=default", "x="):
         with pytest.raises(HarnessError):
             parse_arm(spec, base=tmp_path)
-
-
-def test_checked_in_v8_arm_is_a_valid_instruction_template(tmp_path: Path) -> None:
-    run, _panel, _downloader = make_run(tmp_path)
-    register_arm(run, parse_arm(f"v8={ARMS_DIR / 'v8.txt'}", base=tmp_path))
 
 
 def test_an_arm_name_keeps_its_wording_for_the_run(tmp_path: Path) -> None:
@@ -88,16 +84,18 @@ def test_generation_is_capped_resumable_and_skips_finished_samples(tmp_path: Pat
 
     done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(3), parallel=2)
 
-    assert len(generator.calls) == 3
-    assert report.generated == 3
-    assert report.skipped_for_cap == 5
-    assert len(done) == 3
-    assert missing_samples(run, arms, [entry for entry, _ in species], 2) == 5
+    # A (species, sample) group is paid for whole: a cap of 3 buys one group of two.
+    assert len(generator.calls) == 2
+    assert report.generated == 2
+    assert report.skipped_for_cap == 6
+    assert len(done) == 2
+    assert {key[1:] for key in done} == {next(iter(done))[1:]}
+    assert missing_samples(run, arms, [entry for entry, _ in species], 2) == 6
 
     done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(10))
     assert len(generator.calls) == 8
-    assert report.completed == 3
-    assert report.generated == 5
+    assert report.completed == 2
+    assert report.generated == 6
     assert len(done) == 8
     ledger = Ledger(run.path("generations.jsonl"))
     assert ledger.count("generation-started") == 8
@@ -112,6 +110,54 @@ def test_generation_is_capped_resumable_and_skips_finished_samples(tmp_path: Pat
     _done, report = generate_samples(run, generator, arms, species, 2, budget=Budget(0))
     assert report.completed == 8
     assert len(generator.calls) == 8
+
+
+def test_generation_interleaves_arms_in_a_seeded_order(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arms = [parse_arm("base=default", base=tmp_path), parse_arm("cand-y=default", base=tmp_path)]
+    species = [(entry, frozen_references(run, entry)) for entry in panel]
+    generator = ColourGenerator()
+
+    generate_samples(run, generator, arms, species, 3, budget=Budget(24))
+
+    calls = generator.calls
+    assert len(calls) == 24
+    # Both arms of a (species, sample) run back to back ...
+    groups = [calls[index : index + 2] for index in range(0, 24, 2)]
+    assert all({arm for arm, _taxon in group} == {"base", "cand-y"} for group in groups)
+    assert all(len({taxon for _arm, taxon in group}) == 1 for group in groups)
+    # ... neither arm always goes first, and species are not taken in panel order.
+    assert {group[0][0] for group in groups} == {"base", "cand-y"}
+    assert [group[0][1] for group in groups] != sorted(group[0][1] for group in groups)
+    # The order is the run's own: drawn again from the same seed it is the same.
+    keys = [(entry.taxon_id, index) for entry, _ in species for index in (1, 2, 3)]
+    again = generation_order(Run.open(run.root), arms, keys)
+    assert [(arm.name, key[0]) for key, ordered in again for arm in ordered] == calls
+
+
+def test_generation_records_the_tokens_each_plate_used(tmp_path: Path) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+
+    class Counting:
+        def generate(self, request: GenerationRequest) -> dict[str, int | float]:
+            Image.new("RGB", (30, 40), (1, 2, 3)).save(request.output_path)
+            return {"total_tokens": 4321}
+
+    done, _report = generate_samples(
+        run, Counting(), [arm], [(panel[0], frozen_references(run, panel[0]))], 1, budget=Budget(1)
+    )
+
+    finished = [
+        entry
+        for entry in Ledger(run.path("generations.jsonl")).entries()
+        if entry["event"] == "generation-finished"
+    ]
+    assert [entry["usage"] for entry in finished] == [{"total_tokens": 4321}]
+    record = json.loads(
+        (done[("base", panel[0].taxon_id, 1)].portrait.parent / "sample.json").read_text()
+    )
+    assert record["usage"] == {"total_tokens": 4321}
 
 
 def _leave_plate(run: Run, arm: Arm, entry: PanelSpecies, *events: str) -> Path:

@@ -10,7 +10,8 @@ from typing import Protocol
 import pytest
 from PIL import Image
 from plate_tuning.compare import compare
-from plate_tuning.config import HarnessError
+from plate_tuning.config import HarnessError, JudgeSpec
+from plate_tuning.gate import calibration_gate
 from plate_tuning.generate import GenerationRequest, parse_arm
 from plate_tuning.gepa_integration import gepa_optimizer
 from plate_tuning.panel import (
@@ -36,7 +37,16 @@ from plate_tuning.tune import (
     tune_plate,
     tune_review,
 )
-from plate_tuning_fixtures import BLUE, RED, FakeDownloader, PixelJudge, config, make_run
+from plate_tuning_fixtures import (
+    BLUE,
+    RED,
+    FakeDownloader,
+    PixelJudge,
+    calibration_record,
+    config,
+    make_run,
+    passing_gate,
+)
 
 from inky_bird_frame.errors import GenerationError, MissingDependencyError
 from inky_bird_frame.prompts import PLATE_INSTRUCTIONS, REVIEW_INSTRUCTIONS
@@ -181,11 +191,12 @@ def test_tuning_finds_the_better_wording_and_accepts_it_on_held_out_species(
         budget=Budget(100),
         metric_calls=12,
         holdout_samples=2,
+        gate=passing_gate(),
     )
 
     assert result.best_text == GREY
     assert result.best_dev_score == pytest.approx(1.0)
-    assert result.decision["accept"] is True, result.decision
+    assert result.decision == {"accept": True, "reasons": []}
     assert result.stopped_early is None
     assert "Draw a bird. {data_block}" not in generator.instructions
     assert run.path("tune", "best-plate-instructions.txt").read_text() == GREY + "\n"
@@ -202,8 +213,8 @@ def test_tuning_that_runs_out_of_budget_keeps_the_best_complete_candidate(
     run, panel, _ = make_run(tmp_path)
     generator = InstructionColourGenerator()
 
-    # Seed evaluation needs four plates (two baseline, two seed); the fifth
-    # generation, for the first proposal, is refused.
+    # Four plates are set aside for the held-out test; the seed evaluation takes
+    # the other four (two baseline, two seed), so the first proposal is refused.
     result = tune_plate(
         run,
         config(),
@@ -212,15 +223,76 @@ def test_tuning_that_runs_out_of_budget_keeps_the_best_complete_candidate(
         panel,
         optimizer=stand_in_optimizer,
         reflection_lm=ScriptedReflection(GREY),
-        budget=Budget(4),
+        budget=Budget(8),
         metric_calls=12,
         holdout_samples=1,
+        gate=passing_gate(),
     )
 
-    assert result.stopped_early is not None and "cap of 4" in result.stopped_early
+    assert result.stopped_early is not None and "cap of 8" in result.stopped_early
+    assert result.holdout_reserved == 4
     assert result.best_text == PLATE_INSTRUCTIONS
-    assert result.decision["accept"] is False
+    assert result.decision is not None and result.decision["accept"] is False
     assert len(generator.instructions) == 4
+
+
+def overrunning_optimizer(
+    *,
+    seed_candidate: dict[str, str],
+    trainset: list[object],
+    valset: list[object],
+    adapter: TuningAdapter,
+    reflection_lm: ReflectionLM,
+    max_metric_calls: int,
+    minibatch_size: int,
+    run_dir: Path,
+    seed: int,
+) -> dict[str, str]:
+    """Ignores max_metric_calls, as GEPA does inside its last iteration, and never stops."""
+    component = adapter.component
+    adapter.evaluate(valset, seed_candidate)
+    adapter.evaluate(valset, {component: GREY})
+    number = 0
+    while True:
+        number += 1
+        adapter.evaluate(valset, {component: f"{PLATE_INSTRUCTIONS} Variant {number}."})
+
+
+def test_an_overrunning_optimiser_never_starves_the_held_out_test(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    generator = InstructionColourGenerator()
+    budget = Budget(21)
+
+    result = tune_plate(
+        run,
+        config(),
+        generator,
+        _judges(),
+        panel,
+        optimizer=overrunning_optimizer,
+        reflection_lm=ScriptedReflection(),
+        budget=budget,
+        metric_calls=1,
+        holdout_samples=2,
+        gate=passing_gate(),
+    )
+
+    # Two held-out species x two samples x two arms were set aside; the
+    # optimiser spent the other 13 and was stopped before a half batch.
+    assert result.holdout_reserved == 8
+    assert result.stopped_early is not None
+    assert result.best_text == GREY
+    assert result.holdout is not None
+    assert result.holdout["generation"] == {
+        "completed": 0,
+        "generated": 8,
+        "reprepared": 0,
+        "failed": 0,
+        "skipped_for_cap": 0,
+    }
+    assert result.holdout["pairs_dropped"] == []
+    assert result.decision == {"accept": True, "reasons": []}
+    assert budget.used == 20
 
 
 def test_review_categories_and_scores() -> None:
@@ -273,8 +345,9 @@ def test_review_tuning_uses_panel_verdicts_as_labels(tmp_path: Path) -> None:
         panel,
         samples=1,
         budget=Budget(8),
+        gate=passing_gate(),
     )
-    labels = build_labels([source.root])
+    labels = build_labels([source.root], passing_gate())
     assert len(labels) == 8
     assert {item.acceptable for item in labels if item.categories == {"legs"}} == {False}
 
@@ -302,6 +375,16 @@ def test_review_tuning_uses_panel_verdicts_as_labels(tmp_path: Path) -> None:
     calls = reviewer.calls
     assert calls == Ledger(run.path("reviews.jsonl")).count("review-started")
     assert Ledger(run.path("reviews.jsonl")).count("review-failed") == 1
+
+    # Votes from a judge whose model differs from its calibration do not label plates.
+    moved = replace(
+        config(), judges=(JudgeSpec("fake-1", "claude", "model-z"), *config().judges[1:])
+    )
+    gate = calibration_gate(moved, calibration_record(moved), source="t")
+    assert gate.passed
+    assert build_labels([source.root], gate) == labels
+    stale = calibration_gate(moved, calibration_record(moved, ("fake-2", "fake-3")), source="t")
+    assert build_labels([source.root], stale) == []
 
 
 def _write(path: Path, text: str) -> Path:
@@ -428,7 +511,7 @@ def test_reflection_runs_with_no_tools_outside_the_run_directory(tmp_path: Path)
         f"pwd -P > {captured}.cwd\n"
         f"ls -A > {captured}.here\n"
         "cat > /dev/null\n"
-        "printf 'proposal'\n"
+        'printf \'{"result": "proposal", "usage": {"output_tokens": 7}}\'\n'
     )
     stub.chmod(0o755)
     reflector = ClaudeReflector(run, replace(config(), claude_executable=str(stub)))
@@ -437,13 +520,18 @@ def test_reflection_runs_with_no_tools_outside_the_run_directory(tmp_path: Path)
 
     args = Path(f"{captured}.args").read_text().split("\n")
     assert args[args.index("--tools") + 1] == ""
-    assert args[args.index("--setting-sources") + 1] == "project"
-    assert "--strict-mcp-config" in args
+    assert args[args.index("--output-format") + 1] == "json"
+    assert "--restricted" in args and "--strict-mcp-config" in args
     cwd = Path(Path(f"{captured}.cwd").read_text().strip())
     assert not cwd.is_relative_to(run.root)
     assert not cwd.exists()
     assert Path(f"{captured}.here").read_text() == ""
-    assert Ledger(run.path("reflections.jsonl")).count("reflection-finished") == 1
+    finished = [
+        entry
+        for entry in Ledger(run.path("reflections.jsonl")).entries()
+        if entry["event"] == "reflection-finished"
+    ]
+    assert [entry["usage"] for entry in finished] == [{"output_tokens": 7, "total_tokens": 7}]
 
 
 class FlakyGenerator:
