@@ -12,11 +12,14 @@ import json
 import os
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tests/fake_bin/fake_tools.py"
@@ -371,3 +374,66 @@ def test_display_uninstaller_reports_a_unit_it_could_not_remove(tmp_path: Path) 
     assert result.returncode == 1
     assert f"{host.family}-display" in result.stderr
     assert "Display node services uninstalled." not in result.stdout
+
+
+# Remote display deployment ---------------------------------------------------
+
+
+@pytest.mark.parametrize("failure", ["ssh-stage-noise", "rsync"])
+def test_remote_display_staging_is_removed_on_every_exit(tmp_path: Path, failure: str) -> None:
+    host = Host(tmp_path, "Linux")
+    key = tmp_path / "synthetic-key"
+    key.write_text("")
+    shutil.copyfile(
+        ROOT / "deploy/install-display-local.sh", host.source / "deploy/install-display-local.sh"
+    )
+    host.fail(failure)
+    result = host.run(
+        "install-display-node.sh",
+        INKY_BIRD_DISPLAY_HOST="display.example.test",
+        INKY_BIRD_DISPLAY_USER="fixture",
+        INKY_BIRD_DISPLAY_SSH_KEY=str(key),
+        INKY_BIRD_DISPLAY_APP_DIR=str(host.app),
+        INKY_BIRD_DISPLAY_CONFIG_PATH=str(host.config),
+    )
+    assert result.returncode != 0
+    assert any(call[0] == "ssh" for call in host.calls())
+    assert not list(host.app.parent.glob(".inky-bird-stage.*"))
+
+
+def test_remote_display_refuses_an_existing_staging_path(tmp_path: Path) -> None:
+    host = Host(tmp_path, "Linux")
+    key = tmp_path / "synthetic-key"
+    key.write_text("")
+    od = host.bin / "od"
+    od.write_text("#!/bin/sh\nprintf ' 0a 1b 2c 3d 4e 5f\\n'\n")
+    od.chmod(0o755)
+    host.app.parent.mkdir(parents=True, exist_ok=True)
+    foreign = host.app.parent / ".inky-bird-stage.0a1b2c3d4e5f"
+    foreign.mkdir()
+    (foreign / "keep").write_text("someone else's file\n")
+    result = host.run(
+        "install-display-node.sh",
+        INKY_BIRD_DISPLAY_HOST="display.example.test",
+        INKY_BIRD_DISPLAY_USER="fixture",
+        INKY_BIRD_DISPLAY_SSH_KEY=str(key),
+        INKY_BIRD_DISPLAY_APP_DIR=str(host.app),
+        INKY_BIRD_DISPLAY_CONFIG_PATH=str(host.config),
+        INKY_BIRD_DISPLAY_VENV=str(host.venv),
+    )
+    assert result.returncode == 1
+    assert "already exists" in result.stderr
+    assert (foreign / "keep").read_text() == "someone else's file\n"
+    assert not any(call[0] == "rsync" for call in host.calls())
+
+
+@pytest.mark.parametrize("script", sorted(path.name for path in (ROOT / "deploy").glob("*.sh")))
+def test_deploy_scripts_parse_with_the_bundled_macos_shell(script: str) -> None:
+    result = subprocess.run(
+        [MACOS_BASH, "-n", str(ROOT / "deploy" / script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
