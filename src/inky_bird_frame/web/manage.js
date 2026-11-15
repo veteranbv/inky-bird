@@ -589,7 +589,7 @@ export async function renderStatus(context) {
       detections.replaceChildren(el('h2', 'Recently noted'),
         note('The latest record of each bird, up to 100.'),
         stamp('Updated', current.discovery_refreshed_at));
-      if (!current.work.complete) detections.append(note('The last check did not finish, so these may be out of date.'));
+      if (!current.work.complete && current.discovery_refreshed_at) detections.append(note('The last check did not finish, so these may be out of date.'));
       for (const bird of current.recent_detections || [])
         detections.append(link(bird.common_name, 'bird', { bird: bird.taxon_id }),
           note('Noted ' + (when(bird.latest_detection_at) || 'at an unknown time') + ' · ' +
@@ -639,7 +639,7 @@ export async function renderStatus(context) {
       if (!work.complete) runtime.append(note('Sources need a good check before the next plate is made.'));
       if (!unavailable) for (const [key, label] of [['job-refresh', 'Checking sources now'], ['job-catalog-publish', 'Publishing your plates now'], ['job-notifications', 'Sending notifications now']])
         if (activity[key]?.status === 'running') runtime.append(note(label));
-      runtime.append(note(unavailable ? 'Next check: not known right now.' : nextCheck(activity['job-generate'], current.generation_enabled)));
+      if (current.generation_enabled) runtime.append(note(unavailable ? 'Next check: not known right now.' : nextCheck(activity['job-generate'])));
       const waiting = work.queue || [];
       queue.replaceChildren(el('h2', 'Next up'),
         note(waiting.length ? 'Next up, as of the last check. The order can change.' : 'Nothing is waiting.'));
@@ -717,9 +717,12 @@ export async function renderStatus(context) {
       el('p', state.enabled ? 'Notifications are on.' : 'Notifications are off.'),
       el(
         'p',
-        plural(state.pending, 'message waiting', 'messages waiting') +
-          ' · ' +
-          plural(state.dead_letters, 'message could not be delivered', 'messages could not be delivered'),
+        [
+          state.pending ? plural(state.pending, 'message waiting', 'messages waiting') : '',
+          state.dead_letters
+            ? plural(state.dead_letters, 'message could not be delivered', 'messages could not be delivered')
+            : '',
+        ].filter(Boolean).join(' · ') || 'Nothing is waiting to be sent.',
       ),
     );
     for (const destination of state.destinations)
