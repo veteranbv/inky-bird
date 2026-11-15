@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from inky_bird_frame.config import DisplayNodeConfig, RotationMode
 from inky_bird_frame.display_node import _read_state, parse_catalog_entries, run_display_cycle
-from inky_bird_frame.errors import CatalogError, DataSourceError
+from inky_bird_frame.errors import BusyError, CatalogError, DataSourceError
 
 
 def catalog_payload(images: dict[int, bytes]) -> dict[str, object]:
@@ -929,11 +929,13 @@ class DisplayNodeTests(unittest.TestCase):
             with (
                 patch("inky_bird_frame.display_node.fcntl.flock", side_effect=BlockingIOError),
                 patch("inky_bird_frame.display_node.get_json") as get_json,
-                self.assertRaisesRegex(CatalogError, "already running"),
+                self.assertRaisesRegex(CatalogError, "already running") as raised,
             ):
                 run_display_cycle(config)
 
         get_json.assert_not_called()
+        # Callers tell "try again later" apart from a damaged catalog by type.
+        self.assertIsInstance(raised.exception, BusyError)
 
 
 if __name__ == "__main__":
