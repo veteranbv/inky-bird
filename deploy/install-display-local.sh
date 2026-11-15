@@ -143,6 +143,7 @@ units_replaced=false
 units_stuck=false
 installation_complete=false
 new_runtime_in_use=false
+new_runtime_shadowed=false
 
 # mktemp -d into the variable named $1. A stop signal that arrives after the
 # directory exists but before its name is recorded waits until it is, so
@@ -310,6 +311,11 @@ cleanup() {
       new_runtime_in_use=true
     elif [ "${package_installed}" = true ] && ! restore_package; then
       new_runtime_in_use=true
+      # Python may still import the renamed distribution before the new one.
+      if [ "${installed}" = inky-bird-frame ] && [ "$("${venv}/bin/python" -I -c \
+          "${installed_source_program}" 2>/dev/null || true)" != "${new_runtime}" ]; then
+        new_runtime_shadowed=true
+      fi
     fi
     units_restored=true
     report_units || units_restored=false
@@ -320,7 +326,9 @@ cleanup() {
     if [ "${created_runtimes_dir}" = true ]; then
       rmdir "${runtimes_dir}" 2>/dev/null || true
     fi
-    if [ "${new_runtime_in_use}" = true ]; then
+    if [ "${new_runtime_shadowed}" = true ]; then
+      echo "The upgrade failed; the display still runs the previous version, and the new version could not be taken out. Rerun the installer to finish; the new version is kept in ${new_runtime}." >&2
+    elif [ "${new_runtime_in_use}" = true ]; then
       echo "The upgrade failed after the new version was installed; the display uses the new version, kept in ${new_runtime}." >&2
     elif [ -n "${installed}" ] && [ "${package_installed}" = true ] && [ "${units_restored}" = true ]; then
       echo "The upgrade failed; the previous version is unchanged." >&2

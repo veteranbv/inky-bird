@@ -335,6 +335,7 @@ restart_on_new_runtime() {
 restore_units() {
   local unit
   local changed=false
+  local startable
   if [ "${units_replaced}" = true ]; then
     for unit in "${managed_units[@]}"; do
       if [ -f "${unit_backup_dir}/${unit}" ]; then
@@ -390,14 +391,22 @@ restore_units() {
     if [ ! -e "${unit_root}/${unit}" ]; then
       continue
     fi
+    # A timer whose service could not be put back has nothing to start; it is
+    # not turned back on, and is named below.
+    startable=true
+    if [[ "${unit}" == *.timer ]] && [ ! -e "${unit_root}/${unit%.timer}.service" ]; then
+      startable=false
+    fi
     if contains "${unit}" ${enabled_before[@]+"${enabled_before[@]}"}; then
-      systemctl is-enabled --quiet "${unit}" || sudo systemctl enable "${unit}" || true
+      [ "${startable}" = false ] || systemctl is-enabled --quiet "${unit}" || \
+        sudo systemctl enable "${unit}" || true
     elif systemctl is-enabled --quiet "${unit}"; then
       sudo systemctl disable "${unit}" || true
     fi
     if long_running "${unit}"; then
       if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
-        systemctl is-active --quiet "${unit}" || sudo systemctl start "${unit}" || true
+        [ "${startable}" = false ] || systemctl is-active --quiet "${unit}" || \
+          sudo systemctl start "${unit}" || true
       elif systemctl is-active --quiet "${unit}"; then
         sudo systemctl stop "${unit}" || true
       fi
