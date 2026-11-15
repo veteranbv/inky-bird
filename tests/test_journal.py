@@ -1104,3 +1104,46 @@ def test_non_utf8_analyzer_history_marks_only_that_source_unavailable(tmp_path: 
         for row in cast(list[dict[str, object]], snapshot["history_coverage"])
     }
     assert coverage == {"ebird-archive": "available", "birdnet-analyzer": "unavailable"}
+
+
+def _saved_failure(tmp_path: Path, **fields: object) -> Path:
+    failed = tmp_path / "42-synthetic-failure"
+    write_json_atomic(
+        failed / "failure.json",
+        {
+            "schema_version": 1,
+            "status": "failed",
+            "failed_at": STAMP,
+            "taxon_id": 42,
+            "common_name": "Example Bird",
+            "scientific_name": "Avis exempli",
+            "error": "synthetic",
+            **fields,
+        },
+    )
+    return failed
+
+
+def test_stopped_bird_tells_the_owner_automatic_retries_stopped(tmp_path: Path) -> None:
+    from inky_bird_frame.journal import terminal_failure
+
+    for reason, kind in (("retry_limit", "retry_limit"), ("research_limit", "research_limit")):
+        failed = _saved_failure(tmp_path, error_type="DataSourceError", stop_reason=reason)
+        summary = terminal_failure((failed,), 42)
+        assert summary["failure_kind"] == kind
+        assert "Automatic retries have stopped" in str(summary["failure_message"])
+        assert "backoff" not in str(summary["failure_message"])
+
+
+def test_failure_without_a_stop_reason_reads_as_before(tmp_path: Path) -> None:
+    from inky_bird_frame.journal import terminal_failure
+
+    for fields in ({}, {"stop_reason": "unknown-reason"}, {"stop_reason": 7}):
+        failed = _saved_failure(tmp_path, error_type="DataSourceError", **fields)
+        assert terminal_failure((failed,), 42) == {
+            **failure_guidance("DataSourceError"),
+            "recorded_attempts": 0,
+            "last_attempt_at": None,
+            "review_scores": {},
+            "last_failed_at": STAMP,
+        }
