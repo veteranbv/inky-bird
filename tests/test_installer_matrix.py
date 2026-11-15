@@ -15,8 +15,10 @@ version, or at its last service start, then at each step of the cleanup that
 follows, or stops it there. Rollback commands appear only in these runs.
 
 With one fault every rollback command works, so every unit must be exactly as
-it was; only when the rollback itself fails (sudo expired, or a second fault)
-may the output name a unit instead.
+it was. A unit may differ only when its own rollback failed (sudo expired, or
+the second fault was one of that unit's calls), and only in the way the output
+says it does. Claims that the previous or the new version runs must hold for
+the active link, every service and every enabled or running unit.
 
 The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call, and fails every cleanup
