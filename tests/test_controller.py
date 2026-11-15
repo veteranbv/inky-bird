@@ -4653,7 +4653,7 @@ class DiscoveryProviderTests(unittest.TestCase):
         self.assertEqual(len(result.species), 1)
         self.assertEqual(result.species[0].observation_count, 9)
         self.assertEqual(result.species[0].sources, ("iNaturalist", "eBird"))
-        self.assertTrue(all(provider.status == "ok" for provider in result.providers))
+        self.assertEqual([provider.status for provider in result.providers], ["ok", "ok"])
 
     def test_combined_mode_continues_when_ebird_fails(self) -> None:
         inaturalist = BirdSpecies(12942, "Eastern Bluebird", "Sialia sialis", 9, "iNaturalist")
