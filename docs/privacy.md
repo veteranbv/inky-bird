@@ -14,6 +14,16 @@ state. Keep [controller backups](backup.md) and exports private. Removing an
 import does not necessarily remove saved birds, generated work, or old backups;
 follow the [private-data removal guide](backup.md#private-data-lifecycle-and-removal).
 
+Uploaded import files are kept only for the preview period you set. An upload
+that stopped part-way (still receiving after an hour), or a raw file without its
+preview record, is removed at startup and by the regular cleanup instead of
+waiting for the full period.
+
+Imported eBird checklists are linked by an unsalted SHA-256 of each submission
+ID. That keeps raw IDs out of the files, but submission IDs are short numbers
+and can be recovered by trying every one. Treat those files as private, not
+anonymous.
+
 For Bird Buddy, a dedicated guest account is the recommended least-privilege
 choice. An operator can explicitly accept the broader permissions of an owner
 account instead. Its refresh token retains that account's permissions; choosing
@@ -24,8 +34,8 @@ one feeder in Inky does not make the token read-only or reduce its scope. See
 
 | When you use… | What to expect |
 | --- | --- |
-| [Observation sources](discovery.md) | Inky makes requests to the sources you enable. A nearby-observation request can include the configured search area. Account-backed sources use the credentials you supply. |
-| [Plate generation](architecture.md) | Inky fetches licensed references and uses Codex for species research, illustration, and review. Generation is optional and off in new app-managed configurations. |
+| [Observation sources](discovery.md) | Inky makes requests to the sources you enable. A nearby-observation request can include the configured search area. Account-backed sources use the credentials you supply. Imported species names are sent to iNaturalist to match them to its taxonomy. |
+| [Plate generation](architecture.md) | Inky fetches licensed references and uses Codex for species research, illustration, and review. Generation is optional and off in new configurations. When you turn it on, it uses your own Codex account and that provider's charges apply. |
 | [Notifications](notifications.md) | Inky sends subscribed events to the destinations you configure through Apprise. Some messages include species names. |
 | [Single sign-on](browser-access.md) | Your browser and controller communicate with the identity provider you configure. Ordinary local sign-in does not require an identity provider. |
 | [Catalog publication](operations.md) | If you enable it, the publisher sends approved plates and their metadata to your configured GitHub repository. |
