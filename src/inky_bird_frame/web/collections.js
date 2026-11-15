@@ -230,12 +230,14 @@ export function renderEditCollection(context) {
   // Unresolved names stay unless the owner unticks them. Choosing the bird
   // with the same scientific name and unticking its name resolves it.
   const unresolved = group?.unresolved || [];
-  const kept = new Set(unresolved);
+  const removed = new Set();
   const pending = el('fieldset');
   if (unresolved.length) {
     pending.append(
       el('legend', 'Unresolved species'),
-      note('Untick a name to remove it. To resolve one, choose its bird above, then untick its name.'),
+      note(
+        'Untick a name to remove it. For a name marked "matches", also choose that bird above to keep its checklist links.',
+      ),
     );
     for (const member of unresolved) {
       const row = el('label', '', 'check-label'),
@@ -248,7 +250,7 @@ export function renderEditCollection(context) {
       input.type = 'checkbox';
       input.checked = true;
       input.addEventListener('change', () =>
-        input.checked ? kept.add(member) : kept.delete(member),
+        input.checked ? removed.delete(member) : removed.add(member),
       );
       row.append(
         input,
@@ -271,10 +273,11 @@ export function renderEditCollection(context) {
     try {
       const body = { revision: data.revision, label: name.value, taxon_ids: [...selected] };
       if (group) body.collection_id = group.collection_id;
-      // Sent only when something was unticked, so plain edits keep their 1.0 shape.
-      if (kept.size !== unresolved.length)
-        body.unresolved = unresolved
-          .filter((member) => kept.has(member))
+      // Only the unticked names, and only when there are some, so plain edits
+      // keep their 1.0 shape and a large trip stays within the request limit.
+      if (removed.size)
+        body.remove_unresolved = unresolved
+          .filter((member) => removed.has(member))
           .map(({ common_name, scientific_name }) => ({ common_name, scientific_name }));
       await api('/v1/owner/journal/collections/save', body);
       if (form.isConnected) location.assign(href('collections'));
@@ -634,6 +637,16 @@ function savedSummary(preview) {
   );
 }
 
+// The server's own refusals are complete; only a lost connection leaves the outcome open.
+function savedProblem(error) {
+  return (
+    error.message +
+    (['offline', 'invalid_response'].includes(error.code)
+      ? ' Check Saved birds if the connection was lost.'
+      : '')
+  );
+}
+
 // The confirm step for changes beyond one bird; its outcome opens on its own page.
 function confirmSaved(context, section, problem, body, preview) {
   const { el, button, api, note, href } = context;
@@ -650,7 +663,7 @@ function confirmSaved(context, section, problem, body, preview) {
       });
       location.assign(href('operation', { operation: receipt.operation_id }));
     } catch (error) {
-      problem.textContent = error.message + ' Check Saved birds if the connection was lost.';
+      problem.textContent = savedProblem(error);
       control.disabled = false;
     }
   });
@@ -719,6 +732,13 @@ export function savedToggle(context, bird) {
       const [body, preview] = await savedPreview(api, action, bird.taxon_id);
       const own = action === 'add' ? preview.added_count : preview.removed_count;
       const other = action === 'add' ? preview.removed_count : preview.added_count;
+      if (!own && !other && !preview.migrated_legacy_queue_count) {
+        // Another tab or device already made this change: show it, send nothing.
+        saved = action === 'add';
+        label();
+        status.textContent = saved ? 'Already in Saved birds.' : 'Not in Saved birds.';
+        return;
+      }
       if (own > 1 || other || preview.migrated_legacy_queue_count) {
         status.textContent = '';
         control.remove();
@@ -751,7 +771,7 @@ export function savedToggle(context, bird) {
         ui.showProblem(error);
         return;
       }
-      problem.textContent = error.message + ' Check Saved birds if the connection was lost.';
+      problem.textContent = savedProblem(error);
     } finally {
       control.disabled = false;
     }

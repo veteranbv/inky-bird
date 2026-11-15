@@ -92,7 +92,7 @@ function page(t, respond) {
   return { context, main, requests, assigned, problems };
 }
 
-function savedServer(preview = {}) {
+function savedServer(preview = {}, finished = 'succeeded', result = {}) {
   const changes = [];
   let polls = 0;
   return {
@@ -116,8 +116,13 @@ function savedServer(preview = {}) {
         return {
           operation_id: path.split('/').pop(),
           kind: 'saved-collection',
-          status: polls % 2 ? 'running' : 'succeeded',
-          result: { added_count: 1, removed_count: 0, collection_revision: 'c'.repeat(64) },
+          status: polls % 2 ? 'running' : finished,
+          result: {
+            added_count: 1,
+            removed_count: 0,
+            collection_revision: 'c'.repeat(64),
+            ...result,
+          },
         };
       }
       throw new Error('unexpected ' + path);
@@ -181,8 +186,56 @@ test('a failed toggle stays on the page with its message', async (t) => {
   findButton(section, 'Remove from Saved birds').click();
   await settle(t);
   assert.equal(requests.at(-1).path, '/v1/owner/saved/preview');
-  assert(texts(section).some((text) => text.startsWith('Saved birds or approved artwork changed.')));
+  assert(texts(section).includes('Saved birds or approved artwork changed. Review this action again.'));
   assert.equal(findButton(section, 'Remove from Saved birds').disabled, false);
+});
+
+for (const [saved, shown, label] of [
+  [false, 'Already in Saved birds.', 'Remove from Saved birds'],
+  [true, 'Not in Saved birds.', 'Add to Saved birds'],
+])
+  test(`a stale ${saved ? 'remove' : 'add'} sends nothing and offers no Undo`, async (t) => {
+    // Another tab already made this change, so the server reports nothing to do.
+    const server = savedServer({ added_count: 0, removed_count: 0 });
+    const { context, main } = page(t, server.respond);
+    const section = collections.savedToggle(context, { taxon_id: 7, saved });
+    main.append(section);
+    findButton(section, saved ? 'Remove from Saved birds' : 'Add to Saved birds').click();
+    await settle(t);
+    assert.equal(server.changes.length, 0);
+    assert(texts(section).includes(shown));
+    assert(findButton(section, label));
+    assert.equal(findButton(section, 'Undo'), null);
+  });
+
+test('a change the controller refused does not flip the toggle', async (t) => {
+  const message = 'Saved birds or approved artwork changed. Review this action again.';
+  const server = savedServer({}, 'failed', { message });
+  const { context, main } = page(t, server.respond);
+  const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+  main.append(section);
+  findButton(section, 'Add to Saved birds').click();
+  await settle(t);
+  assert.equal(server.changes.length, 1);
+  const shown = texts(section);
+  assert(shown.includes(message));
+  assert(!shown.includes('Added to Saved birds.'));
+  assert(findButton(section, 'Add to Saved birds'));
+  assert.equal(findButton(section, 'Undo'), null);
+});
+
+test('a lost connection says to check Saved birds', async (t) => {
+  const { context, main } = page(t, (path) => {
+    if (path === '/v1/owner/settings') return { revision: 'r' };
+    throw Object.assign(new Error('Inky cannot be reached.'), { code: 'offline' });
+  });
+  const section = collections.savedToggle(context, { taxon_id: 7, saved: false });
+  main.append(section);
+  findButton(section, 'Add to Saved birds').click();
+  await settle(t);
+  assert(
+    texts(section).includes('Inky cannot be reached. Check Saved birds if the connection was lost.'),
+  );
 });
 
 test('bulk Saved birds changes keep their review step', async (t) => {
@@ -218,6 +271,19 @@ test('an outcome shows plain words, never identifiers or hashes', async () => {
       generation_enabled: false,
     }),
     ['1 bird added', '2 birds removed', '0 legacy seed members migrated', 'Generation off'],
+  );
+  // Fields this page has no words for are left out, never shown by their key.
+  assert.deepEqual(
+    manage.resultLines({
+      window: 'last-30-days',
+      start_date: '2001-03-01',
+      radius_km: 25,
+      species_limit: 10,
+      earliest_observed_on: '2001-03-01',
+      rows: 3,
+      added_checklists: 1,
+    }),
+    ['Source rows: 3', 'New checklists: 1'],
   );
 });
 
@@ -272,6 +338,81 @@ test('a source this page does not know still shows the Sources page', async (t) 
   assert(shown.includes('newer-source'));
   assert(shown.includes('Set up iNaturalist'));
   assert(!shown.includes('Set up newer-source'));
+});
+
+test('a source that first appears in a status update does not stop the updates', async (t) => {
+  const source = (name) => ({ name, enabled: true, status: 'ok', activity: {} });
+  const management = {
+    available: true,
+    window: 'last-30-days',
+    refresh_minutes: 15,
+    sources: [source('inaturalist')],
+    work: { complete: true, discovery_status: 'ok' },
+    activity: { entries: {} },
+    recent_detections: [],
+  };
+  const { context, main } = page(t, (path) => {
+    if (path === '/v1/owner/operations') return { operations: [] };
+    if (path === '/v1/owner/management')
+      return { ...management, sources: [source('inaturalist'), source('newer-source')] };
+    throw new Error('unexpected ' + path);
+  });
+  Object.assign(context, {
+    area: 'sources',
+    data: {},
+    management,
+    unreadable: () => new Element('div'),
+    empty: () => new Element('section'),
+    operationAction: () => new Element('section'),
+    currentRun: () => 0,
+  });
+  await manage.renderStatus(context);
+  t.mock.timers.tick(5000);
+  await flush();
+  assert(texts(main).some((text) => text.startsWith('Updated ')));
+});
+
+test('no retry hint shows while there are no birds to choose', async (t) => {
+  const action = () => {
+    const section = new Element('section');
+    section.append(new Element('button'));
+    return section;
+  };
+  const management = {
+    available: true,
+    generation_enabled: false,
+    retry_wake_available: false,
+    activity: { entries: {} },
+    work: {
+      complete: true,
+      queue: [],
+      can_run: [],
+      waiting: [],
+      needs_attention: [],
+      retry_details: [],
+      terminal_details: [],
+      in_review: { status: 'ok', candidates: [] },
+      retry_requests: [],
+    },
+  };
+  const { context, main } = page(t, (path) => {
+    if (path === '/v1/owner/operations') return { operations: [] };
+    throw new Error('unexpected ' + path);
+  });
+  Object.assign(context, {
+    area: 'work',
+    query: new URLSearchParams(),
+    data: {},
+    management,
+    unreadable: () => new Element('div'),
+    empty: () => new Element('section'),
+    operationAction: action,
+    currentRun: () => 0,
+  });
+  await manage.renderStatus(context);
+  const shown = texts(main);
+  assert(shown.includes('No birds currently need retry selection.'));
+  assert(!shown.includes('Select between 1 and 32 birds.'));
 });
 
 test('a retry selection outside 1 to 32 is a note beside the choices', async (t) => {
@@ -352,7 +493,7 @@ test('the editor keeps unresolved names unless one is unticked', async (t) => {
   const form = main.querySelector('form');
   form.fire('submit');
   await flush();
-  assert.equal('unresolved' in requests.at(-1).body, false);
+  assert.equal('remove_unresolved' in requests.at(-1).body, false);
   assert(texts(main).includes('Turdus migratorius · matches American Robin'));
   const boxes = [];
   (function walk(node) {
@@ -373,6 +514,6 @@ test('the editor keeps unresolved names unless one is unticked', async (t) => {
     label: 'A trip',
     taxon_ids: [1],
     collection_id: group.collection_id,
-    unresolved: [{ common_name: '', scientific_name: 'Unmatched species' }],
+    remove_unresolved: [{ common_name: 'Robin', scientific_name: 'Turdus migratorius' }],
   });
 });
