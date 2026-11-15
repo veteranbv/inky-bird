@@ -15,6 +15,26 @@ venv=${INKY_BIRD_DISPLAY_VENV:-"${HOME}/.virtualenvs/pimoroni"}
 run_initial_display=${INKY_BIRD_RUN_INITIAL_DISPLAY:-false}
 noninteractive_sudo=${INKY_BIRD_NONINTERACTIVE_SUDO:-false}
 
+# Remove one distribution's files, except those the other one also owns.
+remove_distribution_program='
+import sys
+from importlib.metadata import distribution
+removed, kept = distribution(sys.argv[1]), distribution(sys.argv[2])
+owned = {kept.locate_file(path).resolve() for path in kept.files or ()}
+directories = set()
+for path in removed.files or ():
+    target = removed.locate_file(path)
+    if target.resolve() in owned or not (target.is_file() or target.is_symlink()):
+        continue
+    target.unlink()
+    directories.add(target.parent)
+for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
+'
+
 if [ ! -f "${config_path}" ]; then
   echo "Display-node configuration is missing: ${config_path}" >&2
   exit 1
@@ -70,12 +90,18 @@ if [ "${root}" != "${app_dir}" ]; then
     install -m 0644 "${root}/${file}" "${app_dir}/${file}"
   done
 fi
-# The old and new distributions own the same import files. Remove the old
-# RECORD before installing the renamed distribution, never after it.
+renamed_installed=false
 if "${venv}/bin/python" -m pip show inky-bird-frame >/dev/null 2>&1; then
-  "${venv}/bin/python" -m pip uninstall --yes inky-bird-frame
+  renamed_installed=true
 fi
+# Install before removing the renamed distribution: if the install fails, the
+# old one is still there and pip has restored a same-named one itself.
 "${venv}/bin/python" -m pip install --disable-pip-version-check -e "${app_dir}[inky]"
+# Both distributions list some of the same files, such as the inky-bird
+# command; remove only the files the new one does not also own.
+if [ "${renamed_installed}" = true ]; then
+  "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird-frame inky-bird
+fi
 
 unit_dir=$(mktemp -d)
 trap 'rm -rf "${unit_dir}"' EXIT
