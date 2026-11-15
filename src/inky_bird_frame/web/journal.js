@@ -34,6 +34,13 @@ export function plateURL(bird, size = 'full') {
   );
 }
 
+// Idempotency keys and new collection IDs.
+function randomHex(bytes) {
+  return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (item) =>
+    item.toString(16).padStart(2, '0'),
+  ).join('');
+}
+
 const sourceNames = {
   inaturalist: ['iNaturalist', 'Community reports'],
   ebird: ['eBird nearby', 'Community reports'],
@@ -260,9 +267,7 @@ export async function openJournal(ui, message = '') {
         const settings = await api('/v1/owner/settings');
         revision = settings.revision;
         if (!revision) throw new Error('This service has no authoritative configuration file.');
-        key = Array.from(crypto.getRandomValues(new Uint8Array(24)), (item) =>
-          item.toString(16).padStart(2, '0'),
-        ).join('');
+        key = randomHex(24);
       } catch (error) {
         preview = null;
         ui.showProblem(error);
@@ -314,9 +319,7 @@ export async function openJournal(ui, message = '') {
           body = { action, configuration_revision: settings.revision };
         if (taxonId) body.taxon_id = taxonId;
         const preview = await api('/v1/owner/saved/preview', body),
-          key = Array.from(crypto.getRandomValues(new Uint8Array(24)), (value) =>
-            value.toString(16).padStart(2, '0'),
-          ).join('');
+          key = randomHex(24);
         section.append(
           el('h2', 'Change Saved birds?'),
           note(
@@ -678,10 +681,7 @@ export async function openJournal(ui, message = '') {
       'Search iNaturalist community reports. These are not your personal sightings. The query sends this point, radius and dates to iNaturalist.',
     );
     const preview = await api('/v1/owner/community');
-    const key = () =>
-      Array.from(crypto.getRandomValues(new Uint8Array(24)), (item) =>
-        item.toString(16).padStart(2, '0'),
-      ).join('');
+    const key = () => randomHex(24);
     if (preview.status === 'ready') {
       const group = preview.collection;
       main.append(
@@ -915,9 +915,7 @@ export async function openJournal(ui, message = '') {
           );
         for (const member of preview.unresolved)
           content.append(note('Unresolved: ' + (member.scientific_name || member.common_name)));
-        const collection_id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) =>
-          item.toString(16).padStart(2, '0'),
-        ).join('');
+        const collection_id = randomHex(16);
         const problem = el('p', '', 'error');
         problem.setAttribute('role', 'alert');
         content.append(
@@ -1096,9 +1094,7 @@ export async function openJournal(ui, message = '') {
               ),
             );
             if (plan.new_requests.length) {
-              const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) =>
-                item.toString(16).padStart(2, '0'),
-              ).join('');
+              const key = randomHex(16);
               summary.append(
                 button('Confirm these plate requests', async (event) => {
                   const confirm = event.currentTarget;
@@ -1508,9 +1504,7 @@ export async function openJournal(ui, message = '') {
     const problem = el('p', '', 'error');
     problem.setAttribute('role', 'alert');
     function decision(approve, reason = '') {
-      const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) =>
-        item.toString(16).padStart(2, '0'),
-      ).join('');
+      const key = randomHex(16);
       let request = null;
       return button(approve ? 'Confirm local approval' : 'Confirm rejection', async (event) => {
         const control = event.currentTarget;
@@ -1816,12 +1810,11 @@ export async function openJournal(ui, message = '') {
     feedback.append(document.createTextNode('Ideas and feedback are welcome on '), issues, document.createTextNode('.'));
     about.append(feedback);
     main.append(about);
-  } else if (['sources', 'work', 'displays', 'notifications'].includes(area)) {
+  } else if (['sources', 'work', 'notifications'].includes(area)) {
     base(
       {
         sources: 'Sources',
         work: 'Plate work',
-        displays: 'Displays',
         notifications: 'Notifications',
       }[area],
     );
@@ -2000,21 +1993,6 @@ export async function openJournal(ui, message = '') {
             note(requestState(request, work)), stamp('Requested', request.created_at), stamp('Updated', request.updated_at));
         if (!work.retry_requests?.length) requests.append(note('No recorded retry requests.'));
       });
-    } else if (area === 'displays') {
-      main.append(
-        playLink('current'),
-        el('h2', 'Physical wall panel'),
-        el(
-          'p',
-          management.last_confirmed_panel_update
-            ? 'Last confirmed panel update: ' +
-                new Date(management.last_confirmed_panel_update).toLocaleString()
-            : 'No confirmed panel update has been received.',
-        ),
-        note(
-          'A browser view is not proof of a physical panel update. Existing wall selection and scheduling stay unchanged.',
-        ),
-      );
     } else {
       const state = management.notifications;
       main.append(
