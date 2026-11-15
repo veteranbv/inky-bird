@@ -645,6 +645,8 @@ class Snapshot:
     other_code: str
     stray: set[str]
     tree: str
+    # The display's pre-1.0 regular install, which a shared environment holds.
+    regular: str = "absent"
 
 
 def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
@@ -660,6 +662,7 @@ def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
         + json.dumps(
             [machine.state_of(name) for name in ("systemd", "launchd", "pip")], sort_keys=True
         ),
+        digest(machine.venv / "lib/python3/site-packages/inky_bird_frame"),
     )
 
 
@@ -802,16 +805,93 @@ def claims_previous(outcome: Outcome) -> bool:
             "previous version is running again",
             "started again on the previous version",
             "previous version is unchanged",
+            "still runs the previous version",
         )
     )
 
 
 def single_fault(case: Case) -> bool:
     """Only the injected call failed, so every rollback command works and the
-    run must put everything back; naming what it left is no excuse. When sudo
-    expires, or a second failure lands in the cleanup, the rollback itself
-    fails, and a unit it names is accepted."""
+    run must put everything back; naming what it left is no excuse."""
     return case.mode != "expire" and case.first is None
+
+
+def unrestorable(case: Case, unit: str) -> bool:
+    """The rollback could not put ``unit`` back: sudo had expired, or the
+    failed cleanup call was one of this unit's own (for a timer, also its
+    service's)."""
+    if case.mode == "expire":
+        return True
+    if case.first is None or case.mode != "fail":
+        return False
+    names = {unit}
+    if unit.endswith(".timer"):
+        names.add(unit.replace(".timer", ".service"))
+    if unit.startswith("com."):
+        # An agent's restore also works on copies named by its label alone.
+        names.add(unit.rsplit(".", 1)[1])
+    return any(name in argument for name in names for argument in case.arguments)
+
+
+# What a failed run says about a unit it did not put back, as each statement reads.
+UNIT_STATEMENTS = (
+    ("stuck", r"could not be stopped or disabled and may still run the new version, kept in \S+"),
+    ("running", r"(?:services|agents) could not be stopped"),
+    ("stopped", r"these services are stopped"),
+    ("unrestored", r"these agents are not running"),
+    ("changed", r"services are not set up as they were before the upgrade"),
+    ("differs", r"display services are not as they were before the upgrade"),
+    ("restarted", r"services were restarted on the new version"),
+)
+UNIT_STATEMENT = re.compile(
+    "(?:"
+    + "|".join(f"(?P<{name}>{pattern})" for name, pattern in UNIT_STATEMENTS)
+    + r"): (?P<units>.+?)\.$",
+    re.MULTILINE,
+)
+
+
+def named_units(output: str) -> dict[str, set[str]]:
+    """Each unit the output names, with what it says about that unit."""
+    found: dict[str, set[str]] = {}
+    for match in UNIT_STATEMENT.finditer(output):
+        statement = next(name for name, _ in UNIT_STATEMENTS if match.group(name))
+        for unit in match.group("units").split():
+            found.setdefault(unit, set()).add(statement)
+    return found
+
+
+def explained(
+    statements: set[str],
+    before: tuple[bool, bool],
+    now: tuple[bool, bool],
+    file_changed: bool,
+    *,
+    agent: bool,
+) -> bool:
+    """Whether what the output says about a unit accounts for every way it differs."""
+    # An agent's two fields are both "loaded"; the second is checked below.
+    if before[0] != now[0] and not agent:
+        if now[0] and not statements & {"changed", "differs", "stuck"}:
+            return False
+        if not now[0] and not statements & {"changed", "differs", "unrestored", "stopped"}:
+            return False
+    if before[1] != now[1]:
+        if now[1] and not statements & {"running", "stuck", "differs"}:
+            return False
+        if not now[1] and not statements & {"stopped", "unrestored", "differs"}:
+            return False
+    # A unit that could not be stopped keeps its file; one not put back may
+    # have lost its saved definition.
+    return not file_changed or bool(
+        statements & {"changed", "differs", "stuck", "running", "unrestored"}
+    )
+
+
+def excused(case: Case, unit: str, named: dict[str, set[str]], statements: set[str]) -> bool:
+    """A unit may differ only when its rollback could not be done and the
+    output says exactly how it differs (``statements`` that would account for it)."""
+    return unrestorable(case, unit) and bool(named.get(unit, set()) & statements)
 
 
 def check_install(
@@ -842,33 +922,39 @@ def check_install(
         )
         if stopped or not tolerated:
             report.append("I8: the run reported success although it was failed or stopped")
-    strict = single_fault(case)
-    # I2: what is said to run is what runs; anything else is named. A claim
-    # that the previous version runs is checked whatever else is named.
+    named = named_units(output)
+    # I2: what is said to run is what runs, in both directions: every service,
+    # every enabled or running unit and the active link. Only a unit whose
+    # rollback could not be done, and that the output says may run the other
+    # version, may differ.
     previous = claims_previous(outcome)
     if previous and before.role.tag is None:
         report.append("I2: the output says the previous version runs, but there was none")
     if previous and claims_new(outcome):
         report.append("I2: the output says both the previous and the new version run")
     expected = "new" if claims_new(outcome) else before.role.tag
+    other_version = {"stuck", "running", "restarted", "differs"}
+    if (previous or claims_new(outcome)) and after.tag != expected:
+        report.append(f"I2: the output implies {expected} is active, but {after.tag} is")
     for unit, process in after.processes.items():
-        if process["runtime"] == expected:
-            continue
-        if previous or strict or unit not in output:
+        if process["runtime"] != expected and not excused(case, unit, named, other_version):
             report.append(
                 f"I2: {unit} runs {process['runtime']}, the output implies {expected}"
-                + ("" if unit in output else ", and it is not named")
+                + ("" if unit in named else ", and it is not named")
             )
-    for unit, (_, active) in after.units.items():
-        if active and unit.endswith(".timer"):
-            executable = executable_of(machine, unit)
-            found = runtime_of(executable) if executable is not None else None
-            if (
-                found is not None
-                and found[0] != expected
-                and (previous or strict or unit not in output)
-            ):
-                report.append(f"I2: {unit} would run {found[0]}, not {expected}")
+    for unit, (enabled, active) in after.units.items():
+        if not (enabled or active) or not (
+            unit.endswith(".timer") or previous or claims_new(outcome)
+        ):
+            continue
+        executable = executable_of(machine, unit)
+        found = runtime_of(executable) if executable is not None else None
+        if (
+            found is not None
+            and found[0] != expected
+            and not excused(case, unit, named, other_version)
+        ):
+            report.append(f"I2: {unit} would run {found[0]}, not {expected}")
     if claims_new(outcome):
         check_previous_kept(machine, scenario, before, report, output)
     if not failed:
@@ -876,9 +962,11 @@ def check_install(
         return
     if completed(outcome):
         # A late step failed after the new version was installed and started.
-        check_final_units(machine, scenario, after, report, "" if strict else output)
-    # I4: every unit is back as it was; only a failed rollback may name one instead.
-    # That holds even when the new version could not be taken back out.
+        check_final_units(machine, scenario, after, report, case, named)
+    # I4: every unit is back as it was. Only a unit whose rollback could not be
+    # done may differ, and only in the way the output says it does. That holds
+    # even when the new version could not be taken back out.
+    agent = machine.system == "Darwin"
     for unit, state in before.role.units.items() if not completed(outcome) else ():
         now = after.units[unit]
         if (
@@ -888,12 +976,26 @@ def check_install(
             and not now[1]
         ):
             continue
-        if now != state and (strict or unit not in output):
-            report.append(f"I4: {unit} was {state} and is now {now}")
-        if after.files[unit] != before.role.files[unit] and (strict or unit not in output):
-            report.append(f"I4: {unit} definition changed")
+        file_changed = after.files[unit] != before.role.files[unit]
+        if now == state and not file_changed:
+            continue
+        statements = named.get(unit, set())
+        if unrestorable(case, unit) and explained(
+            statements, state, now, file_changed, agent=agent
+        ):
+            continue
+        report.append(
+            f"I4: {unit} was {state} and is now {now}"
+            + (", its definition changed" if file_changed else "")
+            + (f"; the output says {sorted(statements)}" if statements else ", and it is not named")
+        )
     # I6: until the output says the new version is in use, the previous one is intact.
-    if before.role.tag is not None and after.code != before.role.code and not claims_new(outcome):
+    if (
+        before.role.tag is not None
+        and after.code != before.role.code
+        and not claims_new(outcome)
+        and not shadowed_leftover(machine, case, before, outcome)
+    ):
         report.append("I6: the previous version's runtime, environment or source changed")
     # I10: nothing staged is left behind unless the output names it, or it is
     # the runtime the output says is now in use.
@@ -907,6 +1009,20 @@ def check_install(
     for path in sorted(stray_paths(machine) - before.stray):
         if path not in output and not removal_failed(case, path, machine.root):
             report.append(f"I10: {path} was left behind")
+
+
+def shadowed_leftover(machine: Machine, case: Case, before: Snapshot, outcome: Outcome) -> bool:
+    """The one change I6 accepts: a second failure kept the new display
+    package from being taken out of the shared environment, the output says
+    so, and the renamed install Python still imports first is unchanged."""
+    return (
+        case.first is not None
+        and case.mode == "fail"
+        and case.tool == "venv-python"
+        and before.role.tag == "regular"
+        and "the new version could not be taken out" in outcome.output
+        and digest(machine.venv / "lib/python3/site-packages/inky_bird_frame") == before.regular
+    )
 
 
 KEPT = re.compile(
@@ -999,13 +1115,23 @@ def check_success(
 
 
 def check_final_units(
-    machine: Machine, scenario: Scenario, after: RoleView, report: list[str], named: str = ""
+    machine: Machine,
+    scenario: Scenario,
+    after: RoleView,
+    report: list[str],
+    case: Case | None = None,
+    named: dict[str, set[str]] | None = None,
 ) -> None:
     """I4 once the new version is installed: every unit as the new version wants it,
-    except a unit a failed run names as not set up."""
+    except a unit whose setup could not be done and that a failed run names."""
     found: list[str] = []
     check_intended_units(machine, scenario, after, found)
-    report.extend(item for item in found if not named or item.split()[3] not in named)
+    everything = {name for name, _ in UNIT_STATEMENTS}
+    report.extend(
+        item
+        for item in found
+        if case is None or not excused(case, item.split()[3], named or {}, everything)
+    )
 
 
 def check_intended_units(
