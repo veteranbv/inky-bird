@@ -1253,3 +1253,35 @@ def test_storage_reason_stops_at_a_cycle_of_causes() -> None:
     first, second = RuntimeError("first"), RuntimeError("second")
     first.__context__, second.__context__ = second, first
     assert _storage_reason(first) == "unknown cause"
+
+
+def test_the_pairing_pause_applies_to_each_caller_not_the_household(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    AccessStore(config.state_dir).setup_owner("birder", PASSPHRASE)
+    app = create_app(config)
+    kitchen = TestClient(app, base_url=ORIGIN, client=("192.0.2.10", 41000))
+    hallway = TestClient(app, base_url=ORIGIN, client=("192.0.2.11", 41000))
+    first = kitchen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    # A second screen is not held up by the first one's pause.
+    second = hallway.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    kitchen.cookies.clear()
+    again = kitchen.post("/v1/screen/pair", json={}, headers={"Origin": ORIGIN})
+    assert [first.status_code, second.status_code] == [200, 200]
+    assert first.json()["data"]["pairing_code"] != second.json()["data"]["pairing_code"]
+    assert (again.status_code, again.json()["error"]["code"]) == (429, "sign_in_rate_limited")
+
+
+def test_a_trusted_proxy_keeps_each_screen_on_its_own_pairing_pause(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), trusted_proxy_addresses=("192.0.2.1",))
+    AccessStore(config.state_dir).setup_owner("birder", PASSPHRASE)
+    app = create_app(config)
+    proxied = [TestClient(app, base_url=ORIGIN, client=("192.0.2.1", 41000)) for _ in range(3)]
+    statuses = [
+        client.post(
+            "/v1/screen/pair", json={}, headers={"Origin": ORIGIN, "X-Forwarded-For": forwarded}
+        ).status_code
+        for client, forwarded in zip(
+            proxied, ["198.51.100.7", "198.51.100.8", "198.51.100.7"], strict=True
+        )
+    ]
+    assert statuses == [200, 200, 429]

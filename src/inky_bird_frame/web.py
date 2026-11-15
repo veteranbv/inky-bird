@@ -1032,8 +1032,12 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
         await _json_body(request, set())
         if await run_in_threadpool(store.setup_status) is not None:
             raise FeatureUnavailableError("Set up the Inky owner first, then pair this screen")
+        # The pause is per network address. Behind a reverse proxy every screen
+        # shares the proxy's address unless trusted_proxy_addresses names it.
         secret, result = await run_in_threadpool(
-            presentation.request_pair, request.cookies.get(screen_cookie(request), "")
+            presentation.request_pair,
+            request.cookies.get(screen_cookie(request), ""),
+            client=request.client.host if request.client else "",
         )
         response = _result(result)
         response.set_cookie(
