@@ -28,6 +28,7 @@ if [ -z "${uv_bin}" ]; then
   uv_bin=$(command -v uv || true)
 fi
 python_version=${INKY_BIRD_PYTHON_VERSION:-3.11}
+quiesce_timeout_seconds=1800
 log_dir="${support_dir}/logs"
 agents_dir="${HOME}/Library/LaunchAgents"
 serve_plist="${agents_dir}/com.${service_prefix}.serve.plist"
@@ -37,6 +38,50 @@ catalog_publish_plist="${agents_dir}/com.${service_prefix}.catalog-publish.plist
 notifications_plist="${agents_dir}/com.${service_prefix}.notifications.plist"
 scheduler_plist="${agents_dir}/com.${service_prefix}.scheduler.plist"
 legacy_cycle_plist="${agents_dir}/com.${service_prefix}.controller-cycle.plist"
+
+# Run by the installed version's Python: hold its controller cycle lock so no
+# plate is being made while agents stop. Exit 3 if a cycle is still running at
+# the deadline. If the installed code cannot be loaded or cannot read the
+# config, the lock cannot be found: say so and exit 0 without waiting, so a
+# broken or older install can still be upgraded or repaired.
+cycle_lock_program='
+import fcntl, os, sys, time
+from pathlib import Path
+config_path, ready, timeout = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+try:
+    from inky_bird_frame.config import load_config
+    try:
+        config = load_config(config_path, load_secrets=False)
+    except TypeError:
+        config = load_config(config_path)
+    state_dir = config.controller.state_dir
+except Exception:
+    print(
+        "The installed version cannot be loaded with this configuration, so the "
+        "upgrade cannot check for a plate being made.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+state_dir.mkdir(parents=True, exist_ok=True)
+handle = (state_dir / "controller.lock").open("a+")
+deadline = time.monotonic() + timeout
+announced = False
+while True:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(3)
+        if not announced:
+            print("Waiting for the plate being made to finish.", file=sys.stderr)
+            announced = True
+        time.sleep(2)
+ready.touch()
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(1)
+'
 
 restore_catalog_publisher_schedule() {
   local uid=$1
@@ -62,21 +107,16 @@ restore_catalog_publisher_schedule() {
   rmdir "${recovery_dir}"
 }
 
-restore_previous_agent() {
-  local label=$1
-  local plist="${agents_dir}/com.${service_prefix}.${label}.plist"
-  local backup="${plist_backup_dir}/com.${service_prefix}.${label}.plist"
-  if [ ! -f "${backup}" ]; then
-    return 0
-  fi
-  # A loaded label here is the failed replacement; put the saved agent back.
-  launchctl bootout "gui/${uid}/com.${service_prefix}.${label}" 2>/dev/null || true
-  cp "${backup}" "${plist}" || return 0
-  if [ "${label}" = "catalog-publish" ]; then
-    restore_catalog_publisher_schedule "${uid}" || true
-  else
-    launchctl bootstrap "gui/${uid}" "${plist}" || true
-  fi
+contains() {
+  local target=$1
+  local item
+  shift
+  for item in "$@"; do
+    if [ "${item}" = "${target}" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 if [ ! -f "${config_path}" ]; then
@@ -92,6 +132,127 @@ fi
 mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${support_dir}" "${log_dir}" "${agents_dir}"
 chmod 700 "${support_dir}" "${log_dir}"
 find "${log_dir}" -maxdepth 1 -type f -name '*.log*' -exec chmod 600 {} +
+uid=$(id -u)
+work_dir=$(mktemp -d "${support_dir}/install.XXXXXX")
+plist_backup_dir="${work_dir}/launchd"
+mkdir "${plist_backup_dir}"
+installation_complete=false
+cycle_lock_pid=""
+agents_recorded=false
+previously_loaded_labels=()
+stopped_labels=()
+unrestored=()
+still_running=()
+
+hold_cycle_lock() {
+  local python="${app_dir}/.venv/bin/python"
+  local ready="${work_dir}/cycle-lock-held"
+  local status=0
+  if [ ! -x "${python}" ]; then
+    return 0
+  fi
+  "${python}" -I -c "${cycle_lock_program}" "${config_path}" "${ready}" \
+    "${quiesce_timeout_seconds}" &
+  cycle_lock_pid=$!
+  until [ -e "${ready}" ]; do
+    if ! kill -0 "${cycle_lock_pid}" 2>/dev/null; then
+      wait "${cycle_lock_pid}" || status=$?
+      cycle_lock_pid=""
+      if [ "${status}" -eq 0 ]; then
+        return 0
+      fi
+      if [ "${status}" -eq 3 ]; then
+        echo "A plate is still being made. Run the upgrade again after it finishes. No changes made." >&2
+        exit 3
+      fi
+      echo "Could not check whether a plate is being made. No changes made." >&2
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+release_cycle_lock() {
+  if [ -n "${cycle_lock_pid}" ]; then
+    kill "${cycle_lock_pid}" 2>/dev/null || true
+    wait "${cycle_lock_pid}" 2>/dev/null || true
+    cycle_lock_pid=""
+  fi
+}
+
+# Put one agent back as it was: its saved plist, and running again only if
+# this run stopped it. An agent this run never stopped keeps running.
+restore_agent() {
+  local label=$1
+  local agent="com.${service_prefix}.${label}"
+  local plist="${agents_dir}/com.${service_prefix}.${label}.plist"
+  local backup="${plist_backup_dir}/com.${service_prefix}.${label}.plist"
+  local stopped=false
+  local loaded_before=false
+  if contains "${label}" ${stopped_labels[@]+"${stopped_labels[@]}"}; then
+    stopped=true
+  fi
+  if contains "${label}" ${previously_loaded_labels[@]+"${previously_loaded_labels[@]}"}; then
+    loaded_before=true
+  fi
+  # Unload only what this run loaded: a new agent or a replacement.
+  if { [ "${stopped}" = true ] || [ "${loaded_before}" = false ]; } && \
+      launchctl print "gui/${uid}/${agent}" >/dev/null 2>&1; then
+    if ! launchctl bootout "gui/${uid}/${agent}"; then
+      still_running+=("${agent}")
+      return 0
+    fi
+  fi
+  if [ -f "${backup}" ]; then
+    if ! cp "${backup}" "${plist}"; then
+      unrestored+=("${agent}")
+      return 0
+    fi
+  else
+    rm -f "${plist}"
+  fi
+  if [ "${stopped}" != true ]; then
+    return 0
+  fi
+  if [ ! -f "${backup}" ]; then
+    unrestored+=("${agent}")
+  elif [ "${label}" = "catalog-publish" ]; then
+    restore_catalog_publisher_schedule "${uid}" || unrestored+=("${agent}")
+  else
+    launchctl bootstrap "gui/${uid}" "${plist}" || unrestored+=("${agent}")
+  fi
+}
+
+cleanup() {
+  status=$?
+  trap - EXIT
+  release_cycle_lock
+  if [ "${installation_complete}" != true ]; then
+    if [ "${agents_recorded}" = true ]; then
+      for label in serve refresh generate catalog-publish notifications scheduler; do
+        restore_agent "${label}"
+      done
+    fi
+    if [ "${#still_running[@]}" -gt 0 ]; then
+      echo "The upgrade failed and these agents could not be stopped: ${still_running[*]}." >&2
+      echo "Stop each with: launchctl bootout gui/${uid}/<agent>" >&2
+    fi
+    if [ "${#unrestored[@]}" -gt 0 ]; then
+      echo "The upgrade failed and these agents are not running: ${unrestored[*]}." >&2
+      echo "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist" >&2
+    elif [ "${#stopped_labels[@]}" -gt 0 ] && [ "${#still_running[@]}" -eq 0 ]; then
+      echo "The upgrade failed; the agents it stopped were started again." >&2
+    fi
+  elif [ "${status}" -ne 0 ]; then
+    echo "The new version is installed and running, but a final step failed; see the error above." >&2
+  fi
+  rm -rf "${work_dir}"
+  exit "${status}"
+}
+trap cleanup EXIT
+
+hold_cycle_lock
+
 if [ "${root}" != "${app_dir}" ]; then
   mkdir -p "${app_dir}/docs"
   rsync -a --delete "${root}/src/" "${app_dir}/src/"
@@ -101,48 +262,9 @@ if [ "${root}" != "${app_dir}" ]; then
   done
 fi
 
-"${uv_bin}" sync --project "${app_dir}" --python "${python_version}" --extra controller --locked
-
-uid=$(id -u)
-plist_backup_dir=$(mktemp -d "${support_dir}/launchd-restore.XXXXXX")
-previously_loaded_labels=()
-installation_complete=false
-was_previously_loaded() {
-  local target=$1
-  local loaded
-  if [ "${#previously_loaded_labels[@]}" -gt 0 ]; then
-    for loaded in "${previously_loaded_labels[@]}"; do
-      if [ "${loaded}" = "${target}" ]; then
-        return 0
-      fi
-    done
-  fi
-  return 1
-}
-
-cleanup() {
-  status=$?
-  trap - EXIT
-  if [ "${installation_complete}" != true ]; then
-    for label in serve refresh generate catalog-publish notifications scheduler; do
-      if was_previously_loaded "${label}"; then
-        restore_previous_agent "${label}"
-      else
-        # Not running before this install: undo any half-installed agent.
-        launchctl bootout "gui/${uid}/com.${service_prefix}.${label}" 2>/dev/null || true
-        if [ -f "${plist_backup_dir}/com.${service_prefix}.${label}.plist" ]; then
-          cp "${plist_backup_dir}/com.${service_prefix}.${label}.plist" \
-            "${agents_dir}/com.${service_prefix}.${label}.plist" || true
-        else
-          rm -f "${agents_dir}/com.${service_prefix}.${label}.plist"
-        fi
-      fi
-    done
-  fi
-  rm -rf "${plist_backup_dir}"
-  exit "${status}"
-}
-trap cleanup EXIT
+# A stray UV_PROJECT_ENVIRONMENT would build the venv somewhere the agents do not run.
+env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${app_dir}" \
+  --python "${python_version}" --extra controller --locked
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
@@ -153,6 +275,7 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
     cp "${plist}" "${plist_backup_dir}/"
   fi
 done
+agents_recorded=true
 
 "${app_dir}/.venv/bin/python" - \
   "${serve_plist}" "${refresh_plist}" "${generation_plist}" "${catalog_publish_plist}" \
@@ -351,26 +474,21 @@ else:
 PY
 
 if [ -f "${catalog_publish_plist}" ]; then
-  publisher_was_loaded=false
   if launchctl print "gui/${uid}/com.${service_prefix}.catalog-publish" >/dev/null 2>&1; then
     launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"
-    publisher_was_loaded=true
+    stopped_labels+=("catalog-publish")
   fi
-  if ! "${app_dir}/.venv/bin/inky-bird" catalog-publish \
-    --config "${config_path}" --dry-run; then
-    if [ "${publisher_was_loaded}" = true ]; then
-      restore_catalog_publisher_schedule "${uid}"
-    fi
-    exit 1
-  fi
+  # A failure here puts the publisher back, without RunAtLoad, on exit.
+  "${app_dir}/.venv/bin/inky-bird" catalog-publish --config "${config_path}" --dry-run
 fi
 
-launchctl bootout "gui/${uid}/com.${service_prefix}.serve" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.refresh" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.generate" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.notifications" 2>/dev/null || true
-launchctl bootout "gui/${uid}/com.${service_prefix}.scheduler" 2>/dev/null || true
+for label in serve refresh generate catalog-publish notifications scheduler; do
+  if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/${uid}/com.${service_prefix}.${label}"
+    stopped_labels+=("${label}")
+  fi
+done
+release_cycle_lock
 launchctl bootstrap "gui/${uid}" "${serve_plist}"
 if [ -f "${refresh_plist}" ]; then
   launchctl bootstrap "gui/${uid}" "${refresh_plist}"
@@ -407,7 +525,9 @@ fi
 installation_complete=true
 # Remove the legacy single-agent layout only after the new agents verified,
 # so a failed upgrade leaves the previous controller runnable.
-launchctl bootout "gui/${uid}/com.${service_prefix}.controller-cycle" 2>/dev/null || true
+if launchctl print "gui/${uid}/com.${service_prefix}.controller-cycle" >/dev/null 2>&1; then
+  launchctl bootout "gui/${uid}/com.${service_prefix}.controller-cycle"
+fi
 rm -f "${legacy_cycle_plist}"
 echo "Controller installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
