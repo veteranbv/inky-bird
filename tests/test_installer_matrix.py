@@ -64,7 +64,7 @@ import time
 from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -1569,6 +1569,8 @@ class Matrix:
         self.bases: dict[tuple[str, str], Template] = {}
         self.groups: dict[GroupKey, Group] = {}
         self.verified: dict[object, str] = {}
+        # This session's own recording of each run, once it has been made.
+        self.fresh: dict[object, list[list[str]]] = {}
         self.futures: dict[str, Future[Outcome]] = {}
         self.cases_by_id: dict[str, Case] = {}
         self.fingerprint = fingerprint()
@@ -1655,11 +1657,13 @@ class Matrix:
     def record(self, key: GroupKey) -> list[list[str]]:
         steps = self.group(key).record(self.slot())
         self.verified[key] = ""
+        self.fresh[key] = steps
         return steps
 
     def record_cleanup(self, key: CleanupKey) -> list[list[str]]:
         steps = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
         self.verified[key] = ""
+        self.fresh[key] = steps
         return steps
 
     def verify(self, key: GroupKey | CleanupKey, cached: list[list[str]]) -> str:
@@ -1670,6 +1674,7 @@ class Matrix:
                     fresh = self.group(key[:3]).record(self.slot())
                 else:
                     fresh = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
+                self.fresh[key] = fresh
                 self.verified[key] = (
                     ""
                     if signature(fresh) == signature(cached)
@@ -1795,6 +1800,11 @@ class Matrix:
         changed = self.verify(check, recorded)
         if changed:
             return Outcome(-1, "", [changed])
+        # Paths a run creates, such as a runtime's random name, are those of this
+        # session's starting state, which only this session's recording names.
+        recorded = self.fresh[check]
+        if case.arguments:
+            case = replace(case, arguments=tuple(recorded[case.step][3:]))
         return self.group(key).evaluate(case, recorded, self.slot())
 
     def busy(self, scenario: str, state: str) -> Outcome:
