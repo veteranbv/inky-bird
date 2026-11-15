@@ -6,16 +6,26 @@ import { Element, ImageElement, fakeDocument, findButton } from './fake-dom.mjs'
 
 const web = new URL('../../src/inky_bird_frame/web/', import.meta.url);
 const moduleURL = (source) => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
-const dependencies = {
+const stubs = {
   '/app/settings.js': 'export function renderSettings() {}',
   '/app/imports.js': 'export function renderImports() {}',
   '/app/presentation.js': 'export function renderPresentation() {}',
 };
-for (const name of ['frame-tools.js', 'ui.js', 'work-status.js'])
-  dependencies['/app/' + name] = await readFile(new URL(name, web), 'utf8');
-let journalSource = await readFile(new URL('journal.js', web), 'utf8');
-for (const [path, source] of Object.entries(dependencies))
-  journalSource = journalSource.replace(`'${path}'`, JSON.stringify(moduleURL(source)));
+// A data: module cannot resolve '/app/' paths, so every module it imports,
+// and theirs in turn, is inlined as a data: URL too.
+const inlined = new Map();
+async function inline(source) {
+  for (const [, path] of source.matchAll(/from '(\/app\/[\w-]+\.js)'/g)) {
+    if (!inlined.has(path))
+      inlined.set(
+        path,
+        moduleURL(stubs[path] ?? (await inline(await readFile(new URL(path.slice(5), web), 'utf8')))),
+      );
+    source = source.replace(`'${path}'`, JSON.stringify(inlined.get(path)));
+  }
+  return source;
+}
+const journalSource = await inline(await readFile(new URL('journal.js', web), 'utf8'));
 let loads = 0;
 const timed = new WeakSet();
 

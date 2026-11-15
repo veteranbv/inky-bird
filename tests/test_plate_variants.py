@@ -12,7 +12,7 @@ from inky_bird_frame.access import AccessStore
 from inky_bird_frame.config import ControllerConfig
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.journal import JournalService
-from inky_bird_frame.web import create_app
+from inky_bird_frame.web import STATIC_PAGES, create_app
 
 ORIGIN = "https://inky.example.test"
 STAMP = "2026-10-15T12:00:00+00:00"
@@ -233,11 +233,19 @@ def test_static_app_files_revalidate_instead_of_downloading_again(tmp_path: Path
 def test_owner_page_preloads_every_module_it_imports() -> None:
     web = Path(__file__).parents[1] / "src/inky_bird_frame/web"
     page = (web / "index.html").read_text()
-    imported = set()
-    for module in ("app.js", "journal.js"):
-        for line in (web / module).read_text().splitlines():
+    # Walk the whole import graph: a module imported only by another module
+    # still has to be preloaded, or the browser finds it one round trip late.
+    imported: set[str] = set()
+    waiting = ["/app/app.js"]
+    while waiting:
+        source = (web / waiting.pop().removeprefix("/app/")).read_text()
+        for line in source.splitlines():
             if line.startswith("import ") and "'/app/" in line:
-                imported.add(line.split("'")[1])
-    assert imported
+                module = line.split("'")[1]
+                if module not in imported:
+                    imported.add(module)
+                    waiting.append(module)
+    assert {"/app/journal.js", "/app/frame-tools.js", "/app/work-status.js"} <= imported
     for module in imported:
         assert f'<link rel="modulepreload" href="{module}">' in page
+        assert STATIC_PAGES[module] == module.removeprefix("/app/")
