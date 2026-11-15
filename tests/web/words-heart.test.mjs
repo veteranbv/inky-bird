@@ -133,3 +133,13 @@ test('plate counts separate new plates from plates that need a hand', () => {
   assert.deepEqual(words.plateCounts({ available: false }), { newPlates: 0, needsAHand: 0 });
   assert.deepEqual(words.plateCounts(undefined), { newPlates: 0, needsAHand: 0 });
 });
+
+test('a bird with records in different units and no dates is still in the journal', () => {
+  assert.equal(
+    words.journalLine([
+      { source: 'birdbuddy', count: 2, unit: 'postcards', first_noted: null, last_noted: null },
+      { source: 'ebird-archive', count: 3, unit: 'checklists', first_noted: null, last_noted: null },
+    ]),
+    'In your journal: records without dates',
+  );
+});

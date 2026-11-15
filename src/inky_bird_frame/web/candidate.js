@@ -22,7 +22,7 @@ function checks(review) {
 
 export async function renderCandidate(context) {
   const { ui, el, button, api, main, query, href, link, note, base, byId } = context;
-  base('Review candidate');
+  base('A new page for your journal');
   main.append(link('Back to ' + WORDS.inTheWorks, 'work'));
   const candidate = await api(
     '/v1/owner/candidates/' + encodeURIComponent(query.get('bird') || ''),
@@ -30,7 +30,10 @@ export async function renderCandidate(context) {
   const noted = notedClause(byId?.get(candidate.taxon_id)?.retained_evidence);
   const intro = main.querySelector('.intro');
   if (intro)
-    intro.textContent = candidate.common_name + (noted ? ' — ' + noted : '') + '.';
+    intro.textContent =
+      candidate.common_name +
+      (noted ? ' — ' + noted : '') +
+      (candidate.can_approve ? '. Keep it, or send it back.' : '.');
   const content = el('section', '', 'journal-card');
   const image = el('img', '', 'detail-art');
   image.src = candidate.portrait_url;

@@ -16,7 +16,9 @@ export function renderHome(context) {
   base('Your field journal', 'Birds worth keeping close.');
   problems();
   const onFrame = byId.get(data.featured_taxon_id);
-  const featured = onFrame || catalogPlate(data.birds);
+  // When the frame's birds could not be read, it may not be empty.
+  const frameUnknown = (data.notices || []).some((notice) => notice.part === 'current-birds');
+  const featured = onFrame || (frameUnknown ? null : catalogPlate(data.birds));
   // Later notes join the plate's caption, which sits beside it on wide screens.
   let rail = main;
   if (featured) {
@@ -50,8 +52,7 @@ export function renderHome(context) {
       !unreadable &&
       !data.birds.some((bird) => bird.known) &&
       (!management.available || !management.sources.some((source) => source.enabled));
-    // When the frame's birds could not be read, it may not be empty.
-    if (!(data.notices || []).some((notice) => notice.part === 'current-birds'))
+    if (!frameUnknown)
       rail.append(el('p', 'Pick a few birds you love to start your frame.', 'home-start'));
     actions.append(link('Choose birds', 'birds', { scope: 'art' }, 'primary-link'));
     if (fresh) actions.append(link('Connect a source (optional)', 'sources'));

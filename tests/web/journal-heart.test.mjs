@@ -226,6 +226,7 @@ test('an empty frame with an unreadable part is not offered a first start', asyn
   assert.equal(linkTo(main, 'Connect a source (optional)'), undefined);
   // The frame may already hold birds, so Home does not say it is empty.
   assert(!main.textContent.includes('to start your frame'));
+  assert.equal(main.querySelector('.featured-art'), null, 'no stand-in plate for a frame that may not be empty');
 });
 
 test('bird cards and the list use the shared names', async (t) => {
@@ -283,8 +284,8 @@ test('a new plate arrives as a new page for the journal', async (t) => {
     birds: [{ ...bird(7, 'Sample Finch', 'b'), retained_evidence: [evidence('birdbuddy', 1, '2019-01-01', '2019-03-12')] }],
   });
   const { main } = await open(t, { page: 'candidate', bird: '7' }, { state, respond: candidateResponder(candidate()) });
-  assert.equal(main.querySelector('h1').textContent, 'Review candidate');
-  assert(has(main, 'Sample Finch — noted at your feeder on 12 Mar 2019.'));
+  assert.equal(main.querySelector('h1').textContent, 'A new page for your journal');
+  assert(has(main, 'Sample Finch — noted at your feeder on 12 Mar 2019. Keep it, or send it back.'));
   for (const sentence of ['Checks passed', 'No place details in the image'])
     assert(has(main, sentence), sentence);
   for (const raw of ['passed', 'location free', 'true', 'species accuracy', 'Generated art'])
@@ -300,7 +301,7 @@ test('a new plate arrives as a new page for the journal', async (t) => {
 
 test('a new plate without a record of the bird leaves the noted clause out', async (t) => {
   const { main } = await open(t, { page: 'candidate', bird: '7' }, { respond: candidateResponder(candidate()) });
-  assert(has(main, 'Sample Finch.'));
+  assert(has(main, 'Sample Finch. Keep it, or send it back.'));
 });
 
 test('a plate that did not pass says so and keeps the server reason', async (t) => {
@@ -310,6 +311,8 @@ test('a plate that did not pass says so and keeps the server reason', async (t) 
     quality_review: { passed: false, location_free: false },
   });
   const { main } = await open(t, { page: 'candidate', bird: '7' }, { respond: candidateResponder(value) });
+  // A plate that cannot be kept is not offered as one.
+  assert(has(main, 'Sample Finch.'));
   assert(has(main, 'Checks did not pass'));
   assert(has(main, 'The image may show place details'));
   assert(has(main, 'This candidate does not meet ordinary publication checks.'));

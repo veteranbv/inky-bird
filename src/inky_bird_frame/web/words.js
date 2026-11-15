@@ -102,13 +102,22 @@ export function journalLine(evidence) {
     const from = sources.length === 1 ? RECORDS_FROM[sources[0]] : '';
     parts.push(plural(total, 'record', 'records') + (from ? ' ' + from : ''));
   }
-  return parts.length ? 'In your journal: ' + parts.join(' · ') : '';
+  return 'In your journal: ' + (parts.length ? parts.join(' · ') : 'records without dates');
 }
 
+// A value with a time is a moment, counted on the owner's local calendar; a
+// date alone is already a calendar day.
 function daysAgo(value, today) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value ?? ''));
-  if (!match || !plainDate(value)) return null;
-  const day = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const text = String(value ?? '');
+  let day;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    if (!plainDate(text)) return null;
+    day = Date.UTC(Number(text.slice(0, 4)), Number(text.slice(5, 7)) - 1, Number(text.slice(8, 10)));
+  } else {
+    const moment = /^\d{4}-\d{2}-\d{2}[T ]/.test(text) ? new Date(text.slice(0, 10) + 'T' + text.slice(11)) : null;
+    if (!moment || Number.isNaN(moment.getTime())) return null;
+    day = Date.UTC(moment.getFullYear(), moment.getMonth(), moment.getDate());
+  }
   return Math.round((Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) - day) / 86400000);
 }
 const thisWeek = (value, today) => {
