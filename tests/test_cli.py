@@ -3575,7 +3575,8 @@ rotation_mode = "shuffle_bag"
 
         body = degradation.call_args.kwargs["body"]
         self.assertNotIn(secret, body)
-        self.assertIn("DataSourceError", body)
+        self.assertIn("data source error", body)
+        self.assertNotIn("DataSourceError", body)
 
     def test_refresh_does_not_clear_taxonomy_alert_when_ebird_fails(self) -> None:
         config = SimpleNamespace(
