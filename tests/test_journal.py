@@ -1193,13 +1193,13 @@ def test_owner_can_remove_and_resolve_unresolved_collection_members(tmp_path: Pa
         {"common_name": "", "scientific_name": "Unmatched species"},
     ]
     service = JournalService(controller)
-    # Keep the first, drop the second: nothing else changes.
+    # Remove the second: nothing else changes.
     kept = service.save_selection(
         revision=1,
         label="A trip",
         taxon_ids=[],
         collection_id=group.collection_id,
-        unresolved=[unresolved[0]],
+        remove_unresolved=[unresolved[1]],
     )
     assert kept.collections[0].members == group.members[:1]
     assert kept.collections[0].kind == CollectionKind.TRIP
@@ -1210,7 +1210,7 @@ def test_owner_can_remove_and_resolve_unresolved_collection_members(tmp_path: Pa
         label="A trip",
         taxon_ids=[1],
         collection_id=group.collection_id,
-        unresolved=[],
+        remove_unresolved=[unresolved[0]],
     )
     member = resolved.collections[0].members
     assert member == (
@@ -1238,7 +1238,7 @@ def test_resolving_does_not_replace_a_member_already_chosen(tmp_path: Path) -> N
         label="A trip",
         taxon_ids=[1],
         collection_id=group.collection_id,
-        unresolved=[],
+        remove_unresolved=group.owner_dict()["unresolved"],
     )
     assert second.collections[0].members == (manual,)
 
@@ -1268,7 +1268,7 @@ def test_unresolved_choice_must_name_this_collections_members(
             label="A trip",
             taxon_ids=[],
             collection_id=group.collection_id,
-            unresolved=choice,
+            remove_unresolved=choice,
         )
     assert (controller.state_dir / "journal.json").read_bytes() == before
 
@@ -1280,6 +1280,6 @@ def test_new_collection_has_no_unresolved_members_to_keep(tmp_path: Path) -> Non
             revision=0,
             label="New",
             taxon_ids=[],
-            unresolved=[{"common_name": "", "scientific_name": "Unmatched species"}],
+            remove_unresolved=[{"common_name": "", "scientific_name": "Unmatched species"}],
         )
-    assert save_collection(tmp_path, revision=0, label="New", taxon_ids=[], unresolved=[])
+    assert save_collection(tmp_path, revision=0, label="New", taxon_ids=[], remove_unresolved=[])
