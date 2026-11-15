@@ -17,7 +17,7 @@ import {
 import { renderFrame } from '/app/frame.js';
 import { renderCandidate } from '/app/candidate.js';
 import { renderOperation, renderGuides, renderManage, renderStatus } from '/app/manage.js';
-import { WORDS, plateCounts, plural } from '/app/words.js';
+import { WORDS, plateCounts, plural, whyThisBird } from '/app/words.js';
 let run = 0;
 let stopScreen = () => {};
 let frameSignOut = null;
@@ -319,6 +319,13 @@ export async function openJournal(ui, message = '') {
     problems,
     empty,
     playLink,
+    // The line under a plate: from the bird's own records, or its detection this week.
+    whyThisBird: (bird) =>
+      whyThisBird(bird, {
+        detection: management?.available
+          ? (management.recent_detections || []).find((row) => row.taxon_id === bird.taxon_id)
+          : null,
+      }),
     operationNames,
     operationAction,
     savedAction,

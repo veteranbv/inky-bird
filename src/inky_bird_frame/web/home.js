@@ -1,4 +1,4 @@
-import { plateCounts, plural, shortDate, whyThisBird } from '/app/words.js';
+import { plateCounts, plural, shortDate } from '/app/words.js';
 
 // With nothing on the frame, Home still opens on a plate: one from the
 // catalog, the same all day.
@@ -11,8 +11,10 @@ function catalogPlate(birds) {
 }
 
 export function renderHome(context) {
-  const { el, main, data, byId, management, link, note, art, evidence, base, problems, playLink } =
-    context;
+  const {
+    el, main, data, byId, management, link, note, art, evidence, base, problems, playLink,
+    whyThisBird,
+  } = context;
   base('Your field journal', 'Birds worth keeping close.');
   problems();
   const onFrame = byId.get(data.featured_taxon_id);
@@ -28,10 +30,7 @@ export function renderHome(context) {
     caption.append(el('h2', featured.common_name), el('p', featured.scientific_name, 'scientific'));
     if (onFrame) {
       caption.append(note(evidence(featured)));
-      const detection = management.available
-        ? (management.recent_detections || []).find((row) => row.taxon_id === featured.taxon_id)
-        : null;
-      const why = whyThisBird(featured, { detection });
+      const why = whyThisBird(featured);
       if (why) caption.append(el('p', why, 'hint why-this-bird'));
     }
     const feature = el('div', '', 'home-feature');

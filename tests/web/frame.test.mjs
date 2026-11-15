@@ -319,3 +319,22 @@ for (const [name, helper] of [
     assert.equal(why.textContent, '');
     assert.equal(why.hidden, true);
   });
+
+// The journal page hands Play the same reason Home shows for its featured bird.
+test('Play under the journal shows why a bird noted this week is shown', async (t) => {
+  const now = new Date();
+  const today = [now.getFullYear(), now.getMonth() + 1, now.getDate()]
+    .map((part) => String(part).padStart(2, '0'))
+    .join('-');
+  const state = () => {
+    const value = journal();
+    value.birds[0].retained_evidence = [
+      { source: 'birdbuddy', count: 2, unit: 'postcard', first_noted: '2019-03-12', last_noted: today },
+    ];
+    return value;
+  };
+  const { main } = await open(t, { state });
+  const why = main.querySelector('.frame-why');
+  assert.equal(why.textContent, 'Noted at your feeder this week');
+  assert.equal(why.hidden, false);
+});
