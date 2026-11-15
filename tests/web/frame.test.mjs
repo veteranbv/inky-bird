@@ -124,7 +124,7 @@ async function open(t, { state, plate = () => Promise.resolve(png()), secure = t
   close = closeJournal;
   await openJournal(ui);
   await flush();
-  return { main, requests, reloads, problems };
+  return { main, requests, reloads, problems, leave: closeJournal };
 }
 const checks = (requests) => requests.filter(({ path }) => path === '/v1/owner/journal').length;
 const status = (main) => main.querySelector('.frame-dock')?.children[0].textContent;
@@ -180,6 +180,28 @@ test('an ended session on an empty view goes to sign-in', async (t) => {
   await flush();
   assert.equal(problems.length, 1, 'checking stops once the session ended');
 });
+
+for (const [outcome, answer] of [
+  ['ready plates', (resolve) => resolve(journal([1]))],
+  ['an ended session', (_resolve, reject) =>
+    reject(Object.assign(new Error('Sign in again.'), { code: 'sign_in_required' }))],
+]) {
+  test(`a check on an empty view that returns ${outcome} after the owner left does nothing`, async (t) => {
+    let pending = null;
+    const { reloads, problems, leave } = await open(t, {
+      state: () => (pending ? new Promise((resolve, reject) => pending.push([resolve, reject])) : journal([])),
+    });
+    pending = [];
+    t.mock.timers.tick(60000);
+    await flush();
+    assert.equal(pending.length, 1, 'a check is waiting for its answer');
+    leave();
+    answer(...pending[0]);
+    await flush();
+    assert.equal(reloads.length, 0, 'the page the owner moved to is not reloaded');
+    assert.equal(problems.length, 0, 'the page the owner moved to is not replaced');
+  });
+}
 
 test('a hung plate request ends at its deadline and says so', async (t) => {
   const { main, requests } = await open(t, { state: () => journal(), plate: (_path, options) => hang(options) });

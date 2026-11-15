@@ -25,24 +25,28 @@ export function renderFrame(context) {
     Boolean(ids) &&
     ids.some((id) => current.birds.some((bird) => bird.taxon_id === id && bird.plate_ready));
   if (!birds.length) {
-    main.append(
-      empty('No approved plates in this view', 'Inky will not switch to another collection.'),
-      link('Exit Frame', 'collections'),
-    );
+    const card = empty('No approved plates in this view', 'Inky will not switch to another collection.');
+    main.append(card, link('Exit Frame', 'collections'));
+    let left = false;
     // A view that is empty for now starts playing once its plates arrive.
     const waiting = setInterval(async () => {
       if (document.hidden) return;
       try {
         const current = await api('/v1/owner/journal');
+        if (left || !card.isConnected) return;
         if (ready(current, viewIds(current))) location.reload();
       } catch (error) {
+        if (left || !card.isConnected) return;
         if (['sign_in_required', 'secure_access_required'].includes(error.code)) {
           clearInterval(waiting);
           ui.showProblem(error);
         }
       }
     }, 60000);
-    setStopScreen(() => clearInterval(waiting));
+    setStopScreen(() => {
+      left = true;
+      clearInterval(waiting);
+    });
     return;
   }
   document.body.classList.add('presenting');
