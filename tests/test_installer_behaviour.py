@@ -783,3 +783,59 @@ def test_macos_failure_after_install_says_the_new_version_is_running(tmp_path: P
     assert host.loaded_agents()["serve"]["generation"] == "new"
     assert "new version is installed and running" in result.stderr
     assert "started again" not in result.stderr
+
+
+# Display node installer -----------------------------------------------------
+
+
+def display_host(tmp_path: Path) -> Host:
+    """A Pimoroni venv with the renamed pre-1.0 distribution and its timer stopped."""
+    host = Host(tmp_path, "Linux")
+    python = host.venv / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} "
+        'venv-python "$0" "$@"\n'
+    )
+    python.chmod(0o755)
+    Host.write_source(host.app, "old")
+    host.save_state("pip", {"inky-bird-frame": {"source": str(host.app)}})
+    # The renamed distribution was a regular, non-editable install.
+    package = host.venv / "lib/python3/site-packages/inky_bird_frame"
+    shutil.copytree(host.app / "src/inky_bird_frame", package)
+    (package / "installation.py").write_text(OLD_INSTALLATION_MODULE)
+    host.install_units(display_service="inactive", display_timer="inactive")
+    return host
+
+
+def run_display(host: Host) -> subprocess.CompletedProcess[str]:
+    return host.run("install-display-local.sh", INKY_BIRD_NONINTERACTIVE_SUDO="true")
+
+
+def test_display_upgrade_installs_new_before_removing_the_renamed_distribution(
+    tmp_path: Path,
+) -> None:
+    host = display_host(tmp_path)
+    result = run_display(host)
+    assert result.returncode == 0, result.stderr
+    pip = [call for call in host.calls() if call[0] in ("pip", "remove-distribution")]
+    install = next(i for i, call in enumerate(pip) if call[1] == "install")
+    removal = next(i for i, call in enumerate(pip) if call[0] == "remove-distribution")
+    assert install < removal
+    assert pip[removal] == ["remove-distribution", "inky-bird-frame", "inky-bird"]
+    assert not any(call[1] == "uninstall" for call in pip)
+    assert set(host.state_of("pip")) == {"inky-bird"}
+    # Units are rendered by the new package, not the old one it replaced.
+    assert "# rendered by new" in host.unit_text("display.service")
+    assert host.unit_state("display.timer") == {"active": True, "enabled": True}
+
+
+def test_display_failed_package_install_keeps_the_old_distribution(tmp_path: Path) -> None:
+    host = display_host(tmp_path)
+    host.fail("pip-install")
+    result = run_display(host)
+    assert result.returncode == 1
+    assert set(host.state_of("pip")) == {"inky-bird-frame"}
+    assert (host.venv / "lib/python3/site-packages/inky_bird_frame/installation.py").exists()
+    assert not any(call[0] == "remove-distribution" for call in host.calls())
+    assert "# old" in host.unit_text("display.timer")
