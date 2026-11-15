@@ -64,8 +64,10 @@ def _read_capped(response: HTTPResponse, limit: int, display_url: str) -> bytes:
     body = response.read(limit + 1)
     if len(body) > limit:
         raise DataSourceError(f"Response from {display_url} exceeds {limit} bytes")
-    if declared is not None and declared.isdigit() and len(body) != int(declared):
-        # read(amount) returns what arrived before the connection closed.
+    remaining = response.length
+    if isinstance(remaining, int) and remaining > 0:
+        # read(amount) returns what arrived before the connection closed;
+        # http.client keeps the bytes still owed, and none for a chunked body.
         raise HTTPException("response shorter than its declared length")
     return body
 
@@ -86,6 +88,10 @@ class _Deadline:
 
     def stop(self) -> None:
         self._timer.cancel()
+
+    @property
+    def spent(self) -> bool:
+        return self.expired or time.monotonic() >= self.ends_at
 
     def watch(self, sock: socket.socket) -> None:
         with self._lock:
@@ -253,9 +259,9 @@ def _fetch(
         except DataSourceError:
             raise
         except (URLError, HTTPException, OSError) as exc:
-            # A spent deadline shuts the socket down; whatever the interrupted
-            # step raised, it is the timeout.
-            if deadline.expired:
+            # A spent deadline shuts the socket down or refuses to connect;
+            # whatever the interrupted step raised, it is the timeout.
+            if deadline.spent:
                 raise DataSourceError(f"Timed out reading {display_url}") from exc
             raise _transport_error(exc, display_url) from exc
         if deadline.expired:

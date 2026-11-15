@@ -37,6 +37,15 @@ class _RedirectingHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"truncated")
             self.close_connection = True
             return
+        if self.path == "/chunked-with-length":
+            # Recipients ignore Content-Length when the body is chunked.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.write(b'8\r\n{"a": 1}\r\n0\r\n\r\n')
+            self.close_connection = True
+            return
         if self.path in {"/declared-large", "/undeclared-large"}:
             body = b'"' + b"x" * 64 + b'"'
             self.send_response(200)
@@ -325,6 +334,18 @@ class DeadlineAndLimitTests(unittest.TestCase):
             self.assertRaisesRegex(DataSourceError, "^Invalid HTTP response from "),
         ):
             get_bytes(f"http://127.0.0.1:{port}/short-body")
+        with _serving() as port:
+            self.assertEqual(get_bytes(f"http://127.0.0.1:{port}/chunked-with-length"), b'{"a": 1}')
+
+    def test_a_deadline_spent_before_connecting_reads_as_a_timeout(self) -> None:
+        # The deadline starts at 0; every later clock reading is past it.
+        clock = iter([0.0])
+        with (
+            _serving() as port,
+            patch("inky_bird_frame.http.time.monotonic", lambda: next(clock, 1e9)),
+            self.assertRaisesRegex(DataSourceError, "^Timed out reading "),
+        ):
+            get_bytes(f"http://127.0.0.1:{port}/payload", deadline_seconds=60)
 
     def test_requests_identify_this_release(self) -> None:
         expected = f"inky-bird/{__version__}"
