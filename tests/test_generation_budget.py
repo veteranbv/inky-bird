@@ -36,6 +36,7 @@ from inky_bird_frame.errors import (
     DataSourceError,
     GenerationError,
     InsufficientReferencesError,
+    QualityReviewError,
     ResearchLimitError,
     SpeciesStateError,
 )
@@ -1028,6 +1029,92 @@ class KeptAttemptTests(unittest.TestCase):
         if guidance is not None:
             self.assertEqual(guidance.findings, ("Owner correction",))
             self.assertIsNone(guidance.source_plate)
+
+
+def kept_runs(config: AppConfig, taxon_id: int) -> list[str]:
+    archive = config.controller.state_dir / "archive"
+    if not archive.exists():
+        return []
+    return sorted(path.name for path in archive.glob(f"{taxon_id}-*"))
+
+
+def seed_kept_run(config: AppConfig, name: str, *, resume: bool) -> None:
+    portrait = config.controller.state_dir / "archive" / name / "attempt-01" / "portrait.png"
+    write_png(portrait, color=(200, 40, 40))
+    if resume:
+        retries(config).set_quality_guidance(
+            FIRST.taxon_id,
+            ("Crest is too short",),
+            source_plate=portrait.relative_to(config.controller.state_dir).as_posix(),
+        )
+
+
+class KeptRunCleanupTests(unittest.TestCase):
+    OLDER = "1-20260101T000000Z-interrupted"
+    LATEST = "1-20260201T000000Z-interrupted"
+    OTHER = "1-20260101T000000Z"
+
+    def test_a_new_kept_run_replaces_the_bird_s_earlier_one(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            for _ in range(2):
+                with (
+                    fake_codex([None, GenerationError("image tool failed")], [FAILED_REVIEW]),
+                    self.assertRaises(GenerationError),
+                ):
+                    generate_candidate(config, CARDINAL, config.controller.workspace_dir)
+            runs = kept_runs(config, CARDINAL.taxon_id)
+            guidance = retries(config).quality_guidance(CARDINAL.taxon_id)
+
+        self.assertEqual(len(runs), 1)
+        self.assertIsNotNone(guidance)
+        if guidance is not None:
+            self.assertEqual(guidance.source_plate, f"archive/{runs[0]}/attempt-01/portrait.png")
+
+    def test_approval_removes_the_kept_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_kept_run(config, self.LATEST, resume=True)
+            (config.controller.state_dir / "archive" / self.OTHER).mkdir()
+            with (
+                generation([Path(temporary) / "candidate"]),
+                patch("inky_bird_frame.controller.approve_candidate", return_value=MagicMock()),
+            ):
+                result = run_generation_cycle(config)
+            runs = kept_runs(config, FIRST.taxon_id)
+
+        generated = result["generated"]
+        self.assertIsInstance(generated, list)
+        self.assertEqual(len(generated) if isinstance(generated, list) else 0, 1)
+        self.assertEqual(runs, [self.OTHER])
+
+    def test_a_stop_for_the_owner_keeps_only_the_run_their_retry_resumes_from(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_failures(config, FIRST.taxon_id, 11)
+            seed_kept_run(config, self.OLDER, resume=False)
+            seed_kept_run(config, self.LATEST, resume=True)
+            with generation(DataSourceError("source down")):
+                result = run_generation_cycle(config)
+            runs = kept_runs(config, FIRST.taxon_id)
+
+        self.assertIs(first_failure(result)["terminal"], True)
+        self.assertEqual(runs, [self.LATEST])
+
+    def test_a_stop_with_nothing_to_resume_removes_the_kept_runs(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            refresh(config, [FIRST])
+            seed_kept_run(config, self.OLDER, resume=False)
+            (config.controller.state_dir / "archive" / self.OTHER).mkdir()
+            with generation(QualityReviewError("review rounds exhausted")):
+                result = run_generation_cycle(config)
+            runs = kept_runs(config, FIRST.taxon_id)
+
+        self.assertIs(first_failure(result)["terminal"], True)
+        self.assertEqual(runs, [self.OTHER])
 
 
 def live_names(common_name: str) -> TaxonContext:

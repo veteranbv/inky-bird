@@ -2990,11 +2990,33 @@ def _keep_interrupted_attempts(
             invariant_findings=invariant_findings,
             profile_conflicts=profile_conflicts,
         )
+        _remove_unused_kept_runs(state_dir, retry_store, species.taxon_id)
     except (OSError, ValueError, CatalogError) as exc:
         _LOG.warning(
             "Earlier attempts for taxon %s could not be kept (%s)",
             species.taxon_id,
             type(exc).__name__,
+        )
+
+
+def _remove_unused_kept_runs(state_dir: Path, retry_store: RetryStore, taxon_id: int) -> None:
+    """Remove a bird's kept interrupted runs except the one its next try resumes from.
+
+    Never raises: a run left behind is removed the next time this runs.
+    """
+    guidance = retry_store.quality_guidance(taxon_id)
+    source = guidance.source_plate if guidance is not None else None
+    parts = Path(source).parts if source is not None else ()
+    resumed = parts[1] if len(parts) > 2 and parts[0] == "archive" else None
+    archive = state_dir / "archive"
+    try:
+        runs = list(archive.glob(f"{taxon_id}-*-interrupted*")) if archive.is_dir() else []
+        for run in runs:
+            if run.name != resumed and run.is_dir() and not run.is_symlink():
+                shutil.rmtree(run)
+    except OSError as exc:
+        _LOG.warning(
+            "Earlier attempts for taxon %s could not be removed (%s)", taxon_id, type(exc).__name__
         )
 
 
@@ -3423,6 +3445,7 @@ def _stop_for_owner(
         retry_store.clear(species.taxon_id)
         # The owner's retry starts a new run with a full research allowance.
         _research_budget(config).reset_species(species.taxon_id)
+        _remove_unused_kept_runs(config.controller.state_dir, retry_store, species.taxon_id)
     return {
         "taxon_id": species.taxon_id,
         "common_name": species.common_name,
@@ -3627,6 +3650,7 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 )
                 retry_store.clear(species.taxon_id)
                 retry_store.clear_quality_guidance(species.taxon_id)
+                _remove_unused_kept_runs(config.controller.state_dir, retry_store, species.taxon_id)
             except InsufficientReferencesError as exc:
                 retry = retry_store.record_failure(
                     species.taxon_id,
@@ -3682,6 +3706,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                 if species.taxon_id in approved_taxon_ids(config.controller.catalog_dir):
                     retry_store.clear(species.taxon_id)
                     retry_store.clear_quality_guidance(species.taxon_id)
+                    _remove_unused_kept_runs(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
                 else:
                     failures.append(
                         _retry_or_stop(
@@ -3715,6 +3742,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                         retry_store.clear_quality_guidance(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
                     _research_budget(config).reset_species(species.taxon_id)
+                    _remove_unused_kept_runs(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,
@@ -3731,6 +3761,9 @@ def run_generation_cycle(config: AppConfig) -> dict[str, object]:
                     retry_store.clear(species.taxon_id)
                     failure_path = record_failure(config.controller.state_dir, species, exc)
                     _research_budget(config).reset_species(species.taxon_id)
+                    _remove_unused_kept_runs(
+                        config.controller.state_dir, retry_store, species.taxon_id
+                    )
                 failures.append(
                     {
                         "taxon_id": species.taxon_id,
