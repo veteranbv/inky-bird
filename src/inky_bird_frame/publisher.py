@@ -18,6 +18,7 @@ from tempfile import TemporaryDirectory, mkdtemp
 from time import time_ns
 from typing import Literal, cast
 
+import PIL
 from PIL import Image
 
 from . import __version__
@@ -1298,10 +1299,11 @@ def _validate_checkout(checkout: Path, publication: PublicCatalogConfig) -> tupl
         raise
     if authenticated.casefold() != owner.casefold():
         # An organisation is never the signed-in account; its administrators can still merge.
+        # A repository hidden from this account answers 404, so it is not an administrator.
         administrator = _gh(
-            publication, "api", f"repos/{repository}", "--jq", ".permissions.admin"
-        ).stdout.strip()
-        if administrator != "true":
+            publication, "api", f"repos/{repository}", "--jq", ".permissions.admin", check=False
+        )
+        if administrator.returncode != 0 or administrator.stdout.strip() != "true":
             raise CatalogPublishError(
                 f"GitHub CLI must be authenticated as repository owner {owner!r} "
                 f"or an administrator of {repository}"
@@ -1671,6 +1673,8 @@ def _verification_key(
     publication = config.public_catalog
     payload = {
         "version": __version__,
+        # Pillow decodes every plate in the gates; a different release may judge them differently.
+        "pillow": PIL.__version__,
         "repository": publication.repository,
         "remote": publication.remote,
         "base_branch": publication.base_branch,
@@ -1701,15 +1705,17 @@ def _reusable_verification(state_dir: Path, key: str) -> dict[str, object] | Non
 
 
 def _record_verification(state_dir: Path, key: str, result: dict[str, object]) -> None:
-    write_json_atomic(
-        state_dir / _VERIFICATION_RECORD,
-        {
-            "schema_version": 1,
-            "key": key,
-            "outcome": {field: result[field] for field in _VERIFIED_RESULT_FIELDS},
-        },
-        mode=0o600,
-    )
+    # Best effort: without the record the next run only validates everything again.
+    with suppress(OSError):
+        write_json_atomic(
+            state_dir / _VERIFICATION_RECORD,
+            {
+                "schema_version": 1,
+                "key": key,
+                "outcome": {field: result[field] for field in _VERIFIED_RESULT_FIELDS},
+            },
+            mode=0o600,
+        )
 
 
 def run_catalog_publish(config: AppConfig, *, dry_run: bool = False) -> dict[str, object]:

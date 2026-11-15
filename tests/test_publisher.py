@@ -333,6 +333,7 @@ class _FakeGitHub:
         self.fail_next_create = False
         self.login = "example"
         self.admin = "false"
+        self.repository_hidden = False
 
     def add_pull_request(self, branch: str, *, author: str = "example") -> dict[str, object]:
         number = len(self.pull_requests) + 1
@@ -360,13 +361,20 @@ class _FakeGitHub:
         input_text: str | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        del input_text, check
+        del input_text
         self.calls.append(arguments)
         stdout = ""
         if arguments[:2] == ("api", "user"):
             stdout = f"{self.login}\n"
         elif arguments[:2] == ("api", f"repos/{_REPOSITORY}"):
             self.test.assertEqual(arguments[2:], ("--jq", ".permissions.admin"))
+            if self.repository_hidden:
+                # Like gh for a private repository the account cannot see.
+                if check:
+                    raise CatalogPublishError("gh api failed: HTTP 404: Not Found")
+                return subprocess.CompletedProcess(
+                    ["gh", *arguments], 1, stdout="", stderr="HTTP 404: Not Found\n"
+                )
             stdout = f"{self.admin}\n"
         elif arguments[:2] == ("pr", "list"):
             self.test.assertEqual(arguments[arguments.index("--repo") + 1], _REPOSITORY)
@@ -2186,6 +2194,36 @@ class PublicationRunTests(unittest.TestCase):
             record = config.controller.state_dir / "catalog-publish-verified.json"
             self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
 
+    def test_a_different_image_library_validates_in_full_again(self) -> None:
+        with TemporaryDirectory() as temporary:
+            _, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Good Bird")
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+                run_catalog_publish(config)
+                self.assertTrue(run_catalog_publish(config)["verification_reused"])
+                with patch("PIL.__version__", "0.0.0"):
+                    upgraded = run_catalog_publish(config)
+
+            self.assertFalse(upgraded["verification_reused"])
+            self.assertFalse(upgraded["changed"])
+
+    def test_an_unwritable_reuse_record_does_not_fail_a_verified_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            _, _, config, fake = self._environment(Path(temporary))
+            _create_species(config.controller.catalog_dir, 1, "Good Bird")
+            record = config.controller.state_dir / "catalog-publish-verified.json"
+            record.mkdir(parents=True)
+
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+                verified = run_catalog_publish(config)
+                again = run_catalog_publish(config)
+
+            self.assertFalse(verified["changed"])
+            self.assertFalse(again["verification_reused"])
+            self.assertTrue(record.is_dir())
+
     def test_a_changed_remote_catalog_is_validated_in_full_again(self) -> None:
         def damage(clone: Path) -> None:
             (clone / "catalog/species/1-good-bird/display.png").write_bytes(b"not a png")
@@ -2241,6 +2279,74 @@ class PublicationRunTests(unittest.TestCase):
             self.assertFalse(moved["verification_reused"])
             self.assertEqual([item["taxon_id"] for item in _result_items(moved, "published")], [2])
             self.assertIn("catalog/species/2-leaky-bird/manifest.json", _remote_files(remote))
+
+    def test_a_run_that_published_is_never_reused(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            catalog = config.controller.catalog_dir
+            _create_species(catalog, 1, "Good Bird")
+            with _github(fake), _settled():
+                run_catalog_publish(config)
+            before = _run_git(remote, "rev-parse", "refs/heads/main")
+            _create_species(catalog, 2, "New Bird")
+            with _github(fake), _settled():
+                self.assertTrue(run_catalog_publish(config)["merged"])
+                # The remote goes back to the exact catalog tree the publishing run started from.
+                _run_git(remote, "update-ref", "refs/heads/main", before)
+                again = run_catalog_publish(config)
+
+            self.assertFalse(again["verification_reused"])
+            self.assertTrue(again["merged"])
+            self.assertIn("catalog/species/2-new-bird/manifest.json", _remote_files(remote))
+
+    def test_published_species_are_read_from_the_fetched_commit(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, checkout, config, fake = self._environment(root)
+            catalog = config.controller.catalog_dir
+            config.controller.state_dir.mkdir(parents=True)
+            discovery = config.controller.state_dir / "discovery.json"
+            write_json_atomic(discovery, {"place_name": "Exampleville", "state": "Example State"})
+            _create_species(catalog, 1, "Good Bird")
+            with _github(fake):
+                run_catalog_publish(config)
+            fetched = _run_git(remote, "rev-parse", "refs/heads/main")
+
+            def publish_leaky(clone: Path) -> None:
+                leaky = _create_species(clone / "catalog", 2, "Leaky Bird")
+                _set_profile_field(leaky, "habitat", "Parks of exampleville, example state.")
+                rebuild_catalog_index(clone / "catalog")
+
+            # A later remote commit that already lists the bird, which the checkout's
+            # remote ref moves to while the run works.
+            _commit_to_remote(root, remote, publish_leaky)
+            _run_git(checkout, "fetch", "origin", "+refs/heads/main:refs/test/later")
+            _run_git(remote, "update-ref", "refs/heads/main", fetched)
+            leaky = _create_species(catalog, 2, "Leaky Bird")
+            _set_profile_field(leaky, "habitat", "Parks of exampleville, example state.")
+            rebuild_catalog_index(catalog)
+            original = publisher_module._git
+
+            def moving(
+                repository: Path,
+                *arguments: str,
+                check: bool = True,
+                timeout: float = publisher_module._COMMAND_TIMEOUT_SECONDS,
+            ) -> subprocess.CompletedProcess[str]:
+                result = original(repository, *arguments, check=check, timeout=timeout)
+                if arguments[:2] == ("rev-parse", "--verify") and arguments[-1].endswith(
+                    "^{commit}"
+                ):
+                    original(checkout, "update-ref", "refs/remotes/origin/main", "refs/test/later")
+                return result
+
+            with _github(fake), patch("inky_bird_frame.publisher._git", side_effect=moving):
+                result = run_catalog_publish(config)
+
+            self.assertEqual(
+                [item["species"] for item in _result_items(result, "skipped")], ["2-leaky-bird"]
+            )
+            self.assertNotIn("catalog/species/2-leaky-bird/manifest.json", _remote_files(remote))
 
     def test_a_changed_local_catalog_is_validated_in_full_again(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2628,6 +2734,23 @@ class PublicationRunTests(unittest.TestCase):
             with (
                 _github(fake),
                 self.assertRaisesRegex(CatalogPublishError, "administrator of"),
+            ):
+                run_catalog_publish(config)
+
+            self.assertEqual(_remote_branches(remote), ["main"])
+
+    def test_names_the_owner_when_the_account_cannot_see_the_repository(self) -> None:
+        with TemporaryDirectory() as temporary:
+            remote, _, config, fake = self._environment(Path(temporary))
+            fake.login = "someone-else"
+            fake.repository_hidden = True
+            _create_species(config.controller.catalog_dir, 1, "Example Bird")
+
+            with (
+                _github(fake),
+                self.assertRaisesRegex(
+                    CatalogPublishError, "must be authenticated as repository owner 'example'"
+                ),
             ):
                 run_catalog_publish(config)
 
