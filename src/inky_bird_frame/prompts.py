@@ -6,6 +6,7 @@ import json
 import unicodedata
 from html.parser import HTMLParser
 from pathlib import Path
+from string import Formatter
 from typing import Final
 
 from .birds import BirdSpecies, TaxonContext
@@ -33,6 +34,54 @@ DATA_INTRODUCTION: Final = (
 _SKIPPED_TAGS: Final = frozenset({"script", "style"})
 _BREAKING_TAGS: Final = frozenset({"br", "div", "li", "p"})
 _ESCAPED_CATEGORIES: Final = frozenset({"Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp"})
+
+# The plate and review instruction wording can be replaced by an evaluation
+# candidate. The placeholders carry the data block, reference numbering and
+# species-gated notes, so a replacement must keep each exactly once; the head
+# and tail around the instructions (tool request, output path) never change.
+MAX_INSTRUCTION_CHARACTERS: Final = 20000
+PLATE_INSTRUCTION_FIELDS: Final = frozenset(
+    {
+        "common_name",
+        "scientific_name",
+        "data_block",
+        "reference_list",
+        "reference_roles",
+        "skimmer_bill",
+        "correction",
+        "slit_pupil",
+    }
+)
+REVIEW_INSTRUCTION_FIELDS: Final = frozenset({"allowed_domains"})
+_FORBIDDEN_INSTRUCTION_TEXT: Final = ("<reference-data", "</reference-data", "$imagegen")
+
+
+def validate_instructions(template: str, fields: frozenset[str]) -> None:
+    """Refuse instruction wording that could drop or forge a fixed part of the prompt."""
+    if not template.strip():
+        raise GenerationError("Prompt instructions must not be empty")
+    if len(template) > MAX_INSTRUCTION_CHARACTERS:
+        raise GenerationError(
+            f"Prompt instructions must contain at most {MAX_INSTRUCTION_CHARACTERS} characters"
+        )
+    try:
+        parsed = list(Formatter().parse(template))
+    except ValueError:
+        raise GenerationError("Prompt instructions contain an unmatched brace") from None
+    seen: list[str] = []
+    for literal, field, format_spec, conversion in parsed:
+        if any(text in literal for text in _FORBIDDEN_INSTRUCTION_TEXT):
+            raise GenerationError("Prompt instructions must not contain a fixed prompt marker")
+        if field is None:
+            continue
+        if field not in fields or format_spec or conversion is not None:
+            raise GenerationError("Prompt instructions use an unknown placeholder")
+        seen.append(field)
+    if sorted(seen) != sorted(fields):
+        raise GenerationError(
+            "Prompt instructions must use each placeholder exactly once: "
+            + ", ".join(sorted(fields))
+        )
 
 
 class _TextExtractor(HTMLParser):
@@ -233,6 +282,72 @@ Requirements:
 """
 
 
+PLATE_INSTRUCTIONS: Final = """\
+Species identity:
+- Common name, verbatim: "{common_name}"
+- Scientific name, verbatim: "{scientific_name}"
+- Family: the "family" value in the reference data, lettered on its own line beneath the
+  scientific name
+
+Species-specific field notes: the "field_notes" values in the reference data. Letter them on the
+plate in this order, under these exact labels, each followed by its exact value:
+- "Length:", "Wingspan:" and "Weight:", followed by the "length", "wingspan" and "weight" values.
+- "Habitat:" followed by the "habitat" value.
+- "Behavior:" followed by the "behavior" value.
+- A "Field marks" heading, with each "field_marks" entry on its own line.
+- Color swatches, each labelled with one "plumage_palette" name.
+Never print a reference-data key name, such as "field_notes" or a lowercase "length:", on the
+plate.
+
+{data_block}
+
+Reference images, in attachment order:
+{reference_list}
+
+{reference_roles} Synthesize the consistent anatomy, proportions, posture, plumage pattern, and
+colors across the reference photographs. Do not reproduce any photograph's background, pose,
+crop, or composition. When a field mark depends on unequal paired structures such as mandibles,
+identify each structure before editing it.{skimmer_bill}
+{correction}
+
+Style and composition:
+- Portrait 3:4 page on warm aged cream naturalist-notebook paper.
+- Fine graphite and confident ink linework with restrained transparent watercolor.
+- One full-body bird, large and centered-right, in a natural resting posture for the species,
+  never in flight (perched, standing, clinging or swimming, as fits it). If perched or clinging,
+  show only a short plain twig, bare ground or a plain vertical surface, and no other scenery.
+- The bird remains the dominant page element and confidently uses the available space.
+- Left margin contains compact handwritten measurements and field marks.
+- Bottom margin contains a small wing-pattern study, a bill/head study, and color swatches.
+- Right edge contains a thin, self-contained vertical schematic range ruler representing exactly
+  the published body length, the "length" field note. For a range, the ruler itself spans only
+  the published endpoints, with the minimum at the bottom and maximum at the top. Include a small
+  number of roughly even, unlabeled interior ticks as visual subdivisions; their count and spacing
+  do not encode measurement units. For a single value, use one dimension line labeled with that
+  value. Use explicit units. Do not draw a zero-based or wider full-range axis, and do not add a
+  separate range bracket whose endpoints could disagree with the ruler. Letter its label as the
+  words BODY LENGTH, a colon, a space and the exact "length" value, and add the words
+  "SCHEMATIC — NOT TO SCALE". Keep it separate from the bird; never imply that it measures the
+  printed illustration.
+- It should look like a carefully scanned scientific field-journal page, not Audubon, not a
+  decorative poster, not a collage, and not photorealistic.
+- Quiet margins. No scenery, map, location, ZIP code, coordinates, date, logo, or watermark.
+- Preserve the exact 3:4 portrait aspect ratio and keep all text inside safe page margins.
+- Exactly one complete primary bird specimen, with one head, one beak, one anatomically complete
+  pair of wings, one anatomically complete pair of legs, and one tail. In a natural side-on or
+  overlapping pose, the far-side wing or leg may be partly or fully occluded when the visible body
+  geometry clearly supports its natural attachment; do not add a duplicated limb merely to make
+  the count visible. Every visible limb, joint, foot, wing, eye, and tail must remain complete and
+  plausible. The detached bottom-margin wing and bill/head studies are supplementary anatomical
+  details, not additional birds; keep them spatially separate from the primary specimen and make
+  each anatomically accurate. Do not depict a second complete bird.
+- Render the primary bird's tail as a distinct anatomical structure matching the supplied field
+  mark; do not let folded wing tips obscure or impersonate it.{slit_pupil}
+- Render only the exact species name and supplied factual notes. Do not invent extra prose.
+- Before finishing, compare every visible text line character-for-character with the supplied
+  field notes and confirm that the requested edit did not alter unrelated anatomy or design."""
+
+
 def plate_prompt(
     species: BirdSpecies,
     profile: SpeciesProfileData,
@@ -244,13 +359,14 @@ def plate_prompt(
     has_correction_source: bool = False,
     owner_findings: tuple[str, ...] | None = None,
     workspace: Path | None = None,
+    instructions: str | None = None,
 ) -> str:
     """Render the plate prompt.
 
     owner_findings names which invariant findings came from the owner; the
     rest came from automated review. Without it their origin is not stated.
     With workspace, the output is named relative to it, the agent's working
-    directory.
+    directory. instructions replaces PLATE_INSTRUCTIONS for prompt evaluation.
     """
     capped = _profile_data(profile)
     data: dict[str, object] = {
@@ -361,76 +477,27 @@ same plausible proportional relationship in the primary specimen and every suppl
         if _is_skimmer(species)
         else ""
     )
-    return f"""$imagegen
+    instructions_text = PLATE_INSTRUCTIONS if instructions is None else instructions
+    validate_instructions(instructions_text, PLATE_INSTRUCTION_FIELDS)
+    body = instructions_text.format(
+        common_name=species.common_name,
+        scientific_name=species.scientific_name,
+        data_block=data_block(data),
+        reference_list=reference_list(references, start_index=reference_start),
+        reference_roles=reference_roles,
+        skimmer_bill=skimmer_bill,
+        correction=correction,
+        slit_pupil=slit_pupil,
+    )
+    head = f"""$imagegen
 
 Use case: {"precise-object-edit" if has_correction_source else "scientific-educational"}
 Asset type: reusable portrait plate for a 13.3-inch color e-paper frame
 Primary request: {"Correct" if has_correction_source else "Create"} one polished scientific
 field-journal plate for the species below.
 
-Species identity:
-- Common name, verbatim: "{species.common_name}"
-- Scientific name, verbatim: "{species.scientific_name}"
-- Family: the "family" value in the reference data, lettered on its own line beneath the
-  scientific name
-
-Species-specific field notes: the "field_notes" values in the reference data. Letter them on the
-plate in this order, under these exact labels, each followed by its exact value:
-- "Length:", "Wingspan:" and "Weight:", followed by the "length", "wingspan" and "weight" values.
-- "Habitat:" followed by the "habitat" value.
-- "Behavior:" followed by the "behavior" value.
-- A "Field marks" heading, with each "field_marks" entry on its own line.
-- Color swatches, each labelled with one "plumage_palette" name.
-Never print a reference-data key name, such as "field_notes" or a lowercase "length:", on the
-plate.
-
-{data_block(data)}
-
-Reference images, in attachment order:
-{reference_list(references, start_index=reference_start)}
-
-{reference_roles} Synthesize the consistent anatomy, proportions, posture, plumage pattern, and
-colors across the reference photographs. Do not reproduce any photograph's background, pose,
-crop, or composition. When a field mark depends on unequal paired structures such as mandibles,
-identify each structure before editing it.{skimmer_bill}
-{correction}
-
-Style and composition:
-- Portrait 3:4 page on warm aged cream naturalist-notebook paper.
-- Fine graphite and confident ink linework with restrained transparent watercolor.
-- One full-body bird, large and centered-right, in a natural resting posture for the species,
-  never in flight (perched, standing, clinging or swimming, as fits it). If perched or clinging,
-  show only a short plain twig, bare ground or a plain vertical surface, and no other scenery.
-- The bird remains the dominant page element and confidently uses the available space.
-- Left margin contains compact handwritten measurements and field marks.
-- Bottom margin contains a small wing-pattern study, a bill/head study, and color swatches.
-- Right edge contains a thin, self-contained vertical schematic range ruler representing exactly
-  the published body length, the "length" field note. For a range, the ruler itself spans only
-  the published endpoints, with the minimum at the bottom and maximum at the top. Include a small
-  number of roughly even, unlabeled interior ticks as visual subdivisions; their count and spacing
-  do not encode measurement units. For a single value, use one dimension line labeled with that
-  value. Use explicit units. Do not draw a zero-based or wider full-range axis, and do not add a
-  separate range bracket whose endpoints could disagree with the ruler. Letter its label as the
-  words BODY LENGTH, a colon, a space and the exact "length" value, and add the words
-  "SCHEMATIC — NOT TO SCALE". Keep it separate from the bird; never imply that it measures the
-  printed illustration.
-- It should look like a carefully scanned scientific field-journal page, not Audubon, not a
-  decorative poster, not a collage, and not photorealistic.
-- Quiet margins. No scenery, map, location, ZIP code, coordinates, date, logo, or watermark.
-- Preserve the exact 3:4 portrait aspect ratio and keep all text inside safe page margins.
-- Exactly one complete primary bird specimen, with one head, one beak, one anatomically complete
-  pair of wings, one anatomically complete pair of legs, and one tail. In a natural side-on or
-  overlapping pose, the far-side wing or leg may be partly or fully occluded when the visible body
-  geometry clearly supports its natural attachment; do not add a duplicated limb merely to make
-  the count visible. Every visible limb, joint, foot, wing, eye, and tail must remain complete and
-  plausible. The detached bottom-margin wing and bill/head studies are supplementary anatomical
-  details, not additional birds; keep them spatially separate from the primary specimen and make
-  each anatomically accurate. Do not depict a second complete bird.
-- Render the primary bird's tail as a distinct anatomical structure matching the supplied field
-  mark; do not let folded wing tips obscure or impersonate it.{slit_pupil}
-- Render only the exact species name and supplied factual notes. Do not invent extra prose.
-- Before finishing, compare every visible text line character-for-character with the supplied
-  field notes and confirm that the requested edit did not alter unrelated anatomy or design.
+"""
+    tail = f"""
 
 Generate exactly one image using the built-in image generation tool. After generation, copy the
 selected final bitmap to this exact path inside the current workspace:
@@ -438,48 +505,13 @@ selected final bitmap to this exact path inside the current workspace:
 
 Verify that the file exists before finishing. Do not merely describe the image.
 """
+    return head + body + tail
 
 
-def review_prompt(
-    species: BirdSpecies,
-    profile: SpeciesProfileData,
-    references: list[ReferencePhoto],
-    allowed_domains: tuple[str, ...],
-    *,
-    prior_corrections: tuple[str, ...] = (),
-    prior_profile_conflicts: tuple[ProfileConflict, ...] = (),
-) -> str:
-    data: dict[str, object] = {"proposed_profile": _profile_data(profile)}
-    prior_review = ""
-    if prior_corrections or prior_profile_conflicts:
-        data["image_corrections_already_requested"] = _findings_data(prior_corrections)
-        data["profile_conflicts_already_reported"] = _conflicts_data(prior_profile_conflicts)
-        prior_review = """
-Earlier review history for convergence checking: the "image_corrections_already_requested" and
-"profile_conflicts_already_reported" lists in the reference data.
-
-Check that earlier corrected image defects did not regress. Do not reverse an earlier correction
-without naming the concrete visible regression or direct-source conflict that justifies doing so.
-Copy an earlier correction into resolved_corrections only when the current image visibly satisfies
-that exact request. Do not mark a correction resolved when a new correction reverses, refines, or
-otherwise supersedes it. Every resolved_corrections entry must exactly match one earlier correction.
-Repeated or contradictory profile conflicts must remain in profile_conflicts, not be converted into
-an unsupported image edit. Re-evaluate every earlier conflict against the current profile; never
-repeat a stale profile_value from history, and drop a conflict that the current direct sources no
-longer support.
-"""
-    return f"""Review Image 1 as a candidate scientific field-journal plate for
-{species.common_name} ({species.scientific_name}). Images 2 onward are licensed field-reference
-photos of the same species.
-
-Facts proposed by the research pass: the "proposed_profile" value in the reference data.
-
-{data_block(data)}
-{prior_review}
-
+REVIEW_INSTRUCTIONS: Final = """\
 Independently verify the species identity, measurements, and field marks against live source pages
 and the attached references. Do not assume the proposed facts are correct. Restrict browsing to
-these domains: {", ".join(allowed_domains)}. Do not rely on search snippets. Inspect the candidate
+these domains: {allowed_domains}. Do not rely on search snippets. Inspect the candidate
 for correct plumage, proportions, bill, eye, wings, tail, legs, feet, and species field marks
 against the attached field-reference photos. Compare every visible factual claim to the
 independently verified facts. Do not infer a seasonal-plumage correction from one image or an
@@ -533,8 +565,54 @@ detached, duplicated, or implausibly attached visible structure, a missing visib
 feet as occlusion. When passed=false, at least one of correction_findings or profile_conflicts must
 be nonempty. When passed=true, correction_findings and profile_conflicts must both be empty.
 resolved_corrections may contain only exact earlier requests that this image now satisfies. Return
-only the requested JSON.
+only the requested JSON."""
+
+
+def review_prompt(
+    species: BirdSpecies,
+    profile: SpeciesProfileData,
+    references: list[ReferencePhoto],
+    allowed_domains: tuple[str, ...],
+    *,
+    prior_corrections: tuple[str, ...] = (),
+    prior_profile_conflicts: tuple[ProfileConflict, ...] = (),
+    instructions: str | None = None,
+) -> str:
+    data: dict[str, object] = {"proposed_profile": _profile_data(profile)}
+    prior_review = ""
+    if prior_corrections or prior_profile_conflicts:
+        data["image_corrections_already_requested"] = _findings_data(prior_corrections)
+        data["profile_conflicts_already_reported"] = _conflicts_data(prior_profile_conflicts)
+        prior_review = """
+Earlier review history for convergence checking: the "image_corrections_already_requested" and
+"profile_conflicts_already_reported" lists in the reference data.
+
+Check that earlier corrected image defects did not regress. Do not reverse an earlier correction
+without naming the concrete visible regression or direct-source conflict that justifies doing so.
+Copy an earlier correction into resolved_corrections only when the current image visibly satisfies
+that exact request. Do not mark a correction resolved when a new correction reverses, refines, or
+otherwise supersedes it. Every resolved_corrections entry must exactly match one earlier correction.
+Repeated or contradictory profile conflicts must remain in profile_conflicts, not be converted into
+an unsupported image edit. Re-evaluate every earlier conflict against the current profile; never
+repeat a stale profile_value from history, and drop a conflict that the current direct sources no
+longer support.
+"""
+    instructions_text = REVIEW_INSTRUCTIONS if instructions is None else instructions
+    validate_instructions(instructions_text, REVIEW_INSTRUCTION_FIELDS)
+    body = instructions_text.format(allowed_domains=", ".join(allowed_domains))
+    head = f"""Review Image 1 as a candidate scientific field-journal plate for
+{species.common_name} ({species.scientific_name}). Images 2 onward are licensed field-reference
+photos of the same species.
+
+Facts proposed by the research pass: the "proposed_profile" value in the reference data.
+
+{data_block(data)}
+{prior_review}
+
+"""
+    tail = f"""
 
 Reference images, in attachment order:
 {reference_list(references, start_index=2)}
 """
+    return head + body + tail
