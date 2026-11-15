@@ -24,6 +24,7 @@ nothing it starts may outlive it.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import json
@@ -952,6 +953,8 @@ class Matrix:
 
     def __init__(self) -> None:
         self.base = Path(tempfile.mkdtemp(prefix="installer-matrix-"))
+        # Collecting alone records every group; remove them even if no case runs.
+        atexit.register(shutil.rmtree, self.base, True)
         self.groups: dict[tuple[str, str, str], Group] = {}
         self.recordings: dict[tuple[str, str, str], list[list[str]]] = {}
         for number, (kind, scenario, state) in enumerate(plan_groups()):
