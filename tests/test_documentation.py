@@ -108,7 +108,7 @@ def test_canonical_repository_links_and_clone_directory_agree() -> None:
     canonical = "https://github.com/veteranbv/inky-bird"
     contribution = (ROOT / "CONTRIBUTING.md").read_text()
     assert f"git clone {canonical}.git\ncd inky-bird\n" in contribution
-    for path in ("README.md", "pyproject.toml", "src/inky_bird_frame/web/journal.js"):
+    for path in ("README.md", "pyproject.toml", "src/inky_bird_frame/web/manage.js"):
         text = (ROOT / path).read_text()
         assert canonical in text
         assert canonical + "-frame" not in text
