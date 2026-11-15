@@ -7,10 +7,29 @@ or the [Docker guide](docker.md).
 
 ## HTTP errors
 
+Every JSON error has `"ok": false` and `"schema_version": 1`. The `error` value
+takes one of two forms, depending on the address.
+
+| Addresses | `error` value |
+| --- | --- |
+| `/`, `/app`, `/favicon.ico`, `/screen` and `/v1/access` | object with `code` and `message` |
+| Everything under `/app/`, `/v1/owner/`, `/v1/screen/`, `/v1/integrations/`, `/v1/dashboard/` and `/wall/`, except the two display reports in the next row | object with `code` and `message` |
+| `/wall/v1/display-fetch` and `/wall/v1/display-success` | plain string |
+| `/health`, `/v1/catalog`, `/v1/embed/featured-plate`, `/v1/assets/…`, `/v1/display-fetch` and `/v1/display-success` | plain string |
+| Any other address | plain string: 404 `not found` |
+
+The `/wall/` display reports are checked by Inky's access gate before the
+report itself runs, so a refusal from that gate still uses the object form:
+403 `secure_access_required` when the request did not use the configured
+address, and 405 `method_not_allowed` for any method other than `POST`.
+
+An unexpected fault inside the server answers 500 with the plain text
+`Internal Server Error` on any address, not JSON. The service log keeps the
+cause.
+
 ### Owner, screen and integration routes
 
-Requests under `/app/`, `/v1/owner/`, `/v1/screen/`, `/v1/integrations/`,
-`/v1/dashboard/` and `/wall/` answer an error as:
+These addresses answer an error as:
 
 ```json
 {"ok": false, "error": {"code": "not_found", "message": "This Inky address does not exist"}, "schema_version": 1}
@@ -44,17 +63,41 @@ path or address; the private service log keeps the cause.
 
 ### Catalog and display routes
 
-`/health`, `/v1/catalog`, `/v1/embed/featured-plate`, `/v1/assets/…`,
-`/v1/display-fetch` and `/v1/display-success` keep their original form, with
-the error as plain text:
+These addresses keep their original form, with the error as a plain string:
 
 ```json
 {"ok": false, "error": "not found", "schema_version": 1}
 ```
 
-An unknown address outside the owner routes answers 404 `not found`. A wrong
-method answers 405 `method not allowed` with an `Allow` header: `GET, HEAD` for
-reads, `POST` for the two display reports.
+A wrong method answers 405 `method not allowed` with an `Allow` header:
+`GET, HEAD` for the catalog reads, `POST` for `/v1/display-fetch` and
+`/v1/display-success`. `/v1/catalog` answers 503 `active catalog unavailable`
+when the active catalog cannot be read. An image under `/v1/assets/` that is
+not part of the active catalog answers 404 `not found`; one that cannot be read
+or no longer matches its catalog checksum answers 503 `active asset
+unavailable`, or `active catalog unavailable` when the catalog itself cannot be
+read. `/v1/embed/featured-plate` is an HTML page, so when the catalog cannot be
+read it answers 503 with a page that says "Featured plate unavailable".
+
+### Display reports
+
+A display reports a fetch to `/v1/display-fetch` and a finished update to
+`/v1/display-success`, or to the same paths under `/wall/` when its controller
+address ends in `/wall`. The body must be exactly `{"schema_version": 1}`, sent as
+`application/json`. Success answers 200 `{"ok": true, "schema_version": 1}`.
+Both paths answer these errors with a plain string:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 400 | `invalid content length` | The `Content-Length` header is not a number. |
+| 400 | `request incomplete` | The request ended before its body arrived. |
+| 400 | `invalid JSON` | The body is not JSON. |
+| 400 | `invalid telemetry payload` | The body is JSON but not exactly `{"schema_version": 1}`. |
+| 403 | `browser telemetry is not accepted` | The request has an `Origin` header, so it came from a browser. |
+| 411 | `content length required` | There is not exactly one `Content-Length` header. |
+| 413 | `request body too large` | The body is over 1,024 bytes. |
+| 415 | `expected application/json` | The content type is not `application/json`. |
+| 503 | `display telemetry unavailable` | Inky could not save the report. |
 
 ### `HEAD` requests
 

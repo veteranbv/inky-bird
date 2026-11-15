@@ -827,6 +827,77 @@ def test_http_error_codes_and_statuses_match_the_code() -> None:
     assert documented == dict(returned)
 
 
+def _documented_error_forms() -> list[tuple[str, set[str]]]:
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("## HTTP errors", 1)[1].split("\n### ", 1)[0]
+    rows = _markdown_table(section, "| Addresses | `error` value |")
+    assert rows
+    forms = []
+    for addresses, value in rows:
+        assert value.startswith(("object", "plain string")), value
+        form = "object" if value.startswith("object") else "string"
+        forms.append((form, set(re.findall(r"`(/[^`]*)`", addresses))))
+    return forms
+
+
+def _is_prefix(address: str) -> bool:
+    return address != "/" and address.endswith("/")
+
+
+def _documented_error_form(route: str, forms: list[tuple[str, set[str]]]) -> str | None:
+    # An exact address beats a prefix; "…" stands for the rest of the path.
+    for form, addresses in forms:
+        if route in addresses or any(
+            a.endswith("…") and route.startswith(a[:-1]) for a in addresses
+        ):
+            return form
+    for form, addresses in forms:
+        if any(_is_prefix(a) and route.startswith(a) for a in addresses):
+            return form
+    return None
+
+
+def test_documented_error_form_matches_every_route() -> None:
+    from test_route_table import LEGACY_ENVELOPE_ROUTES, UNAUTHENTICATED
+
+    from inky_bird_frame.server import _READ_PATHS, _TELEMETRY_PATHS
+    from inky_bird_frame.web import APP_PREFIXES
+
+    forms = _documented_error_forms()
+    prefixes = {a for _form, addresses in forms for a in addresses if _is_prefix(a)}
+    assert prefixes == set(APP_PREFIXES)
+    for _method, route in UNAUTHENTICATED:
+        expected = "string" if route in LEGACY_ENVELOPE_ROUTES else "object"
+        assert _documented_error_form(route, forms) == expected, route
+    for route in (*_READ_PATHS, *_TELEMETRY_PATHS, "/v1/assets/species/1/portrait.png"):
+        assert _documented_error_form(route, forms) == "string", route
+    plain = {
+        a for form, addresses in forms if form == "string" for a in addresses if not _is_prefix(a)
+    }
+    assert plain == LEGACY_ENVELOPE_ROUTES | _READ_PATHS | _TELEMETRY_PATHS | {"/v1/assets/…"}
+
+
+def test_display_report_errors_match_the_code() -> None:
+    import inspect
+
+    from inky_bird_frame.server import MAX_TELEMETRY_REQUEST_BYTES, CatalogService
+
+    source = inspect.getsource(CatalogService.telemetry_response)
+    returned = {
+        (int(status), error)
+        for status, error in re.findall(r'(\d{3}),\s*\{"ok": False, "error": "([^"]+)"', source)
+    }
+    assert returned
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("### Display reports", 1)[1].split("\n## ", 1)[0]
+    documented = {
+        (int(status), error.strip("`"))
+        for status, error, _when in _markdown_table(section, "| Status | `error` | When |")
+    }
+    assert documented == returned
+    assert f"over {MAX_TELEMETRY_REQUEST_BYTES:,} bytes" in section
+
+
 def test_docs_say_head_answers_like_get() -> None:
     for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
         text = " ".join(path.read_text(encoding="utf-8").split())
