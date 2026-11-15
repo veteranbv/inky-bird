@@ -31,8 +31,11 @@ not replace a state backup.
 
 Bird Buddy authentication lives in `state_dir/birdbuddy-auth.json`. It holds
 two refresh tokens: the current one and the last one Bird Buddy accepted, kept
-for one retry when the current one is rejected. Both make every backup that
-includes the file credential-sensitive. `birdbuddy-detections.json`, eBird
+for one retry when the current one is rejected. It can also hold the current
+access token and its expiry. All of them make every backup that includes the
+file credential-sensitive. The feeder history also records, per feeder, when
+its full confirmed history was last read (`confirmed_history_checked_at`) and
+with which manual-sightings setting. `birdbuddy-detections.json`, eBird
 Archive state, BirdNET Analyzer state, discovery snapshots, and run records
 contain private species and time history even when they contain no account
 credentials or precise location.
@@ -50,6 +53,10 @@ with species names, counts and dates, no places. A missing or out-of-date
 summary is rebuilt from its history automatically, including after you restore
 an older history file, so restore order does not change. `plate-thumbnails/`
 holds small copies of approved plates for grid views and rebuilds itself.
+`birdbuddy-backoff.json` (a wait Bird Buddy asked for),
+`catalog-publish-verified.json` (the last full publication check),
+`controller-started.json` and `new-species-notices.json` can also be left out;
+leaving out the last one can repeat this year's new-species notices.
 
 The browser also keeps private owner and session state in this directory.
 Treat a backup containing it as credential-sensitive even without Bird Buddy.

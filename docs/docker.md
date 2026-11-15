@@ -14,10 +14,6 @@ add a display or source later. If you already run Inky, go to [Update](#update).
 The services Compose starts, and how their configuration and credentials are
 kept apart, are described under [What runs](#what-runs) near the end.
 
-The image includes the project license and the pinned Codex CLI and GitHub CLI
-license material under `/usr/share/licenses/inky-bird-frame/`. See
-[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for component details.
-
 ## Before you begin
 
 You need:
@@ -654,6 +650,13 @@ If Codex cannot start its sandbox on Ubuntu, confirm that the included AppArmor
 profile is installed and loaded. Do not disable AppArmor's system-wide
 unprivileged-user-namespace restriction.
 
-The image publication workflow runs only for trusted `main`, published
-releases, or an owner-started manual run. Pull requests build and test the
-container in CI but cannot publish packages or receive controller credentials.
+## Reference
+
+The image includes the project license and the pinned Codex CLI and GitHub CLI
+license material under `/usr/share/licenses/inky-bird-frame/`. See
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for component details.
+
+Images are published only from trusted `main`, published releases or an
+owner-started manual run. Pull requests build and test the container but
+cannot publish it or receive controller credentials. For HTTP errors, caching and security headers, external
+browser applications and Homepage, see the [reference page](reference.md).
