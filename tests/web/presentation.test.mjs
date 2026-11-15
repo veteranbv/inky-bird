@@ -230,3 +230,18 @@ test('a change pressed while another is saving says so', async (t) => {
   assert.equal(changes(calls).length, 1, 'only one change is sent at a time');
   assert.deepEqual(alerts(second), ['Another change is still being saved. Try again when it finishes.']);
 });
+
+test('revoking a status credential asks first', async (t) => {
+  const { main, calls, reloads } = await open(t, 'integrations', (path, body) =>
+    body ? {} : state(),
+  );
+  findButton(main, 'Revoke Dashboard status').fire('click');
+  await flush();
+  assert.equal(changes(calls).length, 0, 'the first press only asks');
+  findButton(main, 'Keep credential').fire('click');
+  findButton(main, 'Revoke Dashboard status').fire('click');
+  findButton(main, 'Revoke').fire('click');
+  await flush();
+  assert.deepEqual(changes(calls).map(({ body }) => [body.action, body.id]), [['revoke', 'g2']]);
+  assert.equal(reloads.length, 1);
+});

@@ -364,7 +364,13 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     status.append(
       el('h3', grant.name),
       note(label(grant.view) + ' · expires ' + new Date(grant.expires_at * 1000).toLocaleString()),
-      button('Revoke ' + grant.name, () => update({ action: 'revoke', id: grant.id }, status)),
+      revoke(
+        status,
+        grant.id,
+        'Revoke ' + grant.name,
+        'Revoke this status credential? Dashboards that use it stop updating.',
+        'Keep credential',
+      ),
     );
   main.append(status, link('Notification delivery settings', 'notifications'));
 }

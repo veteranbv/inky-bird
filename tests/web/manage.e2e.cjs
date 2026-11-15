@@ -136,9 +136,10 @@ async function integrations(t) {
   ]);
   await heading('Integrations');
   assert.equal(await page.getByText(serviceSecret, { exact: true }).count(), 0);
+  await page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click();
   await Promise.all([
     page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click(),
+    page.getByRole('button', { name: 'Revoke', exact: true }).click(),
   ]);
   await heading('Integrations');
   assert.equal(
