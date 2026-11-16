@@ -28,11 +28,18 @@ The recording runs are tests too, ``<scenario>/<state>/recording`` (and
 ``-after<step>`` for a cleanup): the run without a fault must succeed and pass
 every check, and a run with its first fault must fail.
 
+An uninstall starts with the display timer enabled and running, as on an
+owner's Pi, unless the start state disabled it. No unit may be left enabled
+or running without its definition, and a second uninstall, once the fault is
+gone, must take out every unit.
+
 The default run fails the first and the middle call of every scenario and
-start state, stops the installer at that middle call, and fails every cleanup
-step that moves, links or removes a runtime after a failed upgrade from the
-single-directory layout on both controllers and on a shared Pi's display;
-about 270 tests. Run every case, and the second pass of every upgrade, with::
+start state, stops the installer at that middle call (with a signal chosen
+from the group's name), and fails every cleanup step that moves, links or
+removes a runtime after a failed upgrade from the single-directory layout on
+both controllers and on a shared Pi's display: 223 cases, beside 66 recording
+runs, 19 busy-plate runs and 15 tests of the matrix itself. Run every case,
+and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
 
@@ -42,14 +49,17 @@ selects them, e.g. ``-k "linux-timers/single/ and rm-fail"``. Also:
 
 - ``INKY_MATRIX_TOUCHING=rm,I6`` runs only the cases whose failed call is one
   of those tools, or whose last recorded result had something to check for one
-  of those invariants (results are kept in ``build/installer-matrix``).
+  of those invariants (results are kept in ``build/installer-matrix``, and
+  only those of the same code count).
 - ``INKY_MATRIX_SHARD=2/6`` runs the second of six equal parts, as CI does.
 - ``INKY_MATRIX_WORKERS`` sets how many cases run at once (default 6).
-- ``INKY_INSTALLER_MATRIX_ONLY=install:macos:single`` records only some groups.
+- ``INKY_INSTALLER_MATRIX_ONLY=install:macos:*,uninstall:macos:*`` records
+  only the groups those patterns match, as the macOS job in CI does.
 
 Each starting state is built once and cloned for every run (a filesystem clone
 where there is one), with the absolute paths it records pointed at the clone.
-Every run has its own process group, a time limit and a process budget, and
+Every run has its own process group, a time limit and a process budget that
+also counts the commands the fake ssh starts in groups of their own, and
 starts under an account-wide process ceiling; nothing it starts may outlive it.
 A run removes the machines of any earlier run that was killed. Tests of the
 matrix itself, rather than its cases, run in the first shard only.
@@ -60,6 +70,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -173,6 +184,7 @@ SCENARIOS = {
                 "rolled-back",
                 "shared-single",
                 "shared-staged",
+                "shared-both",
             ),
             "uninstall-controller-systemd.sh",
         ),
@@ -219,7 +231,16 @@ SCENARIOS = {
             "display",
             "Linux",
             (),
-            ("fresh", "single", "staged", "disabled", "shared-staged"),
+            (
+                "fresh",
+                "single",
+                "staged",
+                "disabled",
+                "rolled-back",
+                "shared-single",
+                "shared-staged",
+                "shared-both",
+            ),
         ),
     )
 }
@@ -799,13 +820,19 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
             report.append("I5: the other role's runtime directories changed")
         if other.processes.keys() != before.other.processes.keys():
             report.append("I5: the other role's running services changed")
-    # I7: no definition was deleted for a unit that is still running.
+    # I7: no definition was deleted for a unit that is still enabled or running.
     current = view(machine, scenario.role)
-    for unit, (_, active) in current.units.items():
-        if active:
-            covered.add("I7")
-        if active and current.files[unit] == "absent":
-            report.append(f"I7: {unit} is still running but its definition was deleted")
+    for unit, (enabled, active) in current.units.items():
+        if not (enabled or active):
+            continue
+        covered.add("I7")
+        already = before.role.files.get(unit) == "absent" and before.role.units.get(unit) == (
+            enabled,
+            active,
+        )
+        if current.files[unit] == "absent" and not already:
+            state = "running" if active else "enabled"
+            report.append(f"I7: {unit} is still {state} but its definition was deleted")
     # I9: nothing private is printed.
     if SECRET in output or "synthetic private config" in output or "synthetic key" in output:
         report.append("I9: private configuration or key content was printed")
@@ -1063,18 +1090,41 @@ def check_install(
         for name, (part, code) in before.previous.items():
             if digest(part) != code:
                 report.append(f"I6: the previous version's {name} changed")
-    # I10: nothing staged is left behind unless the output names it, or it is
-    # the runtime the output says is now in use.
+    # I10: nothing staged is left behind unless the output says it is kept or
+    # to be removed by hand, or it is the runtime the output says is now in use.
     in_use = active_runtime(machine, scenario.role) if claims_new(outcome) else None
+    left = named_left(output)
     for path in sorted(after.runtimes - before.role.runtimes):
-        if path not in output and path != in_use:
+        if os.path.realpath(path) not in left and path != in_use:
             report.append(f"I10: runtime {path} was left behind without being named")
     # Once the new version is in use, versions older than the one it replaced go.
     for path in sorted(before.role.runtimes - after.runtimes) if not completed(outcome) else ():
         report.append(f"I10: runtime {path} existed before and was removed by a failed run")
     for path in sorted(stray_paths(machine) - before.stray):
-        if path not in output and not removal_failed(case, path, machine.root):
+        if os.path.realpath(path) not in left and not removal_failed(case, path, machine.root):
             report.append(f"I10: {path} was left behind")
+
+
+# Where an installer says a directory stays: kept, or left for the owner.
+LEFT_STATEMENT = re.compile(
+    r"(?:remove (?:it|them) by hand|remove it after reconnecting|kept for rollback): (.+)$"
+    r"|kept in (\S+?)(?::|\.$)",
+    re.MULTILINE,
+)
+
+
+def named_left(output: str) -> set[str]:
+    """Every path the output says is kept or must be removed by hand, resolved
+    as ``is_named_left`` compares it: an installer may print either spelling."""
+    found: set[str] = set()
+    for match in LEFT_STATEMENT.finditer(output):
+        for path in (match.group(1) or match.group(2)).split():
+            found.add(os.path.realpath(path.rstrip(".")))
+    return found
+
+
+def is_named_left(path: str, output: str) -> bool:
+    return os.path.realpath(path) in named_left(output)
 
 
 def shadowed_leftover(machine: Machine, case: Case, before: Snapshot, outcome: Outcome) -> bool:
@@ -1162,6 +1212,11 @@ def check_success(
     for process in after.processes.values():
         if process["runtime"] != "new":
             report.append(f"I2: after success a service still runs {process['runtime']}")
+    # I3: setup can run again from what is now installed.
+    script = installed_script(machine, scenario)
+    for item in (script, script.parent.parent / "pyproject.toml", script.parent.parent / "uv.lock"):
+        if not item.is_file():
+            report.append(f"I3: after success the installed version has no {item.name}")
     # The previous version stays for rollback; nothing older does.
     expected = 1 if before.role.tag is None or before.role.tag == "regular" else 2
     if scenario.role == "display" and before.role.tag is not None and not before.role.runtimes:
@@ -1177,7 +1232,7 @@ def check_success(
     if len(after.runtimes - named) != expected:
         report.append(f"I10: after success {len(after.runtimes)} runtimes remain, not {expected}")
     for path in sorted(stray_paths(machine) - before.stray):
-        if path not in output:
+        if not is_named_left(path, output):
             report.append(f"I10: {path} was left behind after success")
 
 
@@ -1232,11 +1287,7 @@ def check_uninstall(
     check_common(machine, scenario, before, outcome)
     outcome.covered.update(("U1", "U2", "U3"))
     after = view(machine, scenario.role)
-    remaining = [
-        unit
-        for unit, (enabled, active) in after.units.items()
-        if enabled or active or after.files[unit] != "absent"
-    ]
+    remaining = left_installed(after)
     if outcome.returncode == 0 and remaining:
         report.append(f"U1: uninstall reported success but left {remaining}")
     if "No changes made" in outcome.output:
@@ -1252,6 +1303,15 @@ def check_uninstall(
             report.append(f"U2: {unit} was not removed and is not named")
     if after.code != before.role.code:
         report.append("U3: uninstall changed the installed runtime")
+
+
+def left_installed(role: RoleView) -> list[str]:
+    """Units an uninstall has not taken out: enabled, running or still defined."""
+    return [
+        unit
+        for unit, (enabled, active) in role.units.items()
+        if enabled or active or role.files[unit] != "absent"
+    ]
 
 
 def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
@@ -1338,12 +1398,17 @@ class Limits:
         self.lock = threading.Lock()
         # Each watched process group, and the most processes it was seen with.
         self.groups: dict[int, int] = {}
+        # The file each run's fake ssh lists the groups of its remote commands in.
+        self.remote: dict[int, Path] = {}
         self.thread: threading.Thread | None = None
 
     @contextlib.contextmanager
-    def watch(self, group: int) -> Iterator[None]:
+    def watch(self, group: int, remote: Path) -> Iterator[None]:
+        """Count ``group`` and the remote commands' groups listed in ``remote``
+        as one run, and kill them all when together they exceed the budget."""
         with self.lock:
             self.groups[group] = 0
+            self.remote[group] = remote
             if self.thread is None:
                 self.thread = threading.Thread(target=self.loop, daemon=True)
                 self.thread.start()
@@ -1352,6 +1417,7 @@ class Limits:
         finally:
             with self.lock:
                 peak = self.groups.pop(group)
+                self.remote.pop(group)
             if peak > self.budget:
                 raise AssertionError(
                     f"the run had {peak} processes at once, over its budget of "
@@ -1365,21 +1431,39 @@ class Limits:
                 if not self.groups:
                     self.thread = None
                     return
-                watched = set(self.groups)
+                watched = dict(self.remote)
             listing = subprocess.run(
-                ["/bin/ps", "-ax", "-o", "pgid="], capture_output=True, text=True, check=False
+                ["/bin/ps", "-ax", "-o", "pgid=", "-o", "command="],
+                capture_output=True,
+                text=True,
+                check=False,
             ).stdout
-            counts = Counter(int(value) for value in listing.split())
-            for group in watched:
-                if counts[group] <= self.budget:
+            counts: Counter[int] = Counter()
+            commands: dict[int, list[str]] = {}
+            for line in listing.splitlines():
+                pgid, *command = line.split(None, 1)
+                counts[int(pgid)] += 1
+                commands.setdefault(int(pgid), []).extend(command)
+            for group, remote in watched.items():
+                # A listed group that has ended may have its number reused; only
+                # one still running this machine's commands belongs to the run.
+                machine = str(remote.parent.parent)
+                members = [group] + [
+                    int(listed)
+                    for listed in (remote.read_text().split() if remote.exists() else ())
+                    if any(machine in command for command in commands.get(int(listed), ()))
+                ]
+                total = sum(counts[member] for member in set(members))
+                if total <= self.budget:
                     continue
                 with self.lock:
                     # Only a run still being watched; its ID may be reused once it ends.
                     if group not in self.groups:
                         continue
-                    self.groups[group] = max(self.groups[group], counts[group])
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(group, signal.SIGKILL)
+                    self.groups[group] = max(self.groups[group], total)
+                    for member in set(members):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(member, signal.SIGKILL)
 
 
 LIMITS: Limits | None = None
@@ -1556,9 +1640,14 @@ class Group:
             else:
                 machine.reset_run()
                 rerun = machine.execute(self.script(machine), self.scenario)
+                remaining = left_installed(view(machine, self.scenario.role))
                 if rerun.returncode != 0:
                     outcome.violations.append(
                         "I3: a second uninstall failed: " + rerun.stderr[-800:]
+                    )
+                elif remaining:
+                    outcome.violations.append(
+                        f"U1: a second uninstall reported success but left {remaining}"
                     )
         except AssertionError as error:
             outcome.violations.append(f"I3: the rerun was not contained: {error}")
@@ -1636,7 +1725,7 @@ DEFAULT_SECOND_PASS = {
     ("install", "linux-timers", "single"),
     ("install", "display", "shared-single"),
 }
-UNINSTALL_STATES = ("single", "staged", "shared")
+UNINSTALL_STATES = ("single", "staged", "disabled", "rolled-back", "shared")
 # States in which this role is already installed, so an upgrade checks for a plate.
 UPGRADE_STATES = ("single", "staged", "disabled", "rolled-back", "shared-single", "shared-both")
 
@@ -1683,6 +1772,13 @@ def switches_back(tool: str, arguments: list[str]) -> bool:
     )
 
 
+def default_stop_mode(key: GroupKey) -> str:
+    """How the default subset stops a group's installer, from the group's
+    name alone, so a case keeps its id whatever else is selected."""
+    number = int.from_bytes(hashlib.sha256(group_name(key).encode()).digest()[:4], "big")
+    return STOP_MODES[number % len(STOP_MODES)]
+
+
 def busy_checked(scenario: str, state: str) -> bool:
     return SCENARIOS[scenario].role == "controller" and state in UPGRADE_STATES
 
@@ -1697,10 +1793,18 @@ def plan_groups() -> list[GroupKey]:
         groups.extend(("install", scenario.name, state) for state in scenario.states)
         if scenario.uninstall:
             # Only a Pi runs both roles.
-            states = UNINSTALL_STATES if scenario.system == "Linux" else UNINSTALL_STATES[:-1]
+            states = [
+                state
+                for state in UNINSTALL_STATES
+                if scenario.system == "Linux" or state != "shared"
+            ]
             groups.extend(("uninstall", scenario.name, state) for state in states)
     if ONLY:
-        groups = [group for group in groups if ":".join(group) in ONLY]
+        groups = [
+            group
+            for group in groups
+            if any(fnmatch.fnmatchcase(":".join(group), pattern) for pattern in ONLY)
+        ]
     return groups
 
 
@@ -1933,13 +2037,7 @@ class Matrix:
                 directory = self.root / "templates" / "-".join(key) / "machine"
                 thaw(self.base(scenario, state), directory)
                 machine = Machine(directory, scenario, create=False)
-                if kind == "install":
-                    machine.script(scenario.script)
-                    if scenario.name == "remote-display":
-                        machine.script("install-display-local.sh")
-                else:
-                    machine.script(scenario.uninstall)
-                machine.reset_run()
+                prepare(machine, key)
                 self.groups[key] = Group(kind, scenario, state, freeze(directory))
             return self.groups[key]
 
@@ -1989,7 +2087,7 @@ class Matrix:
     # Cases.
     def cases(self) -> list[Case]:
         found: list[Case] = []
-        for number, ((kind, scenario, state), steps) in enumerate(self.recordings.items()):
+        for (kind, scenario, state), steps in self.recordings.items():
             actions = [
                 (index, tool, tuple(arguments))
                 for index, (_, kind_of_call, tool, *arguments) in enumerate(steps)
@@ -2006,7 +2104,7 @@ class Matrix:
                 else:
                     chosen = position in (0, middle)
                     stop = position == middle
-                    signal_mode = STOP_MODES[number % len(STOP_MODES)]
+                    signal_mode = default_stop_mode((kind, scenario, state))
                 if not chosen:
                     continue
                 call = (kind, scenario, state, index)
@@ -2050,10 +2148,11 @@ class Matrix:
         wanted = {item for item in TOUCHING if INVARIANT.fullmatch(item)}
         if not wanted:
             return False
-        results = read_json(self.results_path).get("cases")
-        if not isinstance(results, dict) or not results:
+        results = self.stored_results()
+        if not results:
             raise RuntimeError(
-                "selecting by invariant needs an earlier run's results; run the matrix first"
+                "selecting by invariant needs an earlier run's results of this code; "
+                "run the matrix first"
             )
         entry = results.get(case_id)
         if not isinstance(entry, dict):
@@ -2061,6 +2160,14 @@ class Matrix:
         checked = set(entry.get("covered", []))
         checked |= {str(item).split(":", 1)[0] for item in entry.get("violations", [])}
         return bool(checked & wanted)
+
+    def stored_results(self) -> dict[str, object]:
+        """Each case's last result, only from runs of this same code."""
+        stored = read_json(self.results_path)
+        results = stored.get("cases")
+        if stored.get("fingerprint") != self.fingerprint or not isinstance(results, dict):
+            return {}
+        return results
 
     # Running.
     def start(self, wanted: list[str]) -> None:
@@ -2122,8 +2229,7 @@ class Matrix:
 
     def close(self) -> None:
         self.pool.shutdown(wait=True, cancel_futures=True)
-        results = read_json(self.results_path).get("cases")
-        stored = results if isinstance(results, dict) else {}
+        stored = self.stored_results()
         for name, future in self.futures.items():
             if not future.done() or future.cancelled() or future.exception() is not None:
                 continue
@@ -2140,6 +2246,26 @@ class Matrix:
             write_json(self.results_path, {"fingerprint": self.fingerprint, "cases": stored})
         shutil.rmtree(self.root, ignore_errors=True)
         self.owner.close()
+
+
+def prepare(machine: Machine, key: GroupKey) -> None:
+    """Give a built starting state the scripts its group runs.
+
+    An upgrade starts with the display timer stopped, as setup asks; an owner
+    who uninstalls has it running, unless it was disabled.
+    """
+    kind, name, state = key
+    scenario = SCENARIOS[name]
+    if kind == "install":
+        machine.script(scenario.script)
+        if scenario.name == "remote-display":
+            machine.script("install-display-local.sh")
+    else:
+        machine.script(scenario.uninstall)
+        timer = f"{machine.family}-display.timer"
+        if machine.system == "Linux" and (machine.units / timer).exists() and state != "disabled":
+            machine.set_unit(timer, active=True, enabled=True)
+    machine.reset_run()
 
 
 def busy_id(scenario: str, state: str) -> str:
@@ -2315,13 +2441,7 @@ def compare_clone(executed: Matrix, key: GroupKey) -> Outcome:
     directory = executed.root / "equivalence" / "-".join(key)
     fresh = Machine(directory / "fresh", scenario)
     fresh.build(SCENARIOS[scenario.start] if scenario.start else scenario, state)
-    if kind == "install":
-        fresh.script(scenario.script)
-        if scenario.name == "remote-display":
-            fresh.script("install-display-local.sh")
-    else:
-        fresh.script(scenario.uninstall)
-    fresh.reset_run()
+    prepare(fresh, key)
     group = executed.group(key)
     template = directory / "template"
     shutil.copytree(fresh.root, template, symlinks=True)
@@ -2359,6 +2479,37 @@ def test_a_run_over_its_process_budget_is_killed() -> None:
     started = time.monotonic()
     with pytest.raises(AssertionError, match="over its budget of 3"):
         run_contained(["/bin/sh", "-c", command], {"PATH": "/bin:/usr/bin"}, watch=caps.watch)
+    assert time.monotonic() - started < 30
+
+
+REMOTE_COMMANDS = """
+import subprocess, sys
+from pathlib import Path
+
+machine = sys.argv[1]
+command = f"sleep 60 & sleep 60 & wait # {machine}"
+remote = [subprocess.Popen(["/bin/sh", "-c", command], process_group=0) for _ in range(2)]
+with (Path(machine) / "fake/groups").open("a") as handle:
+    handle.write("".join(f"{process.pid}\\n" for process in remote))
+for process in remote:
+    process.wait()
+"""
+
+
+def test_the_budget_counts_commands_run_over_ssh(tmp_path: Path) -> None:
+    """Commands the fake ssh starts in groups of their own count toward the run's budget."""
+    first_shard_only()
+    machine = tmp_path / "machine"
+    (machine / "fake").mkdir(parents=True)
+    caps = Limits(budget=3)
+    environment = {"PATH": "/bin:/usr/bin", "FAKE": str(machine / "fake")}
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="over its budget of 3"):
+        run_contained(
+            [sys.executable, "-I", "-c", REMOTE_COMMANDS, str(machine)],
+            environment,
+            watch=caps.watch,
+        )
     assert time.monotonic() - started < 30
 
 

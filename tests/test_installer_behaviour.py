@@ -115,13 +115,14 @@ def run_contained(
     environment: dict[str, str],
     timeout: int = RUN_TIMEOUT_SECONDS,
     *,
-    watch: Callable[[int], contextlib.AbstractContextManager[None]] | None = None,
+    watch: Callable[[int, Path], contextlib.AbstractContextManager[None]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an installer in its own process group; nothing it starts outlives it.
 
     A run that times out, or leaves a process behind, fails the test after the
     whole group is killed and reaped. ``watch`` is entered with the group's ID
-    for as long as the run lasts.
+    and the file listing the groups of the commands the fake ssh ran, for as
+    long as the run lasts.
     """
     assert timeout <= RUN_TIMEOUT_SECONDS
     process = subprocess.Popen(
@@ -149,7 +150,7 @@ def run_contained(
             remote_groups.unlink()
         return survivors
 
-    with watch(process.pid) if watch is not None else contextlib.nullcontext():
+    with watch(process.pid, remote_groups) if watch is not None else contextlib.nullcontext():
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:

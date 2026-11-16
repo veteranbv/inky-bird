@@ -8,7 +8,8 @@ Every call is also numbered in ``$FAKE/steps``. Each line of ``$FAKE/inject``
 (``<step> <mode>``) makes the call with that number fail, makes it and every later sudo
 call fail (``expire``), or stops the installer once it completes: SIGTERM
 (``kill``), SIGHUP (``hangup``) or SIGINT to its whole process group
-(``interrupt``). Status queries are numbered but never injected.
+(``interrupt``; a display installer run over ssh then gets SIGHUP at once, as
+when the connection drops). Status queries are numbered but never injected.
 """
 
 from __future__ import annotations
@@ -143,6 +144,11 @@ def kill_installer(mode: str = "kill") -> None:
     if pid is None:
         return
     if mode == "interrupt":
+        nearest = _installer_pid()
+        if nearest is not None and nearest != pid:
+            # The call ran on the display: the connection drops while its
+            # installer waits for this call, not once it has gone on.
+            os.kill(nearest, signal.SIGHUP)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         os.killpg(os.getpgid(pid), signal.SIGINT)
     else:
