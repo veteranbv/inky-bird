@@ -2015,14 +2015,23 @@ def first_failures(steps: list[list[str]]) -> list[int]:
         found.update(after[:1])
     found.update(starts[-1:])
     if starts:
-        # A removal after the last start is cleanup the run survives, not a failure.
+        # Only a call whose failure must fail the run has a rollback to test.
         later = [
             int(index)
-            for index, kind_of_call, tool, *_ in steps
-            if kind_of_call == "action" and int(index) > starts[-1] and tool not in ("rm", "rmdir")
+            for index, kind_of_call, tool, *arguments in steps
+            if kind_of_call == "action"
+            and int(index) > starts[-1]
+            and not survivable(tool, arguments)
         ]
         found.update(later[:1])
     return sorted(found)
+
+
+def survivable(tool: str, arguments: list[str]) -> bool:
+    """Calls after the last start the run outlives: removing temporary files
+    or older runtimes, which it names instead, and owner access setup, which
+    it reports as incomplete while the new version keeps running."""
+    return tool in ("rm", "rmdir") or (tool == "inky-bird" and arguments[:2] == ["access", "setup"])
 
 
 def switches_back(tool: str, arguments: list[str]) -> bool:
