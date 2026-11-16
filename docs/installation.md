@@ -609,6 +609,41 @@ defaults. Configuration is TOML everywhere. Keep real files outside the Git
 checkout, mode `0600`, and out of backups or support bundles that are shared
 publicly.
 
+### Private environment file
+
+Secrets that the configuration names by environment variable, such as the OIDC
+client secret (`client_secret_env`), provider keys (`*_env`), notification
+URLs (`url_env`) or a GitHub token for `gh`, can live in one private file
+instead of the service definition. Set `INKY_BIRD_ENV_FILE` to the file's
+absolute path. The path is not secret, so a service definition can carry it.
+Every `inky-bird` command, including `serve`, `scheduler` and the scheduled
+jobs, reads the file before it reads the configuration. When the variable is
+unset or empty, nothing changes.
+
+```text
+# One setting per line. Lines starting with # are comments.
+INKY_OIDC_CLIENT_SECRET="value with spaces"
+GH_TOKEN=value
+EBIRD_API_KEY='value'
+```
+
+- A value already set in the process environment wins over the file.
+- Values are used exactly as written: no `$` expansion, no `export`, and a `#`
+  after a value is part of the value. Use double quotes for escapes such as
+  `\"` or `\\`; single quotes take the text literally. Spaces around a value
+  are removed unless it is quoted.
+- The file must be a regular file, not a link, owned by the account that runs
+  the service (or root), mode `0600`, in folders that only their owner or root
+  can change, and at most 64 KiB.
+
+The command stops with a configuration error if the file is unsafe or a line
+is not a valid setting. The error names the file and the line number, never a
+value. `config validate` shows the path in `private_environment_file`, and
+`doctor` adds a `private_environment` check.
+
+The setup installers do not write this file yet. Existing installations keep
+working as before.
+
 ## Update
 
 Keep using your existing `$CONFIG`, runtime directory and service names during
