@@ -248,3 +248,71 @@ def test_existing_managed_config_without_the_key_keeps_generation_on(tmp_path: P
     path = tmp_path / "config.toml"
     path.write_text(existing)
     assert load_config(path).controller.generation_enabled is True
+
+
+def test_a_system_service_preview_accepts_settings_read_from_the_environment(
+    tmp_path: Path,
+) -> None:
+    """A system service loads its private environment file in every unit, so
+    provider keys, notification URLs and the OIDC secret may come from there."""
+    path = _config(tmp_path, controller=OIDC, tail=NOTIFICATIONS)
+    path.write_text(
+        path.read_text().replace(
+            "[discovery]\n",
+            '[discovery]\nsource = "ebird"\nebird_api_key_env = "SETUP_PREVIEW_TOKEN"\n',
+        )
+    )
+    values = {
+        "SETUP_PREVIEW_TOKEN": "synthetic",
+        "SETUP_PREVIEW_NOTIFY_URL": "json://example.test/hook",
+        "SETUP_PREVIEW_OIDC_SECRET": "synthetic-secret",
+    }
+    with (
+        patch.dict(os.environ, values),
+        patch("inky_bird_frame.installation.platform.system", return_value="Linux"),
+        patch("inky_bird_frame.installation.subprocess.run") as run,
+    ):
+        result = setup(
+            InstallationRole.CONTROLLER,
+            path,
+            apply=False,
+            source_dir=_source(tmp_path),
+            service_account="inky-bird",
+        )
+        with pytest.raises(InstallationError, match="--service-account inky-bird"):
+            setup(
+                InstallationRole.CONTROLLER,
+                path,
+                apply=True,
+                source_dir=_source(tmp_path),
+                service_account="inky-bird",
+            )
+    run.assert_not_called()
+    assert result["applied"] is False
+    assert result["service_account"] == "inky-bird"
+    assert "--service-account inky-bird" in str(result["confirmation"])
+    changes = result["changes"]
+    assert isinstance(changes, list) and not any("OIDC" in change for change in changes)
+    assert not (tmp_path / "native-access.env").exists()
+
+
+@pytest.mark.parametrize("name", ["native-access.env", "native-tls.env"])
+def test_a_system_service_preview_refuses_the_serving_only_native_files(
+    tmp_path: Path, name: str
+) -> None:
+    path = _config(tmp_path)
+    (tmp_path / name).write_text('UNRELATED_SECRET="sensitive-test-value"\n')
+    (tmp_path / name).chmod(0o600)
+    with (
+        patch("inky_bird_frame.installation.platform.system", return_value="Linux"),
+        pytest.raises(InstallationError, match="private environment file") as error,
+    ):
+        setup(
+            InstallationRole.CONTROLLER,
+            path,
+            apply=False,
+            source_dir=_source(tmp_path),
+            service_account="inky-bird",
+        )
+    assert name in str(error.value)
+    assert "sensitive-test-value" not in str(error.value)

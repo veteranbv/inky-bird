@@ -112,6 +112,7 @@ import pytest
 from test_installer_behaviour import (
     MACOS_BASH,
     ROOT,
+    SYSTEM_ACCOUNT,
     Host,
     fake_tools,
     run_contained,
@@ -193,6 +194,9 @@ class Scenario:
     start: str = ""
     # Options the installer is run with; ``{machine}`` is the machine's root.
     arguments: tuple[str, ...] = ()
+    # Installed as root for this account (``--service-account``), under
+    # ``{machine}/srv/<account>``.
+    service_account: str = ""
 
     @property
     def shell(self) -> str:
@@ -202,6 +206,17 @@ class Scenario:
 DISPLAY_ENVIRONMENT = (("INKY_BIRD_NONINTERACTIVE_SUDO", "true"),)
 # The owner's --stopped-hook, which ``Host.stopped_hook`` writes.
 HOOK_ARGUMENTS = ("--stopped-hook", "{machine}/home/support/stopped-hook")
+# A system service, installed as root for its own account.
+SYSTEM_ARGUMENTS = (
+    "--service-account",
+    SYSTEM_ACCOUNT,
+    "--install-root",
+    f"{{machine}}/srv/{SYSTEM_ACCOUNT}",
+)
+SYSTEM_ENVIRONMENT = (("FAKE_UNITS", TIMER_UNITS), ("FAKE_UID", "0"))
+# The owner used the user installer first, then removed its services as the
+# system installer's refusal says; its folders stay in the owner's home.
+USER_REMOVED = "user-removed"
 SCENARIOS = {
     scenario.name: scenario
     for scenario in (
@@ -283,6 +298,28 @@ SCENARIOS = {
             ("staged",),
             start="linux-app",
             arguments=HOOK_ARGUMENTS,
+        ),
+        # Installed as root for a service account, which runs the application.
+        Scenario(
+            "linux-system",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            SYSTEM_ENVIRONMENT,
+            ("fresh", "staged", RETAINED, USER_REMOVED),
+            arguments=SYSTEM_ARGUMENTS,
+            service_account=SYSTEM_ACCOUNT,
+        ),
+        Scenario(
+            "linux-system-hook",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            SYSTEM_ENVIRONMENT,
+            ("staged",),
+            start="linux-system",
+            arguments=(*SYSTEM_ARGUMENTS, *HOOK_ARGUMENTS),
+            service_account=SYSTEM_ACCOUNT,
         ),
         Scenario(
             "linux-timers-to-app",
@@ -409,7 +446,14 @@ class Machine(Host):
         super().__init__(root, scenario.system, family, number_file_commands=True, create=create)
         self.scenario = scenario
         self.key = root / "synthetic-key"
+        if scenario.service_account:
+            self.use_system_layout(scenario.service_account)
         if create:
+            if scenario.service_account:
+                self.make_system(scenario.service_account)
+                # What a removal that left the install root would take with it.
+                (root / "outside").mkdir()
+                (root / "outside/keep").write_text("outside\n")
             self.config.write_text(f"synthetic private config {CONFIG_CANARY}\n")
             self.key.write_text("synthetic key\n")
             display_venv(self)
@@ -571,6 +615,8 @@ class Machine(Host):
                 self.set_unit(f"{self.family}-display.timer", active=False, enabled=False)
         elif state == "renamed":
             self.install_renamed_display()
+        elif state == USER_REMOVED:
+            self.install_and_remove_user_services()
         elif state == "rolled-back":
             self.install_rolled_back(scenario)
         elif state == "shared-single":
@@ -585,6 +631,21 @@ class Machine(Host):
             raise AssertionError(state)
         self.finish_cycles()
         self.check_built(scenario, state)
+
+    def install_and_remove_user_services(self) -> None:
+        """The user installer's controller in the owner's home, then its uninstaller."""
+        user = SCENARIOS["linux-timers"]
+        home = {
+            "FAKE_LAYOUT_APP_DIR": str(self.home / "Services" / self.family),
+            "FAKE_LAYOUT_SUPPORT_DIR": str(self.home / "support"),
+            "FAKE_LAYOUT_CONFIG_PATH": str(self.home / "support/config.toml"),
+            "FAKE_STATE_DIR": str(self.root / "state"),
+        }
+        source = self.checkout("old")
+        for name in (user.script, user.uninstall):
+            result = self.execute(self.script(name, source=source), user, **home)
+            assert result.returncode == 0, result.stdout + result.stderr
+            self.finish_cycles()
 
     def install_rolled_back(self, scenario: Scenario) -> None:
         """An upgrade the owner undid by hand by switching back to the kept version.
@@ -627,6 +688,7 @@ class Machine(Host):
         role = view(self, scenario.role)
         expected = {
             "fresh": None,
+            USER_REMOVED: None,
             "shared-staged": None,
             "renamed": "regular",
             RETAINED: "mid",
@@ -947,7 +1009,11 @@ PATH_PATTERN = re.compile(r"/[^\s'\"<>:;,]+")
 
 
 def allowed_output_roots(machine: Machine) -> tuple[str, ...]:
+    system = (str(machine.install_root),) if machine.install_root is not None else ()
     return (
+        *system,
+        # The owner's hook.
+        str(machine.home / "support"),
         str(machine.app),
         str(machine.app.parent / ".inky-bird-stage."),
         str(machine.support),
@@ -1019,10 +1085,67 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
     # I9: nothing private is printed.
     if CONFIG_CANARY in output or "synthetic private config" in output or "synthetic key" in output:
         report.append("I9: private configuration or key content was printed")
+    check_system(machine, outcome)
     roots = allowed_output_roots(machine)
     for match in PATH_PATTERN.findall(output):
         if match.startswith(str(machine.root)) and not match.startswith(roots):
             report.append(f"I9: a private path was printed: {match}")
+
+
+# Who each call a system-service install makes must run as: what reads the
+# account's data or runs the application, the account; the rest, root.
+SYSTEM_IDENTITIES = {
+    "inky-bird": "account",
+    "upgrade-gate": "account",
+    "uv": "root",
+    "rsync": "root",
+    "systemctl": "root",
+    "chown": "root",
+    "stopped-hook": "root",
+}
+# The heredoc checks and syncs as the account, and renders the units as root.
+HEREDOC_IDENTITIES = {"sync": "account", "render": "root"}
+# Commands that delete, move, link or give away what they name.
+DESTRUCTIVE_TOOLS = ("rm", "mv", "rmdir", "ln", "chown")
+
+
+def check_system(machine: Machine, outcome: Outcome) -> None:
+    """I12, for a system service: each call ran as the identity it must; root
+    deleted, moved, linked or gave away nothing outside the install root, its
+    temporary files and the unit folder, and nothing outside it is gone; and
+    the account owns nothing of its code."""
+    if machine.install_root is None:
+        return
+    report = outcome.violations
+    outcome.covered.add("I12")
+    for call in machine.calls():
+        if call[0] != "as":
+            continue
+        identity, what, *detail = call[1:]
+        if what == "heredoc":
+            expected = HEREDOC_IDENTITIES.get(detail[0], "a system mode")
+        else:
+            expected = SYSTEM_IDENTITIES.get(what, identity)
+        if identity != expected:
+            report.append(f"I12: {what} {' '.join(detail)} ran as {identity}, not {expected}")
+    allowed = tuple(
+        os.path.realpath(path) + os.sep
+        for path in (machine.install_root, machine.tmp, machine.units)
+    )
+    for _, kind_of_call, tool, *arguments in machine.steps():
+        if kind_of_call != "action" or tool not in DESTRUCTIVE_TOOLS:
+            continue
+        for argument in arguments:
+            if argument.startswith("/") and not os.path.realpath(argument).startswith(allowed):
+                report.append(f"I12: {tool} reached {argument}, outside the install root")
+    keep = machine.root / "outside/keep"
+    if not keep.is_file() or keep.read_text() != "outside\n":
+        report.append("I12: a file outside the install root was removed or changed")
+    code = os.path.realpath(machine.install_root / "app") + os.sep
+    account = machine.state_of("accounts")[machine.account]
+    for path, owner in machine.state_of("owners").items():
+        if os.path.realpath(path).startswith(code) and owner["uid"] == account["uid"]:
+            report.append(f"I12: {machine.account} owns {path}, part of its own code")
 
 
 # Every line the scripts in deploy/ print, as its echo spells it, by what it
@@ -1106,6 +1229,40 @@ CLAIMS = {
         "unchanged"
     ),
     "Uninstall was stopped. No changes made.": "unchanged",
+    # unchanged: system-service mode
+    "${unit##*/} is a system service of ${owner}. Run the installer again with "
+    "--service-account ${owner}. No changes made.": "unchanged",
+    "Install system services as root: sudo $0 --service-account NAME. No changes made.": (
+        "unchanged"
+    ),
+    "--install-root needs --service-account. No changes made.": "unchanged",
+    "--service-account must be inky-bird, or inky-bird- followed by lowercase letters and "
+    "digits. No changes made.": "unchanged",
+    "The account ${service_account} does not exist; create it as docs/installation.md shows. "
+    "No changes made.": "unchanged",
+    "The account ${service_account} has root's user or group ID; use an account of its own. "
+    "No changes made.": "unchanged",
+    "The account ${service_account} is in an administrator group; remove it from that group. "
+    "No changes made.": "unchanged",
+    "The account ${service_account} can log in; give it the shell /usr/sbin/nologin. "
+    "No changes made.": "unchanged",
+    "The home directory of ${service_account} must be ${install_root}/home. No changes made.": (
+        "unchanged"
+    ),
+    "--install-root must be an absolute path without . or .. parts, other than /. "
+    "No changes made.": "unchanged",
+    "${install_root}, or a folder above it, can be changed by someone other than root. "
+    "No changes made.": "unchanged",
+    "${service_account} can change the source checkout ${root}; use a checkout only root can "
+    "change. No changes made.": "unchanged",
+    "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by "
+    "${service_account}. No changes made.": "unchanged",
+    "Could not check the service account. No changes made.": "unchanged",
+    "${service_prefix}-${name}.service was installed by the user installer for ${owner}; this "
+    "installer does not move it. Remove it with deploy/uninstall-controller-systemd.sh run as "
+    "${owner}, then run this again. No changes made.": "unchanged",
+    "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: "
+    "sudo $0 --service-account ${owner}. No changes made.": "unchanged",
     # uninstalled
     "Controller LaunchAgents uninstalled.": "uninstalled",
     "Controller services uninstalled.": "uninstalled",
@@ -1208,6 +1365,10 @@ CLAIMS = {
     "The stopped-boundary hook failed with exit status ${status}; the upgrade did not switch to "
     "the new version.": "neutral",
     "The new version started, but its web service failed its health check.": "neutral",
+    "Processes of ${service_account} still run after its services stopped; the upgrade did "
+    "not switch to the new version.": "neutral",
+    "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new "
+    "version.": "neutral",
 }
 CLAIM_CLASSES = ("installed", "new", "previous", "unchanged", "uninstalled", "neutral")
 # A shell expansion in a printed line: ${name}, ${name[*]-default}, $name or $1.
@@ -1511,7 +1672,7 @@ def check_quiet_writers(
             if held != "lock-held":
                 report.append(f"I11: {unit} running {runtime} was stopped without the writer locks")
     hooks = [call for call in calls if call[0] == "stopped-hook"]
-    if not scenario.arguments:
+    if "--stopped-hook" not in scenario.arguments:
         if hooks:
             report.append("I11: a hook ran that was not asked for")
         return
@@ -2208,6 +2369,7 @@ STATE_DIRECTORY = Path(
 # "sample" fails every eighth call of every group instead.
 SAMPLE_STRIDE = 8
 DEFAULT_SECOND_PASS = {
+    ("install", "linux-system", "staged"),
     ("install", "macos", "single"),
     ("install", "linux-timers", "single"),
     ("install", "display", "shared-single"),
@@ -2812,7 +2974,7 @@ def prepare(machine: Machine, key: GroupKey) -> None:
         machine.script(scenario.script, source=machine.app)
     elif kind == "install":
         machine.script(scenario.script)
-        if scenario.arguments:
+        if "--stopped-hook" in scenario.arguments:
             machine.stopped_hook()
         if scenario.name == "remote-display":
             machine.script("install-display-local.sh")
@@ -2934,6 +3096,7 @@ CLONE_CHECKS = (
     ("install", "macos", "single"),
     ("install", "linux-timers", "shared-single"),
     ("install", "linux-app", "staged"),
+    ("install", "linux-system", "staged"),
     ("install", "display", "shared-both"),
     ("install", "remote-display", "single"),
     ("uninstall", "linux-timers", "shared"),

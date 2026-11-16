@@ -5,8 +5,29 @@ if [ "$(uname -s)" != "Linux" ] || ! command -v systemctl >/dev/null 2>&1; then
   echo "Controller installer requires Linux with systemd." >&2
   exit 1
 fi
-if [ "$(id -u)" = 0 ]; then
+unit_root="/etc/systemd/system"
+# The first line of each unit a system-service installation renders.
+system_marker="# Inky Bird system service"
+system_requested=false
+for argument in "$@"; do
+  if [ "${argument}" = --service-account ]; then
+    system_requested=true
+  fi
+done
+current_uid=$(id -u)
+if [ "${current_uid}" = 0 ] && [ "${system_requested}" = false ]; then
+  for unit in "${unit_root}"/inky-bird*-controller.service; do
+    if [ -f "${unit}" ] && [ "$(head -n 1 "${unit}")" = "${system_marker}" ]; then
+      owner=$(sed -n 's/^User=//p' "${unit}" | tail -n 1)
+      echo "${unit##*/} is a system service of ${owner}. Run the installer again with --service-account ${owner}. No changes made." >&2
+      exit 1
+    fi
+  done
   echo "Run the installer as the account that will own the controller, not as root. No changes made." >&2
+  exit 1
+fi
+if [ "${system_requested}" = true ] && [ "${current_uid}" != 0 ]; then
+  echo "Install system services as root: sudo $0 --service-account NAME. No changes made." >&2
   exit 1
 fi
 
@@ -34,18 +55,21 @@ sys.exit(0 if safe else 1)
 
 stopped_hook=""
 stopped_hook_timeout=0
+service_account=""
+install_root=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --stopped-hook | --stopped-hook-timeout)
+    --stopped-hook | --stopped-hook-timeout | --service-account | --install-root)
       if [ "$#" -lt 2 ]; then
         echo "$1 needs a value. No changes made." >&2
         exit 1
       fi
-      if [ "$1" = --stopped-hook ]; then
-        stopped_hook=$2
-      else
-        stopped_hook_timeout=$2
-      fi
+      case "$1" in
+        --stopped-hook) stopped_hook=$2 ;;
+        --stopped-hook-timeout) stopped_hook_timeout=$2 ;;
+        --service-account) service_account=$2 ;;
+        *) install_root=$2 ;;
+      esac
       shift 2
       ;;
     *)
@@ -69,6 +93,10 @@ if [ -z "${stopped_hook}" ] && [ "${stopped_hook_timeout}" -gt 0 ]; then
   echo "--stopped-hook-timeout needs --stopped-hook. No changes made." >&2
   exit 1
 fi
+if [ -n "${install_root}" ] && [ -z "${service_account}" ]; then
+  echo "--install-root needs --service-account. No changes made." >&2
+  exit 1
+fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The managed directory's copy of this script reinstalls the active runtime.
@@ -81,9 +109,74 @@ if [ -L "${root}/.venv" ] && [ -f "${root}/deploy/.managed-copy" ]; then
     root=${active_root}
   fi
 fi
-native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
 service_prefix="" app_dir="" support_dir="" config_path=""
-eval "${native_names}"
+account_uid="" account_gid="" account_group="" account_home="" problem="" unsafe_path=""
+give_directories=""
+if [ -z "${service_account}" ]; then
+  native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
+  eval "${native_names}"
+else
+  # A system service: the account names the services and owns the data; the
+  # code under ${install_root}/app is root's alone.
+  umask 022
+  install_root=${install_root:-/srv/${service_account}}
+  system_helper="${root}/src/inky_bird_frame/system_service.py"
+  preflight=$(python3 -I "${system_helper}" preflight "${service_account}" "${install_root}" "${root}") ||
+    preflight="problem=failed"
+  eval "${preflight}"
+  case "${problem}" in
+    "") ;;
+    account-name)
+      echo "--service-account must be inky-bird, or inky-bird- followed by lowercase letters and digits. No changes made." >&2
+      exit 1
+      ;;
+    account-missing)
+      echo "The account ${service_account} does not exist; create it as docs/installation.md shows. No changes made." >&2
+      exit 1
+      ;;
+    account-root)
+      echo "The account ${service_account} has root's user or group ID; use an account of its own. No changes made." >&2
+      exit 1
+      ;;
+    account-admin)
+      echo "The account ${service_account} is in an administrator group; remove it from that group. No changes made." >&2
+      exit 1
+      ;;
+    account-shell)
+      echo "The account ${service_account} can log in; give it the shell /usr/sbin/nologin. No changes made." >&2
+      exit 1
+      ;;
+    account-home)
+      echo "The home directory of ${service_account} must be ${install_root}/home. No changes made." >&2
+      exit 1
+      ;;
+    root-path)
+      echo "--install-root must be an absolute path without . or .. parts, other than /. No changes made." >&2
+      exit 1
+      ;;
+    root-unsafe)
+      echo "${install_root}, or a folder above it, can be changed by someone other than root. No changes made." >&2
+      exit 1
+      ;;
+    source-writable)
+      echo "${service_account} can change the source checkout ${root}; use a checkout only root can change. No changes made." >&2
+      exit 1
+      ;;
+    layout-unsafe)
+      echo "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
+      exit 1
+      ;;
+    *)
+      echo "Could not check the service account. No changes made." >&2
+      exit 1
+      ;;
+  esac
+  service_prefix=${service_account}
+  app_dir="${install_root}/app"
+  support_dir="${install_root}/config"
+  config_path="${support_dir}/config.toml"
+  environment_file="${support_dir}/private.env"
+fi
 export INKY_BIRD_SERVICE_PREFIX="${service_prefix}"
 python_version=${INKY_BIRD_PYTHON_VERSION:-3.11}
 quiesce_timeout_seconds=1800
@@ -93,7 +186,6 @@ uv_bin=${UV_BIN:-}
 if [ -z "${uv_bin}" ]; then
   uv_bin=$(command -v uv || true)
 fi
-unit_root="/etc/systemd/system"
 # Each runtime holds one source copy and the venv built from it;
 # ${app_dir}/.venv links to the active one.
 runtimes_dir="${app_dir}/.runtimes"
@@ -103,11 +195,72 @@ catalog_root=${root}
 if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
   catalog_root=${app_dir}
 fi
-user=$(id -un)
+if [ -n "${service_account}" ]; then
+  user=${service_account}
+else
+  user=$(id -un)
+fi
 managed_units=()
 for name in controller scheduler refresh generate catalog-publish notifications; do
   managed_units+=("${service_prefix}-${name}.service" "${service_prefix}-${name}.timer")
 done
+
+# A system service's installer runs as root: it changes the code and the
+# units itself, and runs the application as the account, with only the
+# environment given here.
+account_prefix=()
+presence_timeout_seconds=30
+if [ -n "${service_account}" ]; then
+  account_prefix=(setpriv "--reuid=${account_uid}" "--regid=${account_gid}" --init-groups --
+    env -i "PATH=/usr/local/bin:/usr/bin:/bin" "HOME=${account_home}" "LANG=C.UTF-8"
+    "INKY_BIRD_ENV_FILE=${environment_file}")
+fi
+admin() {
+  if [ -n "${service_account}" ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+admin_ready() {
+  [ -n "${service_account}" ] || sudo -v
+}
+as_account() {
+  ${account_prefix[@]+"${account_prefix[@]}"} "$@"
+}
+# Whether root may delete, move or replace $2 inside $1. For a system service
+# the path must lie under the install root through folders the account cannot
+# change, so it cannot lead out between this check and its use.
+contained() {
+  [ -z "${service_account}" ] ||
+    python3 -I "${system_helper}" contained "${service_account}" "${install_root}" "$1" "$2"
+}
+# Wait up to presence_timeout_seconds until no process of the service account
+# runs, other than the writer lock holder this run started.
+account_processes_gone() {
+  local deadline=$((SECONDS + presence_timeout_seconds))
+  local listed pid others status
+  while true; do
+    status=0
+    listed=$(pgrep -u "${account_uid}") || status=$?
+    if [ "${status}" -gt 1 ]; then
+      return 1
+    fi
+    others=""
+    for pid in ${listed}; do
+      if [ "${pid}" != "${writer_lock_pid}" ]; then
+        others="${others} ${pid}"
+      fi
+    done
+    if [ -z "${others}" ]; then
+      return 0
+    fi
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      return 1
+    fi
+    sleep "${poll_seconds}"
+  done
+}
 
 if [ ! -f "${config_path}" ]; then
   echo "Controller configuration is missing: ${config_path}" >&2
@@ -122,18 +275,27 @@ for name in controller scheduler refresh generate catalog-publish notifications;
   if [ -f "${unit}" ]; then
     owner=$(sed -n 's/^User=//p' "${unit}" | tail -n 1)
     owner=${owner:-root}
+    if [ -n "${service_account}" ] && [ "$(head -n 1 "${unit}")" != "${system_marker}" ]; then
+      echo "${service_prefix}-${name}.service was installed by the user installer for ${owner}; this installer does not move it. Remove it with deploy/uninstall-controller-systemd.sh run as ${owner}, then run this again. No changes made." >&2
+      exit 1
+    fi
     if [ "${owner}" != "${user}" ]; then
+      if [ "$(head -n 1 "${unit}")" = "${system_marker}" ]; then
+        echo "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: sudo $0 --service-account ${owner}. No changes made." >&2
+        exit 1
+      fi
       echo "${service_prefix}-${name}.service runs as ${owner}. Run the installer as ${owner}. No changes made." >&2
       exit 1
     fi
   fi
 done
-if ! sudo -v; then
+if ! admin_ready; then
   echo "Administrator access is required to install system services." >&2
   exit 1
 fi
 
 work_dir=""
+ready_dir=""
 unit_dir=""
 unit_backup_dir=""
 created_runtimes_dir=false
@@ -236,11 +398,11 @@ hold_writer_locks() {
   local ready
   local status=0
   writer_lock_holds=$((writer_lock_holds + 1))
-  ready="${work_dir}/writer-locks-held.${writer_lock_holds}"
+  ready="${ready_dir}/writer-locks-held.${writer_lock_holds}"
   if [ ! -x "${python}" ] || [ "${writer_locks_unavailable}" = true ]; then
     return 0
   fi
-  start_background writer_lock_pid "${python}" -I \
+  start_background writer_lock_pid ${account_prefix[@]+"${account_prefix[@]}"} "${python}" -I \
     "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" hold-writer-locks \
     "${config_path}" "${ready}" "${quiesce_timeout_seconds}"
   until [ -e "${ready}" ]; do
@@ -387,9 +549,14 @@ run_stopped_hook() {
 # Loaded is not working: the new web service must answer its health check
 # from the new runtime, on this machine.
 check_new_serve() {
-  if ! run_bounded "$((health_timeout_seconds + 15))" "${new_runtime}/.venv/bin/python" -I \
+  local environment=()
+  if [ -n "${service_account}" ]; then
+    environment=("${environment_file}")
+  fi
+  if ! run_bounded "$((health_timeout_seconds + 15))" \
+      ${account_prefix[@]+"${account_prefix[@]}"} "${new_runtime}/.venv/bin/python" -I \
       "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" check-serve "${config_path}" \
-      "${health_timeout_seconds}"; then
+      "${health_timeout_seconds}" ${environment[@]+"${environment[@]}"}; then
     echo "The new version started, but its web service failed its health check." >&2
     exit 1
   fi
@@ -414,7 +581,8 @@ record_units() {
 }
 
 replace_venv_link() {
-  rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
+  contained "${app_dir}" "${app_dir}/.venv.next" && contained "${app_dir}" "${app_dir}/.venv" && \
+    rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
     python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
       "${app_dir}/.venv.next" "${app_dir}/.venv"
 }
@@ -431,6 +599,7 @@ activate_runtime() {
     venv_before=directory
     make_temp_dir legacy_runtime "${runtimes_dir}/runtime.XXXXXX"
     previous_runtime=${legacy_runtime}
+    contained "${runtimes_dir}" "${legacy_runtime}/.venv"
     mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
   else
     venv_before=absent
@@ -451,21 +620,22 @@ restore_venv() {
     directory)
       if [ -n "${legacy_runtime}" ] && [ -d "${legacy_runtime}/.venv" ]; then
         if [ -L "${app_dir}/.venv" ]; then
-          rm -f "${app_dir}/.venv" || return 1
+          { contained "${app_dir}" "${app_dir}/.venv" && rm -f "${app_dir}/.venv"; } || return 1
         fi
-        if ! mv "${legacy_runtime}/.venv" "${app_dir}/.venv"; then
+        if ! { contained "${app_dir}" "${app_dir}/.venv" && mv "${legacy_runtime}/.venv" "${app_dir}/.venv"; }; then
           # Leave the services the new version rather than nothing at all.
           replace_venv_link "${new_runtime}/.venv"
           return 1
         fi
       fi
-      if [ -n "${legacy_runtime}" ] && ! rmdir "${legacy_runtime}"; then
+      if [ -n "${legacy_runtime}" ] && ! { contained "${runtimes_dir}" "${legacy_runtime}" &&
+          rmdir "${legacy_runtime}"; }; then
         leftovers+=("${legacy_runtime}")
       fi
       ;;
     *)
       # Nothing ran before this run, so nothing uses the link it made.
-      if ! rm -f "${app_dir}/.venv"; then
+      if ! { contained "${app_dir}" "${app_dir}/.venv" && rm -f "${app_dir}/.venv"; }; then
         leftovers+=("${app_dir}/.venv" "${new_runtime}")
         new_runtime_linked=true
       fi
@@ -476,7 +646,8 @@ restore_venv() {
 
 remove_next_link() {
   if [ -e "${app_dir}/.venv.next" ] || [ -L "${app_dir}/.venv.next" ]; then
-    rm -f "${app_dir}/.venv.next" || leftovers+=("${app_dir}/.venv.next")
+    { contained "${app_dir}" "${app_dir}/.venv.next" && rm -f "${app_dir}/.venv.next"; } ||
+      leftovers+=("${app_dir}/.venv.next")
   fi
 }
 
@@ -488,7 +659,7 @@ restart_on_new_runtime() {
   for unit in ${active_before[@]+"${active_before[@]}"}; do
     if [ -e "${unit_root}/${unit}" ] && systemctl is-active --quiet "${unit}" && \
         ! contains "${unit}" ${started_units[@]+"${started_units[@]}"}; then
-      if sudo systemctl restart "${unit}"; then
+      if admin systemctl restart "${unit}"; then
         restarted+=("${unit}")
       else
         stuck_units+=("${unit}")
@@ -510,21 +681,21 @@ restore_units() {
       if [ -f "${unit_backup_dir}/${unit}" ]; then
         if ! cmp -s "${unit_backup_dir}/${unit}" "${unit_root}/${unit}"; then
           changed=true
-          sudo install -m 0644 "${unit_backup_dir}/${unit}" "${unit_root}/${unit}" || true
+          admin install -m 0644 "${unit_backup_dir}/${unit}" "${unit_root}/${unit}" || true
         fi
       elif [ -e "${unit_root}/${unit}" ]; then
         changed=true
         if { running "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
-            ! sudo systemctl disable --now "${unit}"; then
+            ! admin systemctl disable --now "${unit}"; then
           # Keep its file so a rerun or the uninstaller can still find and stop it.
           stuck_units+=("${unit}")
           continue
         fi
-        sudo rm -f "${unit_root}/${unit}" || true
+        admin rm -f "${unit_root}/${unit}" || true
       fi
     done
     if [ "${changed}" = true ]; then
-      sudo systemctl daemon-reload || true
+      admin systemctl daemon-reload || true
     fi
   fi
   # A service started after the switch runs the new version; stop it before
@@ -535,7 +706,7 @@ restore_units() {
         *.service)
           if [ -e "${unit_root}/${unit}" ] && running "${unit}" && \
               { ! long_running "${unit}" || contains "${unit}" ${started_units[@]+"${started_units[@]}"}; }; then
-            sudo systemctl stop "${unit}" || stuck_units+=("${unit}")
+            admin systemctl stop "${unit}" || stuck_units+=("${unit}")
           fi
           ;;
       esac
@@ -568,16 +739,16 @@ restore_units() {
     fi
     if contains "${unit}" ${enabled_before[@]+"${enabled_before[@]}"}; then
       [ "${startable}" = false ] || systemctl is-enabled --quiet "${unit}" || \
-        sudo systemctl enable "${unit}" || true
+        admin systemctl enable "${unit}" || true
     elif systemctl is-enabled --quiet "${unit}"; then
-      sudo systemctl disable "${unit}" || true
+      admin systemctl disable "${unit}" || true
     fi
     if long_running "${unit}"; then
       if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
         [ "${startable}" = false ] || running "${unit}" || \
-          sudo systemctl start "${unit}" || true
+          admin systemctl start "${unit}" || true
       elif running "${unit}"; then
-        sudo systemctl stop "${unit}" || true
+        admin systemctl stop "${unit}" || true
       fi
     fi
   done
@@ -657,14 +828,14 @@ cleanup() {
     report_restore
     if [ -n "${new_runtime}" ] && [ "${#stuck_units[@]}" -eq 0 ] && \
         [ "${venv_restored}" = true ] && [ "${new_runtime_linked}" != true ] && \
-        ! rm -rf "${new_runtime}"; then
+        ! { contained "${runtimes_dir}" "${new_runtime}" && rm -rf "${new_runtime}"; }; then
       leftovers+=("${new_runtime}")
     fi
     if [ "${#leftovers[@]}" -gt 0 ]; then
       echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${leftovers[*]}" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
-      rmdir "${runtimes_dir}" 2>/dev/null || true
+      { contained "${app_dir}" "${runtimes_dir}" && rmdir "${runtimes_dir}" 2>/dev/null; } || true
     fi
     if [ "${status}" -eq 0 ]; then
       status=1
@@ -694,21 +865,55 @@ unit_dir="${work_dir}/units"
 unit_backup_dir="${work_dir}/previous-units"
 mkdir "${unit_dir}" "${unit_backup_dir}"
 
-chmod 600 "${config_path}"
+ready_dir=${work_dir}
 if [ ! -d "${runtimes_dir}" ]; then
   created_runtimes_dir=true
 fi
-mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}" "${support_dir}"
+if [ -z "${service_account}" ]; then
+  chmod 600 "${config_path}"
+  mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}" "${support_dir}"
+else
+  # The writer lock holder, which runs as the account, says here that it holds them.
+  ready_dir="${work_dir}/account"
+  mkdir "${ready_dir}"
+  chown "${service_account}:${account_group}" "${ready_dir}"
+  chmod 711 "${work_dir}"
+  mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}"
+  # The account's folders it does not own yet: missing, or empty ones a run
+  # stopped before it gave them away. Their folder is root's, so none of them
+  # can be a link here.
+  for name in ${give_directories}; do
+    if [ ! -d "${install_root}/${name}" ]; then
+      mkdir -m 0700 "${install_root}/${name}"
+    fi
+    chown "${service_account}:${account_group}" "${install_root}/${name}"
+  done
+  as_account chmod 600 "${config_path}"
+  # Created empty if missing; an existing file is never rewritten or shown.
+  # shellcheck disable=SC2016 # $1 expands in the account's shell, not here.
+  as_account sh -c 'test -e "$1" || (umask 077 && : >>"$1")' sh "${environment_file}"
+fi
 runtimes_dir=$(cd -P "${runtimes_dir}" && pwd)
 
 # Build and check the new runtime beside the live one; nothing running changes.
 make_temp_dir new_runtime "${runtimes_dir}/runtime.XXXXXX"
+contained "${runtimes_dir}" "${new_runtime}"
 stage_runtime_source "${new_runtime}"
+# A system service keeps the interpreter uv may download with its code, where
+# the account can run but not change it, and compiles bytecode it cannot write.
+uv_environment=()
+uv_options=()
+if [ -n "${service_account}" ]; then
+  uv_environment=("UV_PYTHON_INSTALL_DIR=${app_dir}/.python")
+  uv_options=(--compile-bytecode)
+fi
 # A stray UV_PROJECT_ENVIRONMENT would build the venv somewhere the units do not run.
-env -u UV_PROJECT_ENVIRONMENT "${uv_bin}" sync --project "${new_runtime}" \
-  --python "${python_version}" --extra controller --locked
+env -u UV_PROJECT_ENVIRONMENT ${uv_environment[@]+"${uv_environment[@]}"} "${uv_bin}" sync \
+  --project "${new_runtime}" --python "${python_version}" --extra controller --locked \
+  ${uv_options[@]+"${uv_options[@]}"}
 # The CLI reports a rejection as a JSON envelope on stdout; show its message.
-if ! validation=$("${new_runtime}/.venv/bin/inky-bird" config validate --config "${config_path}"); then
+if ! validation=$(as_account "${new_runtime}/.venv/bin/inky-bird" config validate \
+    --config "${config_path}"); then
   echo "The new version cannot use this configuration. No changes made." >&2
   python3 -I -c '
 import json, sys
@@ -719,7 +924,8 @@ except (ValueError, KeyError, TypeError):
 ' "${validation}" >&2
   exit 1
 fi
-if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$("${new_runtime}/.venv/bin/python" -I \
+if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$(as_account \
+    "${new_runtime}/.venv/bin/python" -I \
     "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" state-dir "${config_path}"); then
   echo "Could not read the state directory for the stopped-boundary hook. No changes made." >&2
   exit 1
@@ -727,7 +933,7 @@ fi
 
 hold_writer_locks false
 # Waiting for a plate can outlast cached sudo credentials; ask again before stopping anything.
-if ! sudo -v; then
+if ! admin_ready; then
   echo "Administrator access is required to install system services. No changes made." >&2
   exit 1
 fi
@@ -736,13 +942,13 @@ record_units
 # before replacing its runtime; a managed installation removes it below.
 if systemctl is-active --quiet "${service_prefix}-scheduler.service"; then
   stopped_units+=("${service_prefix}-scheduler.service")
-  sudo systemctl stop "${service_prefix}-scheduler.service"
+  admin systemctl stop "${service_prefix}-scheduler.service"
 fi
 for name in refresh generate catalog-publish notifications; do
   timer="${service_prefix}-${name}.timer"
   if systemctl is-active --quiet "${timer}"; then
     stopped_units+=("${timer}")
-    sudo systemctl stop "${timer}"
+    admin systemctl stop "${timer}"
   fi
 done
 # A job a timer started may be waiting for one of the writer locks; let it
@@ -765,7 +971,7 @@ for name in refresh generate catalog-publish notifications; do
   done
 done
 if [ -n "${stopped_hook}" ]; then
-  if ! sudo -v; then
+  if ! admin_ready; then
     echo "Administrator access is required to install system services." >&2
     exit 1
   fi
@@ -774,19 +980,27 @@ if [ -n "${stopped_hook}" ]; then
   # with the others below.
   if systemctl is-active --quiet "${service_prefix}-controller.service"; then
     stopped_units+=("${service_prefix}-controller.service")
-    sudo systemctl stop "${service_prefix}-controller.service"
+    admin systemctl stop "${service_prefix}-controller.service"
+  fi
+  if [ -n "${service_account}" ] && ! account_processes_gone; then
+    echo "Processes of ${service_account} still run after its services stopped; the upgrade did not switch to the new version." >&2
+    exit 1
   fi
   run_stopped_hook
   release_writer_locks
 fi
 # The wait above can also outlast cached credentials; the steps below need them.
-if ! sudo -v; then
+if ! admin_ready; then
   echo "Administrator access is required to install system services." >&2
   exit 1
 fi
 
-"${new_runtime}/.venv/bin/python" - \
-  "${unit_dir}" "${catalog_root}" "${app_dir}" "${config_path}" "${HOME}" "${user}" <<'PY'
+# Check the configuration, sync the catalog and render the units, with the
+# interpreter and arguments given. A system service runs it twice: as its
+# account to check the configuration and sync the catalog ("sync"), then as
+# root, which reads no secret, to render its units ("render").
+controller_program() {
+  "$@" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -800,7 +1014,26 @@ from inky_bird_frame.publisher import sync_public_catalog
 
 unit_dir, root, app_dir, config_path, home = map(Path, sys.argv[1:6])
 user = sys.argv[6]
-config = load_config(config_path)
+mode = sys.argv[7] if len(sys.argv) > 7 else ""
+system = None
+if mode == "render":
+    from inky_bird_frame.installation import SystemService, read_account_config
+
+    config = read_account_config(config_path, int(sys.argv[10]))
+    controller = config.controller
+    writable = (config_path.parent, home, controller.workspace_dir, controller.catalog_dir)
+    system = SystemService(sys.argv[8], Path(sys.argv[9]), (*writable, controller.state_dir))
+elif mode == "sync":
+    from inky_bird_frame.installation import (
+        load_private_environment,
+        validate_native_controller_setup,
+    )
+
+    load_private_environment()
+    config = load_config(config_path)
+    validate_native_controller_setup(config, config_path, system_service=True)
+else:
+    config = load_config(config_path)
 environment_credentials = []
 if config.discovery.geoapify_api_key_env:
     environment_credentials.append("geoapify_api_key_env")
@@ -811,7 +1044,7 @@ if (
     and config.discovery.birdweather_token_env
 ):
     environment_credentials.append("birdweather_token_env")
-if environment_credentials:
+if environment_credentials and not mode:
     names = ", ".join(environment_credentials)
     raise ConfigurationError(
         f"The systemd installer cannot use {names}; store the corresponding credential "
@@ -822,32 +1055,36 @@ environment_destinations = [
     for destination in config.notifications.destinations
     if config.notifications.enabled and destination.url_env is not None
 ]
-if environment_destinations:
+if environment_destinations and not mode:
     names = ", ".join(environment_destinations)
     raise ConfigurationError(
         "The systemd installer requires direct notification URLs in the private "
         f"config file; replace url_env for: {names}"
     )
-native_oidc_environment(config, config_path)
-config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)
-config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)
-with catalog_state_lock(config.controller.state_dir):
-    source_catalog = root / "catalog"
-    managed_catalog = app_dir / "catalog"
-    if root != app_dir and managed_catalog.resolve() != config.controller.catalog_dir.resolve():
+if not mode:
+    native_oidc_environment(config, config_path)
+if mode != "render":
+    config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)
+    config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)
+    with catalog_state_lock(config.controller.state_dir):
+        source_catalog = root / "catalog"
+        managed_catalog = app_dir / "catalog"
+        if root != app_dir and managed_catalog.resolve() != config.controller.catalog_dir.resolve():
+            sync_public_catalog(
+                source_catalog,
+                managed_catalog,
+                allow_replacements=True,
+                retain_independent_approvals=True,
+            )
+            source_catalog = managed_catalog
         sync_public_catalog(
             source_catalog,
-            managed_catalog,
+            config.controller.catalog_dir,
             allow_replacements=True,
             retain_independent_approvals=True,
         )
-        source_catalog = managed_catalog
-    sync_public_catalog(
-        source_catalog,
-        config.controller.catalog_dir,
-        allow_replacements=True,
-        retain_independent_approvals=True,
-    )
+if mode == "sync":
+    sys.exit(0)
 
 service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
 # The command named like the services: 0.9 installs had only inky-bird-frame,
@@ -861,15 +1098,34 @@ units = controller_systemd_units(
     home=home,
     user=user,
     service_prefix=service_prefix,
+    system=system,
 )
 for name, content in units.items():
     (unit_dir / name).write_text(content)
 PY
+}
+
+if [ -z "${service_account}" ]; then
+  controller_program "${new_runtime}/.venv/bin/python" - \
+    "${unit_dir}" "${catalog_root}" "${app_dir}" "${config_path}" "${HOME}" "${user}"
+else
+  # Root copies the public catalog into the code it keeps; the account syncs
+  # its own catalog from there.
+  if [ "${catalog_root}" != "${app_dir}" ]; then
+    contained "${app_dir}" "${app_dir}/catalog"
+    rsync -a --delete "${catalog_root}/catalog/" "${app_dir}/catalog/"
+  fi
+  controller_program as_account "${new_runtime}/.venv/bin/python" - \
+    "${unit_dir}" "${app_dir}" "${app_dir}" "${config_path}" "${account_home}" "${user}" sync
+  controller_program "${new_runtime}/.venv/bin/python" - \
+    "${unit_dir}" "${app_dir}" "${app_dir}" "${config_path}" "${account_home}" "${user}" \
+    render "${account_group}" "${environment_file}" "${account_uid}"
+fi
 
 # Only an unreachable bird source may wait for the scheduled refresh; any other
 # failure means the new version does not work here.
 refresh_status=0
-refresh_output=$("${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
+refresh_output=$(as_account "${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}") || \
   refresh_status=$?
 printf '%s\n' "${refresh_output}"
 if [ "${refresh_status}" -ne 0 ]; then
@@ -888,66 +1144,74 @@ except (ValueError, KeyError, TypeError):
 fi
 
 if [ -f "${unit_dir}/${service_prefix}-catalog-publish.timer" ]; then
-  "${new_runtime}/.venv/bin/inky-bird" catalog-publish \
+  as_account "${new_runtime}/.venv/bin/inky-bird" catalog-publish \
     --config "${config_path}" --dry-run
 fi
 
+# The account must not be able to change the code it is about to run.
+if [ -n "${service_account}" ] && ! code_check=$(python3 -I "${system_helper}" verify-code \
+    "${service_account}" "${install_root}"); then
+  unsafe_path=${app_dir}
+  eval "${code_check}"
+  echo "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new version." >&2
+  exit 1
+fi
 activate_runtime
 units_replaced=true
 for unit in "${unit_dir}"/*; do
-  sudo install -m 0644 "${unit}" "${unit_root}/$(basename "${unit}")"
+  admin install -m 0644 "${unit}" "${unit_root}/$(basename "${unit}")"
 done
 for optional in refresh generate catalog-publish notifications; do
   if [ ! -f "${unit_dir}/${service_prefix}-${optional}.timer" ]; then
     if [ -e "${unit_root}/${service_prefix}-${optional}.timer" ]; then
-      sudo systemctl disable --now "${service_prefix}-${optional}.timer"
+      admin systemctl disable --now "${service_prefix}-${optional}.timer"
     fi
-    sudo rm -f \
+    admin rm -f \
       "${unit_root}/${service_prefix}-${optional}.service" \
       "${unit_root}/${service_prefix}-${optional}.timer"
   fi
 done
 if [ ! -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
   if [ -e "${unit_root}/${service_prefix}-scheduler.service" ]; then
-    sudo systemctl disable --now "${service_prefix}-scheduler.service"
+    admin systemctl disable --now "${service_prefix}-scheduler.service"
   fi
-  sudo rm -f "${unit_root}/${service_prefix}-scheduler.service"
+  admin rm -f "${unit_root}/${service_prefix}-scheduler.service"
 fi
 
-sudo systemctl daemon-reload
-sudo systemctl enable "${service_prefix}-controller.service"
+admin systemctl daemon-reload
+admin systemctl enable "${service_prefix}-controller.service"
 if [ -f "${unit_dir}/${service_prefix}-refresh.timer" ]; then
-  sudo systemctl enable "${service_prefix}-refresh.timer"
+  admin systemctl enable "${service_prefix}-refresh.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
-  sudo systemctl enable "${service_prefix}-scheduler.service"
+  admin systemctl enable "${service_prefix}-scheduler.service"
 fi
 if [ -f "${unit_dir}/${service_prefix}-generate.timer" ]; then
-  sudo systemctl enable "${service_prefix}-generate.timer"
+  admin systemctl enable "${service_prefix}-generate.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-catalog-publish.timer" ]; then
-  sudo systemctl enable "${service_prefix}-catalog-publish.timer"
+  admin systemctl enable "${service_prefix}-catalog-publish.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-notifications.timer" ]; then
-  sudo systemctl enable "${service_prefix}-notifications.timer"
+  admin systemctl enable "${service_prefix}-notifications.timer"
 fi
 started_units+=("${service_prefix}-controller.service")
-sudo systemctl restart "${service_prefix}-controller.service"
+admin systemctl restart "${service_prefix}-controller.service"
 if [ -f "${unit_dir}/${service_prefix}-refresh.timer" ]; then
-  sudo systemctl restart "${service_prefix}-refresh.timer"
+  admin systemctl restart "${service_prefix}-refresh.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-scheduler.service" ]; then
   started_units+=("${service_prefix}-scheduler.service")
-  sudo systemctl restart "${service_prefix}-scheduler.service"
+  admin systemctl restart "${service_prefix}-scheduler.service"
 fi
 if [ -f "${unit_dir}/${service_prefix}-generate.timer" ]; then
-  sudo systemctl restart "${service_prefix}-generate.timer"
+  admin systemctl restart "${service_prefix}-generate.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-catalog-publish.timer" ]; then
-  sudo systemctl restart "${service_prefix}-catalog-publish.timer"
+  admin systemctl restart "${service_prefix}-catalog-publish.timer"
 fi
 if [ -f "${unit_dir}/${service_prefix}-notifications.timer" ]; then
-  sudo systemctl restart "${service_prefix}-notifications.timer"
+  admin systemctl restart "${service_prefix}-notifications.timer"
 fi
 
 systemctl is-enabled --quiet "${service_prefix}-controller.service"
@@ -992,7 +1256,7 @@ for runtime in "${runtimes_dir}"/*; do
   # This script and the files it reads are in the runtime it was run from.
   if [ "${runtime}" -ef "${root}" ]; then
     echo "The runtime this installer ran from is kept in ${runtime}." >&2
-  elif ! rm -rf "${runtime}"; then
+  elif ! { contained "${runtimes_dir}" "${runtime}" && rm -rf "${runtime}"; }; then
     echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
   fi
 done
@@ -1001,6 +1265,6 @@ echo "Configuration: ${config_path}"
 if [ -n "${previous_runtime}" ]; then
   echo "Previous version kept for rollback: ${previous_runtime}"
 fi
-if ! "${app_dir}/.venv/bin/inky-bird" access setup --if-needed --config "${config_path}"; then
+if ! as_account "${app_dir}/.venv/bin/inky-bird" access setup --if-needed --config "${config_path}"; then
   echo "Controller installation completed; owner setup is incomplete. Run access setup in a private terminal. Display and scheduled work continue." >&2
 fi

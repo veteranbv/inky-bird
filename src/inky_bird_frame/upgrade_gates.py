@@ -8,7 +8,7 @@ standard library is imported here at module level.
 
 ``check-serve`` runs with the new version's interpreter after the switch and
 asks the local web service for ``/health``: it must answer ``ok`` from this
-same runtime.
+same runtime. A system service passes its private environment file third.
 
 ``state-dir`` prints the configured state directory.
 """
@@ -49,6 +49,7 @@ RETRY_SECONDS = 2.0
 HEALTH_REQUEST_SECONDS = 5.0
 HEALTH_RETRY_SECONDS = 1.0
 MAX_HEALTH_BYTES = 64 * 1024
+PRIVATE_ENVIRONMENT_FILE = "INKY_BIRD_ENV_FILE"
 
 
 def lock_paths(state_dir: Path) -> list[Path]:
@@ -232,12 +233,18 @@ def fetch_health(
         connection.close()
 
 
-def check_serve(config_path: Path, deadline_seconds: float) -> int:
+def check_serve(
+    config_path: Path, deadline_seconds: float, environment_file: Path | None = None
+) -> int:
     """Ask the local web service for ``/health`` until it answers ``ok`` from
-    this runtime, or the deadline passes."""
+    this runtime, or the deadline passes. A system service's private
+    environment file may name the trust (``SSL_CERT_FILE``) to verify it with."""
     from inky_bird_frame.config import load_config
-    from inky_bird_frame.installation import native_tls_environment
+    from inky_bird_frame.installation import load_private_environment, native_tls_environment
 
+    if environment_file is not None:
+        os.environ[PRIVATE_ENVIRONMENT_FILE] = str(environment_file)
+        load_private_environment()
     config = load_config(config_path, load_secrets=False)
     controller = config.controller
     address = _loopback(controller.bind_host)
@@ -291,8 +298,10 @@ def main(arguments: list[str]) -> int:
         config_path, ready, timeout = rest
         return hold_writer_locks(Path(config_path), Path(ready), float(timeout))
     if command == "check-serve":
-        config_path, deadline = rest
-        return check_serve(Path(config_path), float(deadline))
+        config_path, deadline, *environment_file = rest
+        return check_serve(
+            Path(config_path), float(deadline), *(Path(path) for path in environment_file)
+        )
     if command == "state-dir":
         (config_path,) = rest
         return print_state_dir(Path(config_path))

@@ -212,11 +212,12 @@ def test_systemd_controller_installer_restarts_boot_persistent_services() -> Non
     initial_refresh = script.index(
         '"${new_runtime}/.venv/bin/inky-bird" refresh --config "${config_path}"'
     )
-    quiesce = script.index('sudo systemctl stop "${timer}"')
+    # admin is sudo for the user installer and the command itself as root.
+    quiesce = script.index('admin systemctl stop "${timer}"')
     runtime_build = script.index('stage_runtime_source "${new_runtime}"')
     validation = script.index('"${new_runtime}/.venv/bin/inky-bird" catalog-publish')
     activation = script.index("\nactivate_runtime\n")
-    unit_install = script.index('sudo install -m 0644 "${unit}"')
+    unit_install = script.index('admin install -m 0644 "${unit}"')
     assert runtime_build < quiesce < initial_refresh < validation < activation < unit_install
     assert "deadline=$((SECONDS + quiesce_timeout_seconds))" in script
     assert 'systemctl show --property=ActiveState --value "${service}"' in script
@@ -887,7 +888,7 @@ def test_controller_installers_hold_writer_locks_run_the_hook_and_check_health_i
         ),
         (
             "install-controller-systemd.sh",
-            'sudo systemctl stop "${service_prefix}-scheduler.service"',
+            'admin systemctl stop "${service_prefix}-scheduler.service"',
         ),
     ):
         script = (root / name).read_text()

@@ -47,6 +47,19 @@ def _save(name: str, value: dict[str, object]) -> None:
     (FAKE / f"{name}.json").write_text(json.dumps(value, sort_keys=True))
 
 
+def _identity() -> str:
+    """Who this call runs as: the service account under the fake setpriv,
+    root when the installer runs as root (``FAKE_UID=0``), otherwise the user."""
+    return os.environ.get("FAKE_IDENTITY") or (
+        "root" if os.environ.get("FAKE_UID") == "0" else "user"
+    )
+
+
+def _as(*what: object) -> None:
+    """Record who ran a call that only one identity may run."""
+    _log("as", _identity(), *what)
+
+
 STEP_LOCK_TIMEOUT_SECONDS = 30.0
 KILL = False
 # Which stop ``KILL`` sends once the call completes.
@@ -361,6 +374,12 @@ def system_python(arguments: list[str]) -> int:
         for name in ("service_prefix", "app_dir", "support_dir", "config_path"):
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
+    helper = [index for index, item in enumerate(arguments) if item.endswith("system_service.py")]
+    if helper:
+        # The real helper, against the synthetic account database and file owners.
+        program = f"import sys; sys.path.insert(0, {str(TOOLS.parent)!r}); import fake_tools; "
+        program += "fake_tools.run_with_accounts(sys.argv[1:])"
+        return _exec([sys.executable, "-I", "-S", "-c", program, *arguments[helper[0] :]])
     if any(argument.endswith(".venv.next") for argument in arguments):
         # Points the active link at a runtime: the switch, or a switch back.
         _log("switch")
@@ -429,6 +448,7 @@ def plutil(arguments: list[str]) -> int:
 
 def uv(arguments: list[str]) -> int:
     project = Path(arguments[arguments.index("--project") + 1])
+    _as("uv")
     _log("uv", *arguments, "UV_PROJECT_ENVIRONMENT" in os.environ)
     if "uv" in _rules():
         (project / ".venv").mkdir(exist_ok=True)
@@ -532,6 +552,7 @@ def systemctl(arguments: list[str]) -> int:
     if verb == "is-enabled":
         return 0 if record["enabled"] else 1
     _log("systemctl", *arguments)
+    _as("systemctl", verb)
     if f"systemctl:{verb}:{unit}" in rules or f"systemctl:{verb}" in rules:
         return 1
     if verb == "daemon-reload":
@@ -629,6 +650,7 @@ def rsync(arguments: list[str]) -> int:
             paths.append(argument)
     source_text, target_text = (path.split(":", 1)[-1] for path in paths[-2:])
     _log("rsync", source_text, target_text)
+    _as("rsync")
     if "rsync" in _rules():
         return 23
     source, target = Path(source_text), Path(target_text)
@@ -893,6 +915,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     if arguments[:1] == ["-"]:
         source = sys.stdin.read()
         _log("heredoc", tag)
+        # A system service checks and syncs as its account, then renders as root.
+        mode = arguments[7] if len(arguments) > 7 else ""
+        _as("heredoc", mode or "both")
         # The real program takes the catalog lock unless told the installer holds it.
         if "catalog_state_lock" in source and _cycle_lock_held() and arguments[-1] != "true":
             print("waiting forever for the catalog lock the installer holds", file=sys.stderr)
@@ -904,12 +929,14 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird-frame")
         # The macOS program takes one plist per agent, then the source and app.
         plists = len([argument for argument in arguments if argument.endswith(".plist")])
-        if "sync_public_catalog" in source:
+        if "sync_public_catalog" in source and mode != "render":
             # The real program syncs the catalog from the install source first.
             root = Path(arguments[plists + 1] if "plistlib" in source else arguments[2])
             if not (root / "catalog").is_dir():
                 print("synthetic catalog source is missing", file=sys.stderr)
                 return 1
+        if mode == "sync":
+            return 0
         if "plistlib" in source or "controller_systemd_units" in source:
             executable = _executable(source, prefix)
         if "plistlib" in source:
@@ -950,10 +977,17 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             unit_dir, app_dir, user = Path(arguments[1]), Path(arguments[3]), arguments[6]
             for name in os.environ["FAKE_UNITS"].split():
                 content = f"[Unit]\n# new\n# rendered by {tag}\n"
+                if mode == "render":
+                    content = f"{SYSTEM_MARKER}\n{content}"
                 if name.endswith(".service"):
                     content += (
                         f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/{executable}\n"
                     )
+                    if mode == "render":
+                        group, environment_file = arguments[8:10]
+                        content += (
+                            f"Group={group}\nEnvironment=INKY_BIRD_ENV_FILE={environment_file}\n"
+                        )
                 (unit_dir / f"{prefix}-{name}").write_text(content)
         elif "display_systemd_units" in source:
             import subprocess
@@ -976,6 +1010,7 @@ def _upgrade_gate(tag: str, script: str, arguments: list[str], environment: dict
     which runtime the recorded serving process runs."""
     command = arguments[0]
     _log("upgrade-gate", command, tag)
+    _as("upgrade-gate", command)
     if command == "check-serve":
         return _check_serve(tag)
     # -P keeps the helper's own directory, which shadows standard modules, off the path.
@@ -992,11 +1027,19 @@ def _check_serve(tag: str) -> int:
     rules = _rules()
     if "health-hang" in rules:
         time.sleep(3600)
-    prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird")
-    serving = {
-        _process_runtime(f"com.{prefix}.serve"),
-        _process_runtime(f"{prefix}-controller.service"),
-    }
+    prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX")
+    if prefix is None:
+        # The account's scrubbed environment names no prefix: any web service.
+        serving = {
+            str(process["runtime"])
+            for name, process in _state("processes").items()
+            if isinstance(process, dict) and name.endswith("-controller.service")
+        }
+    else:
+        serving = {
+            _process_runtime(f"com.{prefix}.serve"),
+            _process_runtime(f"{prefix}-controller.service"),
+        }
     if "health-fail" in rules or tag not in serving:
         print("The web service health check failed: synthetic failure.", file=sys.stderr)
         return 1
@@ -1020,6 +1063,7 @@ def stopped_hook(arguments: list[str]) -> int:
     import time
 
     rules = _rules()
+    _as("stopped-hook")
     held = "lock-held" if _cycle_lock_held() else "lock-free"
     venv = Path(os.environ["FAKE_LAYOUT_APP_DIR"]) / ".venv"
     tag = Path(os.path.realpath(venv)) / "tag"
@@ -1062,6 +1106,7 @@ def stopped_hook(arguments: list[str]) -> int:
 def inky_bird(executable: str, arguments: list[str]) -> int:
     tag = runtime_tag(executable)
     _log("inky-bird", tag, *arguments)
+    _as("inky-bird", arguments[0])
     # These take writer locks themselves: run while an installer holds them,
     # they would wait for it forever.
     if arguments[:1] in (["refresh"], ["catalog-publish"]) and _cycle_lock_held():
@@ -1084,7 +1129,8 @@ def inky_bird(executable: str, arguments: list[str]) -> int:
 
 def _is_query(tool: str, arguments: list[str]) -> bool:
     """Calls that only read state; failing one would just be a different answer."""
-    if tool in ("uname", "id"):
+    # setpriv only runs its command as the account; that command is the step.
+    if tool in ("uname", "id", "pgrep", "setpriv"):
         return True
     if tool == "launchctl":
         return arguments[:1] == ["print"]
@@ -1104,6 +1150,160 @@ def _injected_failure(tool: str, arguments: list[str]) -> int:
         error = {"type": "internal", "message": "synthetic failure"}
         print(json.dumps({"ok": False, "error": error, "schema_version": 1}))
     return {"rsync": 23, "ssh": 255, "launchctl": 5}.get(tool, 1)
+
+
+# The first line of every unit a system-service installation renders.
+SYSTEM_MARKER = "# Inky Bird system service"
+# Fixed group IDs for the administrator groups an account may be put in.
+ADMIN_GROUP_IDS = {"sudo": 27, "wheel": 10, "admin": 80}
+
+
+def _accounts() -> dict[str, dict[str, object]]:
+    """The synthetic account database: name to uid, gid, group, home, shell, groups."""
+    accounts = _state("accounts")
+    return {name: entry for name, entry in accounts.items() if isinstance(entry, dict)}
+
+
+def _account_by_uid(uid: int) -> tuple[str, dict[str, object]] | None:
+    for name, entry in _accounts().items():
+        if entry["uid"] == uid:
+            return name, entry
+    return None
+
+
+def _group_ids() -> dict[str, int]:
+    groups = dict(ADMIN_GROUP_IDS)
+    for entry in _accounts().values():
+        groups[str(entry["group"])] = int(str(entry["gid"]))
+    return groups
+
+
+def run_with_accounts(arguments: list[str]) -> None:
+    """Run a helper script as the host would, with the synthetic accounts in
+    the account database and the owners ``chown`` recorded on the files."""
+    import grp
+    import pwd
+    import runpy
+
+    real_getpwnam, real_getgrgid = pwd.getpwnam, grp.getgrgid
+    real_lstat, real_stat = os.lstat, os.stat
+    accounts = _accounts()
+    groups = _group_ids()
+    owners = _state("owners")
+
+    def getpwnam(name: str) -> pwd.struct_passwd:
+        entry = accounts.get(name)
+        if entry is None:
+            return real_getpwnam(name)
+        fields = (name, "x", entry["uid"], entry["gid"], "", entry["home"], entry["shell"])
+        return pwd.struct_passwd(fields)
+
+    def getgrgid(id: int) -> grp.struct_group:
+        for name, number in groups.items():
+            if number == id:
+                return grp.struct_group((name, "x", id, []))
+        return real_getgrgid(id)
+
+    def getgrouplist(name: str, gid: int) -> list[int]:
+        entry = accounts.get(name)
+        listed = entry.get("groups", []) if entry is not None else []
+        assert isinstance(listed, list)
+        return [gid, *(groups[str(group)] for group in listed)]
+
+    def owned(result: os.stat_result, path: str | bytes | os.PathLike[str]) -> os.stat_result:
+        recorded = owners.get(os.path.abspath(os.fsdecode(path)))
+        if not isinstance(recorded, dict):
+            return result
+        fields = list(result[:10])
+        fields[4], fields[5] = recorded["uid"], recorded["gid"]
+        return os.stat_result(fields)
+
+    def lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        return owned(real_lstat(path), path)
+
+    def stat(path: str | os.PathLike[str]) -> os.stat_result:
+        return owned(real_stat(path), path)
+
+    # The synthetic account database, and owners recorded by the fake chown.
+    pwd.getpwnam = getpwnam
+    grp.getgrgid = getgrgid
+    os.getgrouplist = getgrouplist
+    os.lstat = lstat  # type: ignore[assignment]  # stat_result keyword options are not used
+    os.stat = stat  # type: ignore[assignment]
+    sys.argv = arguments
+    runpy.run_path(arguments[0], run_name="__main__")
+
+
+def setpriv(arguments: list[str]) -> int:
+    """Run a command as a synthetic account: only with its supplementary
+    groups and a scrubbed environment (``env -i``), which it then sees alone,
+    beside the fakes' own settings."""
+    import shutil
+
+    separator = arguments.index("--")
+    options, command = arguments[:separator], arguments[separator + 1 :]
+    values = dict(option.split("=", 1) for option in options if "=" in option)
+    found = _account_by_uid(int(values.get("--reuid", "-1")))
+    if (
+        found is None
+        or "--init-groups" not in options
+        or values.get("--regid") != str(found[1]["gid"])
+        or command[:2] != ["env", "-i"]
+    ):
+        print(f"setpriv: refused to run {command[:2]} as {values}", file=sys.stderr)
+        return 64
+    given: dict[str, str] = {}
+    rest = command[2:]
+    while rest and "=" in rest[0] and not rest[0].startswith("/"):
+        name, value = rest.pop(0).split("=", 1)
+        given[name] = value
+    environment = {name: value for name, value in os.environ.items() if name.startswith("FAKE")}
+    environment.update(given, FAKE_IDENTITY="account", FAKE_UID=str(found[1]["uid"]))
+    _log("as-account", found[0], json.dumps(sorted(given)), rest[0])
+    executable = shutil.which(rest[0], path=given.get("PATH", "")) or rest[0]
+    return _exec([executable, *rest[1:]], environment)
+
+
+def chown(arguments: list[str]) -> int:
+    """Give entries to a synthetic account, one at a time, never recursively."""
+    if any(argument.startswith("-") for argument in arguments):
+        print(f"chown: refused {arguments}: one entry at a time", file=sys.stderr)
+        return 64
+    owner, *paths = arguments
+    entry = _accounts().get(owner.partition(":")[0])
+    if entry is None or not paths or not all(os.path.lexists(path) for path in paths):
+        print(f"chown: cannot give {paths} to {owner}", file=sys.stderr)
+        return 1
+    _as("chown")
+    owners = _state("owners")
+    for path in paths:
+        owners[os.path.abspath(path)] = {"uid": entry["uid"], "gid": entry["gid"]}
+    _save("owners", owners)
+    return 0
+
+
+def pgrep(arguments: list[str]) -> int:
+    """The processes of one account: its services that run now, and with the
+    rule ``account-process`` one of its own that never stops."""
+    uid = int(arguments[arguments.index("-u") + 1])
+    accounts = _accounts()
+    found = []
+    running = sorted({*_state("processes"), *_state("busy")})
+    for number, unit in enumerate(running):
+        path = _units_dir() / unit
+        users = [
+            line.partition("=")[2]
+            for line in (path.read_text().splitlines() if path.exists() else ())
+            if line.startswith("User=")
+        ]
+        entry = accounts.get(users[-1]) if users else None
+        if entry is not None and entry["uid"] == uid:
+            found.append(40000 + number)
+    if "account-process" in _rules() and _account_by_uid(uid) is not None:
+        found.append(49999)
+    for pid in found:
+        print(pid)
+    return 0 if found else 1
 
 
 def main() -> int:
@@ -1138,6 +1338,9 @@ def main() -> int:
             "rsync": rsync,
             "ssh": ssh,
             "stopped-hook": stopped_hook,
+            "setpriv": setpriv,
+            "chown": chown,
+            "pgrep": pgrep,
         }
         status = handlers[tool](arguments)
     if KILL:

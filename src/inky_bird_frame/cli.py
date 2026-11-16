@@ -1328,6 +1328,7 @@ def setup_command(args: argparse.Namespace) -> int:
             uv_bin=args.uv_bin,
             python_version=args.python_version,
             venv=args.venv,
+            service_account=args.service_account,
         )
     )
     return 0
@@ -1374,12 +1375,18 @@ def build_parser() -> argparse.ArgumentParser:
             role_parser.add_argument("--support-dir", type=Path, help="Managed support directory")
             role_parser.add_argument("--uv-bin", type=Path, help="Path to the uv executable")
             role_parser.add_argument("--python-version", help="Python version for the controller")
+            role_parser.add_argument(
+                "--service-account",
+                help="Preview a system service that runs as this account (install it as root)",
+            )
             role_parser.set_defaults(venv=None)
         else:
             role_parser.add_argument(
                 "--venv", type=Path, help="Pimoroni Python environment for the display node"
             )
-            role_parser.set_defaults(support_dir=None, uv_bin=None, python_version=None)
+            role_parser.set_defaults(
+                support_dir=None, uv_bin=None, python_version=None, service_account=None
+            )
         role_parser.set_defaults(func=setup_command)
 
     doctor_parser = subparsers.add_parser(

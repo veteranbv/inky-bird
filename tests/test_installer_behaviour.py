@@ -28,6 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tests/fake_bin/fake_tools.py"
 UPGRADE_GATES = ROOT / "src/inky_bird_frame/upgrade_gates.py"
+SYSTEM_SERVICE = ROOT / "src/inky_bird_frame/system_service.py"
 _spec = importlib.util.spec_from_file_location("fake_tools", TOOLS)
 assert _spec is not None and _spec.loader is not None
 fake_tools = importlib.util.module_from_spec(_spec)
@@ -79,6 +80,8 @@ SYSTEM_PATHS = {
 }
 
 
+# The account a system-service installation runs as, unless a test names another.
+SYSTEM_ACCOUNT = "inky-bird"
 # Every installer run gets this long, then its whole process group is killed.
 RUN_TIMEOUT_SECONDS = 120
 
@@ -272,6 +275,9 @@ class Host:
         self.agents = self.home / "Library/LaunchAgents"
         self.venv = self.home / ".virtualenvs/pimoroni"
         self.tmp = root / "tmp"
+        # A system service's account and install root; see ``use_system_layout``.
+        self.account = ""
+        self.install_root: Path | None = None
         if not create:
             return
         for directory in (self.bin, self.home, self.support, self.state, self.units, self.tmp):
@@ -290,6 +296,9 @@ class Host:
             "sudo",
             "rsync",
             "ssh",
+            "setpriv",
+            "chown",
+            "pgrep",
         ):
             path = self.bin / tool
             path.write_text(tool_wrapper(tool))
@@ -312,6 +321,8 @@ class Host:
         (package / "installation.py").write_text(FAKE_INSTALLATION_MODULE)
         # The installers' upgrade helper runs for real against the synthetic config.
         (package / "upgrade_gates.py").write_text(UPGRADE_GATES.read_text())
+        # So do a system service's checks, against the synthetic accounts and owners.
+        (package / "system_service.py").write_text(SYSTEM_SERVICE.read_text())
         (directory / "src/runtime-tag").write_text(f"{tag}\n")
         (directory / "catalog").mkdir(exist_ok=True)
         (directory / "deploy").mkdir(exist_ok=True)
@@ -344,6 +355,7 @@ class Host:
             "quiesce_timeout_seconds=1800", f"quiesce_timeout_seconds={quiesce_timeout}"
         )
         text = text.replace("health_timeout_seconds=90", f"health_timeout_seconds={health_timeout}")
+        text = text.replace("presence_timeout_seconds=30", "presence_timeout_seconds=1")
         # Polling for the cycle lock helper is only a wait; a short one keeps runs quick.
         text = text.replace("poll_seconds=1\n", "poll_seconds=0.05\n")
         # So is the helper's own watch for its installer to end, and its wait for a
@@ -358,19 +370,71 @@ class Host:
     def stopped_hook(self) -> Path:
         """An owner's --stopped-hook, which reaches the fake tools without the
         installer's environment: it runs with only the variables it is given."""
-        path = self.support / "stopped-hook"
+        path = self.home / "support/stopped-hook"
         exports = "".join(
             f"{name}={shlex.quote(value)}; export {name}\n"
             for name, value in (
                 ("FAKE", str(self.fake)),
                 ("FAKE_STATE_DIR", str(self.state)),
                 ("FAKE_LAYOUT_APP_DIR", str(self.app)),
+                # A hook runs as whoever runs the installer: root for a system service.
+                *((("FAKE_UID", "0"),) if self.account else ()),
             )
         )
         shebang, body = tool_wrapper("stopped-hook").split("\n", 1)
         path.write_text(f"{shebang}\n{exports}{body}")
         path.chmod(0o755)
         return path
+
+    # A system service, installed as root for an account of its own.
+    def use_system_layout(self, account: str) -> None:
+        """Name the paths of a system-service installation for ``account``."""
+        self.account = account
+        self.install_root = Path(os.path.realpath(self.root)) / "srv" / account
+        self.app = self.install_root / "app"
+        self.support = self.install_root / "config"
+        self.config = self.support / "config.toml"
+        self.state = self.install_root / "state"
+
+    def make_system(self, account: str = SYSTEM_ACCOUNT, uid: int = 2001) -> None:
+        """Add ``account`` and the configuration it owns, as the docs have the
+        administrator do before the first install."""
+        self.use_system_layout(account)
+        self.add_account(account, uid)
+        self.support.mkdir(parents=True)
+        self.config.write_text("synthetic private config\n")
+        self.give(self.support, account)
+        self.give(self.config, account)
+
+    def add_account(
+        self,
+        name: str,
+        uid: int,
+        *,
+        home: Path | None = None,
+        shell: str = "/usr/sbin/nologin",
+        groups: tuple[str, ...] = (),
+    ) -> None:
+        accounts = self.state_of("accounts")
+        accounts[name] = {
+            "uid": uid,
+            "gid": uid,
+            "group": name,
+            "home": str(home or Path(os.path.realpath(self.root)) / "srv" / name / "home"),
+            "shell": shell,
+            "groups": list(groups),
+        }
+        self.save_state("accounts", accounts)
+
+    def give(self, path: Path, account: str) -> None:
+        """Record ``path`` as owned by ``account``, as the fake chown does."""
+        entry = self.state_of("accounts")[account]
+        owners = self.state_of("owners")
+        owners[os.path.abspath(path)] = {"uid": entry["uid"], "gid": entry["gid"]}
+        self.save_state("owners", owners)
+
+    def system_options(self) -> tuple[str, ...]:
+        return ("--service-account", self.account, "--install-root", str(self.install_root))
 
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
