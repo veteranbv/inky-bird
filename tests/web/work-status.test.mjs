@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const source = await readFile(new URL('../../src/inky_bird_frame/web/work-status.js', import.meta.url), 'utf8');
-const { sourceState, nextCheck, requestState } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const { sourceState, sourceNote, nextCheck, requestState } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 
 test('saved success is not described as a currently active source', () => {
   assert.equal(sourceState({ enabled: true, status: 'ok' }, true), 'Checked');
@@ -40,4 +40,13 @@ test('an unknown request status is not reported as finished', () => {
 test('an incomplete saved check is named', () => {
   assert.match(sourceState({ enabled: true, status: 'degraded' }, true), /incomplete/);
   assert.equal(sourceState({ enabled: true, status: 'not_checked' }, true), 'Not checked yet');
+});
+
+test('a partial check and birds kept from the last good check are said plainly', () => {
+  assert.equal(sourceNote({ enabled: true, status: 'ok', partial: true }), 'Its last check read only part of its history.');
+  assert.equal(sourceNote({ enabled: true, status: 'error', carried_species_count: 3 }), 'Showing its last birds for now.');
+  assert.equal(sourceNote({ enabled: true, status: 'error', carried_species_count: 0 }), '');
+  assert.equal(sourceNote({ enabled: true, status: 'ok', partial: false }), '');
+  assert.equal(sourceNote({ enabled: true, status: 'ok' }), '');
+  assert.equal(sourceNote({ enabled: false, status: 'error', carried_species_count: 3, partial: true }), '');
 });

@@ -1,5 +1,5 @@
 import { icon } from '/app/ui.js';
-import { sourceState, nextCheck, requestState } from '/app/work-status.js';
+import { sourceState, sourceNote, nextCheck, requestState } from '/app/work-status.js';
 import { plural, plainDate, windowName, eventName, when } from '/app/words.js';
 
 export { plural };
@@ -573,11 +573,12 @@ export async function renderStatus(context) {
       const chip = el('span', '', 'chip');
       top.append(el('h2', name), chip);
       const summary = note('');
+      const extra = note('');
       const details = el('details');
       details.append(el('summary', 'Details'));
       const body = el('div');
       details.append(body);
-      node.append(top, summary, details);
+      node.append(top, summary, extra, details);
       if (['ebird-archive', 'birdnet-analyzer'].includes(source.name))
         node.append(link('Import history', 'imports', { kind: source.name }));
       if (known) {
@@ -585,7 +586,7 @@ export async function renderStatus(context) {
         setup.setAttribute('aria-label', 'Set up ' + name);
         node.append(setup);
       }
-      rows.set(source.name, { chip, summary, details, body, kind: sourceNames[source.name]?.[1] });
+      rows.set(source.name, { chip, summary, extra, details, body, kind: sourceNames[source.name]?.[1] });
       main.append(node);
     }
     const detections = el('section', '', 'journal-card');
@@ -609,6 +610,8 @@ export async function renderStatus(context) {
               checked ? 'last checked ' + checked : 'not checked yet',
             ].filter(Boolean).join(' · ');
         row.summary.hidden = !source.enabled;
+        row.extra.textContent = unavailable ? '' : sourceNote(source);
+        row.extra.hidden = !row.extra.textContent;
         row.details.hidden = !source.enabled;
         row.body.replaceChildren(
           ...(row.kind ? [note(row.kind)] : []),

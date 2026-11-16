@@ -13,6 +13,14 @@ export function sourceState(source, complete) {
   return 'Not checked yet';
 }
 
+// One plain sentence for what the state chip cannot say on its own.
+export function sourceNote(source) {
+  if (!source.enabled) return '';
+  if (source.status === 'error' && source.carried_species_count > 0) return 'Showing its last birds for now.';
+  if (source.status === 'ok' && source.partial === true) return 'Its last check read only part of its history.';
+  return '';
+}
+
 export function nextCheck(job, enabled = true, now = Date.now()) {
   if (!enabled) return 'Plate making is off.';
   if (job?.status === 'running') return 'Working now. New requests wait their turn.';

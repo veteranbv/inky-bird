@@ -1617,7 +1617,10 @@ class JournalService:
             )
             enabled = provider in config.discovery.sources
             status = result.get("status")
-            counts = [result.get(field) for field in ("species_count", "unresolved_count")]
+            counts = [
+                result.get(field)
+                for field in ("species_count", "unresolved_count", "carried_species_count")
+            ]
             if any(value is not None and (type(value) is not int or value < 0) for value in counts):
                 raise JournalError("Source diagnostic counts are invalid")
             sources.append(
@@ -1631,6 +1634,10 @@ class JournalService:
                     else "off",
                     "species_count": counts[0] if enabled else None,
                     "unresolved_count": counts[1] if enabled else None,
+                    # Only whether the check was partial: the provider's own
+                    # text stays in the controller state, like its errors.
+                    "partial": enabled and isinstance(result.get("warning"), str),
+                    "carried_species_count": counts[2] if enabled else None,
                     "activity": activity_rows.get("source-" + provider.value, {})
                     if enabled
                     else {},

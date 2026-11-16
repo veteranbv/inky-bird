@@ -647,6 +647,90 @@ def test_merged_latest_timestamp_is_not_attributed_to_each_provider(tmp_path: Pa
     assert records[1]["timestamp_source"] == "birdweather"
 
 
+def _sources_with_providers(
+    tmp_path: Path, providers: list[dict[str, object]]
+) -> dict[str, dict[str, object]]:
+    controller = config(tmp_path)
+    app = AppConfig(
+        DiscoveryConfig(
+            "12345",
+            None,
+            None,
+            None,
+            None,
+            8,
+            20,
+            ObservationWindow.LAST_30_DAYS,
+            sources=(
+                DiscoveryProvider.BIRDWEATHER,
+                DiscoveryProvider.BIRDBUDDY,
+                DiscoveryProvider.EBIRD_ARCHIVE,
+            ),
+        ),
+        controller,
+        DisplayNodeConfig("http://localhost:8000", tmp_path / "display"),
+    )
+    write_json_atomic(
+        controller.state_dir / "discovery.json",
+        {
+            "schema_version": 2,
+            "refreshed_at": STAMP,
+            "place_name": "",
+            "state": "",
+            "species": [],
+            "providers": providers,
+        },
+    )
+    management = JournalService(controller, app_config=app).management(approved=set())
+    assert "PRIVATE_" not in json.dumps(management)
+    rows = cast(list[dict[str, object]], management["sources"])
+    return {str(row["name"]): row for row in rows}
+
+
+def test_sources_report_a_partial_check_and_birds_carried_from_the_last_good_check(
+    tmp_path: Path,
+) -> None:
+    sources = _sources_with_providers(
+        tmp_path,
+        [
+            {
+                "name": "birdbuddy",
+                "status": "ok",
+                "species_count": 2,
+                "warning": "PRIVATE_WARNING_TEXT",
+            },
+            {
+                "name": "birdweather",
+                "status": "error",
+                "species_count": 0,
+                "error": "PRIVATE_ERROR_TEXT",
+                "last_success_at": STAMP,
+                "carried_species_count": 3,
+            },
+            {"name": "ebird-archive", "status": "ok", "species_count": 1},
+            # A disabled source keeps no saved detail on the page.
+            {"name": "inaturalist", "status": "error", "carried_species_count": 4, "warning": "x"},
+        ],
+    )
+    assert sources["birdbuddy"]["partial"] is True
+    assert sources["birdbuddy"]["carried_species_count"] is None
+    assert sources["birdweather"]["partial"] is False
+    assert sources["birdweather"]["carried_species_count"] == 3
+    assert sources["ebird-archive"]["partial"] is False
+    assert sources["ebird-archive"]["carried_species_count"] is None
+    assert sources["inaturalist"]["partial"] is False
+    assert sources["inaturalist"]["carried_species_count"] is None
+
+
+@pytest.mark.parametrize("carried", [-1, "3", 1.5, True])
+def test_sources_reject_an_invalid_carried_count(tmp_path: Path, carried: object) -> None:
+    with pytest.raises(JournalError, match="counts are invalid"):
+        _sources_with_providers(
+            tmp_path,
+            [{"name": "birdweather", "status": "error", "carried_species_count": carried}],
+        )
+
+
 def test_v1_migration_happens_only_on_edit_and_keeps_exact_private_backup(tmp_path: Path) -> None:
     original = {
         "schema_version": 1,
