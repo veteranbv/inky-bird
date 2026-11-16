@@ -12,28 +12,56 @@ run_initial_display=${INKY_BIRD_RUN_INITIAL_DISPLAY:-false}
 noninteractive_sudo=${INKY_BIRD_NONINTERACTIVE_SUDO:-false}
 unit_root="/etc/systemd/system"
 
-# Remove one distribution's files, except those the other one also owns.
+# Remove one distribution's files, except those the other one also owns. With
+# a third argument, move them into that directory instead, listing every move
+# first, so restore_distribution_program can put them back.
 remove_distribution_program='
+import json
+import shutil
 import sys
 from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
 try:
     removed = distribution(sys.argv[1])
 except PackageNotFoundError:
     sys.exit(0)
 kept = distribution(sys.argv[2])
+backup = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 owned = {kept.locate_file(path).resolve() for path in kept.files or ()}
-directories = set()
+targets = []
 for path in removed.files or ():
     target = removed.locate_file(path)
     if target.resolve() in owned or not (target.is_file() or target.is_symlink()):
         continue
-    target.unlink()
+    targets.append(target)
+if backup is not None:
+    backup.mkdir(exist_ok=True)
+    plan = [[str(target), str(backup / str(number))] for number, target in enumerate(targets)]
+    (backup / "plan.json").write_text(json.dumps(plan))
+directories = set()
+for number, target in enumerate(targets):
+    if backup is None:
+        target.unlink()
+    else:
+        shutil.move(str(target), str(backup / str(number)))
     directories.add(target.parent)
 for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
     try:
         directory.rmdir()
     except OSError:
         pass
+'
+restore_distribution_program='
+import json
+import shutil
+import sys
+from pathlib import Path
+plan = Path(sys.argv[1]) / "plan.json"
+if plan.exists():
+    for original, saved in json.loads(plan.read_text()):
+        if Path(saved).exists() or Path(saved).is_symlink():
+            Path(original).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(saved, original)
 '
 validate_program='
 import sys
@@ -199,11 +227,10 @@ restore_package() {
       "${venv}/bin/python" -m pip uninstall --disable-pip-version-check -y inky-bird
       ;;
     inky-bird-frame)
-      # While the renamed distribution is still what Python imports, removing
-      # the new one leaves the previous version exactly as it was.
-      if [ "${old_package_removed}" = true ] && [ "$("${venv}/bin/python" -I -c \
-          "${installed_source_program}" 2>/dev/null || true)" = "${new_runtime}" ]; then
-        return 1
+      # Put back the renamed distribution's files, then take the new one out.
+      if [ "${old_package_removed}" = true ]; then
+        "${venv}/bin/python" -I -c "${restore_distribution_program}" "${package_backup_dir}" || \
+          return 1
       fi
       "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird inky-bird-frame
       ;;
@@ -367,6 +394,7 @@ trap 'exit 143' TERM
 make_temp_dir work_dir
 unit_dir="${work_dir}/units"
 unit_backup_dir="${work_dir}/previous-units"
+package_backup_dir="${work_dir}/previous-package"
 mkdir "${unit_dir}" "${unit_backup_dir}"
 
 chmod 600 "${config_path}"
@@ -446,6 +474,15 @@ units_replaced=true
 "${sudo_command[@]}" install -m 0644 "${unit_dir}/${timer}" "${unit_root}/${timer}"
 "${sudo_command[@]}" systemctl daemon-reload
 "${sudo_command[@]}" systemctl enable "${service_prefix}-display.timer"
+# The renamed distribution's regular install shadows the new editable one, so
+# it goes before anything starts; it is kept aside until the upgrade is done.
+# Both list some of the same files, such as the inky-bird command; only the
+# files the new one does not also own go.
+if [ "${installed}" = inky-bird-frame ]; then
+  old_package_removed=true
+  "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird-frame inky-bird \
+    "${package_backup_dir}"
+fi
 "${sudo_command[@]}" systemctl restart "${service_prefix}-display.timer"
 if [ "${run_initial_display}" = true ]; then
   "${sudo_command[@]}" systemctl start "${service_prefix}-display.service"
@@ -453,14 +490,6 @@ fi
 systemctl is-enabled --quiet "${service_prefix}-display.timer"
 systemctl is-active --quiet "${service_prefix}-display.timer"
 
-# The renamed distribution's regular install shadows the new editable one, so
-# the previous version keeps running until this point. Both list some of the
-# same files, such as the inky-bird command; remove only the files the new one
-# does not also own.
-if [ "${installed}" = inky-bird-frame ]; then
-  old_package_removed=true
-  "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird-frame inky-bird
-fi
 installation_complete=true
 # Keep the previous runtime for rollback; nothing runs from anything older.
 if [ -n "${installed_source}" ] && \
