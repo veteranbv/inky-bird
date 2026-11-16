@@ -1,0 +1,14 @@
+{
+  "name": "Inky Bird",
+  "short_name": "Inky",
+  "description": "Your journal",
+  "start_url": "/app",
+  "scope": "/app",
+  "display": "standalone",
+  "background_color": "#f6f1e7",
+  "theme_color": "#fcf9f2",
+  "icons": [
+    { "src": "/app/icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "/app/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

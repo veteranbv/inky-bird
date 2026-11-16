@@ -21,6 +21,7 @@ FENCED_BLOCK = re.compile(r"^\s*```.*?^\s*```\s*$", re.MULTILINE | re.DOTALL)
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(\s*(?P<target><[^>]+>|[^\s)]+)(?:\s+[^)]*)?\s*\)")
 HTML_LINK = re.compile(r"\b(?:href|src|srcset)\s*=\s*[\"'](?P<target>[^\"']+)[\"']")
 REFERENCE_LINK = re.compile(r"^\s*\[[^\]]+\]:\s*(?P<target>\S+)", re.MULTILINE)
+UI_TEXT = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"|`([^`]*)`|>([^<>]+)<")
 HEADING = re.compile(r"^#{1,6}\s+(?P<title>.+?)\s*#*\s*$", re.MULTILINE)
 
 
@@ -108,7 +109,7 @@ def test_canonical_repository_links_and_clone_directory_agree() -> None:
     canonical = "https://github.com/veteranbv/inky-bird"
     contribution = (ROOT / "CONTRIBUTING.md").read_text()
     assert f"git clone {canonical}.git\ncd inky-bird\n" in contribution
-    for path in ("README.md", "pyproject.toml", "src/inky_bird_frame/web/journal.js"):
+    for path in ("README.md", "pyproject.toml", "src/inky_bird_frame/web/manage.js"):
         text = (ROOT / path).read_text()
         assert canonical in text
         assert canonical + "-frame" not in text
@@ -806,3 +807,144 @@ def test_cli_exit_codes_and_error_types_match_the_code() -> None:
             assert int(stated.group(1)) == expected, code
         else:
             assert expected == 1, f"{code} exits {expected}; the table must say so"
+
+
+def test_http_error_codes_and_statuses_match_the_code() -> None:
+    from inky_bird_frame.web import HTTP_ERROR_CODES
+
+    source = (ROOT / "src/inky_bird_frame/web.py").read_text(encoding="utf-8")
+    returned: defaultdict[str, set[int]] = defaultdict(set)
+    for status, code in re.findall(r'_error\(\s*(\d{3}),\s*"([a-z_]+)"', source):
+        returned[code].add(int(status))
+    assert set(returned) == set(HTTP_ERROR_CODES)
+
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("### Owner, screen and integration routes", 1)[1].split("\n### ", 1)[0]
+    documented = {
+        row[0].strip("`"): {int(row[1])}
+        for row in _markdown_table(section, "| `code` | Status | Meaning |")
+    }
+    assert documented == dict(returned)
+
+
+def _documented_error_forms() -> list[tuple[str, set[str]]]:
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("## HTTP errors", 1)[1].split("\n### ", 1)[0]
+    rows = _markdown_table(section, "| Addresses | `error` value |")
+    assert rows
+    forms = []
+    for addresses, value in rows:
+        assert value.startswith(("object", "plain string")), value
+        form = "object" if value.startswith("object") else "string"
+        forms.append((form, set(re.findall(r"`(/[^`]*)`", addresses))))
+    return forms
+
+
+def _is_prefix(address: str) -> bool:
+    return address != "/" and address.endswith("/")
+
+
+def _documented_error_form(route: str, forms: list[tuple[str, set[str]]]) -> str | None:
+    # An exact address beats a prefix; "…" stands for the rest of the path.
+    for form, addresses in forms:
+        if route in addresses or any(
+            a.endswith("…") and route.startswith(a[:-1]) for a in addresses
+        ):
+            return form
+    for form, addresses in forms:
+        if any(_is_prefix(a) and route.startswith(a) for a in addresses):
+            return form
+    return None
+
+
+def test_documented_error_form_matches_every_route() -> None:
+    from test_route_table import LEGACY_ENVELOPE_ROUTES, UNAUTHENTICATED
+
+    from inky_bird_frame.server import _READ_PATHS, _TELEMETRY_PATHS
+    from inky_bird_frame.web import APP_PREFIXES
+
+    forms = _documented_error_forms()
+    prefixes = {a for _form, addresses in forms for a in addresses if _is_prefix(a)}
+    assert prefixes == set(APP_PREFIXES)
+    for _method, route in UNAUTHENTICATED:
+        expected = "string" if route in LEGACY_ENVELOPE_ROUTES else "object"
+        assert _documented_error_form(route, forms) == expected, route
+    for route in (*_READ_PATHS, *_TELEMETRY_PATHS, "/v1/assets/species/1/portrait.png"):
+        assert _documented_error_form(route, forms) == "string", route
+    plain = {
+        a for form, addresses in forms if form == "string" for a in addresses if not _is_prefix(a)
+    }
+    assert plain == LEGACY_ENVELOPE_ROUTES | _READ_PATHS | _TELEMETRY_PATHS | {"/v1/assets/…"}
+
+
+def test_display_report_errors_match_the_code() -> None:
+    import inspect
+
+    from inky_bird_frame.server import MAX_TELEMETRY_REQUEST_BYTES, CatalogService
+
+    source = inspect.getsource(CatalogService.telemetry_response)
+    returned = {
+        (int(status), error)
+        for status, error in re.findall(r'(\d{3}),\s*\{"ok": False, "error": "([^"]+)"', source)
+    }
+    assert returned
+    guide = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    section = guide.split("### Display reports", 1)[1].split("\n## ", 1)[0]
+    documented = {
+        (int(status), error.strip("`"))
+        for status, error, _when in _markdown_table(section, "| Status | `error` | When |")
+    }
+    assert documented == returned
+    assert f"over {MAX_TELEMETRY_REQUEST_BYTES:,} bytes" in section
+
+
+def test_docs_say_head_answers_like_get() -> None:
+    for path in [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]:
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "returns 404 to `HEAD`" not in text, path.name
+        assert "`HEAD /health` returns 404" not in text, path.name
+    reference = (ROOT / "docs/reference.md").read_text(encoding="utf-8")
+    assert "Every `GET` route answers `HEAD`" in reference
+
+
+def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    web = ROOT / "src/inky_bird_frame/web"
+    literals = [
+        next(group for group in match.groups() if group is not None).strip()
+        for path in sorted(web.iterdir())
+        if path.suffix in {".js", ".html"}
+        for match in UI_TEXT.finditer(path.read_text(encoding="utf-8"))
+    ]
+    # Text a person reads starts with a capital; identifiers, classes and routes do not.
+    shown = [text for text in literals if text[:1].isupper() and "/" not in text]
+    rows = _markdown_table(readme, "| Word | Meaning |")
+    assert rows
+    for word, _meaning in rows:
+        label = re.compile(rf"\b{re.escape(word.strip('*'))}s?\b", re.IGNORECASE)
+        assert any(label.search(text) for text in shown), word
+
+
+def test_operations_guide_says_upgraded_birds_get_twelve_counted_tries() -> None:
+    guide = " ".join((ROOT / "docs/operations.md").read_text(encoding="utf-8").split())
+    assert "past 12 tries before an upgrade stops at its next failure" not in guide
+    assert "Failures from before this release are not counted" in guide
+
+
+def test_installation_guide_describes_when_upgrade_skips_the_plate_check() -> None:
+    guide = " ".join((ROOT / "docs/installation.md").read_text(encoding="utf-8").split())
+    assert "If the installed version cannot run at all, setup refuses" not in guide
+    assert "If the installed version cannot be loaded" in guide
+    assert "refuses only if the check itself fails to run" in guide
+
+
+def test_example_config_matches_retry_cap_and_generation_default() -> None:
+    example = " ".join((ROOT / "config.example.toml").read_text(encoding="utf-8").split())
+    assert "up to 6 hours, or delivery_retry_minutes if that is longer" in example
+    assert "Older files without this line keep generation on, unless app-managed" in example
+
+
+def test_notifications_guide_says_the_new_species_record_fails_quietly() -> None:
+    guide = " ".join((ROOT / "docs/notifications.md").read_text(encoding="utf-8").split())
+    assert "A notice or health record that cannot be saved" not in guide
+    assert "A queued notice or health record that cannot be saved leaves a warning" in guide

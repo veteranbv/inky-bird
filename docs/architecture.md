@@ -74,10 +74,12 @@ any pre-collection seed-queue taxa and records a one-time migration timestamp.
 This happens before pending approvals and prevents a later cycle from undoing
 an explicit collection removal.
 
-An authorized Bird Buddy provider keeps two additional private files under
-`state_dir`. `birdbuddy-auth.json` contains the user's authorization
-attestation, selected feeder, and rotating refresh token; the email, password,
-and short-lived access token are never stored. `birdbuddy-detections.json`
+An authorized Bird Buddy provider keeps private files under `state_dir`.
+`birdbuddy-auth.json` contains the user's authorization attestation, selected
+feeder, rotating refresh token and, when Bird Buddy issued one, the current
+access token and its expiry, so a sync does not sign in again each time. The
+email and password are never stored. `birdbuddy-backoff.json` records a wait
+Bird Buddy asked for; it is safe to delete. `birdbuddy-detections.json`
 deduplicates postcard species for 366 days, retains older all-time totals, and
 keeps the newest confirmed metadata evidence for each species and provenance.
 Private media identifiers link complete confirmed records back to cached
@@ -87,7 +89,7 @@ only while the corresponding confirmed media remains visible; it can update
 archived totals without retaining the postcard ID.
 Confirmed evidence closes the transient-feed gap without counting several
 media files as several visits. Account-level manual evidence affects discovery
-only when `birdbuddy_include_manual_sightings` is enabled. Both files use atomic
+only when `birdbuddy_include_manual_sightings` is enabled. These files use atomic
 mode-`0600` writes and never enter the served or published catalog.
 
 A self-hosted BirdNET-Go provider makes one bounded, read-only species-summary
@@ -99,9 +101,10 @@ catalog.
 
 BirdNET Analyzer imports use `birdnet-analyzer-detections.json` under
 `state_dir`. The private mode-`0600` file stores an unsalted SHA-256 of each
-recording segment's file name and times, species names, and an optional
-operator-supplied date. It never stores source paths, offsets, confidence
-values, or audio in readable form. Each species in a segment is its own record.
+record's CSV `File` value (often a full path), start and end times and species
+name. It keeps the species names and an optional operator-supplied date as
+written. It never stores source paths, offsets, confidence values, or audio in
+readable form. Each species in a segment is its own record.
 Reimports replace the species list of each segment in the upload atomically, so
 a re-analysis can add, change or remove detections; date-window discovery
 excludes undated segments rather than inventing observation times.
@@ -109,7 +112,7 @@ excludes undated segments rather than inventing observation times.
 eBird Archive imports use `ebird-archive-observations.json` under `state_dir`.
 The complete-snapshot state retains an unsalted SHA-256 of each eBird
 submission ID, calendar dates, and species identity only. Submission IDs are
-short numbers, so these hashes can be reversed by trying every ID: treat them as
+short sequential identifiers, so these hashes can be reversed by trying every ID: treat them as
 private owner data at rest, not as anonymous identifiers. Account details, raw checklist and location
 identifiers, coordinates, counts, comments, effort, and media metadata are
 discarded during import. A mode-`0600` atomic replacement occurs only after the
@@ -174,9 +177,9 @@ failures never block controller or display work.
 
 The controller exposes a small HTTP interface:
 
-- `GET /health`: service state, catalog counts, and application version. It
-  answers `GET` only: `HEAD /health` returns 404, so point a monitor that
-  uses `HEAD` at `/v1/catalog`
+- `GET /health`: service state, catalog counts, the notification dead-letter
+  count and application version. `HEAD` answers like `GET` without a body, on
+  this and every other `GET` route
 - `GET /v1/catalog`
 - `HEAD /v1/catalog`: the same fail-closed readiness status without a body
 - `GET /v1/assets/<active-image-path>`

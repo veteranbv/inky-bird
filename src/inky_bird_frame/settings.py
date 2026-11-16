@@ -112,7 +112,7 @@ def confirmed_config(initial: AppConfig, revision: str, *, load_secrets: bool) -
     """Bind validation and execution to the same confirmed configuration bytes."""
     path = initial.configuration_path
     if path is None:
-        raise SettingsError("Start Inky with its authoritative configuration file")
+        raise SettingsError("Start Inky with its settings file")
     content, raw, config = _read(path)
     if _revision(content) != revision:
         raise SettingsConflictError("Settings changed. Reload and review this action again.")

@@ -34,7 +34,9 @@ from inky_bird_frame.errors import CatalogError
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.journal import (
     MAX_JOURNAL_BYTES,
+    ChecklistEvidence,
     CollectionKind,
+    JournalCollection,
     JournalConflictError,
     JournalError,
     JournalMember,
@@ -45,6 +47,7 @@ from inky_bird_frame.journal import (
     read_journal,
     remove_collection,
     save_collection,
+    save_imported_collection,
 )
 from inky_bird_frame.retry import RetryRecord
 from inky_bird_frame.web import create_app
@@ -382,9 +385,25 @@ def test_every_journal_route_uses_owner_and_csrf_boundary(tmp_path: Path) -> Non
         assert client.get("/app/../journal.json").status_code == 404
         # Corruption errors never echo a private filename or a stored payload.
         (controller.state_dir / "journal.json").write_text("PRIVATE_PAYLOAD")
+        # Damaged local state is the controller's problem, not the request's.
         failed = client.get("/v1/owner/journal")
-        assert failed.status_code == 400
+        assert failed.status_code == 503
+        assert failed.json()["error"]["code"] == "journal_unavailable"
         assert "PRIVATE_PAYLOAD" not in failed.text and str(tmp_path) not in failed.text
+        refused = client.post(
+            "/v1/owner/journal/collections/save",
+            json={**body, "revision": 1},
+            headers={"Origin": ORIGIN, "X-Inky-CSRF": csrf},
+        )
+        assert refused.status_code == 503
+        (controller.state_dir / "journal.json").unlink()
+        mistake = client.post(
+            "/v1/owner/journal/collections/save",
+            json={**body, "revision": 0, "taxon_ids": ["not a bird"]},
+            headers={"Origin": ORIGIN, "X-Inky-CSRF": csrf},
+        )
+        assert mistake.status_code == 400
+        assert mistake.json()["error"]["code"] == "journal_error"
 
 
 def test_journal_keeps_missing_birds_and_projects_all_source_types_without_raw_errors(
@@ -985,9 +1004,9 @@ def test_unrelated_unavailable_history_still_allows_changes_for_listed_birds(
     assert service.favorite(revision=0, taxon_id=1, favorite=True).revision == 1
     assert service.save_selection(revision=1, label="Later", taxon_ids=[1]).revision == 2
     # A bird missing from the list may be in the unreadable history: say so.
-    with pytest.raises(JournalError, match="^Retained history needs attention"):
+    with pytest.raises(JournalError, match="^Your saved history from this source cannot be read"):
         service.favorite(revision=2, taxon_id=900, favorite=True)
-    with pytest.raises(JournalError, match="^Retained history needs attention"):
+    with pytest.raises(JournalError, match="^Your saved history from this source cannot be read"):
         service.save_selection(revision=2, label="Later", taxon_ids=[1, 900])
 
 
@@ -1104,3 +1123,230 @@ def test_non_utf8_analyzer_history_marks_only_that_source_unavailable(tmp_path: 
         for row in cast(list[dict[str, object]], snapshot["history_coverage"])
     }
     assert coverage == {"ebird-archive": "available", "birdnet-analyzer": "unavailable"}
+
+
+def _saved_failure(tmp_path: Path, **fields: object) -> Path:
+    failed = tmp_path / "42-synthetic-failure"
+    write_json_atomic(
+        failed / "failure.json",
+        {
+            "schema_version": 1,
+            "status": "failed",
+            "failed_at": STAMP,
+            "taxon_id": 42,
+            "common_name": "Example Bird",
+            "scientific_name": "Avis exempli",
+            "error": "synthetic",
+            **fields,
+        },
+    )
+    return failed
+
+
+def test_stopped_bird_tells_the_owner_automatic_retries_stopped(tmp_path: Path) -> None:
+    from inky_bird_frame.journal import terminal_failure
+
+    for reason, kind in (("retry_limit", "retry_limit"), ("research_limit", "research_limit")):
+        failed = _saved_failure(tmp_path, error_type="DataSourceError", stop_reason=reason)
+        summary = terminal_failure((failed,), 42)
+        assert summary["failure_kind"] == kind
+        assert "Automatic retries have stopped" in str(summary["failure_message"])
+        assert "backoff" not in str(summary["failure_message"])
+
+
+def test_failure_without_a_stop_reason_reads_as_before(tmp_path: Path) -> None:
+    from inky_bird_frame.journal import terminal_failure
+
+    for fields in ({}, {"stop_reason": "unknown-reason"}, {"stop_reason": 7}):
+        failed = _saved_failure(tmp_path, error_type="DataSourceError", **fields)
+        assert terminal_failure((failed,), 42) == {
+            **failure_guidance("DataSourceError"),
+            "recorded_attempts": 0,
+            "last_attempt_at": None,
+            "review_scores": {},
+            "last_failed_at": STAMP,
+        }
+
+
+def trip_with_unresolved(controller: ControllerConfig) -> JournalCollection:
+    link = ChecklistEvidence("c" * 64, "Turdus migratorius")
+    group = JournalCollection(
+        "b" * 32,
+        "A trip",
+        (
+            JournalMember(None, "Robin", "Turdus migratorius", MemberOrigin.EBIRD, (link,)),
+            JournalMember(None, "", "Unmatched species", MemberOrigin.EBIRD, ()),
+        ),
+        CollectionKind.TRIP,
+        "2001-03-01",
+        "2001-03-02",
+        1,
+        1,
+    )
+    save_imported_collection(controller.state_dir, revision=0, collection=group)
+    return group
+
+
+def test_saving_without_an_unresolved_choice_keeps_every_unresolved_member(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    state = JournalService(controller).save_selection(
+        revision=1, label="Renamed", taxon_ids=[], collection_id=group.collection_id
+    )
+    assert state.collections[0].members == group.members
+
+
+def test_owner_can_remove_and_resolve_unresolved_collection_members(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    unresolved = cast(list[object], group.owner_dict()["unresolved"])
+    assert unresolved == [
+        {"common_name": "Robin", "scientific_name": "Turdus migratorius"},
+        {"common_name": "", "scientific_name": "Unmatched species"},
+    ]
+    service = JournalService(controller)
+    # Remove the second: nothing else changes.
+    kept = service.save_selection(
+        revision=1,
+        label="A trip",
+        taxon_ids=[],
+        collection_id=group.collection_id,
+        remove_unresolved=[unresolved[1]],
+    )
+    assert kept.collections[0].members == group.members[:1]
+    assert kept.collections[0].kind == CollectionKind.TRIP
+    # Choosing the matching bird in place of its unresolved name resolves it
+    # and keeps its checklist link.
+    resolved = service.save_selection(
+        revision=2,
+        label="A trip",
+        taxon_ids=[1],
+        collection_id=group.collection_id,
+        remove_unresolved=[unresolved[0]],
+    )
+    member = resolved.collections[0].members
+    assert member == (
+        JournalMember(
+            1, "Robin", "Turdus migratorius", MemberOrigin.EBIRD, group.members[0].evidence
+        ),
+    )
+    assert read_journal(controller.state_dir) == resolved
+    owner = resolved.collections[0].owner_dict()
+    assert owner["unresolved"] == [] and owner["taxon_ids"] == [1]
+
+
+def test_resolving_does_not_replace_a_member_already_chosen(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    service = JournalService(controller)
+    first = service.save_selection(
+        revision=1, label="A trip", taxon_ids=[1], collection_id=group.collection_id
+    )
+    manual = next(item for item in first.collections[0].members if item.taxon_id == 1)
+    assert manual.origin == MemberOrigin.SAVED
+    second = service.save_selection(
+        revision=2,
+        label="A trip",
+        taxon_ids=[1],
+        collection_id=group.collection_id,
+        remove_unresolved=group.owner_dict()["unresolved"],
+    )
+    assert second.collections[0].members == (manual,)
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        "all",
+        [{"common_name": "", "scientific_name": "Not in this collection"}],
+        [{"scientific_name": "Unmatched species"}],
+        [
+            {"common_name": "", "scientific_name": "Unmatched species"},
+            {"common_name": "", "scientific_name": "Unmatched species"},
+        ],
+    ],
+)
+def test_unresolved_choice_must_name_this_collections_members(
+    tmp_path: Path, choice: object
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    before = (controller.state_dir / "journal.json").read_bytes()
+    with pytest.raises(JournalError):
+        JournalService(controller).save_selection(
+            revision=1,
+            label="A trip",
+            taxon_ids=[],
+            collection_id=group.collection_id,
+            remove_unresolved=choice,
+        )
+    assert (controller.state_dir / "journal.json").read_bytes() == before
+
+
+def test_new_collection_has_no_unresolved_members_to_keep(tmp_path: Path) -> None:
+    with pytest.raises(JournalError):
+        save_collection(
+            tmp_path,
+            revision=0,
+            label="New",
+            taxon_ids=[],
+            remove_unresolved=[{"common_name": "", "scientific_name": "Unmatched species"}],
+        )
+    assert save_collection(tmp_path, revision=0, label="New", taxon_ids=[], remove_unresolved=[])
+
+
+def _owner_client(client: TestClient) -> dict[str, str]:
+    login = client.post(
+        "/v1/owner/login",
+        headers={"Origin": ORIGIN},
+        json={"username": "qa-owner", "passphrase": "a synthetic long passphrase"},
+    )
+    return {"Origin": ORIGIN, "X-Inky-CSRF": login.json()["data"]["csrf"]}
+
+
+def test_the_collection_route_removes_unresolved_members_and_old_pages_still_save(
+    tmp_path: Path,
+) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    group = trip_with_unresolved(controller)
+    unresolved = cast(list[object], group.owner_dict()["unresolved"])
+    AccessStore(controller.state_dir).setup_owner("qa-owner", "a synthetic long passphrase")
+    with TestClient(create_app(controller), base_url=ORIGIN) as client:
+        headers = _owner_client(client)
+        route = "/v1/owner/journal/collections/save"
+        base = {"label": "A trip", "taxon_ids": [], "collection_id": group.collection_id}
+        # A page from before this field keeps every unresolved member.
+        old = client.post(route, json={**base, "revision": 1}, headers=headers)
+        assert old.status_code == 200, old.text
+        assert old.json()["data"]["collections"][0]["unresolved"] == unresolved
+        refused = client.post(
+            route, json={**base, "revision": 2, "remove_unresolved": "all"}, headers=headers
+        )
+        assert refused.status_code == 400
+        removed = client.post(
+            route,
+            json={**base, "revision": 2, "remove_unresolved": [unresolved[1]]},
+            headers=headers,
+        )
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["data"]["collections"][0]["unresolved"] == unresolved[:1]
+
+
+def test_owner_bird_rows_say_when_their_art_was_approved(tmp_path: Path) -> None:
+    controller = config(tmp_path)
+    catalog(controller)
+    save_collection(tmp_path / "state", revision=0, label="Waiting", taxon_ids=[2])
+    birds = {
+        cast(int, bird["taxon_id"]): bird
+        for bird in cast(list[dict[str, object]], JournalService(controller).snapshot()["birds"])
+    }
+    assert birds[1]["approved_at"] == STAMP
+    # A bird without approved art has no approval time to show.
+    assert "approved_at" not in birds[2]

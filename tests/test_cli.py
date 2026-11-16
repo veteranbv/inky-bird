@@ -122,7 +122,9 @@ def controller_config(state_dir: Path, catalog_dir: Path | None = None) -> Simpl
                 "audubon.org",
                 "birds.example",
                 "field.example",
-            )
+            ),
+            max_searches_per_day=5,
+            max_searches_per_species=2,
         ),
     )
 
@@ -729,12 +731,30 @@ class CliTests(unittest.TestCase):
                 return_value=SimpleNamespace(controller=controller),
             ) as load,
             patch("inky_bird_frame.cli.serve_catalog") as serve,
+            patch("inky_bird_frame.cli.record_controller_start"),
         ):
             result = serve_command(args)
 
         self.assertEqual(result, 0)
         load.assert_called_once_with(Path("instance.toml"), load_secrets=False)
         serve.assert_called_once_with(controller, app_config=load.return_value)
+
+    def test_serve_notes_its_start_before_serving(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = controller_config(Path(temporary))
+            started = Path(temporary) / "controller-started.json"
+            seen: list[bool] = []
+
+            def serve(*_args: object, **_kwargs: object) -> None:
+                seen.append(started.is_file())
+
+            with (
+                patch("inky_bird_frame.cli.load_config", return_value=config),
+                patch("inky_bird_frame.cli.serve_catalog", side_effect=serve),
+            ):
+                serve_command(Namespace(config=Path("instance.toml")))
+
+        self.assertEqual(seen, [True])
 
     def test_access_bootstrap_never_prints_the_setup_secret(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -3557,7 +3577,8 @@ rotation_mode = "shuffle_bag"
 
         body = degradation.call_args.kwargs["body"]
         self.assertNotIn(secret, body)
-        self.assertIn("DataSourceError", body)
+        self.assertIn("data source error", body)
+        self.assertNotIn("DataSourceError", body)
 
     def test_refresh_does_not_clear_taxonomy_alert_when_ebird_fails(self) -> None:
         config = SimpleNamespace(
@@ -3775,6 +3796,28 @@ def test_generate_failures_notify_terminal_errors_and_defer_transient_ones() -> 
     assert item["title"] == "Some bird generations are retrying"
     assert item["body"] == "2 species failed and were deferred without blocking the queue."
     assert [call.kwargs["key"] for call in recover.call_args_list] == ["generation-cycle"]
+
+
+def test_each_approved_plate_of_a_bird_is_announced() -> None:
+    first = {"taxon_id": 7, "common_name": "Example Bird", "portrait_sha256": "a" * 64}
+    replacement = {**first, "portrait_sha256": "b" * 64}
+    keys: list[str] = []
+    for result in (
+        {"published_pending": [first]},
+        {"generated": [{"taxon_id": 7, "common_name": "Example Bird", "published": replacement}]},
+    ):
+        with (
+            patch("inky_bird_frame.cli._config", return_value=_generation_config()),
+            patch("inky_bird_frame.cli.run_generation_cycle", return_value=result),
+            patch("inky_bird_frame.cli.safe_notify") as notify,
+            patch("inky_bird_frame.cli.safe_record_degradation"),
+            patch("inky_bird_frame.cli.safe_record_recovery"),
+            redirect_stdout(io.StringIO()),
+        ):
+            generate_command(Namespace())
+        keys.extend(call.kwargs["dedupe_key"] for call in notify.call_args_list)
+
+    assert keys == [f"7:{'a' * 64}", f"7:{'b' * 64}"]
 
 
 def test_generate_reports_both_deferred_and_manual_retry_items() -> None:

@@ -79,6 +79,11 @@ packages = ["src/inky_bird_frame"]
 [tool.hatch.build.targets.wheel.force-include]
 "docs/browser-access.md" = "inky_bird_frame/web/access-guide.txt"
 
+[tool.hatch.build.targets.sdist]
+# The plate catalog (over 1 GB) is published data, not package source. The
+# prompt evaluation harness is a separate development tool (evals/pyproject.toml).
+exclude = ["/catalog", "/evals"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -90,9 +95,10 @@ select = ["B", "E", "F", "I", "N", "SIM", "UP", "W"]
 python_version = "3.11"
 strict = true
 warn_unused_configs = true
-files = ["src/inky_bird_frame", "tests"]
+files = ["src/inky_bird_frame", "tests", "evals/plate_tuning"]
 # The vendored review contract is loaded by path; let tests type-check against it.
-mypy_path = ".github/scripts"
+# The evaluation harness package lives under evals/.
+mypy_path = ".github/scripts:evals"
 
 [[tool.mypy.overrides]]
 # Authlib ships no PEP 561 metadata. oidc.py checks its two imported surfaces
@@ -100,9 +106,17 @@ mypy_path = ".github/scripts"
 module = ["authlib.integrations.httpx_client", "authlib.oidc.core"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# The optional optimiser is installed only with the evaluation harness and is
+# imported in one module, gepa_integration.py.
+module = ["gepa"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+# The evaluation harness (evals/plate_tuning) is not part of the installed package.
+pythonpath = ["evals"]
 markers = [
     "repository_catalog: reads the committed catalog images, so it needs a full checkout",
 ]

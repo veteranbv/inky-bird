@@ -12,9 +12,22 @@ const root = path.resolve(__dirname, '../..');
 const python = process.env.INKY_QA_PYTHON || path.join(root, '.venv/bin/python');
 const username = 'synthetic-owner';
 const password = require('node:crypto').randomBytes(32).toString('base64url');
-const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'inky-history-browser-'));
-const origin = 'http://127.0.0.1:18796',
-  configPath = path.join(fixture, 'config.toml');
+// Everything in the fixture is synthetic: a fresh configuration, a random
+// password and its sessions, the public plates and synthetic history. CI keeps
+// it under INKY_QA_EVIDENCE_DIR so a failed run can upload it.
+const fixture = fs.mkdtempSync(
+  path.join(process.env.INKY_QA_EVIDENCE_DIR || os.tmpdir(), 'inky-history-browser-'),
+);
+const configPath = path.join(fixture, 'config.toml');
+// The server binds its own free port and reports it here, so parallel runs
+// never collide and readiness can only ever reach this run's server.
+const portFile = path.join(fixture, 'server.port');
+// The server appends one line per 5xx answer, missing app asset (404 under
+// /app) or unhandled exception, written before the answer is sent, so every
+// request path is covered however it was routed or made (page, fetch or API
+// request).
+const serverErrorFile = path.join(fixture, 'server-errors.jsonl');
+const readinessDeadlineMs = 120000;
 const publicCatalog = JSON.parse(fs.readFileSync(root + '/catalog/index.json')).species;
 const cardinal = publicCatalog.find((bird) => bird.common_name === 'Northern Cardinal');
 const robin = publicCatalog.find((bird) => bird.common_name === 'American Robin');
@@ -43,7 +56,7 @@ sys.path.insert(0,'tests')
 from ebird_fixtures import EXPORT_COLUMNS
 root=Path(${JSON.stringify(fixture)})
 p=root/'config.toml'
-raw=tomllib.loads(p.read_text());raw['controller'].update(catalog_dir=str(root/'catalog'),port=18796,bind_host='127.0.0.1');p.write_bytes(_toml(raw))
+raw=tomllib.loads(p.read_text());raw['controller'].update(catalog_dir=str(root/'catalog'),bind_host='127.0.0.1');p.write_bytes(_toml(raw))
 birds=json.loads(${JSON.stringify(JSON.stringify([cardinal, robin]))})
 with (root/'archive.csv').open('w',newline='') as handle:
  writer=csv.DictWriter(handle,fieldnames=EXPORT_COLUMNS,restval='');writer.writeheader()
@@ -75,15 +88,37 @@ const server = spawn(
   python,
   [
     '-c',
-    `from pathlib import Path
+    `import json,os,socket,tomllib
+from pathlib import Path
 import uvicorn
 from inky_bird_frame.config import load_config
+from inky_bird_frame.settings import _toml
+listener=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+listener.bind(('127.0.0.1',0));listener.listen(64)
+port=listener.getsockname()[1]
+p=Path(${JSON.stringify(configPath)})
+raw=tomllib.loads(p.read_text());raw['controller']['port']=port;p.write_bytes(_toml(raw))
 from inky_bird_frame.web import create_app
 import inky_bird_frame.community as community
 # Only this synthetic QA server replaces the remote community query.
 community.get_json=lambda *args,**kwargs: {'total_results':1,'results':[{'count':4,'taxon':{'id':${cardinal.taxon_id},'rank':'species','preferred_common_name':'Northern Cardinal','name':'Cardinalis cardinalis'}}]}
-config=load_config(Path(${JSON.stringify(configPath)}),load_secrets=False)
-uvicorn.run(create_app(config.controller,app_config=config),host='127.0.0.1',port=18796,access_log=False)
+config=load_config(p,load_secrets=False)
+served=create_app(config.controller,app_config=config)
+problems=Path(${JSON.stringify(serverErrorFile)})
+def record(entry):
+ with problems.open('a') as handle: handle.write(json.dumps(entry)+'\\n')
+async def app(scope,receive,send):
+ async def checked(message):
+  status=message.get('status',0) if message['type']=='http.response.start' else 0
+  if status>=500 or (status==404 and (scope.get('path','')+'/').startswith('/app/')):
+   record({'response':status,'path':scope.get('path')})
+  await send(message)
+ try: await served(scope,receive,checked)
+ except Exception as error:
+  record({'exception':type(error).__name__,'path':scope.get('path')});raise
+ready=Path(${JSON.stringify(portFile)});pending=ready.with_suffix('.pending')
+pending.write_text(str(port));os.replace(pending,ready)
+uvicorn.Server(uvicorn.Config(app,host='127.0.0.1',port=port,access_log=False)).run(sockets=[listener])
 `,
   ],
   {
@@ -93,16 +128,83 @@ uvicorn.run(create_app(config.controller,app_config=config),host='127.0.0.1',por
   },
 );
 
+let serverExit = null;
+server.on('exit', (code, signal) => {
+  serverExit = { code, signal };
+});
+// A crash inside the browser driver skips the cleanup below; never leave the server running.
+process.on('exit', () => {
+  if (!serverExit) server.kill('SIGTERM');
+});
+
+// Fails unless this run's own server answers before the deadline.
+async function serverOrigin() {
+  const deadline = Date.now() + readinessDeadlineMs;
+  let origin = null;
+  for (;;) {
+    if (serverExit) throw new Error('Synthetic server exited before it was ready');
+    if (Date.now() > deadline) throw new Error('Synthetic server was not ready in time');
+    if (!origin && fs.existsSync(portFile)) {
+      const port = Number(fs.readFileSync(portFile, 'utf8'));
+      assert(Number.isInteger(port) && port > 0 && port < 65536);
+      origin = 'http://127.0.0.1:' + port;
+    }
+    if (origin) {
+      try {
+        const response = await fetch(origin + '/v1/access', { signal: AbortSignal.timeout(5000) });
+        if (response.ok) return origin;
+      } catch {}
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+let serverErrorsRead = 0;
+let serverExitReported = false;
+// Moves new server-side problems into errors under the current phase.
+function collectServerErrors(t) {
+  if (fs.existsSync(serverErrorFile)) {
+    const lines = fs.readFileSync(serverErrorFile, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines.slice(serverErrorsRead))
+      t.errors.push({ phase: t.phase, server: JSON.parse(line) });
+    serverErrorsRead = lines.length;
+  }
+  if (serverExit && !serverExitReported) {
+    serverExitReported = true;
+    t.errors.push({ phase: t.phase, serverExit });
+  }
+}
+
+// Every page the journeys reach reads in the owner's words: no retired names
+// and no raw machine values. Commands and typed values are not prose.
+const RETIRED = [
+  'Saved birds', 'Current and saved', 'current selection', 'Available artwork',
+  'Review candidate', 'Plate work', 'Runnable', 'held for recovery', 'Operation outcome',
+  'Owner operation', 'Wall panel', 'not a sighting', 'approved artwork', 'dead letter',
+  'Refresh observations', 'Confirm action',
+];
+async function plainWords(page, label) {
+  const text = await page.evaluate(() => {
+    const main = document.querySelector('main');
+    if (!main) return '';
+    const copy = main.cloneNode(true);
+    for (const node of copy.querySelectorAll('pre, code, input, textarea, select')) node.remove();
+    return copy.textContent;
+  });
+  for (const old of RETIRED)
+    assert(!text.toLowerCase().includes(old.toLowerCase()), label + ': old name ' + old);
+  const raw = text.match(/\b(true|false|succeeded|last-\d+-days|last-week|last-day|all-time)\b/);
+  assert.equal(raw, null, label + ': a raw machine value is shown: ' + raw?.[0]);
+}
+
 function run(body) {
-  const t = { phase: 'start', engine, root, fixture, origin, publicCatalog, cardinal, robin, plateRoute, username, password };
+  const t = { phase: 'start', engine, root, fixture, publicCatalog, cardinal, robin, plateRoute, username, password };
   let browser, page;
   (async () => {
-    for (let n = 0; n < 50; n++) {
-      try {
-        if ((await fetch(origin + '/v1/access')).ok) break;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    t.phase = 'server-readiness';
+    const origin = await serverOrigin();
+    t.origin = origin;
+    t.phase = 'browser-launch';
     browser = await playwright[engine].launch({
       headless: true,
       ...(process.env.INKY_QA_BROWSER_EXECUTABLE
@@ -123,10 +225,36 @@ function run(body) {
     );
     page = await context.newPage();
     await page.clock.install();
-    const errors = [];
+    const errors = (t.errors = []);
     page.on('pageerror', (error) => errors.push({ phase: t.phase, message: error.message }));
+    // The server records the resource failures that matter (5xx and missing
+    // app assets); other 4xx answers are expected by the journeys.
+    context.on('console', (message) => {
+      if (message.type() === 'error' && !message.text().startsWith('Failed to load resource'))
+        errors.push({ phase: t.phase, console: message.text() });
+    });
+    // Fulfilled routes never reach the server, so they are not reported.
+    context.on('response', (response) => {
+      if (response.status() >= 500 || response.status() === 404) collectServerErrors(t);
+    });
+    let shots = 0;
     async function heading(name) {
       await page.getByRole('heading', { name, exact: true }).waitFor();
+      await plainWords(page, name);
+      // For reading every page as the owner would; never part of a normal run.
+      if (process.env.INKY_QA_SHOTS) {
+        const size = page.viewportSize();
+        const slug = String(++shots).padStart(3, '0') + '-' + name.replace(/[^A-Za-z0-9]+/g, '-');
+        for (const [width, height] of [[375, 812], [1280, 800]]) {
+          await page.setViewportSize({ width, height });
+          await page.waitForTimeout(100);
+          await page.screenshot({
+            path: path.join(process.env.INKY_QA_SHOTS, slug + '-' + width + '.png'),
+            fullPage: true,
+          });
+        }
+        await page.setViewportSize(size);
+      }
     }
     async function step(name) {
       for (let n = 0; n < 30; n++) {
@@ -140,6 +268,10 @@ function run(body) {
       JSON.parse(fs.readFileSync(path.join(fixture, 'var/controller/journal.json')));
     Object.assign(t, { browser, context, page, errors, heading, step, state });
     await body(t);
+    // Catches what no browser response showed, such as an API request's 5xx.
+    t.phase = 'server-errors';
+    collectServerErrors(t);
+    assert.deepEqual(errors, [], 'the real server answered every request without an error');
   })()
     .catch(async (error) => {
       if (page)
@@ -153,6 +285,7 @@ function run(body) {
             engine,
             phase: t.phase,
             type: error.name,
+            message: String(error.message).slice(0, 4000),
             actual: Array.isArray(error.actual) ? error.actual : undefined,
           },
           null,
@@ -161,6 +294,14 @@ function run(body) {
         { mode: 0o600 },
       );
       console.error('History browser failed at ' + t.phase + ': ' + error.name);
+      // Journey messages are synthetic; layout failures carry their measured boxes.
+      console.error('  ' + String(error.message).slice(0, 4000));
+      // Recorded problems are synthetic and often happened in an earlier phase.
+      for (const entry of Array.isArray(error.actual) ? error.actual : [])
+        if (entry && typeof entry === 'object' && 'phase' in entry)
+          console.error(
+            '  recorded in ' + entry.phase + ': ' + JSON.stringify({ ...entry, phase: undefined }),
+          );
       console.error(
         error.stack
           ?.split('\n')

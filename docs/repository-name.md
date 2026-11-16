@@ -25,13 +25,18 @@ on macOS or `~/.config/inky-bird` on Linux, and the `inky-bird` service family.
 Existing installs keep their detected configuration/runtime/service family.
 Explicit custom paths remain supported.
 
-Setup, doctor and uninstall use the same read-only identity resolver. A support
-root (even with a lost config), managed environment, installed unit/plist or
-loaded service/timer identifies an installation. If both families exist,
-setup and uninstall refuse to proceed;
-doctor reports the conflict. Resolve it with the operator rather than removing
-state or enabling another scheduler. A user LaunchAgent installer still refuses
-to compete with operator-managed system LaunchDaemons under either name.
+Setup, doctor and uninstall find the installation the same way, without
+changing anything. A support folder (even with a lost config), managed
+environment, installed unit or plist, or loaded service or timer identifies an
+installation. When only one name has services, or the configuration you pass
+to setup is in one name's support folder, that installation is used and
+leftover data under the other name does not block it. When both names still
+look installed, setup and uninstall stop and list what they found, and doctor
+reports the conflict; see
+[Troubleshooting](troubleshooting.md#find-your-installations-names-and-paths).
+Do not remove state or start a second scheduler to get past it. The user
+LaunchAgent installer also refuses to compete with administrator-managed system
+LaunchDaemons under either name.
 
 Uninstall removes only the selected family's jobs, including its dynamic
 scheduler. It leaves configuration, artwork, history, authentication and the
@@ -51,62 +56,31 @@ it requires the timer and service to be inactive before it changes any files.
 Use the existing service family, preserve the last panel image, and record the
 original enabled/active state for restoration.
 
-For an operator-managed pip/wheel deployment:
+If you install the wheel yourself with pip:
 
-1. Stage the exact new wheel, its dependencies and a recoverable old runtime.
-   Verify their source, hashes and compatibility before stopping anything.
-2. Quiesce the role's writers and take a completed encrypted state backup.
-   Prove an isolated restore of that backup. A source checkout is not a backup.
-3. Remove `inky-bird-frame` from that exact virtual environment **first**. Install
-   the staged `inky-bird` wheel into the same environment. Do not upgrade
-   unrelated hardware packages or relocate state as part of this operation.
-4. Check installed metadata, both commands, imports, doctor and the role's real
-   behavior. Resume the recorded schedule and verify a natural successful
-   display refresh with controller-received telemetry.
-5. If validation fails, stop the affected role and restore its matched runtime
-   and state preimages. If rolling back by wheel, remove `inky-bird` before
-   reinstalling the old wheel. Never erase journals or fabricate receipts.
+1. Download the new wheel and its dependencies, and keep the old wheel so you
+   can go back.
+2. Stop the role's services and timers, then take a backup with the
+   [backup guide](backup.md). A source checkout is not a backup.
+3. In that virtual environment, uninstall `inky-bird-frame` **first**, then
+   install the `inky-bird` wheel. Do not upgrade unrelated hardware packages or
+   move state at the same time.
+4. Check that both commands run and that `doctor` passes, then start the
+   services again and wait for the next display update to succeed.
+5. If something fails, stop the role and restore the old runtime and your
+   backup. To go back by wheel, uninstall `inky-bird` before reinstalling the
+   old wheel.
 
-The naming change does not alter the catalog wire format or private-state
-schema. Runtime replacement still needs its ordinary recovery checks. A label
-change alone is not a reason to reset an otherwise valid soak interval.
+The name change does not alter the catalog format or the private state files.
 
 ## Containers and release bundles
 
-One trusted build publishes both image names. Publication checks that every
-tag resolves to the build's same multi-platform index digest, with both Linux
-architectures and provenance/SBOM attestation manifests. An old image name does
-not mean old code. Compare an immutable digest or source revision, not a label.
+Every build is published under both image names with the same digest, so an
+old image name does not mean old code. To check what you run, compare the image
+digest or source revision, not the name.
 
 New releases provide `inky-bird-docker.tar.gz`. The old
 `inky-bird-frame-docker.tar.gz` filename remains a byte-identical download alias;
 both contain the canonical `inky-bird-docker/` directory. Use the supplied
 checksum and the documented `--strip-components=1` extraction. Keep existing
 `.env`, private configuration and Compose volumes when updating the image.
-
-## Repository cutover
-
-The GitHub rename is a separate owner operation, after compatibility changes
-pass the normal exact-head review and required checks. It does not deploy an
-application or create a release.
-
-1. Record the repository ID, rules, required-check producers, hooks, Pages,
-   reusable actions, release assets and package access.
-2. Verify trusted main publication under both image names. Do not publish an
-   unmerged release to test a name change.
-3. Check the personal gallery's catalog-fetch URLs and build integration.
-   A working deployed page does not prove its next build can fetch the catalog.
-4. Rename GitHub, then verify old/new Git reads, issue and release links, raw
-   index/manifest/image reads, package access and trusted check producers.
-   Prove the next normal publication can update both packages.
-5. Update local remotes and dependent source links deliberately. A catalog
-   publisher's configured repository and checkout remote must match. Leave
-   their old spellings together while relying on verified redirects, or update
-   both in a coordinated operation; never change one alone.
-
-Keep the old repository name unused so GitHub's redirects remain available.
-See [GitHub's rename documentation](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository).
-Pause if a required check, publisher, gallery read or old installation breaks.
-A bounded rename-back preserves the repository identity; reverse any separate
-configuration edits from their own preimages. Do not create another repository
-at either name as a rollback technique.

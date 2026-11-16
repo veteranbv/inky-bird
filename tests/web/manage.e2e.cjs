@@ -1,9 +1,11 @@
-// Manage, Sources, Settings, Plate work and candidate review.
+// Manage, Sources, Settings, In the works and new plates.
 // Run through journal.e2e.cjs only: phases run in its order and hand state
 // to later phases through t.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { noSideways } = require('./e2e-layout.cjs');
+const { execFileSync } = require('node:child_process');
 
 async function birdBuddySettings(t) {
   const { page, origin, heading } = t;
@@ -32,31 +34,89 @@ async function birdBuddySettings(t) {
   );
 }
 
-// Plate work: candidate review and recovery holds.
+// Saving a key from a session signed in long ago asks for the password first;
+// typing it must not withdraw the review that holds the confirmation.
+async function recentSignIn(t) {
+  const { page, origin, root, fixture, heading, password } = t;
+  t.phase = 'settings-recent-sign-in';
+  // Age this installation's own sessions past the recent sign-in window,
+  // under the store's lock, as real time would.
+  execFileSync(
+    process.env.INKY_QA_PYTHON || path.join(root, '.venv/bin/python'),
+    [
+      '-c',
+      `from dataclasses import replace
+from pathlib import Path
+from inky_bird_frame.access import RECENT_AUTH_SECONDS, AccessStore
+from inky_bird_frame.config import load_config
+store=AccessStore(load_config(Path(${JSON.stringify(path.join(fixture, 'config.toml'))}),load_secrets=False).controller.state_dir)
+with store._locked() as state:
+ assert state.sessions
+ state.sessions=[replace(s,authenticated_at=s.authenticated_at-2*RECENT_AUTH_SECONDS) for s in state.sessions]
+ store._save(state)
+`,
+    ],
+    { cwd: root, env: { PATH: process.env.PATH, PYTHONPATH: root + '/src' } },
+  );
+  await page.goto(origin + '/app?page=settings&source=ebird');
+  await heading('eBird nearby');
+  await page.getByLabel('eBird API key', { exact: true }).fill('SYNTHETIC_EBIRD_KEY');
+  await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+  await page.getByRole('button', { name: 'Save settings', exact: true }).click();
+  const confirmation = page.getByLabel('Your Inky password', { exact: true });
+  await confirmation.waitFor();
+  // Typed key by key, as an owner would.
+  await confirmation.pressSequentially(password);
+  await confirmation.press('Enter');
+  await page.getByRole('button', { name: 'Confirm and save', exact: true }).click();
+  await heading('eBird nearby');
+  await page.getByText('Saved. Leave this empty to keep it.', { exact: true }).waitFor();
+  assert.equal(await page.getByLabel('eBird API key', { exact: true }).inputValue(), '');
+}
+
+// An outcome page says what happened in its own sentence, never the controller's.
+async function plainOutcome(page) {
+  const text = await page.locator('main').innerText();
+  assert(
+    !/Candidate (approved|rejected)|locally|catalog publication|explicit reviewed|no model|Plate work|Operation outcome|Owner operation|succeeded|_/i.test(text),
+    'machine words on the outcome page: ' + text,
+  );
+}
+
+// In the works: new plates and plates that need a hand.
 async function candidates(t) {
   const { page, origin, fixture, heading } = t;
   t.phase = 'candidate-inspection-and-approval';
   await page.goto(origin + '/app?page=work');
-  await heading('Plate work');
+  await heading('In the works');
+  await page.getByText('Plates are made one at a time.', { exact: true }).waitFor();
+  await page.getByText('2 new plates are ready to look at.', { exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Needs a hand', exact: true }).waitFor();
+  const workText = await page.locator('main').innerText();
+  assert(!/Plate work|Runnable|held for recovery|operator recovery|succeeded|_/.test(workText), 'machine words on In the works');
+  await noSideways(page, 'In the works');
   await page
-    .getByRole('link', { name: 'Inspect Synthetic QA candidate 9999991', exact: true })
+    .getByRole('link', { name: 'Look at Synthetic QA candidate 9999991', exact: true })
     .click();
-  await heading('Review candidate');
+  await heading('A new page for your journal');
+  await page.getByText('Checks passed', { exact: true }).waitFor();
+  await page.getByText('No place details in the image', { exact: true }).waitFor();
   await page.locator('.detail-art').evaluate((image) => image.decode());
   await page
     .getByRole('checkbox', {
-      name: 'I inspected the full plate, its text, anatomy and cited review. Make this artwork approved locally and eligible for existing publication.',
+      name: 'I looked at the whole plate: the bird, its lettering and the references.',
       exact: true,
     })
     .check();
-  await page.getByRole('button', { name: 'Confirm local approval', exact: true }).click();
-  await heading('Operation outcome');
+  await page.getByRole('button', { name: 'Keep this plate', exact: true }).click();
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('The plate is in your journal.', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('The plate is in your journal.', { exact: true }).waitFor();
+  await heading('Keeping a new plate');
+  await plainOutcome(page);
   assert(
     fs.existsSync(
       path.join(fixture, 'catalog/species/9999991-synthetic-qa-candidate-9999991/manifest.json'),
@@ -64,18 +124,22 @@ async function candidates(t) {
   );
   t.phase = 'candidate-rejection';
   await page.goto(origin + '/app?page=candidate&bird=9999992');
-  await heading('Review candidate');
+  await heading('A new page for your journal');
   await page
-    .getByLabel('Why reject this candidate?', { exact: true })
+    .getByText('This note is sent to the image service to guide the next attempt.', { exact: true })
+    .waitFor();
+  await page
+    .getByLabel('Why send it back?', { exact: true })
     .fill('Synthetic QA rejection, retain the fixture privately.');
-  await page.getByRole('button', { name: 'Confirm rejection', exact: true }).click();
-  await heading('Operation outcome');
+  await page.getByRole('button', { name: 'Send this plate back', exact: true }).click();
   for (let n = 0; n < 20; n++) {
-    if (await page.getByText('succeeded', { exact: true }).isVisible()) break;
+    if (await page.getByText('The plate was sent back.', { exact: true }).isVisible()) break;
     await page.clock.runFor(1100);
     await page.waitForTimeout(20);
   }
-  await page.getByText('succeeded', { exact: true }).waitFor();
+  await page.getByText('The plate was sent back.', { exact: true }).waitFor();
+  await heading('Sending a plate back');
+  await plainOutcome(page);
   assert(
     fs.existsSync(
       path.join(
@@ -84,17 +148,20 @@ async function candidates(t) {
       ),
     ),
   );
-  t.phase = 'recovery-hold-banner';
+  t.phase = 'needs-a-hand';
+  // Home greets new plates only; a plate that needs a hand lives in Manage.
   await page.goto(origin + '/app');
-  await heading('Your field journal');
-  await page.getByRole('link', { name: '1 plate held for recovery', exact: true }).waitFor();
-  assert.equal(await page.getByText(/ready for your review/).count(), 0);
-  await page.getByRole('link', { name: '1 plate held for recovery', exact: true }).click();
-  await heading('Plate work');
+  await heading('Your journal');
+  assert.equal(await page.getByText(/held for recovery|needs? a hand|ready to look at/i).count(), 0);
+  // Manage counts the plate that needs a hand and links to it.
+  await page.goto(origin + '/app?page=manage');
+  await heading('Manage');
+  await page.getByRole('link', { name: /^(1 plate needs|[2-9] plates need) a hand$/ }).click();
+  await heading('In the works');
   await page
-    .getByText('Taxon 9999993: incomplete or unsafe pending state. Use operator recovery before retrying.', { exact: true })
+    .getByText(/^Taxon 9999993: its new plate is unfinished\./)
     .waitFor();
-  assert.equal(await page.getByRole('link', { name: /Inspect .*9999993/ }).count(), 0);
+  assert.equal(await page.getByRole('link', { name: /Look at .*9999993/ }).count(), 0);
 }
 
 async function integrations(t) {
@@ -103,18 +170,18 @@ async function integrations(t) {
   await page.goto(origin + '/app?page=integrations');
   await heading('Integrations');
   await page
-    .getByLabel('Permitted view', { exact: true })
+    .getByLabel('Birds to show', { exact: true })
     .first()
     .selectOption(imported.collection_id);
   await page
     .getByLabel(
-      'I approve exposing this selected species membership on my trusted network or VPN',
+      'I understand anyone on my network or VPN can see which birds this shows',
       { exact: true },
     )
     .check();
   await Promise.all([
     page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Enable this art view', exact: true }).click(),
+    page.getByRole('button', { name: 'Turn on dashboard plates', exact: true }).click(),
   ]);
   const artResponse = await context.request.get(origin + '/v1/dashboard/art');
   assert.equal(artResponse.status(), 200);
@@ -129,16 +196,17 @@ async function integrations(t) {
   });
   assert.equal(aggregate.status(), 200);
   assert(!JSON.stringify(await aggregate.json()).includes(trip.label));
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Integrations');
   await Promise.all([
     page.waitForEvent('load'),
     page.getByRole('button', { name: 'I saved it · clear this copy', exact: true }).click(),
   ]);
   await heading('Integrations');
   assert.equal(await page.getByText(serviceSecret, { exact: true }).count(), 0);
+  await page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click();
   await Promise.all([
     page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click(),
+    page.getByRole('button', { name: 'Revoke', exact: true }).click(),
   ]);
   await heading('Integrations');
   assert.equal(
@@ -159,18 +227,18 @@ async function health(t) {
   t.phase = 'health-and-guides';
   await page.goto(origin + '/app?page=health');
   await heading('Health and help');
-  await page.getByRole('heading', { name: 'Approved catalog index · ok', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Your plates · Fine', exact: true }).waitFor();
   for (const [area, title] of [
     ['backups', 'Backups and upgrades'],
     ['advanced', 'Advanced tools'],
   ]) {
     await page.goto(origin + '/app?page=' + area);
     await heading(title);
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await noSideways(page, title);
   }
 }
 
-module.exports = { birdBuddySettings, candidates, integrations, health };
+module.exports = { birdBuddySettings, recentSignIn, candidates, integrations, health };
 
 if (require.main === module) {
   console.error('Run tests/web/journal.e2e.cjs');

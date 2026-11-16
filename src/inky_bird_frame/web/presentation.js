@@ -1,21 +1,34 @@
 // Owner-only controls. Screen cookies and status credentials are not owner logins.
+import { inlineProblem, clearProblem } from '/app/ui.js';
+import { confirmAction } from '/app/frame-tools.js';
+import { WORDS, when } from '/app/words.js';
+
 export async function renderPresentation(ui, { base, link, note, data, area }) {
   const { api, element: el, button } = ui,
     main = document.querySelector('#main');
   base(
-    area === 'integrations' ? 'Integrations' : 'Displays',
-    'Choose what each destination may see. A browser never reports a physical panel update.',
+    area === 'integrations' ? 'Integrations' : 'Wall frame',
+    area === 'integrations'
+      ? 'Choose what your home dashboard may see.'
+      : 'Choose what your wall frame and paired screens show.',
   );
-  const state = await api('/v1/owner/presentation');
+  let state;
+  try {
+    state = await api('/v1/owner/presentation');
+  } catch (error) {
+    main.append(link('Back to Manage', 'manage'));
+    inlineProblem(ui, main, error, { label: 'Try again', action: () => location.reload() });
+    return;
+  }
   const label = (key) =>
     key === 'current'
-      ? 'Current and saved'
+      ? WORDS.onMyFrame
       : key === 'saved'
-        ? 'Saved birds'
+        ? WORDS.addedByYou
         : key === 'all'
-          ? 'All available artwork'
+          ? WORDS.allBirds
           : key === 'favorites'
-            ? 'Favorites'
+            ? WORDS.favorites
             : data.collections.find((group) => group.collection_id === key)?.label ||
               'Removed collection';
   const views = [
@@ -29,6 +42,9 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   ];
   let serial = 0,
     busy = false;
+  // At most one open confirmation per section.
+  const confirmations = new WeakMap();
+  const refuse = (section, text) => inlineProblem(ui, section, new Error(text));
   function field(section, title, type = 'text', value = '') {
     const label = el('label', title),
       input = el('input');
@@ -45,7 +61,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     return input;
   }
   function choice(section, selected = 'current') {
-    const name = el('label', 'Permitted view'),
+    const name = el('label', 'Birds to show'),
       input = el('select');
     input.id = 'view-' + ++serial;
     name.htmlFor = input.id;
@@ -58,16 +74,30 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     section.append(name, input);
     return input;
   }
+  // Resolves true once the change was made, false when it was not.
   async function update(body, section, done = () => location.reload()) {
-    if (busy) return;
+    if (busy) {
+      inlineProblem(ui, section, {
+        message: 'Another change is still being saved. Try again when it finishes.',
+      });
+      return false;
+    }
     busy = true;
     try {
-      done(
-        await api('/v1/owner/presentation', { revision: state.revision, confirm: true, ...body }),
-      );
+      const result = await api('/v1/owner/presentation', {
+        revision: state.revision,
+        confirm: true,
+        ...body,
+      });
+      clearProblem(section);
+      done(result);
+      return true;
     } catch (error) {
       if (error.code === 'confirmation_required') {
+        clearProblem(section);
+        confirmations.get(section)?.remove();
         const notice = el('section', '', 'notice');
+        confirmations.set(section, notice);
         notice.append(
           note(
             'Confirm it is you before granting or changing access. Your choices stay on this page.',
@@ -85,7 +115,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
                 await update(body, section, done);
               } catch (failure) {
                 password.value = '';
-                notice.append(el('p', failure.message, 'error'));
+                inlineProblem(ui, notice, failure);
               }
             }),
           );
@@ -93,39 +123,57 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
         }
         if (ui.singleSignOnReady)
           notice.append(
-            button('Confirm with single sign-on', () => ui.confirmWithSSO()),
+            button('Confirm with single sign-on', async () => {
+              try {
+                await ui.confirmWithSSO();
+              } catch (failure) {
+                inlineProblem(ui, notice, failure);
+              }
+            }),
             note(
               'Sign-in returns to Account and access. Return here and repeat this change; unsaved entries will clear.',
             ),
           );
         notice.append(button('Cancel confirmation', () => notice.remove()));
         section.append(notice);
-      } else section.append(el('p', error.message, 'error'));
+      } else inlineProblem(ui, section, error);
+      return false;
     } finally {
       busy = false;
     }
   }
+  // Revoking takes two presses: the first only asks.
+  function revoke(section, id, label, question, keep) {
+    return confirmAction({
+      button,
+      label,
+      question,
+      confirmLabel: label.startsWith('Remove') ? 'Remove' : 'Revoke',
+      cancelLabel: keep,
+      action: () => update({ action: 'revoke', id }, section),
+    }).node;
+  }
   main.append(link('Back to Manage', 'manage'));
   if (area === 'displays') {
     main.append(
-      el('h2', 'Browser screens'),
+      el('h2', 'Paired screens'),
       note(
-        'Open /screen through HTTPS on the tablet or computer you want to pair. Genuine controller loopback also works. Plain LAN HTTP can use owner Frame instead. A pairing code connects a read-only screen; it is not part of normal owner sign-in.',
+        'On the tablet or computer you want to use, open /screen at your HTTPS address, then match its code here. A paired screen shows plates only and cannot sign in. On a plain home-network address, use Play instead.',
       ),
-      el('a', 'Open screen pairing'),
+      el('a', 'Open the screen page'),
     );
     main.lastChild.href = '/screen';
     main.lastChild.className = 'text-link';
     for (const grant of state.grants.filter((grant) => grant.kind !== 'status')) {
       const section = el('section', '', 'journal-card');
       section.append(
-        el('h2', grant.kind === 'pending' ? 'Pairing request · ' + grant.pairing_code : grant.name),
+        el('h2', grant.kind === 'pending' ? 'Screen waiting to pair · ' + grant.pairing_code : grant.name),
       );
       if (grant.kind === 'pending') {
-        section.append(note('Match this code on the actual screen before granting access.'));
+        section.append(note('Check that the screen shows this code before you pair it.'));
         const name = field(section, 'Screen name', 'text', ''),
           view = choice(section),
-          days = field(section, 'Access expires after days', 'number', '90');
+          days = field(section, 'Days to keep showing birds', 'number', '90');
         name.maxLength = 128;
         days.min = '1';
         days.max = '365';
@@ -137,7 +185,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
         section.append(
           button('Pair this screen', () => {
             if (!consent.checked) {
-              section.append(el('p', 'Match the code and confirm first.', 'error'));
+              refuse(section, 'Match the code and confirm first.');
               return;
             }
             update(
@@ -155,52 +203,52 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
       } else
         section.append(
           note(label(grant.view)),
-          note('Expires ' + new Date(grant.expires_at * 1000).toLocaleString()),
+          ...(when(grant.expires_at * 1000)
+            ? [note('Shows birds until ' + when(grant.expires_at * 1000))]
+            : []),
           note(
             grant.last_seen_at
-              ? 'Last connection, hour precision: ' +
-                  new Date(grant.last_seen_at * 1000).toLocaleString()
+              ? 'Last seen ' + when(grant.last_seen_at * 1000)
               : 'Not connected yet',
           ),
         );
       section.append(
-        button(grant.kind === 'pending' ? 'Remove request' : 'Revoke screen', () =>
-          update({ action: 'revoke', id: grant.id }, section),
-        ),
-        note(
-          'Revocation clears an online screen on its next check. An offline screen cannot receive it until it reconnects.',
-        ),
+        grant.kind === 'pending'
+          ? revoke(section, grant.id, 'Remove request', 'Remove this pairing request?', 'Keep request')
+          : revoke(
+              section,
+              grant.id,
+              'Revoke screen',
+              'Revoke this screen? It stops showing birds at its next check.',
+              'Keep access',
+            ),
+        note('A screen that is on clears at its next check; one that is off clears when it reconnects.'),
       );
       main.append(section);
     }
     const wall = el('section', '', 'journal-card');
     wall.append(
-      el('h2', 'Physical wall panel'),
-      note('Selected route: ' + label(state.wall_view)),
-      note(
-        'This applies on its next scheduled refresh only if the display uses the selected-wall address. Existing /v1/catalog clients remain unchanged.',
-      ),
-      note(
-        'An empty or removed view pauses rotation and keeps the last image on the panel. Choose a view with approved plates to resume.',
-      ),
+      el('h2', 'What your wall frame shows'),
+      note('Now: ' + label(state.wall_view)),
+      note('A change shows from its next refresh, if your wall frame uses the /wall address below.'),
+      note('If the view has no plates, the wall frame keeps its last plate until it does.'),
     );
     const view = choice(wall, state.wall_view),
-      consent = field(wall, 'I want this view on the selected-wall route', 'checkbox');
+      consent = field(wall, 'Show this view on my wall frame', 'checkbox');
     wall.append(
-      button('Confirm wall selection', () => {
+      button('Show on my wall frame', () => {
         if (consent.checked) update({ action: 'wall', view: view.value }, wall);
-        else wall.append(el('p', 'Confirm the wall change first.', 'error'));
+        else refuse(wall, 'Tick the box first.');
       }),
       note(
-        'One-time operator setup: set display_node.controller_url to ' +
+        'One-time setup on the wall frame: set display_node.controller_url to ' +
           location.origin +
-          '/wall, then restart the display service. This page does not change that device configuration.',
+          '/wall, then restart its display service. This page cannot change that for you.',
       ),
       note(
-        'Last confirmed panel update: ' +
-          (data.management.last_confirmed_panel_update
-            ? new Date(data.management.last_confirmed_panel_update).toLocaleString()
-            : 'Not received'),
+        data.management.last_confirmed_panel_update
+          ? 'Your wall frame last changed ' + when(data.management.last_confirmed_panel_update) + '.'
+          : 'Your wall frame has not reported a change yet.',
       ),
     );
     main.append(wall);
@@ -208,34 +256,34 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   }
   const art = el('section', '', 'journal-card');
   art.append(
-    el('h2', 'Dashboard artwork'),
+    el('h2', 'Plates on a dashboard'),
     note(state.dashboard_view ? 'On · ' + label(state.dashboard_view) : 'Off'),
     note(
-      'This is a minimal art page, without owner cookies, private labels, dates, source names or detection details. Anyone who can reach its permitted network address can learn the selected species. Framing restrictions do not authenticate a visitor.',
+      'A plain page of plates: no dates, sources or private names. Anyone who can reach it on your network can see which birds it shows.',
     ),
   );
   const view = choice(art, state.dashboard_view || 'current'),
     consent = field(
       art,
-      'I approve exposing this selected species membership on my trusted network or VPN',
+      'I understand anyone on my network or VPN can see which birds this shows',
       'checkbox',
     );
   art.append(
-    button('Enable this art view', () => {
+    button('Turn on dashboard plates', () => {
       if (consent.checked) update({ action: 'dashboard', view: view.value }, art);
-      else art.append(el('p', 'Read and confirm the exposure first.', 'error'));
+      else refuse(art, 'Tick the box first.');
     }),
   );
   if (state.dashboard_view)
-    art.append(button('Turn dashboard art off', () => update({ action: 'dashboard-off' }, art)));
+    art.append(button('Turn dashboard plates off', () => update({ action: 'dashboard-off' }, art)));
   art.append(
     note(
-      'Permitted framing origins: ' +
-        (state.embed_allowed_origins.join(', ') ||
-          'This Inky origin only. Configure controller.embed_allowed_origins and restart for a separate dashboard.'),
+      state.embed_allowed_origins.length
+        ? 'Dashboards that may show it: ' + state.embed_allowed_origins.join(', ')
+        : 'Only this Inky address may show it. For another dashboard, set controller.embed_allowed_origins and restart Inky.',
     ),
     note(
-      'An HTTPS dashboard needs an HTTPS Inky address. A remote phone still needs a private route or VPN. Never disable certificate checks or expose owner paths just to make an embed work.',
+      'An HTTPS dashboard needs an HTTPS Inky address, and a phone away from home needs your VPN. Never turn off certificate checks to make it work.',
     ),
   );
   const mixedContent =
@@ -245,7 +293,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     art.append(
       el(
         'p',
-        'Your configured dashboard uses HTTPS, but this Inky address uses HTTP. The browser will block this art recipe. Open Inky through its private HTTPS address before copying it. Status sensors still work server-side.',
+        'Your dashboard uses HTTPS, but this Inky address uses HTTP, so the browser will block the plates. Open Inky at its HTTPS address before copying this. Status sensors still work.',
         'notice',
       ),
     );
@@ -262,7 +310,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   status.append(
     el('h2', 'Status sensors'),
     note(
-      'A separate read-only credential exposes only version, approved-library and in-rotation counts, coarse discovery state and panel health. In rotation counts approved plates in its permitted view, which can differ from the wall view. It cannot read collections, histories, source credentials or images. It expires and can be revoked here.',
+      'A separate read-only credential shares only the version, how many plates you have and how many are showing in its view, how the last check went, and the wall frame’s health. It cannot see collections, history, keys or images. It expires, and you can revoke it here.',
     ),
   );
   const name = field(status, 'Credential name', 'text', 'Dashboard status'),
@@ -271,46 +319,55 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
   days.min = '1';
   days.max = '365';
   name.maxLength = 128;
-  status.append(
-    button('Create status credential', () =>
-      update(
-        { action: 'status', name: name.value, view: permitted.value, days: Number(days.value) },
-        status,
-        (result) => {
-          state.revision += 1;
-          const once = el('section', '', 'notice'),
-            secret = el('pre');
-          secret.textContent = result.secret;
-          once.append(
-            el('h2', 'Copy this credential now'),
-            note(
-              'It is shown once. Store it in your dashboard secret store. Reloading loses this copy; revoke and create another if needed.',
-            ),
-            secret,
-          );
-          const config = el('pre');
-          config.textContent =
-            'GET ' +
-            location.origin +
-            '/v1/integrations/status\nAuthorization: Bearer <saved status credential>\n\nHome Assistant:\nrest:\n  - resource: ' +
-            location.origin +
-            '/v1/integrations/status\n    headers:\n      Authorization: !secret inky_status_authorization\n    scan_interval: 60\n    sensor:\n      - name: Inky plates in rotation\n        value_template: "{{ value_json.data.view_ready_count }}"\n      - name: Inky approved plates\n        value_template: "{{ value_json.data.approved_count }}"\n\nHomepage customapi:\nwidget:\n  type: customapi\n  url: ' +
-            location.origin +
-            '/v1/integrations/status\n  headers:\n    Authorization: "Bearer {{HOMEPAGE_VAR_INKY_STATUS}}"\n  mappings:\n    - field: data.view_ready_count\n      label: In rotation\n      format: number\n    - field: data.approved_count\n      label: Approved\n      format: number';
-          once.append(
-            config,
-            button('I saved it · clear this copy', () => location.reload()),
-          );
-          status.append(once);
-        },
-      ),
-    ),
-  );
+  // One press makes one credential: the button stays off once it is made.
+  const create = button('Create status credential', async () => {
+    create.disabled = true;
+    const made = await update(
+      { action: 'status', name: name.value, view: permitted.value, days: Number(days.value) },
+      status,
+      (result) => {
+        create.disabled = true;
+        state.revision += 1;
+        const once = el('section', '', 'notice'),
+          secret = el('pre');
+        secret.textContent = result.secret;
+        once.append(
+          el('h2', 'Copy this credential now'),
+          note(
+            'It is shown only once. Keep it in your dashboard’s secret store. If you lose it, revoke it and make another.',
+          ),
+          secret,
+        );
+        const config = el('pre');
+        config.textContent =
+          'GET ' +
+          location.origin +
+          '/v1/integrations/status\nAuthorization: Bearer <saved status credential>\n\nHome Assistant:\nrest:\n  - resource: ' +
+          location.origin +
+          '/v1/integrations/status\n    headers:\n      Authorization: !secret inky_status_authorization\n    scan_interval: 60\n    sensor:\n      - name: Inky plates in rotation\n        value_template: "{{ value_json.data.view_ready_count }}"\n      - name: Inky approved plates\n        value_template: "{{ value_json.data.approved_count }}"\n\nHomepage customapi:\nwidget:\n  type: customapi\n  url: ' +
+          location.origin +
+          '/v1/integrations/status\n  headers:\n    Authorization: "Bearer {{HOMEPAGE_VAR_INKY_STATUS}}"\n  mappings:\n    - field: data.view_ready_count\n      label: In rotation\n      format: number\n    - field: data.approved_count\n      label: Approved\n      format: number';
+        once.append(
+          config,
+          button('I saved it · clear this copy', () => location.reload()),
+        );
+        status.append(once);
+      },
+    );
+    if (!made) create.disabled = false;
+  });
+  status.append(create);
   for (const grant of state.grants.filter((grant) => grant.kind === 'status'))
     status.append(
       el('h3', grant.name),
-      note(label(grant.view) + ' · expires ' + new Date(grant.expires_at * 1000).toLocaleString()),
-      button('Revoke ' + grant.name, () => update({ action: 'revoke', id: grant.id }, status)),
+      note(label(grant.view) + (when(grant.expires_at * 1000) ? ' · until ' + when(grant.expires_at * 1000) : '')),
+      revoke(
+        status,
+        grant.id,
+        'Revoke ' + grant.name,
+        'Revoke this status credential? Dashboards that use it stop updating.',
+        'Keep credential',
+      ),
     );
-  main.append(status, link('Notification delivery settings', 'notifications'));
+  main.append(status, link('Notifications', 'notifications'));
 }

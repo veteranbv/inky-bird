@@ -89,7 +89,7 @@ Named selections live in `state_dir/journal.json`, schema version 2. The file
 contains a revision and groups with opaque IDs, names, kinds, inclusive dates
 and typed members. Personal trip members keep checklist links as unsalted
 SHA-256 hashes of eBird submission IDs, plus their original source scientific
-names. Submission IDs are short numbers, so the hashes can be reversed by trying
+names. Submission IDs are short sequential identifiers, so the hashes can be reversed by trying
 every ID: they keep raw IDs out of the file, but the file is private owner data,
 not anonymous. Source corrections can mark evidence
 as changed without silently editing your curated membership.

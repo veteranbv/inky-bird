@@ -1,10 +1,11 @@
-// Frame, Displays and paired screens.
+// Play, the wall frame and paired screens.
 // Run through journal.e2e.cjs only: phases run in its order and hand state
 // to later phases through t. pairedScreen leaves t.screenContext and
 // t.replacement, which save and manage phases read.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { layout, noSideways, boxes } = require('./e2e-layout.cjs');
 
 // Frame controls fade after five idle seconds and take no taps while faded,
 // so every Frame step reveals them first. Narrow screens keep secondary
@@ -39,9 +40,10 @@ const zoomEnlarges = async (target) => {
   const fit = await plateScale(target);
   await target.getByRole('button', { name: 'Zoom', exact: true }).click();
   const zoomed = await plateScale(target);
-  assert(zoomed > fit * 1.5, 'Zoom enlarges the plate');
+  await layout(target, zoomed > fit * 1.5, 'Zoom does not enlarge the plate', { fit, zoomed });
   await target.getByRole('button', { name: 'Fit whole plate', exact: true }).click();
-  assert(Math.abs((await plateScale(target)) - fit) < 0.001);
+  const restored = await plateScale(target);
+  await layout(target, Math.abs(restored - fit) < 0.001, 'Fit does not restore the plate', { fit, restored });
 };
 // With More closed and the page unscrolled, the control bar sits fully
 // below the bird name and the owner's note under it, and every control is
@@ -51,18 +53,22 @@ const captionClear = async (target) => {
   await target.keyboard.press('Shift');
   await target.locator('.frame-controls:not(.quiet)').waitFor();
   assert.equal(await target.locator('.frame-controls.expanded').count(), 0);
-  const caption = await target.locator('.frame-caption').boundingBox();
-  const bar = await target.locator('.frame-controls').boundingBox();
+  const note = target.locator('.frame-side > p.hint', { hasText: 'Plates change once a minute' });
+  const found = await boxes({
+    caption: target.locator('.frame-caption'),
+    bar: target.locator('.frame-controls'),
+    ...((await note.count()) ? { note } : {}),
+  });
   // Half-pixel tolerance for subpixel layout.
-  assert(caption && bar && caption.y + caption.height <= bar.y + 0.5, 'the bar covers the bird name');
-  const note = target.locator('main > p.hint', { hasText: 'Plates change once a minute' });
-  if (await note.count()) {
-    const box = await note.boundingBox();
-    assert(box && box.y + box.height <= bar.y + 0.5, 'the bar covers the note');
-  }
+  const above = (box) => box && found.bar && box.y + box.height <= found.bar.y + 0.5;
+  await layout(target, above(found.caption), 'the bar covers the bird name', found);
+  if ('note' in found) await layout(target, above(found.note), 'the bar covers the note', found);
   for (const control of await target.locator('.frame-controls').locator('button:visible, a:visible').all()) {
     const box = await control.boundingBox();
-    assert(box && box.width >= 44 && box.height >= 44, 'a Frame control is under 44 px');
+    await layout(target, box && box.width >= 44 && box.height >= 44, 'a Frame control is under 44 px', {
+      control: box,
+      name: await control.innerText(),
+    });
   }
 };
 // The small phone sizes the bar must also clear.
@@ -73,13 +79,182 @@ const captionClearSmall = async (target) => {
   }
   await target.setViewportSize({ width: 390, height: 844 });
 };
+// On a short landscape screen the plate fills the left column at full
+// height, beside the name, notes, notice and controls, and nothing overlaps.
+const landscapeShort = (width, height) => width > height && height <= 640;
+const plateBeside = async (target, where) => {
+  const size = await target.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  const found = await boxes({
+    plate: target.locator('.frame-viewport'),
+    name: target.locator('.frame-caption'),
+    bar: target.locator('.frame-controls'),
+  });
+  await layout(
+    target,
+    found.plate && found.plate.height >= 0.7 * size.height && found.plate.y >= 0 &&
+      found.plate.y + found.plate.height <= size.height + 0.5,
+    where + ': the plate is under 70% of the window height',
+    found,
+  );
+  for (const key of ['name', 'bar'])
+    await layout(
+      target,
+      found[key] && found[key].x >= found.plate.x + found.plate.width - 0.5,
+      where + ': the ' + key + ' is not beside the plate',
+      found,
+    );
+  await noSideways(target, where);
+};
+const screenSizes = async (target) => {
+  for (const [width, height] of [
+    [844, 390],
+    [1024, 600],
+    [1280, 800],
+  ]) {
+    await target.setViewportSize({ width, height });
+    await captionClear(target);
+    if (landscapeShort(width, height)) await plateBeside(target, 'Screen at ' + width + 'x' + height);
+    else await noSideways(target, 'Screen at ' + width + 'x' + height);
+  }
+};
+// Another system's fonts: a wider fallback face and taller lines. No Frame
+// layout may depend on how tall its text is.
+const STRESSED_TEXT =
+  '* { font-family: "Courier New", monospace !important; letter-spacing: .04em !important; line-height: 1.6 !important }';
+// Boxes once they stop moving, so a measurement never races a layout pass.
+async function settledBoxes(target, named) {
+  let last = JSON.stringify(await boxes(named));
+  for (let n = 0; n < 20; n++) {
+    await target.waitForTimeout(50);
+    const now = JSON.stringify(await boxes(named));
+    if (now === last) break;
+    last = now;
+  }
+  return JSON.parse(last);
+}
+// Fills the notice with as much of its own text, repeated, as fits in
+// exactly `lines` lines, and returns the line count it shows.
+const noticeLines = (notice, words, lines) =>
+  notice.evaluate(
+    (status, [words, lines]) => {
+      const count = () => {
+        const range = document.createRange();
+        range.selectNodeContents(status);
+        return new Set([...range.getClientRects()].map((line) => Math.round(line.top))).size;
+      };
+      let text = '';
+      for (let n = 0; n < 400; n++) {
+        const longer = (text ? text + ' ' : '') + words[n % words.length];
+        status.textContent = longer;
+        if (count() > lines) break;
+        text = longer;
+      }
+      status.textContent = text;
+      return count();
+    },
+    [words, lines],
+  );
+// One-, two- and three-line notices in Frame never cover the bird name or
+// the note, and sit above the bar, at every size.
+async function noticeClear(t, stressed) {
+  const { page, origin, plateRoute } = t;
+  const label = stressed ? 'stress-' : '';
+  // The page's own stylesheet carries the stress rules: its policy refuses
+  // inline styles.
+  const stylesheet = /\/app\/app\.css(\?|$)/;
+  const stress = async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: (await response.text()) + '\n' + STRESSED_TEXT });
+  };
+  if (stressed) await page.route(stylesheet, stress);
+  for (const [width, height] of [
+    [320, 568],
+    [375, 667],
+    [375, 812],
+    [844, 390],
+    [1024, 600],
+    [1280, 800],
+  ]) {
+    const size = width + 'x' + height;
+    t.phase = 'frame-notice-clear-' + label + size;
+    await page.setViewportSize({ width, height });
+    await page.goto(origin + '/app?page=frame&view=all');
+    await page.locator('.frame-art').waitFor();
+    await captionClear(page);
+    await page.route(plateRoute, (route) => route.abort());
+    await page.keyboard.press('Shift');
+    await page.locator('.frame-controls:not(.quiet)').waitFor();
+    await page.getByRole('button', { name: 'Next', exact: true }).click();
+    await page.getByText(/This plate did not load\. Keeping the last one/).waitFor();
+    const notice = page.locator('.frame-dock [role="status"]');
+    const words = (await notice.innerText()).split(/\s+/);
+    for (const lines of [1, 2, 3]) {
+      const shown = await noticeLines(notice, words, lines);
+      await page.evaluate(() => scrollTo(0, 0));
+      const found = await settledBoxes(page, {
+        notice,
+        name: page.locator('.frame-caption'),
+        note: page.locator('.frame-side > p.hint', { hasText: 'Plates change once a minute' }),
+        bar: page.locator('.frame-controls'),
+      });
+      const where = size + ', ' + lines + '-line notice: ';
+      await layout(page, shown === lines, where + 'the notice shows ' + shown + ' lines', found);
+      const apart = (other) =>
+        found.notice &&
+        other &&
+        (other.y + other.height <= found.notice.y + 0.5 ||
+          found.notice.y + found.notice.height <= other.y + 0.5);
+      await layout(page, apart(found.name), where + 'the notice covers the bird name', found);
+      await layout(page, apart(found.note), where + 'the notice covers the note', found);
+      await layout(
+        page,
+        found.notice && found.bar && found.notice.y + found.notice.height <= found.bar.y + 0.5,
+        where + 'the notice is not above the bar',
+        found,
+      );
+      await layout(
+        page,
+        found.bar && found.bar.y + found.bar.height <= height + 0.5,
+        where + 'the bar is below the window',
+        found,
+      );
+      for (const key of ['name', 'note'])
+        await layout(
+          page,
+          found.bar && found[key] && found[key].y + found[key].height <= found.bar.y + 0.5,
+          where + 'the bar covers the ' + (key === 'name' ? 'bird name' : 'note'),
+          found,
+        );
+      if (landscapeShort(width, height)) await plateBeside(page, where.slice(0, -2));
+      // A notice shows two lines; the rest is one tap away and always in the
+      // status text for assistive technology.
+      const more = page.locator('.notice-more');
+      await layout(page, (await more.isVisible()) === lines > 2, where + 'More is wrong for this notice', found);
+      if (lines > 2) {
+        const full = await notice.textContent();
+        await page.getByRole('button', { name: 'More of this notice', exact: true }).click();
+        await layout(
+          page,
+          (await notice.evaluate((node) => node.scrollHeight <= node.clientHeight + 1)) &&
+            (await notice.textContent()) === full &&
+            (await more.getAttribute('aria-expanded')) === 'true',
+          where + 'More does not show the whole notice',
+          found,
+        );
+        await page.getByRole('button', { name: 'Less of this notice', exact: true }).click();
+      }
+    }
+    await page.unroute(plateRoute);
+  }
+  if (stressed) await page.unroute(stylesheet, stress);
+}
 
 // Paired read-only screen; its context stays open for the integrations phase.
 async function pairedScreen(t) {
   const { page, context, browser, origin, fixture, root, engine, heading, cardinal, robin, publicCatalog, errors, trip } = t;
   t.phase = 'pair-readonly-screen';
   await page.goto(origin + '/app?page=displays');
-  await heading('Displays');
+  await heading('Wall frame');
   const screenContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
     isMobile: engine !== 'firefox',
@@ -112,9 +287,9 @@ async function pairedScreen(t) {
   assert.equal(await screen.locator('.pairing-code').innerText(), pairCode);
   await screenContext.unroute('**/v1/screen/forget');
   await page.reload();
-  await page.getByRole('heading', { name: 'Pairing request · ' + pairCode, exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'Screen waiting to pair · ' + pairCode, exact: true }).waitFor();
   await page.getByLabel('Screen name', { exact: true }).fill('Synthetic tablet');
-  await page.getByLabel('Permitted view', { exact: true }).first().selectOption(trip.collection_id);
+  await page.getByLabel('Birds to show', { exact: true }).first().selectOption(trip.collection_id);
   await page
     .getByLabel('I matched this code on the screen I want to pair', { exact: true })
     .check();
@@ -129,8 +304,7 @@ async function pairedScreen(t) {
   await captionClearSmall(screen);
   await zoomEnlarges(screen);
   await screen.keyboard.press('Escape');
-  await screen.setViewportSize({ width: 844, height: 390 });
-  await captionClear(screen);
+  await screenSizes(screen);
   await screen.setViewportSize({ width: 390, height: 844 });
   assert.equal((await screenContext.request.get(origin + '/v1/owner/journal')).status(), 401);
   const screenView = (await (await screenContext.request.get(origin + '/v1/screen/view')).json())
@@ -165,11 +339,14 @@ async function pairedScreen(t) {
     await fullscreenSettles(screen, true);
     screenAmbient = (await screen.evaluate(() => document.fullscreenElement?.tagName)) === 'HTML';
   }
-  const screenInside = async (locator) => {
+  const screenInside = async (locator, what) => {
     const size = await screen.evaluate(() => ({ width: innerWidth, height: innerHeight }));
     const box = await locator.boundingBox();
-    return (
-      box && box.y >= 0 && box.x >= 0 && box.y + box.height <= size.height && box.x + box.width <= size.width
+    await layout(
+      screen,
+      box && box.y >= 0 && box.x >= 0 && box.y + box.height <= size.height && box.x + box.width <= size.width,
+      what + ' is outside the window',
+      { box },
     );
   };
   await screenContext.route('**/v1/screen/plates/' + replacement.taxon_id + '?*', (route) =>
@@ -190,8 +367,8 @@ async function pairedScreen(t) {
     200,
   );
   await screen.clock.runFor(15100);
-  await screen.getByText(/temporarily unavailable/).waitFor();
-  if (screenAmbient) assert(await screenInside(screen.getByText(/temporarily unavailable/)));
+  await screen.getByText(/not available right now/).waitFor();
+  if (screenAmbient) await screenInside(screen.getByText(/not available right now/), 'the plate notice');
   assert.equal(await screen.locator('img[src]').count(), 0);
   currentJournal = (await (await context.request.get(origin + '/v1/owner/journal')).json()).data;
   assert.equal(
@@ -205,11 +382,11 @@ async function pairedScreen(t) {
   );
   await screen.clock.runFor(15100);
   const emptyNotice = screen.getByText(
-    'No approved plates in the permitted view. Inky will not switch views.',
+    'This view has no plates now. The screen waits here and starts again when it has some.',
     { exact: true },
   );
   await emptyNotice.waitFor();
-  if (screenAmbient) assert(await screenInside(emptyNotice));
+  if (screenAmbient) await screenInside(emptyNotice, 'the empty-view notice');
   assert.equal(await screen.locator('img[src]').count(), 0);
   // An emptied view leaves nothing to step through.
   await screen.keyboard.press('ArrowRight');
@@ -225,7 +402,9 @@ async function pairedScreen(t) {
   assert(await screen.evaluate(() => document.body.classList.contains('presenting')));
   await screen.getByRole('button', { name: 'Forget this screen', exact: true }).waitFor();
   await screenContext.unroute('**/v1/screen/forget');
+  // Revoking asks first; the first press changes nothing.
   await page.getByRole('button', { name: 'Revoke screen', exact: true }).click();
+  await page.getByRole('button', { name: 'Revoke', exact: true }).click();
   await screen.clock.runFor(15100);
   await screen.getByRole('heading', { name: 'Screen access ended', exact: true }).waitFor();
   assert.equal(await screen.locator('img').count(), 0);
@@ -239,7 +418,7 @@ async function ownerFrame(t) {
   await page.locator('.frame-art').waitFor();
   await page.locator('.frame-art').evaluate((image) => image.decode());
   await zoomEnlarges(page);
-  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await noSideways(page, 'Frame');
   t.phase = 'frame-ambient-labels';
   // Toggles keep their names and report state through aria-pressed.
   const labels = page.getByRole('button', { name: 'Bird name', exact: true });
@@ -302,9 +481,16 @@ async function ownerFrame(t) {
     // Fullscreen can resize the window to the real screen (Firefox), so the
     // live window metrics are the frame of reference, not the viewport.
     const size = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-    const inside = (box) =>
-      box && box.y >= 0 && box.x >= 0 && box.y + box.height <= size.height && box.x + box.width <= size.width;
-    assert(inside(await page.locator('.frame-caption').boundingBox()));
+    const inside = async (locator, what) => {
+      const box = await locator.boundingBox();
+      await layout(
+        page,
+        box && box.y >= 0 && box.x >= 0 && box.y + box.height <= size.height && box.x + box.width <= size.width,
+        what + ' is outside the fullscreen window',
+        { box, window: size },
+      );
+    };
+    await inside(page.locator('.frame-caption'), 'the bird name');
     assert(
       await page.evaluate(() => {
         const caption = document.querySelector('.frame-caption');
@@ -318,9 +504,9 @@ async function ownerFrame(t) {
     await page.route(plateRoute, (route) => route.abort());
     await page.keyboard.press('Shift');
     await page.getByRole('button', { name: 'Next', exact: true }).click();
-    const notice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
+    const notice = page.getByText(/This plate did not load\. Keeping the last one/);
     await notice.waitFor();
-    assert(inside(await notice.boundingBox()));
+    await inside(notice, 'the notice');
     await page.unroute(plateRoute);
     await page.evaluate(() => document.exitFullscreen());
     assert(await fullscreenSettles(page, false));
@@ -339,15 +525,24 @@ async function ownerFrame(t) {
   const fits = async (locator) => {
     const box = await locator.boundingBox();
     // One-pixel tolerance for subpixel layout.
-    assert(box && box.x >= -1 && box.x + box.width <= windowWidth + 1);
+    await layout(
+      page,
+      box && box.x >= -1 && box.x + box.width <= windowWidth + 1,
+      'a Frame control is outside the window',
+      { control: box, name: await locator.innerText() },
+    );
   };
-  const barFits = () =>
-    page.locator('.frame-controls').evaluate((bar) => bar.scrollWidth <= bar.clientWidth + 1);
-  assert(await barFits());
+  const barFits = async () => {
+    const bar = await page
+      .locator('.frame-controls')
+      .evaluate((node) => ({ scrollWidth: node.scrollWidth, clientWidth: node.clientWidth }));
+    await layout(page, bar.scrollWidth <= bar.clientWidth + 1, 'the bar scrolls sideways', { bar });
+  };
+  await barFits();
   for (const name of ['Previous', 'Play', 'Next', 'More'])
     await fits(page.getByRole('button', { name, exact: true }));
   await openMore(page);
-  assert(await barFits());
+  await barFits();
   for (const control of await page.locator('#frame-more').locator('button:visible, a:visible').all())
     await fits(control);
   await page.keyboard.press('Escape');
@@ -359,12 +554,29 @@ async function ownerFrame(t) {
   await captionClearSmall(page);
   const previousControl = page.getByRole('button', { name: 'Previous', exact: true });
   await previousControl.click();
-  const clearanceNotice = page.getByText(/Plate unavailable\. Keeping the last approved plate\./);
+  const clearanceNotice = page.getByText(/This plate did not load\. Keeping the last one/);
   await clearanceNotice.waitFor();
-  const noticeBox = await clearanceNotice.boundingBox();
-  const barBox = await page.locator('.frame-controls').boundingBox();
-  assert(noticeBox && barBox && noticeBox.y >= 0 && noticeBox.y + noticeBox.height <= barBox.y);
+  const clearance = await boxes({ notice: clearanceNotice, bar: page.locator('.frame-controls') });
+  await layout(
+    page,
+    clearance.notice &&
+      clearance.bar &&
+      clearance.notice.y >= 0 &&
+      clearance.notice.y + clearance.notice.height <= clearance.bar.y,
+    'the notice is not above the bar',
+    clearance,
+  );
   await page.unroute(plateRoute);
+  // A notice never covers the bird name or the note under the plate, on a
+  // small phone, a phone or a desktop, with system fonts and with stressed
+  // text metrics.
+  const restoreSize = page.viewportSize();
+  await noticeClear(t, false);
+  await noticeClear(t, true);
+  await page.setViewportSize(restoreSize);
+  await page.goto(origin + '/app?page=frame&view=all');
+  await page.locator('.frame-art').waitFor();
+  await page.locator('.frame-art').evaluate((image) => image.decode());
   t.phase = 'frame-swipe';
   // A horizontal mouse drag on the plate steps to the next plate instead of
   // starting a native image drag.
@@ -414,7 +626,7 @@ async function ownerFrame(t) {
   await page.route('**/v1/owner/journal', (route) => route.abort());
   await page.route(plateRoute, (route) => route.abort());
   await page.clock.runFor(60100);
-  await page.getByText(/Keeping the last approved plate\./).waitFor();
+  await page.getByText(/Keeping the last plate; Inky keeps checking\./).waitFor();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   await page.unroute('**/v1/owner/journal');
   await page.route('**/v1/owner/journal', async (route) => {
@@ -424,7 +636,7 @@ async function ownerFrame(t) {
     await route.fulfill({ response, json: body });
   });
   await page.clock.runFor(60100);
-  await page.getByText(/This view has no approved plates or was removed\./).waitFor();
+  await page.getByText(/This view has no plates now\./).waitFor();
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
   // Playback stays on, but an emptied view has nothing left to step to.
   const emptiedSteps = [];
@@ -514,14 +726,49 @@ async function ownerFrame(t) {
   assert.equal(await page.getByRole('button', { name: 'More', exact: true }).count(), 0);
   for (const name of ['Previous', 'Play', 'Next', 'Shuffle', 'Bird name', 'Zoom'])
     assert(await page.getByRole('button', { name, exact: true }).isVisible());
-  assert(await page.locator('.frame-controls').evaluate((bar) => bar.scrollWidth <= bar.clientWidth + 1));
-  const wideBar = await page.locator('.frame-controls').boundingBox();
-  assert(wideBar.y + wideBar.height <= 800);
+  const wideBar = await page.locator('.frame-controls').evaluate((node) => ({
+    scrollWidth: node.scrollWidth,
+    clientWidth: node.clientWidth,
+    ...node.getBoundingClientRect().toJSON(),
+  }));
+  await layout(page, wideBar.scrollWidth <= wideBar.clientWidth + 1, 'the wide bar scrolls sideways', { bar: wideBar });
+  await layout(page, wideBar.bottom <= 800, 'the wide bar is below the window', { bar: wideBar });
   await captionClear(page);
   await zoomEnlarges(page);
   await page.setViewportSize({ width: 844, height: 390 });
   await captionClear(page);
   await page.setViewportSize({ width: 390, height: 844 });
+  t.phase = 'frame-plain-http';
+  // Over plain HTTP the page adds a note that the screen may sleep; the bar
+  // must still clear it, the bird name and the other note at every size.
+  const plain = await page.context().newPage();
+  try {
+    await plain.addInitScript(() =>
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, get: () => false }),
+    );
+    await plain.goto(origin + '/app?page=frame&view=' + imported.collection_id);
+    await plain.locator('.frame-art').waitFor();
+    const sleepNote = plain.locator('.frame-side > p.hint', { hasText: 'This screen may sleep' });
+    await sleepNote.waitFor();
+    for (const viewport of [
+      { width: 320, height: 568 },
+      { width: 375, height: 812 },
+      { width: 1280, height: 800 },
+    ]) {
+      await plain.setViewportSize(viewport);
+      await captionClear(plain);
+      const found = await boxes({ sleepNote, bar: plain.locator('.frame-controls') });
+      await layout(
+        plain,
+        found.sleepNote && found.bar && found.sleepNote.y + found.sleepNote.height <= found.bar.y + 0.5,
+        'the bar covers the sleep note',
+        found,
+      );
+      await noSideways(plain, 'Frame over plain HTTP');
+    }
+  } finally {
+    await plain.close();
+  }
 }
 
 module.exports = { pairedScreen, ownerFrame };

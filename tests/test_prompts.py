@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from pathlib import Path
 
 from inky_bird_frame.birds import BirdSpecies, TaxonContext
+from inky_bird_frame.errors import GenerationError
 from inky_bird_frame.models import ProfileConflict, ReferencePhoto, SpeciesProfileData
 from inky_bird_frame.prompts import PROMPT_VERSION, plate_prompt, profile_prompt, review_prompt
 
 
 class PromptTests(unittest.TestCase):
     def test_prompt_contract_version(self) -> None:
-        self.assertEqual(PROMPT_VERSION, "field-journal-v8")
+        self.assertEqual(PROMPT_VERSION, "field-journal-v10")
 
     def test_edit_target_does_not_freeze_anatomy_flagged_for_redraw(self) -> None:
         species = BirdSpecies(1, "Test Bird", "Avis test", 1, "test")
@@ -81,7 +83,7 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn("$imagegen", prompt)
         self.assertIn("blue head", prompt)
-        self.assertIn("Photo by observer", prompt)
+        self.assertNotIn("Photo by observer", prompt)
         self.assertNotIn("12345", prompt)
         self.assertNotIn("Exampleville", prompt)
 
@@ -191,7 +193,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("required to use one compatible published measurement set", normalized_review)
 
     def test_plate_and_review_prompts_enforce_schematic_ruler(self) -> None:
-        species = BirdSpecies(12942, "Eastern Bluebird", "Sialia sialis", 26, "iNaturalist")
+        species = BirdSpecies(4496, "Black Skimmer", "Rynchops niger", 26, "iNaturalist")
         profile = SpeciesProfileData(
             taxon_id=12942,
             common_name="Eastern Bluebird",
@@ -226,13 +228,16 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Keep the accepted body proportions", prompt)
         self.assertIn("not a request to redraw a feature", normalized_prompt)
         self.assertIn("Do not shrink the bird", prompt)
-        self.assertIn("BODY LENGTH: 7 in", prompt)
+        self.assertIn(
+            'BODY LENGTH, a colon, a space and the exact "length" value',
+            normalized_prompt,
+        )
+        self.assertIn('"length": "7 in"', prompt)
         self.assertIn("SCHEMATIC — NOT TO SCALE", prompt)
-        self.assertIn("minimum at the bottom and maximum at the top", prompt)
-        self.assertIn("roughly even, unlabeled interior ticks", normalized_prompt)
-        self.assertIn("count and spacing do not encode measurement units", normalized_prompt)
-        self.assertIn("Do not draw a zero-based or wider full-range axis", prompt)
-        self.assertIn("do not add a separate range bracket", normalized_prompt)
+        self.assertIn("minimum at the bottom, maximum at the top", prompt)
+        self.assertIn("Interior ticks are unlabeled and even", normalized_prompt)
+        self.assertIn("No zero-based or wider axis", prompt)
+        self.assertIn("no separate range bracket", normalized_prompt)
         self.assertIn("Match both the direction and degree", normalized_prompt)
         self.assertIn("the lower mandible is the jaw below the gape line", normalized_prompt)
         self.assertIn("its tip must be farther from the shared bill base", normalized_prompt)
@@ -248,8 +253,8 @@ class PromptTests(unittest.TestCase):
             "thin black vertical slit rather than a round or oval pupil", normalized_prompt
         )
         self.assertIn("Never invent a vertical slit", normalized_prompt)
-        self.assertIn("compare every visible text line character-for-character", normalized_prompt)
-        self.assertIn("Undo any incidental spelling, number, punctuation", normalized_prompt)
+        self.assertIn("compare every text line character-for-character", normalized_prompt)
+        self.assertNotIn("Undo any incidental", normalized_prompt)
         self.assertNotIn("Do not copy or lightly edit", prompt)
 
         review = review_prompt(species, profile, [], ("example.test", "example.org"))
@@ -292,6 +297,9 @@ class PromptTests(unittest.TestCase):
 
 
 _FIXTURE_DOMAINS = ("birds.example", "field.example")
+
+
+_FIXTURE_WORKSPACE = Path("/srv/example-user/workspace")
 
 
 def _fixture_species() -> BirdSpecies:
@@ -388,6 +396,30 @@ def _rendered_prompts() -> list[str]:
             prior_corrections=("Repair the visible leg",),
             prior_profile_conflicts=(_fixture_conflict(),),
         ),
+        plate_prompt(_skimmer(), profile, references, Path("candidate.png")),
+        plate_prompt(
+            _skimmer(),
+            profile,
+            references,
+            Path("candidate.png"),
+            ("Lengthen the lower mandible",),
+            invariant_findings=("Keep the slit pupil",),
+            has_correction_source=True,
+        ),
+        *(
+            plate_prompt(
+                species,
+                profile,
+                references,
+                _FIXTURE_WORKSPACE / ".inky-bird-frame-generation/1-attempt-01-x/generated.png",
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern", "Keep the pale eye"),
+                has_correction_source=has_source,
+                owner_findings=("Keep the pale eye",),
+                workspace=_FIXTURE_WORKSPACE,
+            )
+            for has_source in (True, False)
+        ),
     ]
 
 
@@ -396,7 +428,236 @@ def _rendered_prompts() -> list[str]:
 RENDERED_PROMPT_SHA256 = {
     "field-journal-v7": "84079b7217e69381494122bdee62257b08f9b216b2c9094e566e90239cf90816",
     "field-journal-v8": "9164b21301e4386d75ef442cb6a1db00f93443fbfbdd7f0bae9a45551975e877",
+    "field-journal-v9": "a46acbd1f99bd08ed9ee6e1d762e485083ca46e9c3b763446e73f9a5c4a14fee",
+    "field-journal-v10": "f1446aeda88291b9a01065311b039a34a92dd983a7c4fd69391dd523d016cfaf",
 }
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _skimmer() -> BirdSpecies:
+    return BirdSpecies(4496, "Black Skimmer", "Rynchops niger", 1, "test")
+
+
+class PlateWordingTests(unittest.TestCase):
+    def test_posture_fits_the_species_and_perch_is_plain(self) -> None:
+        prompt = _normalized(
+            plate_prompt(_fixture_species(), _fixture_profile(), [], Path("candidate.png"))
+        )
+
+        self.assertNotIn("natural perched posture", prompt)
+        self.assertIn(
+            "a natural resting posture (perched, standing, clinging or swimming, as fits the"
+            " species), never in flight",
+            prompt,
+        )
+        posture_options = prompt.split("resting posture (", 1)[1].split(")", 1)[0]
+        self.assertNotIn("flight", posture_options)
+        self.assertNotIn("or in flight", prompt)
+        self.assertIn(
+            "on at most a short plain twig, bare ground or a plain vertical surface.",
+            prompt,
+        )
+        self.assertIn("Quiet margins. No invented prose, scenery,", prompt)
+
+    def test_skimmer_and_slit_pupil_notes_only_for_skimmers(self) -> None:
+        skimmer_notes = (
+            "For an open skimmer bill",
+            "In a side-profile skimmer with an open bill",
+            "thin black vertical slit",
+            "Never invent a vertical slit",
+        )
+        ordinary = _normalized(
+            plate_prompt(_fixture_species(), _fixture_profile(), [], Path("candidate.png"))
+        )
+        skimmer = _normalized(
+            plate_prompt(_skimmer(), _fixture_profile(), [], Path("candidate.png"))
+        )
+        for note in skimmer_notes:
+            with self.subTest(note=note):
+                self.assertNotIn(note, ordinary)
+                self.assertIn(note, skimmer)
+        general = "When a field mark depends on unequal paired structures such as mandibles"
+        self.assertIn(general, ordinary)
+        self.assertIn(general, skimmer)
+
+    def test_final_check_does_not_ask_to_undo_drift(self) -> None:
+        prompt = _normalized(
+            plate_prompt(_fixture_species(), _fixture_profile(), [], Path("candidate.png"))
+        )
+
+        self.assertNotIn("drift", prompt)
+        self.assertIn("Generate exactly one image", prompt)
+        self.assertIn("compare every text line character-for-character", prompt)
+
+    def test_constraints_are_labelled_by_origin(self) -> None:
+        for has_source in (True, False):
+            with self.subTest(has_correction_source=has_source):
+                prompt = plate_prompt(
+                    _fixture_species(),
+                    _fixture_profile(),
+                    [],
+                    Path("candidate.png"),
+                    ("Shorten the tail",),
+                    invariant_findings=("Owner note", "Review note"),
+                    has_correction_source=has_source,
+                    owner_findings=("Owner note",),
+                )
+                normalized = _normalized(prompt)
+                self.assertNotIn("human review", normalized)
+                self.assertIn("From the owner:", normalized)
+                self.assertIn("From earlier automated review:", normalized)
+                data = json.loads(
+                    prompt.split("<reference-data>\n", 1)[1].split("\n</reference-data>", 1)[0]
+                )
+                self.assertEqual(data["constraints_from_the_owner"], ["Owner note"])
+                self.assertEqual(data["constraints_from_automated_review"], ["Review note"])
+                self.assertEqual(data["corrections"], ["Shorten the tail"])
+
+    def test_constraints_of_unknown_origin_are_not_called_human(self) -> None:
+        prompt = plate_prompt(
+            _fixture_species(),
+            _fixture_profile(),
+            [],
+            Path("candidate.png"),
+            (),
+            invariant_findings=("Earlier note",),
+        )
+        normalized = _normalized(prompt)
+
+        self.assertNotIn("human review", normalized)
+        self.assertNotIn("From the owner", normalized)
+        self.assertIn('"constraints_from_earlier_review": [', prompt)
+
+    def test_output_is_named_relative_to_the_workspace(self) -> None:
+        workspace = Path("/srv/example-user/workspace")
+        output = workspace / ".inky-bird-frame-generation" / "1-attempt-01-x" / "generated.png"
+        prompt = plate_prompt(
+            _fixture_species(),
+            _fixture_profile(),
+            [],
+            output,
+            workspace=workspace,
+        )
+
+        self.assertNotIn("/srv", prompt)
+        self.assertNotIn("example-user", prompt)
+        tail = prompt.split("this exact path inside the current workspace:\n", 1)[1]
+        self.assertEqual(
+            tail.splitlines()[0], ".inky-bird-frame-generation/1-attempt-01-x/generated.png"
+        )
+
+    def test_edit_constraints_keep_their_accepted_review_header(self) -> None:
+        prompt = _normalized(
+            plate_prompt(
+                _fixture_species(),
+                _fixture_profile(),
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Owner note",),
+                has_correction_source=True,
+                owner_findings=("Owner note",),
+            )
+        )
+
+        self.assertIn(
+            "Non-regression constraints from earlier accepted reviews: - From the owner:", prompt
+        )
+
+    def test_output_outside_the_workspace_is_refused(self) -> None:
+        with self.assertRaises(GenerationError):
+            plate_prompt(
+                _fixture_species(),
+                _fixture_profile(),
+                [],
+                Path("/elsewhere/generated.png"),
+                workspace=Path("/srv/example/workspace"),
+            )
+
+
+class PlateLabelTests(unittest.TestCase):
+    LABEL_LINES = (
+        '- "Length:", "Wingspan:" and "Weight:" with the "length", "wingspan" and "weight" values.',
+        '- "Habitat:" with the "habitat" value.',
+        '- "Behavior:" with the "behavior" value.',
+        '- A "Field marks" heading, then each "field_marks" entry on its own line, exactly as'
+        " supplied,",
+        '- Color swatches, each labelled with one "plumage_palette" name.',
+        'Never print a reference-data key name, such as "field_notes" or a lowercase "length:".',
+        '- Family: the "family" value in the reference data, on its own line beneath the'
+        " scientific name",
+    )
+
+    @staticmethod
+    def _profile() -> SpeciesProfileData:
+        return SpeciesProfileData(
+            taxon_id=1,
+            common_name="Test Bird",
+            scientific_name="Avis test",
+            family="Sentinelidae",
+            measurements={"length": "11-12 qx", "wingspan": "21-22 qx", "weight": "31-32 qy"},
+            field_marks=["sentinel mark one", "sentinel mark two", "sentinel mark three", "four"],
+            habitat="Sentinel habitat",
+            behavior="Sentinel behavior",
+            palette=["sentinel red", "sentinel green", "sentinel blue"],
+            sources=[],
+        )
+
+    def _branches(self) -> dict[str, str]:
+        species, profile = _fixture_species(), self._profile()
+        return {
+            "first": plate_prompt(species, profile, [], Path("candidate.png")),
+            "regenerate": plate_prompt(
+                species,
+                profile,
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern",),
+            ),
+            "edit": plate_prompt(
+                species,
+                profile,
+                [],
+                Path("candidate.png"),
+                ("Shorten the tail",),
+                invariant_findings=("Keep the wing pattern",),
+                has_correction_source=True,
+            ),
+            "skimmer": plate_prompt(_skimmer(), profile, [], Path("candidate.png")),
+        }
+
+    def test_every_plate_branch_names_the_printed_labels_outside_the_data(self) -> None:
+        for name, prompt in self._branches().items():
+            with self.subTest(branch=name):
+                outside = _normalized(prompt.split("<reference-data>", 1)[0])
+                for line in self.LABEL_LINES:
+                    self.assertIn(_normalized(line), outside)
+                self.assertIn(
+                    "Letter them on the plate in this order, under these exact labels, each"
+                    " followed by its exact value:",
+                    outside,
+                )
+
+    def test_label_instructions_carry_no_profile_value(self) -> None:
+        profile = self._profile()
+        values = [
+            profile["family"],
+            profile["habitat"],
+            profile["behavior"],
+            *profile["measurements"].values(),
+            *profile["field_marks"][:3],
+            *profile["palette"],
+        ]
+        for name, prompt in self._branches().items():
+            before, rest = prompt.split("<reference-data>\n", 1)
+            after = rest.split("\n</reference-data>", 1)[1]
+            for value in values:
+                with self.subTest(branch=name, value=value):
+                    self.assertNotIn(value, before + after)
 
 
 class PromptReferenceNumberingTests(unittest.TestCase):
@@ -404,18 +665,33 @@ class PromptReferenceNumberingTests(unittest.TestCase):
         references = _fixture_references()
         prompt = review_prompt(_fixture_species(), _fixture_profile(), references, _FIXTURE_DOMAINS)
 
-        provenance = prompt.split("Reference provenance:\n", 1)[1].strip().splitlines()
-
-        self.assertTrue(provenance[0].startswith("Image 2: Photo by observer-1;"), provenance)
-        self.assertEqual(len(provenance), len(references))
-        self.assertTrue(
-            provenance[-1].startswith(f"Image {len(references) + 1}: Photo by observer-3;"),
-            provenance,
+        provenance = (
+            prompt.split("Reference images, in attachment order:\n", 1)[1].strip().splitlines()
         )
-        self.assertNotIn("Image 1: Photo by", prompt)
+
+        self.assertEqual(provenance[0], "Image 2: reference photo")
+        self.assertEqual(len(provenance), len(references))
+        self.assertEqual(provenance[-1], f"Image {len(references) + 1}: reference photo")
+        self.assertNotIn("Image 1: reference photo", prompt)
 
 
 class PromptVersionTests(unittest.TestCase):
+    def test_version_fixtures_cover_every_gated_branch(self) -> None:
+        rendered = _normalized("\n".join(_rendered_prompts()))
+
+        for text in (
+            "For an open skimmer bill",
+            "In a side-profile skimmer with an open bill",
+            "thin black vertical slit",
+            "From the owner:",
+            "From earlier automated review:",
+            "From earlier review:",
+            ".inky-bird-frame-generation/1-attempt-01-x/generated.png",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, rendered)
+        self.assertNotIn(_FIXTURE_WORKSPACE.as_posix(), rendered)
+
     def test_rendered_prompt_text_matches_its_version(self) -> None:
         digest = hashlib.sha256("\n\0\n".join(_rendered_prompts()).encode("utf-8")).hexdigest()
 
