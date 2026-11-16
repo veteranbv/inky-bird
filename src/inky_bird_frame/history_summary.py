@@ -7,6 +7,7 @@ match that file's identity, so it is always safe to delete.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -22,6 +23,7 @@ from .errors import DataSourceError
 from .http import write_json_atomic
 
 SCHEMA_VERSION = 1
+_ENVELOPE = frozenset({"schema_version", "source", "history", "body_sha256"})
 # Far above the largest supported history: one short row per species.
 MAX_SUMMARY_BYTES = 32 * 1024 * 1024
 T = TypeVar("T")
@@ -110,6 +112,12 @@ def _identity(info: os.stat_result) -> dict[str, int]:
     return {"st_ino": info.st_ino, "st_size": info.st_size, "st_mtime_ns": info.st_mtime_ns}
 
 
+def _body_sha256(payload: dict[str, object]) -> str:
+    body = {key: value for key, value in payload.items() if key not in _ENVELOPE}
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def write_summary(history_path: Path, source: str, body: dict[str, object]) -> None:
     """Caller holds the source's history lock and has just written its history.
 
@@ -121,6 +129,7 @@ def write_summary(history_path: Path, source: str, body: dict[str, object]) -> N
             summary_path(history_path),
             {
                 **body,
+                "body_sha256": _body_sha256(body),
                 "schema_version": SCHEMA_VERSION,
                 "source": source,
                 "history": _identity(history_path.lstat()),
@@ -167,7 +176,9 @@ def load_summary(
     ``rebuild`` reads the complete history without taking that lock again.
     """
     payload = _fresh_payload(history_path, source)
-    if payload is not None and _names_showable(payload):
+    if payload is not None and (
+        _names_showable(payload) or payload.get("body_sha256") == _body_sha256(payload)
+    ):
         try:
             return parse(payload)
         except DataSourceError:
@@ -198,8 +209,10 @@ def _showable(value: str) -> bool:
 
 
 def _names_showable(payload: dict[str, object]) -> bool:
-    """A stored summary with a name the journal would refuse is rebuilt once.
+    """False for a summary holding a name the journal would refuse.
 
+    Such a summary is trusted only when its body matches the checksum written
+    with it, so its names came from the history; otherwise it is rebuilt.
     Names from the history itself are kept as they are: the journal shows a
     matched bird under its own name and refuses only an unmatched odd name.
     """

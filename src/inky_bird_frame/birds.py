@@ -138,7 +138,8 @@ BIRDWEATHER_MAX_SPECIES: Final = 100
 # lookups cannot be batched because every source name needs an exact-match check.
 INATURALIST_TAXONOMY_REQUEST_DELAY_SECONDS: Final = 1.0
 # Save crosswalk progress and release its lock at least this often so an
-# interrupted first import keeps its lookups and other writers are not starved.
+# interrupted first import keeps its lookups and another writer can take a
+# turn. The operating system decides who gets the lock next.
 TAXONOMY_CHECKPOINT_ENTRIES: Final = 25
 TAXONOMY_LOCK_HOLD_SECONDS: Final = 30.0
 
@@ -211,7 +212,7 @@ def parse_inaturalist_species_counts(payload: object) -> list[BirdSpecies]:
         count = item.get("count")
         if not isinstance(common, str) or not isinstance(scientific, str):
             continue
-        if not isinstance(taxon_id, int) or not isinstance(count, int):
+        if not isinstance(taxon_id, int) or type(count) is not int or count < 0:
             continue
         species.append(
             BirdSpecies(

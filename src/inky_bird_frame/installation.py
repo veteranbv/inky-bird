@@ -194,7 +194,7 @@ def _native_oidc_secret(config: AppConfig, config_path: Path) -> tuple[str, str,
                 "use one nonempty printable value"
             )
     except (OSError, UnicodeError, ValueError):
-        raise InstallationError("Native access cache is invalid or cannot be written") from None
+        raise InstallationError("Native access cache is invalid or cannot be read") from None
     return name, secret, path
 
 

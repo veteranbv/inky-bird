@@ -138,7 +138,8 @@ the same bird is announced too. A notice that matches one still queued or
 already delivered is not sent again; the outbox remembers the last 1,000
 delivered notices. A queued notice or health record that cannot be saved leaves
 a warning in the service log. A new-species record that cannot be saved leaves
-no warning; this year's notice can then repeat.
+no warning; this year's notice can then repeat. If two refreshes finish at the
+same moment, one can overwrite the other's record, with the same result.
 
 A refresh failure of any kind counts toward the "Bird discovery is degraded"
 alert, except when another refresh is already running.

@@ -534,7 +534,8 @@ def commit_analyzer(
         revision=revision,
         preview_hash=preview["preview_hash"],
         key=key,
-        allow_reduction=False,
+        # The page asks the owner to acknowledge removals and sends this.
+        allow_reduction=bool(preview["stats"]["removed"]),
     )
     imports.cancel(identifier)
     return preview, result
@@ -576,7 +577,7 @@ def test_analyzer_commit_with_removals_is_recovered_with_its_removal_count(
         revision=revision,
         preview_hash=preview["preview_hash"],
         key="mixed-analyzer-import",
-        allow_reduction=False,
+        allow_reduction=True,
     )
 
     recovered = recover_import(
@@ -595,7 +596,7 @@ def test_analyzer_commit_with_removals_is_recovered_with_its_removal_count(
             revision=revision,
             preview_hash=preview["preview_hash"],
             key="mixed-analyzer-import",
-            allow_reduction=False,
+            allow_reduction=True,
         )["removed"]
         == 1
     )

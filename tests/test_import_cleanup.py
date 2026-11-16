@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -70,12 +71,23 @@ def test_startup_removes_an_interrupted_upload(tmp_path: Path) -> None:
         assert not imports.metadata_path.exists()
 
 
+def _failing_for(target: Path, method: Callable[..., object]) -> Callable[..., object]:
+    """Fail one method for one path only, so other threads keep working."""
+
+    def call(self: Path, *args: object, **kwargs: object) -> object:
+        if self == target:
+            raise PermissionError("denied")
+        return method(self, *args, **kwargs)
+
+    return call
+
+
 def test_unexpected_cleanup_failure_is_an_owner_operation_error(tmp_path: Path) -> None:
     imports = HistoryImports(configuration(tmp_path))
     partial_upload(imports, age_seconds=2 * 60 * 60)
 
     with (
-        patch.object(Path, "unlink", side_effect=PermissionError("denied")),
+        patch.object(Path, "unlink", _failing_for(imports.path, Path.unlink)),
         pytest.raises(OwnerOperationError, match="cleanup") as raised,
     ):
         imports.cleanup_expired()
@@ -84,8 +96,9 @@ def test_unexpected_cleanup_failure_is_an_owner_operation_error(tmp_path: Path) 
 
 def test_unreadable_staging_directory_is_an_owner_operation_error(tmp_path: Path) -> None:
     config = configuration(tmp_path)
+    staging = config.controller.state_dir / "owner-import"
     with (
-        patch.object(Path, "lstat", side_effect=PermissionError("denied")),
+        patch.object(Path, "lstat", _failing_for(staging, Path.lstat)),
         pytest.raises(OwnerOperationError, match="Import staging"),
     ):
         HistoryImports(config)

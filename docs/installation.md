@@ -210,7 +210,7 @@ with owner controls locked; run `uv run inky-bird access setup --config "$CONFIG
 later in a private terminal.
 
 New artwork is off with `config.example.toml` (`generation_enabled = false`),
-so a new controller shows approved artwork only. Setup output then includes
+so a new controller shows the approved plates only. Setup output then includes
 `"generation_enabled": false` and a `generation` line that says how to turn it
 on. To make new plates, set `generation_enabled = true` under `[controller]` and
 run setup again. Generation uses your own Codex sign-in, through your ChatGPT
@@ -322,7 +322,9 @@ The generation service's `TimeoutStartSec` follows the configuration:
 `max_species_attempts_per_cycle` x (2 x `max_generation_attempts` + 2) x 20
 minutes, plus 15 minutes. With the example values that is 48,900 seconds, about
 13.6 hours. Run setup again after changing either setting. The other one-shot
-services stop after 30 minutes, and the display service after 15.
+services stop after 30 minutes, and the display service after 15. A first
+publication of a large catalog over a slow upload link may stop at the 30-minute
+limit; it starts again at the next timer run.
 
 ### Docker controller
 
@@ -360,9 +362,9 @@ the [operations guide](operations.md#seed-and-manage-a-private-collection).
 
 Open `http://CONTROLLER_ADDRESS:8793/app` in a browser on your home network,
 using the controller's actual LAN address, and sign in with the username and
-password you created at the end of setup. The approved artwork is under
-**Birds → Available artwork**; Home stays empty until a bird is observed or
-saved. See [browser access](browser-access.md) for allowed addresses and HTTPS.
+password you created at the end of setup. The plates are under **Birds → More
+plates**. With nothing on your frame yet, Home shows a plate from the catalog
+and **Choose birds**. See [browser access](browser-access.md) for allowed addresses and HTTPS.
 
 ### Import an approved catalog without changing parent permissions
 
@@ -387,8 +389,9 @@ records must be recovered before changing the transaction location; the command
 does not silently discard them. Imports without `--state-dir` retain sibling
 transaction staging for offline catalogs.
 
-Catalog import preserves the approved artwork and its metadata. Adding that
-artwork to Saved birds is a separate owner action, not evidence of a sighting.
+Catalog import preserves the approved plates and their metadata. Putting a
+plate on your frame is a separate owner action; it does not record the bird as
+noted.
 
 ## 2. Prepare the display Pi
 

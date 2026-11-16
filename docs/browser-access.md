@@ -7,7 +7,7 @@ setup before sharing access. Existing installations create that first account
 locally, so a visitor cannot claim your retained birds during an upgrade.
 
 Owner access covers the [journal](journal.md), sources, history imports,
-collections, and plate work. [Paired screens and dashboards](presentation.md)
+collections, and the plates in the works. [Paired screens and dashboards](presentation.md)
 use separate read-only access. This guide describes `main`; for an upgrade,
 follow the instructions that ship with your target release.
 
@@ -65,7 +65,7 @@ automatically. HTTPS is available when you need encryption.
 ## What changes on an existing installation
 
 The browser journal adds a private owner account. It does not replace your
-configuration, provider credentials, detection history, plates, saved birds,
+configuration, provider credentials, detection history, plates, the birds on your frame,
 generation limits or display settings. Your existing schedules keep running.
 The older catalog and dashboard routes retain their trusted-network contract;
 the new owner account does not put them behind a login.

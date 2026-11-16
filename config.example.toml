@@ -50,7 +50,7 @@ birdbuddy_include_manual_sightings = false
 # To change this existing file through the browser, use the explicit adoption
 # preview in Settings, then re-run the installer and restart the service.
 # configuration_ownership = "managed"
-# New installs show approved artwork only. Set true to create new artwork with
+# New installs show approved plates only. Set true to make new plates with
 # your own image-generation account; that provider's charges apply. After changing
 # it, re-run native setup, or for Docker run config-sync and restart the services.
 # Older files without this line keep generation on, unless app-managed.
@@ -119,7 +119,7 @@ insufficient_references_retry_minutes = 10080
 # owner_subject = "exact-verified-owner-subject" # optional managed headless binding
 
 [research]
-# Successful profiles are cached by taxon, so retries of the artwork do not research the
+# Successful profiles are cached by taxon, so retries of a plate do not research the
 # species again. Five searches/day matches the default four generation cycles/day with room
 # for one recovery. Raise it deliberately when generation_minutes is reduced or after seeding.
 enabled = true

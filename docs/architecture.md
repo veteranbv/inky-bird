@@ -221,7 +221,7 @@ it gets `no-store`, like every other owner response. The owner bird image route
 accepts a `thumbnail` kind beside `portrait` and `profile`. Grid cards and
 collection covers use thumbnails: JPEG (WebP where Pillow has no JPEG support)
 up to 480x640 at quality 85, made on demand and cached under
-`state_dir/plate-thumbnails/`. Frame, Home, the bird page and paired screens use
+`state_dir/plate-thumbnails/`. Play, Home, the bird page and paired screens use
 the full PNG. Display-node `/wall` assets and the public catalog are unchanged.
 
 The featured-plate route is a small HTML representation for dashboards. It
