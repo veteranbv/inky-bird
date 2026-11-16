@@ -44,6 +44,7 @@ from inky_bird_frame.cli import (
     config_validate_command,
     ebird_archive_import_command,
     ebird_archive_status_command,
+    error_code,
     generate_command,
     main,
     notifications_dispatch_command,
@@ -65,11 +66,13 @@ from inky_bird_frame.config import (
 from inky_bird_frame.controller import (
     HUMAN_REVIEW_SOURCE,
     REVIEW_FAILURE_FALLBACK,
+    ControllerCycleBusyError,
     exclusive_cycle_lock,
     read_generation_queue,
 )
 from inky_bird_frame.ebird_archive import EbirdArchiveHistory, EbirdArchiveImportStats
 from inky_bird_frame.errors import (
+    BusyError,
     CatalogError,
     CatalogPublishError,
     ConfigurationError,
@@ -79,6 +82,7 @@ from inky_bird_frame.errors import (
     UsageError,
 )
 from inky_bird_frame.models import ProfileConflict
+from inky_bird_frame.publisher import CatalogPublishBusyError
 from inky_bird_frame.retry import RetryStore
 
 
@@ -3700,9 +3704,35 @@ def _generation_config() -> SimpleNamespace:
     return SimpleNamespace(controller=SimpleNamespace(generation_enabled=True))
 
 
-def _busy_error(exc: Exception) -> Exception:
+def _would_block(exc: Exception) -> Exception:
     exc.__cause__ = BlockingIOError(35, "Resource temporarily unavailable")
     return exc
+
+
+def test_a_held_controller_cycle_lock_is_a_busy_generation_error(tmp_path: Path) -> None:
+    with (
+        exclusive_cycle_lock(tmp_path),
+        pytest.raises(BusyError) as raised,
+        exclusive_cycle_lock(tmp_path),
+    ):
+        pass
+
+    assert isinstance(raised.value, GenerationError)
+    assert error_code(raised.value) == "busy"
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (_would_block(GenerationError("Generation example failed")), "generation"),
+        (_would_block(DataSourceError("Source example failed")), "data_source"),
+        (_would_block(CatalogPublishError("Publication example failed")), "publication"),
+    ],
+)
+def test_only_lock_contention_is_busy_not_any_would_block_cause(
+    failure: Exception, code: str
+) -> None:
+    assert error_code(failure) == code
 
 
 @pytest.mark.parametrize(
@@ -3741,7 +3771,7 @@ def test_generate_busy_failure_is_not_a_degradation() -> None:
         patch("inky_bird_frame.cli._config", return_value=_generation_config()),
         patch(
             "inky_bird_frame.cli.run_generation_cycle",
-            side_effect=_busy_error(GenerationError("Another controller cycle is already running")),
+            side_effect=ControllerCycleBusyError("Another controller cycle is already running"),
         ),
         patch("inky_bird_frame.cli.safe_record_degradation") as degrade,
         pytest.raises(GenerationError),
@@ -3898,7 +3928,7 @@ def test_catalog_publish_records_a_degradation_for_every_failure(
 @pytest.mark.parametrize(
     "failure",
     [
-        _busy_error(CatalogPublishError("Another catalog publication is running")),
+        CatalogPublishBusyError("Another catalog publication is running"),
         CatalogPublishError("PRIVATE_DETAIL"),
     ],
 )
