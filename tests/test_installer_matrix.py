@@ -24,6 +24,10 @@ and every enabled or running unit; an installer's own success line is such a
 claim. The previous version is hashed whole: its runtime directory, or the
 source, installer and project files of a single-directory install.
 
+Upgrades start from what each layout's own installers left: the frozen
+installers of the last release (``release-0.9.8``, under the inky-bird-frame
+names), of the single-directory layout, or today's.
+
 The recording runs are tests too, ``<scenario>/<state>/recording`` (and
 ``-after<step>`` for a cleanup): the run without a fault must succeed and pass
 every check, and a run with its first fault must fail.
@@ -37,8 +41,8 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 223 cases, beside 66 recording
-runs, 19 busy-plate runs and 15 tests of the matrix itself. Run every case,
+both controllers and on a shared Pi's display: 232 cases, beside 69 recording
+runs, 21 busy-plate runs and 21 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
@@ -113,6 +117,40 @@ SINGLE_DIRECTORY_SHA256 = {
         "36ea22ef7d35f0f5b8bcc137d02551054c58a919397e747f7d35c0d56ee5b0da"
     ),
 }
+# The installers of the last public release, v0.9.8, which owners upgrade from:
+# the inky-bird-frame names throughout, and no service prefix or runtimes.
+RELEASE = "release-0.9.8"
+RELEASE_DIRECTORY = ROOT / "tests/fake_bin/release_0_9_8"
+RELEASE_SHA256 = {
+    "install-controller-systemd.sh": (
+        "226db4b9ac924c0b7203789b1189a78d91c7a75e4d5e963718ef6fe5af02b1be"
+    ),
+    "install-controller.sh": "f76b1619bc48cb61c6e1d06fc9b38f1a90e5a3ca46051ece0d3b9383b00da207",
+    "install-display-local.sh": (
+        "85120c662f393939efba1a5be31c9bc190e4524c5a296aae89b2bdb99aa5d108"
+    ),
+}
+# The fixed paths each of them names, which a machine points at itself.
+RELEASE_SYSTEM_PATHS = {
+    "install-controller.sh": ("/usr/bin/plutil",),
+    "install-controller-systemd.sh": ("/etc/systemd/system",),
+    "install-display-local.sh": ("/etc/systemd/system",),
+}
+RELEASE_FAMILY = "inky-bird-frame"
+# The release's distribution name, which the fake uv and pip read.
+RELEASE_PYPROJECT = 'name = "inky-bird-frame"\nversion = "0.9.8"\n'
+# 0.9.8 rendered display units without a service prefix argument.
+RELEASE_INSTALLATION_MODULE = """from pathlib import Path
+
+TAG = (Path(__file__).resolve().parents[1] / "runtime-tag").read_text().strip()
+
+
+def display_systemd_units(config, *, executable, app_dir, config_path, user):
+    service = f"# 0.9.8\\n# rendered by {TAG}\\n[Service]\\nUser={user}\\nExecStart={executable}\\n"
+    timer = f"# 0.9.8\\n# rendered by {TAG}\\n"
+    names = ("inky-bird-frame-display.service", "inky-bird-frame-display.timer")
+    return dict(zip(names, (service, timer)))
+"""
 TIMER_UNITS = "controller.service refresh.service refresh.timer generate.service generate.timer"
 APP_UNITS = "controller.service scheduler.service"
 AGENTS = "serve refresh catalog-publish"
@@ -149,7 +187,7 @@ SCENARIOS = {
             "controller",
             "Darwin",
             (("FAKE_AGENTS", AGENTS),),
-            ("fresh", "single", "staged", "disabled", "rolled-back"),
+            ("fresh", "single", "staged", "disabled", "rolled-back", RELEASE),
             "uninstall-controller.sh",
         ),
         Scenario(
@@ -167,6 +205,7 @@ SCENARIOS = {
                 "shared-single",
                 "shared-staged",
                 "shared-both",
+                RELEASE,
             ),
             "uninstall-controller-systemd.sh",
         ),
@@ -222,6 +261,7 @@ SCENARIOS = {
                 "shared-single",
                 "shared-staged",
                 "shared-both",
+                RELEASE,
             ),
             "uninstall-display-local.sh",
         ),
@@ -285,26 +325,47 @@ def display_venv(host: Host) -> None:
     inky.chmod(0o755)
 
 
+def family_of(state: str) -> str:
+    """The service names a starting state was installed under."""
+    return RELEASE_FAMILY if state == RELEASE else "inky-bird"
+
+
 class Machine(Host):
     """One synthetic computer for a group of cases, in a fixed directory."""
 
-    def __init__(self, root: Path, scenario: Scenario, *, create: bool = True) -> None:
-        super().__init__(root, scenario.system, number_file_commands=True, create=create)
+    def __init__(
+        self, root: Path, scenario: Scenario, *, create: bool = True, family: str = "inky-bird"
+    ) -> None:
+        super().__init__(root, scenario.system, family, number_file_commands=True, create=create)
         self.scenario = scenario
         self.key = root / "synthetic-key"
         if create:
             self.config.write_text(f"synthetic private config {SECRET}\n")
             self.key.write_text("synthetic key\n")
             display_venv(self)
+            if family == RELEASE_FAMILY:
+                # The release installed only the command of its own name.
+                (self.venv / "bin/inky-bird").unlink()
 
     # Building starting states.
-    def checkout(self, tag: str) -> Path:
+    def checkout(self, tag: str, *, release: bool = False) -> Path:
         directory = self.root / f"source-{tag}"
         Host.write_source(directory, tag)
+        if release:
+            (directory / "pyproject.toml").write_text(RELEASE_PYPROJECT)
+            (directory / "src/inky_bird_frame/installation.py").write_text(
+                RELEASE_INSTALLATION_MODULE
+            )
         return directory
 
     def environment_for(self, scenario: Scenario, **extra: str) -> dict[str, str]:
         environment = self.environment(**dict(scenario.environment))
+        if self.family == RELEASE_FAMILY:
+            # The release's installers find these paths only here; today's from
+            # the layout the machine reports.
+            environment.update(
+                INKY_BIRD_SUPPORT_DIR=str(self.support), INKY_BIRD_CONFIG_PATH=str(self.config)
+            )
         if scenario.name == "remote-display":
             environment.update(
                 INKY_BIRD_DISPLAY_HOST="display.example.test",
@@ -347,13 +408,17 @@ class Machine(Host):
 
     def install(self, scenario: Scenario, layout: str, tag: str) -> None:
         """Install ``scenario``'s role from a ``tag`` checkout in one layout."""
-        source = self.checkout(tag)
+        source = self.checkout(tag, release=layout == "release")
         name = scenario.script
         if scenario.name == "remote-display":
             name = "install-display-local.sh"
             scenario = SCENARIOS["display"]
-        text = (SINGLE_DIRECTORY / name).read_text() if layout == "single" else None
-        script = self.script(name, source=source, text=text)
+        text = system_paths = None
+        if layout == "single":
+            text = (SINGLE_DIRECTORY / name).read_text()
+        elif layout == "release":
+            text, system_paths = (RELEASE_DIRECTORY / name).read_text(), RELEASE_SYSTEM_PATHS[name]
+        script = self.script(name, source=source, text=text, system_paths=system_paths)
         result = self.execute(script, scenario)
         assert result.returncode == 0, result.stdout + result.stderr
         if scenario.role == "display":
@@ -375,7 +440,9 @@ class Machine(Host):
     def install_renamed_display(self) -> None:
         """The pre-1.0 renamed distribution as a regular install, timer stopped."""
         Host.write_source(self.app, "old")
-        self.save_state("pip", {"inky-bird-frame": {"source": str(self.app)}})
+        self.save_state(
+            "pip", {"inky-bird-frame": {"source": str(self.app), "scripts": ["inky-bird"]}}
+        )
         package = self.venv / "lib/python3/site-packages/inky_bird_frame"
         shutil.copytree(self.app / "src/inky_bird_frame", package)
         service = f"{self.family}-display.service"
@@ -393,6 +460,8 @@ class Machine(Host):
             pass
         elif state in ("single", "staged"):
             self.install(scenario, state, "old")
+        elif state == RELEASE:
+            self.install(scenario, "release", "old")
         elif state == "disabled":
             self.install(scenario, "single", "old")
             if scenario.system == "Darwin":
@@ -514,7 +583,6 @@ def runtime_of(executable: Path) -> tuple[str, Path] | None:
         return None
     venv = executable.parent.parent
     site = venv / "lib/python3/site-packages"
-    pth = site / "_inky_bird.pth"
     real = Path(os.path.realpath(venv))
     # A controller venv runs from where it is; a deleted or moved one is missing.
     if (real / "tag").exists():
@@ -522,8 +590,8 @@ def runtime_of(executable: Path) -> tuple[str, Path] | None:
     # A regular install in site-packages is imported before any editable one.
     if (site / "inky_bird_frame").is_dir():
         return "regular", site
-    if pth.exists():
-        source = Path(pth.read_text().split()[0])
+    source = fake_tools.editable_source(site)
+    if source is not None:
         tag = source / "runtime-tag"
         return (tag.read_text().strip() if tag.exists() else "missing"), source.parent
     tag = Path(os.path.realpath(venv)) / "tag"
@@ -554,7 +622,7 @@ def imported_source(venv: Path) -> Path:
 
 def display_runtime(machine: Machine) -> Code:
     site = machine.venv / "lib/python3/site-packages"
-    found = runtime_of(machine.venv / "bin/inky-bird")
+    found = runtime_of(machine.venv / "bin" / machine.family)
     if found is None or not site.exists() or not any(site.iterdir()):
         return Code(None)
     tag, directory = found
@@ -1145,6 +1213,13 @@ def check_install(
         if stopped or not tolerated:
             report.append("I8: the run reported success although it was failed or stopped")
     named = named_units(output)
+    if "unchanged" in claims(output) and (
+        after.units != before.role.units
+        or after.files != before.role.files
+        or after.code != before.role.code
+        or after.runtimes != before.role.runtimes
+    ):
+        report.append("I2: the output says nothing changed, but this role's units or runtime did")
     # I2: what is said to run is what runs, in both directions: every service,
     # every enabled or running unit and the active link. Only a unit whose
     # rollback could not be done, and that the output says may run the other
@@ -1206,13 +1281,6 @@ def check_install(
             statements, state, now, file_changed, agent=agent
         ):
             continue
-    if "unchanged" in claims(output) and (
-        after.units != before.role.units
-        or after.files != before.role.files
-        or after.code != before.role.code
-        or after.runtimes != before.role.runtimes
-    ):
-        report.append("I2: the output says nothing changed, but this role's units or runtime did")
         report.append(
             f"I4: {unit} was {state} and is now {now}"
             + (", its definition changed" if file_changed else "")
@@ -1318,7 +1386,7 @@ def active_runtime(machine: Machine, role: str) -> str | None:
             return None
         directory = Path(os.path.realpath(venv)).parent
     else:
-        found = runtime_of(machine.venv / "bin/inky-bird")
+        found = runtime_of(machine.venv / "bin" / machine.family)
         if found is None or found[0] == "regular":
             return None
         directory = Path(os.path.realpath(found[1]))
@@ -1493,7 +1561,7 @@ def installed_script(machine: Machine, scenario: Scenario) -> Path:
         if venv.exists():
             return imported_source(Path(os.path.realpath(venv))).parent / "deploy" / name
     else:
-        found = runtime_of(machine.venv / "bin/inky-bird")
+        found = runtime_of(machine.venv / "bin" / machine.family)
         if found is not None and found[0] not in ("regular", "missing"):
             return found[1] / "deploy" / name
     return machine.script(name)
@@ -1724,7 +1792,7 @@ class Group:
 
     def machine(self, slot: Path) -> Machine:
         thaw(self.template, slot)
-        machine = Machine(slot, self.scenario, create=False)
+        machine = Machine(slot, self.scenario, create=False, family=family_of(self.state))
         fix_inodes(machine)
         return machine
 
@@ -1873,7 +1941,15 @@ DEFAULT_SECOND_PASS = {
 }
 UNINSTALL_STATES = ("single", "staged", "disabled", "rolled-back", "shared")
 # States in which this role is already installed, so an upgrade checks for a plate.
-UPGRADE_STATES = ("single", "staged", "disabled", "rolled-back", "shared-single", "shared-both")
+UPGRADE_STATES = (
+    "single",
+    "staged",
+    "disabled",
+    "rolled-back",
+    "shared-single",
+    "shared-both",
+    RELEASE,
+)
 
 
 def second_pass(kind: str, scenario: str, state: str) -> bool:
@@ -1983,6 +2059,7 @@ def fingerprint() -> str:
         *sorted((ROOT / "deploy").glob("*.sh")),
         *sorted((ROOT / "tests/fake_bin").rglob("*.py")),
         *sorted(SINGLE_DIRECTORY.glob("*.sh")),
+        *sorted(RELEASE_DIRECTORY.glob("*.sh")),
         ROOT / "tests/test_installer_matrix.py",
         ROOT / "tests/test_installer_behaviour.py",
     ]
@@ -2169,7 +2246,7 @@ class Matrix:
         with self.once(("base", key)):
             if key not in self.bases:
                 directory = self.root / "bases" / f"{built.name}-{state}" / "machine"
-                machine = Machine(directory, built)
+                machine = Machine(directory, built, family=family_of(state))
                 machine.build(built, state)
                 assert not machine.survivors()
                 self.bases[key] = freeze(directory)
@@ -2182,7 +2259,7 @@ class Matrix:
                 scenario = SCENARIOS[name]
                 directory = self.root / "templates" / "-".join(key) / "machine"
                 thaw(self.base(scenario, state), directory)
-                machine = Machine(directory, scenario, create=False)
+                machine = Machine(directory, scenario, create=False, family=family_of(state))
                 prepare(machine, key)
                 self.groups[key] = Group(kind, scenario, state, freeze(directory))
             return self.groups[key]
@@ -2585,7 +2662,7 @@ def compare_clone(executed: Matrix, key: GroupKey) -> Outcome:
     scenario = SCENARIOS[name]
     # Beside the matrix's own machines, so both paths take the same form.
     directory = executed.root / "equivalence" / "-".join(key)
-    fresh = Machine(directory / "fresh", scenario)
+    fresh = Machine(directory / "fresh", scenario, family=family_of(state))
     fresh.build(SCENARIOS[scenario.start] if scenario.start else scenario, state)
     prepare(fresh, key)
     group = executed.group(key)
@@ -2779,3 +2856,13 @@ def test_every_printed_line_is_classified() -> None:
     )
     assert not sorted(set(CLAIMS) - set(found)), "CLAIMS lists lines no script prints"
     assert set(CLAIMS.values()) <= set(CLAIM_CLASSES)
+
+
+def test_release_installers_are_the_pinned_copies() -> None:
+    """Upgrades from the last release are tested from exactly its installers."""
+    first_shard_only()
+    found = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(RELEASE_DIRECTORY.glob("*.sh"))
+    }
+    assert found == RELEASE_SHA256

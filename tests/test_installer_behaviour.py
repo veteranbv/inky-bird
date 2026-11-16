@@ -306,15 +306,17 @@ class Host:
         *,
         source: Path | None = None,
         text: str | None = None,
+        system_paths: tuple[str, ...] | None = None,
     ) -> Path:
-        """Copy an installer into a checkout with its system paths in this host."""
+        """Copy an installer into a checkout with its system paths in this host;
+        ``system_paths`` names them for a ``text`` that is not today's script."""
         text = (ROOT / "deploy" / name).read_text() if text is None else text
         replacements = {
             "/Library/LaunchDaemons": str(self.fake / "LaunchDaemons"),
             "/usr/bin/plutil": str(self.bin / "plutil"),
             "/etc/systemd/system": str(self.units),
         }
-        for path in SYSTEM_PATHS[name]:
+        for path in SYSTEM_PATHS[name] if system_paths is None else system_paths:
             assert path in text, f"{name} no longer names {path}"
             text = text.replace(path, replacements[path])
         text = text.replace(

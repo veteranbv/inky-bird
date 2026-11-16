@@ -224,15 +224,14 @@ def resolve_runtime(executable: str) -> dict[str, object]:
     """
     venv = Path(executable).parent.parent
     site = site_packages(venv)
-    pth = site / "_inky_bird.pth"
+    source = editable_source(site)
     # A controller venv carries its tag; it runs from the venv directory itself.
     if (Path(os.path.realpath(venv)) / "tag").exists():
         tag, directory = runtime_tag(executable), Path(os.path.realpath(venv))
     # A regular install in site-packages is imported before any editable one.
     elif (site / "inky_bird_frame").is_dir():
         tag, directory = "regular", site / "inky_bird_frame"
-    elif pth.exists():
-        source = Path(pth.read_text().split()[0])
+    elif source is not None:
         tag_file = source / "runtime-tag"
         tag = tag_file.read_text().strip() if tag_file.exists() else "missing"
         directory = Path(os.path.realpath(source))
@@ -240,6 +239,29 @@ def resolve_runtime(executable: str) -> dict[str, object]:
         tag, directory = runtime_tag(executable), Path(os.path.realpath(venv))
     inode = directory.stat().st_ino if directory.exists() else 0
     return {"runtime": tag, "directory": str(directory), "inode": inode}
+
+
+def editable_source(site: Path) -> Path | None:
+    """The source an editable install makes Python import: of the ``.pth``
+    entries, in the order Python reads them, the first that holds the
+    package, else the first (whose source is gone)."""
+    sources = [Path(pth.read_text().split()[0]) for pth in sorted(site.glob("*.pth"))]
+    found = [source for source in sources if (source / "inky_bird_frame").is_dir()]
+    return next(iter(found or sources), None)
+
+
+def distribution_name(project: Path) -> str:
+    """The distribution a project builds: the last release's, or today's."""
+    import re
+
+    pyproject = project / "pyproject.toml"
+    text = pyproject.read_text() if pyproject.exists() else ""
+    found = re.search(r'^name = "([^"]+)"', text, re.MULTILINE)
+    return found.group(1) if found else "inky-bird"
+
+
+# The commands each distribution installs: the release had only the old name.
+SCRIPTS = {"inky-bird": ("inky-bird", "inky-bird-frame"), "inky-bird-frame": ("inky-bird-frame",)}
 
 
 # Fakes reach each other through PATH (sudo runs systemctl, ssh runs an
@@ -273,7 +295,8 @@ def build_venv(project: Path) -> None:
     """Create the synthetic venv ``uv sync`` would build for ``project``."""
     bin_dir = project / ".venv/bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for name, tool in (("python", "venv-python"), ("inky-bird", "inky-bird")):
+    scripts = SCRIPTS[distribution_name(project)]
+    for name, tool in (("python", "venv-python"), *((script, "inky-bird") for script in scripts)):
         path = bin_dir / name
         path.write_text(wrapper(tool))
         path.chmod(0o755)
@@ -627,7 +650,9 @@ def _remove(venv: Path, name: str) -> None:
 
     site = site_packages(venv)
     if name == "inky-bird-frame":
+        # A regular install, or the release's editable one.
         shutil.rmtree(site / "inky_bird_frame", ignore_errors=True)
+        (site / "_inky_bird_frame.pth").unlink(missing_ok=True)
     else:
         (site / "_inky_bird.pth").unlink(missing_ok=True)
 
@@ -643,11 +668,16 @@ def _pip(venv: Path, arguments: list[str]) -> int:
             print("synthetic index failure", file=sys.stderr)
             return 1
         source = arguments[-1].split("[", 1)[0]
-        dists["inky-bird"] = {"source": source}
+        name = distribution_name(Path(source))
+        dists[name] = {"source": source, "scripts": list(SCRIPTS[name])}
         _save("pip", dists)
         site = site_packages(venv)
         site.mkdir(parents=True, exist_ok=True)
-        (site / "_inky_bird.pth").write_text(f"{source}/src\n")
+        (site / f"_{name.replace('-', '_')}.pth").write_text(f"{source}/src\n")
+        for script in SCRIPTS[name]:
+            path = venv / "bin" / script
+            path.write_text(wrapper("inky-bird"))
+            path.chmod(0o755)
         return 0
     if verb == "uninstall":
         dists.pop(arguments[-1], None)
@@ -655,6 +685,17 @@ def _pip(venv: Path, arguments: list[str]) -> int:
         _remove(venv, arguments[-1])
         return 0
     return 0
+
+
+def _executable(source: str, prefix: str) -> str:
+    """The command a controller program's services start, as it names it."""
+    import re
+
+    named = re.search(r'executable = app_dir / "\.venv/bin/([\w-]+)"', source)
+    if named is not None:
+        return named.group(1)
+    assert 'executable = app_dir / ".venv/bin" / service_prefix' in source, "unknown executable"
+    return prefix
 
 
 def venv_python(executable: str, arguments: list[str]) -> int:
@@ -681,9 +722,17 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             removed, kept = arguments[2:4]
             _log("remove-distribution", removed, kept)
             dists = _state("pip")
-            dists.pop(removed, None)
+            gone = dists.pop(removed, None)
             _save("pip", dists)
             _remove(venv, removed)
+
+            # The commands this pip installed go too, except those the kept one
+            # also installed; an install made elsewhere names none.
+            def scripts(dist: object) -> set[str]:
+                return set(dist.get("scripts", ())) if isinstance(dist, dict) else set()
+
+            for script in scripts(gone) - scripts(dists.get(kept)):
+                (venv / "bin" / script).unlink(missing_ok=True)
             return 0
         _log("python-c", tag)
         # -S keeps the test interpreter's own site-packages out of the import path.
@@ -698,18 +747,23 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         if f"{tag}:heredoc" in rules:
             print("synthetic configuration rejection", file=sys.stderr)
             return 1
-        prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+        # The release named its services before the name was chosen at install.
+        prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird-frame")
+        # The macOS program takes one plist per agent, then the source and app.
+        plists = len([argument for argument in arguments if argument.endswith(".plist")])
         if "sync_public_catalog" in source:
             # The real program syncs the catalog from the install source first.
-            root = Path(arguments[7] if "plistlib" in source else arguments[2])
+            root = Path(arguments[plists + 1] if "plistlib" in source else arguments[2])
             if not (root / "catalog").is_dir():
                 print("synthetic catalog source is missing", file=sys.stderr)
                 return 1
+        if "plistlib" in source or "controller_systemd_units" in source:
+            executable = _executable(source, prefix)
         if "plistlib" in source:
             import plistlib
 
-            paths = arguments[1:7]
-            app_dir = Path(arguments[8])
+            paths = arguments[1 : plists + 1]
+            app_dir = Path(arguments[plists + 2])
             order = (
                 "serve",
                 "refresh",
@@ -719,11 +773,17 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                 "scheduler",
             )
             wanted = os.environ.get("FAKE_AGENTS", "serve refresh").split()
-            for label, path in zip(order, paths, strict=True):
+            if plists == 5:
+                # The release always rendered these three agents.
+                wanted += ["serve", "refresh", "generate"]
+            for label, path in zip(order[: len(paths)], paths, strict=True):
                 if label in wanted:
                     payload = {
                         "Label": f"com.{prefix}.{label}",
-                        "ProgramArguments": [str(app_dir / ".venv/bin/inky-bird"), label],
+                        "ProgramArguments": [
+                            str(app_dir / ".venv/bin" / executable),
+                            label,
+                        ],
                         "RunAtLoad": True,
                         "Comment": "new",
                         # Which runtime rendered it, so a definition left
@@ -738,7 +798,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
             for name in os.environ["FAKE_UNITS"].split():
                 content = f"[Unit]\n# new\n# rendered by {tag}\n"
                 if name.endswith(".service"):
-                    content += f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/inky-bird\n"
+                    content += (
+                        f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/{executable}\n"
+                    )
                 (unit_dir / f"{prefix}-{name}").write_text(content)
         elif "display_systemd_units" in source:
             import subprocess
