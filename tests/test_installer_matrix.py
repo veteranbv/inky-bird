@@ -842,61 +842,194 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
             report.append(f"I9: a private path was printed: {match}")
 
 
-# Each installer's own last word on success, as its final lines begin. A run
-# that prints one says the new version is installed, whatever else it says.
-SUCCESS_LINES = (
-    "Controller installed from ",
-    "Display node installed from ",
-    "Display node deployed to ",
-)
+# Every line the scripts in deploy/ print, as its echo spells it, by what it
+# claims about the whole run. ``test_every_printed_line_is_classified`` keeps
+# this the full list, so a claim reworded or added cannot go unread:
+# - installed: the run put the new version in place (only a later step failed);
+# - new: the new version is active although the run did not finish;
+# - previous: the previous version runs, as it did before;
+# - unchanged: the run changed nothing;
+# - uninstalled: every unit was taken out;
+# - neutral: no claim about the run as a whole. Statements about single units
+#   are read by ``UNIT_STATEMENTS``; one they cannot read leaves its unit unnamed.
+CLAIMS = {
+    # installed
+    "Controller installed from ${root} into ${app_dir}.": "installed",
+    "Display node installed from ${root} into ${app_dir}.": "installed",
+    "Display node deployed to ${remote}.": "installed",
+    "Controller installation completed; owner setup is incomplete. Run access setup in a "
+    "private terminal. Display and scheduled work continue.": "installed",
+    "The new version is installed and running, but a final step failed; see the error above.": (
+        "installed"
+    ),
+    "The new version is installed, but a final step failed; see the error above.": "installed",
+    "Stopped while finishing; the new version is installed and running.": "installed",
+    # new
+    "Could not switch back to the previous version; the new one is kept in ${new_runtime}.": (
+        "new"
+    ),
+    "Could not switch back to the previous version; the new one stays active, kept in "
+    "${new_runtime}.": "new",
+    "The upgrade failed after the new version was installed; the display uses the new "
+    "version, kept in ${new_runtime}.": "new",
+    # previous
+    "The upgrade failed; the agents it stopped were started again on the previous version.": (
+        "previous"
+    ),
+    "The upgrade failed; the services it stopped were started again on the previous version.": (
+        "previous"
+    ),
+    "The upgrade failed; the previous version is running again.": "previous",
+    "The upgrade failed; the previous version is unchanged.": "previous",
+    "The upgrade failed; the display still runs the previous version, and the new version "
+    "could not be taken out. Rerun the installer to finish; the new version is kept in "
+    "${new_runtime}.": "previous",
+    # unchanged
+    "Not enough remote capacity for isolated source staging and the managed copy: need $3 "
+    "KiB, have ${available} KiB. No live runtime changes made.": "unchanged",
+    "${service_prefix}-${name}.service runs as ${owner}. Run the installer as ${owner}. "
+    "No changes made.": "unchanged",
+    "A plate is still being made. Run the upgrade again after it finishes. No changes made.": (
+        "unchanged"
+    ),
+    "Administrator access is required to install system services. No changes made.": ("unchanged"),
+    "Administrator access is required to remove system services. No changes made.": "unchanged",
+    "Administrator access is required to remove the display service. No changes made.": (
+        "unchanged"
+    ),
+    "Could not check whether a plate is being made. No changes made.": "unchanged",
+    "Could not choose a private staging name. No changes made.": "unchanged",
+    "Could not find where the services are installed. No changes made.": "unchanged",
+    "Inky uses operator-managed system services. Use that deployment process to upgrade; "
+    "the user installer made no changes.": "unchanged",
+    "Noninteractive administrator access is required before installing the display service. "
+    "No changes made.": "unchanged",
+    "Remote staging path already exists; run the deployment again. No changes made.": ("unchanged"),
+    "Run the installer as the account that will own the controller, not as root. "
+    "No changes made.": "unchanged",
+    "Stop the existing display timer and let its service finish before updating its "
+    "runtime. Preserve a recoverable runtime backup first. No changes made.": "unchanged",
+    "The new version cannot use this configuration. No changes made.": "unchanged",
+    "Uninstall was stopped. No changes made.": "unchanged",
+    # uninstalled
+    "Controller LaunchAgents uninstalled.": "uninstalled",
+    "Controller services uninstalled.": "uninstalled",
+    "Display node services uninstalled.": "uninstalled",
+    # neutral
+    "  Application runtime and catalog copy: ${app_dir}": "neutral",
+    "  Application runtime and managed catalog: ${app_dir}": "neutral",
+    "  Configuration: ${config_path}": "neutral",
+    "  Display state directory configured in ${config_path}": "neutral",
+    "  Logs and support data: ${support_dir}": "neutral",
+    "  Pimoroni Python environment: ${venv}": "neutral",
+    "  Support data: ${support_dir}": "neutral",
+    "  Workspace, state, and catalog directories configured in ${config_path}": "neutral",
+    "Administrator access is required to install system services.": "neutral",
+    "Administrator access is required to install the display service.": "neutral",
+    "Booted out LaunchAgent: ${agent}": "neutral",
+    "Cannot create remote staging directory.": "neutral",
+    "Cannot determine remote staging capacity.": "neutral",
+    "Check them with: systemctl status ${changed[*]}": "neutral",
+    "Check them with: systemctl status ${differ[*]}": "neutral",
+    "Configuration: ${config_path}": "neutral",
+    "Controller configuration is missing: ${config_path}": "neutral",
+    "Controller installer currently supports macOS.": "neutral",
+    "Controller installer requires Linux with systemd.": "neutral",
+    "Controller uninstaller currently supports macOS.": "neutral",
+    "Controller uninstaller requires Linux with systemd.": "neutral",
+    "Could not fetch bird observations yet. The scheduled refresh will try again.": "neutral",
+    "Could not remove an older runtime; remove it by hand: ${runtime}": "neutral",
+    "Could not remove isolated public-source staging; remove it after reconnecting: "
+    "${remote_stage}": "neutral",
+    "Could not remove temporary files; remove them by hand: ${reply_dir}": "neutral",
+    "Could not remove temporary files; remove them by hand: ${work_dir}": "neutral",
+    "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
+    "${leftovers[*]}": "neutral",
+    "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
+    "${new_runtime}": "neutral",
+    "Display deployment key is missing: ${ssh_key}": "neutral",
+    "Display installer requires Linux with systemd.": "neutral",
+    "Display uninstaller requires Linux with systemd.": "neutral",
+    "Display-node configuration is missing: ${config_path}": "neutral",
+    "Fix the cause shown above and run the uninstaller again.": "neutral",
+    "INKY_BIRD_NONINTERACTIVE_SUDO must be true or false.": "neutral",
+    "INKY_BIRD_RUN_INITIAL_DISPLAY must be true or false.": "neutral",
+    "Intentionally left in place:": "neutral",
+    "LaunchAgent is not loaded: ${agent}": "neutral",
+    "Logs: ${log_dir}": "neutral",
+    "Pimoroni Python environment is missing: ${venv}": "neutral",
+    "Plist is not installed: ${plist}": "neutral",
+    "Previous version kept for rollback: ${previous_runtime}": "neutral",
+    "Reloaded the systemd unit configuration.": "neutral",
+    "Remote application, config and venv paths must be absolute, single-line paths.": "neutral",
+    "Remote staging did not return a recognized private temporary directory.": "neutral",
+    "Remove those paths manually if you no longer need the controller data.": "neutral",
+    "Remove those paths manually if you no longer need the display data.": "neutral",
+    "Removed /etc/systemd/system/${unit}.": "neutral",
+    "Removed plist: ${plist}": "neutral",
+    "Run the uninstaller again to finish.": "neutral",
+    "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist": "neutral",
+    "Start them with: sudo systemctl start ${stopped[*]}": "neutral",
+    "Stop each with: launchctl bootout gui/${uid}/<agent>": "neutral",
+    "Stop them with: sudo systemctl stop ${running[*]}": "neutral",
+    "Stopped $1.": "neutral",
+    "Stopped ${service_prefix}-display.service.": "neutral",
+    "Stopped and disabled $1.": "neutral",
+    "Stopped and disabled ${service_prefix}-display.timer.": "neutral",
+    "The new version could not refresh bird observations; see the error above.": "neutral",
+    "The previous version is kept in ${legacy_runtime}.": "neutral",
+    "The upgrade failed and these agents are not running: ${unrestored[*]}.": "neutral",
+    "The upgrade failed and these agents could not be stopped: ${still_running[*]}.": "neutral",
+    "The upgrade failed and these services are stopped: ${stopped[*]}.": "neutral",
+    "The upgrade failed and these services could not be stopped: ${running[*]}.": "neutral",
+    "These display services are not as they were before the upgrade: ${differ[*]}.": "neutral",
+    "These services are not set up as they were before the upgrade: ${changed[*]}.": "neutral",
+    "These services could not be stopped or disabled and may still run the new version, "
+    "kept in ${new_runtime}: ${stuck_units[*]}.": "neutral",
+    "These services were restarted on the new version: ${restarted[*]}.": "neutral",
+    "They may still run the new version, kept in ${new_runtime}.": "neutral",
+    "Timed out waiting for ${service} to finish.": "neutral",
+    "Uninstall did not finish. Could not remove: ${failures[*]}.": "neutral",
+    "Uninstall did not finish. Could not stop or remove: ${failures[*]}.": "neutral",
+    "Uninstall was stopped before it finished; still installed: ${remaining[*]-none}.": ("neutral"),
+    "uv is not executable. Install uv or set UV_BIN.": "neutral",
+}
+CLAIM_CLASSES = ("installed", "new", "previous", "unchanged", "uninstalled", "neutral")
+# A shell expansion in a printed line: ${name}, ${name[*]-default}, $name or $1.
+EXPANSION = re.compile(r"\$\{[^}]*\}|\$\w+")
+
+
+def claim_pattern(text: str) -> re.Pattern[str]:
+    """The lines an echo of ``text`` prints, whatever its expansions hold."""
+    return re.compile(".*".join(re.escape(part) for part in EXPANSION.split(text)))
+
+
+CLAIM_PATTERNS = tuple((claim_pattern(text), kind) for text, kind in CLAIMS.items())
+
+
+def claims(output: str) -> set[str]:
+    """What the printed lines claim, by ``CLAIMS`` class; neutral lines claim nothing."""
+    found: set[str] = set()
+    for line in output.splitlines():
+        found.update(kind for pattern, kind in CLAIM_PATTERNS if pattern.fullmatch(line))
+    return found - {"neutral"}
 
 
 def says_installed(output: str) -> bool:
-    return any(line.startswith(SUCCESS_LINES) for line in output.splitlines())
+    return "installed" in claims(output)
 
 
 def claims_new(outcome: Outcome) -> bool:
-    return (
-        outcome.returncode == 0
-        or says_installed(outcome.output)
-        or any(
-            phrase in outcome.output
-            for phrase in (
-                "new version is installed",
-                "uses the new version",
-                "the new one stays active",
-                "the new one is kept in",
-            )
-        )
-    )
+    return outcome.returncode == 0 or bool(claims(outcome.output) & {"installed", "new"})
 
 
 def completed(outcome: Outcome) -> bool:
     """The run finished installing the new version; only a step after that failed."""
-    return (
-        outcome.returncode == 0
-        or says_installed(outcome.output)
-        or any(
-            phrase in outcome.output
-            for phrase in (
-                "is installed and running, but a final step failed",
-                "new version is installed, but a final step failed",
-                "Stopped while finishing",
-            )
-        )
-    )
+    return outcome.returncode == 0 or says_installed(outcome.output)
 
 
 def claims_previous(outcome: Outcome) -> bool:
-    return any(
-        phrase in outcome.output
-        for phrase in (
-            "previous version is running again",
-            "started again on the previous version",
-            "previous version is unchanged",
-            "still runs the previous version",
-        )
-    )
+    return "previous" in claims(outcome.output)
 
 
 def single_fault(case: Case) -> bool:
@@ -1073,6 +1206,13 @@ def check_install(
             statements, state, now, file_changed, agent=agent
         ):
             continue
+    if "unchanged" in claims(output) and (
+        after.units != before.role.units
+        or after.files != before.role.files
+        or after.code != before.role.code
+        or after.runtimes != before.role.runtimes
+    ):
+        report.append("I2: the output says nothing changed, but this role's units or runtime did")
         report.append(
             f"I4: {unit} was {state} and is now {now}"
             + (", its definition changed" if file_changed else "")
@@ -1288,9 +1428,15 @@ def check_uninstall(
     outcome.covered.update(("U1", "U2", "U3"))
     after = view(machine, scenario.role)
     remaining = left_installed(after)
-    if outcome.returncode == 0 and remaining:
+    claimed = claims(outcome.output)
+    if (outcome.returncode == 0 or "uninstalled" in claimed) and remaining:
         report.append(f"U1: uninstall reported success but left {remaining}")
-    if "No changes made" in outcome.output:
+    if "uninstalled" in claimed and (outcome.returncode != 0 or "did not finish" in outcome.output):
+        report.append(
+            f"U1: the output says uninstalled, but the run did not finish "
+            f"(exit {outcome.returncode})"
+        )
+    if "unchanged" in claimed:
         if after.units != before.role.units or after.files != before.role.files:
             report.append("U2: the uninstaller said it made no changes, but it did")
         return
@@ -2539,13 +2685,7 @@ def test_an_installer_says_it_succeeded_only_once_it_has(name: str) -> None:
     the matrix reads it as a claim that the new version is installed."""
     first_shard_only()
     lines = (ROOT / "deploy" / name).read_text().splitlines()
-    success = [
-        number
-        for number, line in enumerate(lines)
-        if line.startswith('echo "') and line.removeprefix('echo "').startswith(SUCCESS_LINES)
-    ]
-    assert len(success) == 1, f"{name} has {len(success)} success lines"
-    (number,) = success
+    (number,) = success_lines(lines, "installed", name)
     done = max(index for index, line in enumerate(lines) if line == COMPLETION_MARKERS[name])
     assert number > done, f"{name} says it succeeded before the new version is in place"
     printed = re.sub(r"\$\{[^}]+\}", "/x", lines[number].removeprefix('echo "').rstrip('"'))
@@ -2560,3 +2700,82 @@ def test_single_directory_installers_are_the_pinned_copies() -> None:
         for path in sorted(SINGLE_DIRECTORY.glob("*.sh"))
     }
     assert found == SINGLE_DIRECTORY_SHA256
+
+
+def success_lines(lines: list[str], kind: str, name: str) -> list[int]:
+    """The script's own last word on success: its one unindented line of ``kind``."""
+    found = [
+        number
+        for number, line in enumerate(lines)
+        if line.startswith("echo ")
+        and any(CLAIMS.get(text) == kind for text in printed_texts(line))
+    ]
+    assert len(found) == 1, f"{name} has {len(found)} success lines"
+    return found
+
+
+# A call that stops, disables or removes a unit; uninstallers make no others.
+UNINSTALL_STEP = re.compile(
+    r"\bsystemctl (?:disable|stop|daemon-reload)\b|\blaunchctl bootout\b|\brm -f\b"
+)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["uninstall-controller.sh", "uninstall-controller-systemd.sh", "uninstall-display-local.sh"],
+)
+def test_an_uninstaller_says_it_succeeded_only_once_it_has(name: str) -> None:
+    """Its success line comes after its last change and after its check that
+    every change worked; one printed earlier would sit beside a failure."""
+    first_shard_only()
+    lines = (ROOT / "deploy" / name).read_text().splitlines()
+    (number,) = success_lines(lines, "uninstalled", name)
+    last = max(index for index, line in enumerate(lines) if UNINSTALL_STEP.search(line))
+    checked = max(index for index, line in enumerate(lines) if "did not finish" in line)
+    assert number > last, f"{name} says it uninstalled before its last change"
+    assert number > checked, f"{name} says it uninstalled before checking its changes worked"
+
+
+# What prints text: echo with a double-quoted argument, or printf's format.
+ECHO = re.compile(r'\becho\s+"((?:[^"\\]|\\.)*)"')
+PRINTF = re.compile(r"""\bprintf\s+(?!-v)(['"])(.*?)\1""")
+# Output whose text the table cannot read: an echo of anything but one
+# double-quoted string, or a here-document printed with cat.
+UNREADABLE_OUTPUT = re.compile(r'\becho\b(?!\s+")|\bcat\b[^|]*<<')
+PRINTF_DIRECTIVE = re.compile(r"%[-#0 +]*\d*(?:\.\d+)?[a-zA-Z]|\\n")
+
+
+def printed_texts(line: str) -> list[str]:
+    """Each text a script line prints, as written; a printf format with no
+    words of its own prints only its arguments and is left out."""
+    found = [match.group(1) for match in ECHO.finditer(line)]
+    for match in PRINTF.finditer(line):
+        if re.search(r"[A-Za-z]{2}", PRINTF_DIRECTIVE.sub("", match.group(2))):
+            found.append(match.group(2))
+    return found
+
+
+def test_every_printed_line_is_classified() -> None:
+    """The matrix decides what a run claimed from ``CLAIMS``, so every line a
+    script prints is in it, and nothing else is; output it cannot read, such
+    as an unquoted echo or a here-document, is not allowed."""
+    first_shard_only()
+    found: dict[str, str] = {}
+    unreadable = []
+    for path in sorted((ROOT / "deploy").glob("*.sh")):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            where = f"{path.name}:{number}"
+            for text in printed_texts(line):
+                found.setdefault(text, where)
+            if UNREADABLE_OUTPUT.search(line):
+                unreadable.append(where)
+    unclassified = sorted(f"{where}: {text}" for text, where in found.items() if text not in CLAIMS)
+    assert not unclassified, (
+        "classify each printed line in CLAIMS in tests/test_installer_matrix.py as installed, "
+        "new, previous, unchanged, uninstalled or neutral:\n" + "\n".join(unclassified)
+    )
+    assert not unreadable, 'print text with echo "..." so CLAIMS can read it: ' + ", ".join(
+        unreadable
+    )
+    assert not sorted(set(CLAIMS) - set(found)), "CLAIMS lists lines no script prints"
+    assert set(CLAIMS.values()) <= set(CLAIM_CLASSES)
