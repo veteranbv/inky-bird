@@ -66,8 +66,32 @@ class PlateThumbnails:
         # Writing and pruning share one lock so pruning never removes a
         # temporary file that another thread is about to rename into place.
         self._lock = threading.Lock()
+        self._hashes: tuple[tuple[int, int, int, int] | None, dict[int, str]] | None = None
+        self._cache_warned = False
 
     def _catalog_hashes(self) -> dict[int, str]:
+        # Keyed by the index file's identity, taken before it is read: an index
+        # replaced during the read changes the identity, so it is read again.
+        try:
+            info = (self.journal.config.catalog_dir / "index.json").stat()
+            identity: tuple[int, int, int, int] | None = (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+            )
+        except FileNotFoundError:
+            identity = None
+        except OSError:
+            return self._read_hashes()
+        memo = self._hashes
+        if memo is not None and memo[0] == identity:
+            return memo[1]
+        hashes = self._read_hashes()
+        self._hashes = (identity, hashes)
+        return hashes
+
+    def _read_hashes(self) -> dict[int, str]:
         return {
             cast(int, entry["taxon_id"]): cast(str, entry["portrait_sha256"])
             for entry in self.journal.catalog()
@@ -103,7 +127,10 @@ class PlateThumbnails:
                         path.unlink(missing_ok=True)
         except OSError:
             # The thumbnail is still correct; only the rebuildable cache failed.
-            logging.getLogger(__name__).warning(
-                "Plate thumbnail cache could not be updated; check the state directory"
-            )
+            # Every grid card would repeat this, so it is reported once per process.
+            if not self._cache_warned:
+                self._cache_warned = True
+                logging.getLogger(__name__).warning(
+                    "Plate thumbnail cache could not be updated; check the state directory"
+                )
         return Thumbnail(body, media_type, digest)
