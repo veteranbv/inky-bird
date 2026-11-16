@@ -24,8 +24,9 @@ configuration and data.
   **Favorites**, **On my frame**, birds **Noted by you** or birds with **No
   plate yet**. Open a bird to read its plate's reviewed facts and sources.
   Older plates with incomplete profiles say so.
-- **Collections** keeps **On my frame**, your **Favorites**, the collections you
-  make and **All birds**, each with its plates first.
+- **Collections** keeps **On my frame**, **On my frame · added by you**, your
+  **Favorites**, the collections you make and **All birds**, each with its
+  plates first.
 - **Play** shows plates full screen in your browser, one a minute. For a shared
   screen, [pair a read-only view](presentation.md#pair-a-read-only-screen).
 - **Manage** keeps the machinery, in five groups:

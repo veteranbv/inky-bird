@@ -622,10 +622,16 @@ up.
    scheduler:
 
    ```bash
-   docker compose run --rm --no-deps -T --entrypoint tar controller \
-     -C /data -czf - . > "$BACKUP/controller-data.tar.gz"
-   chmod 600 "$BACKUP/controller-data.tar.gz"
-   tar -tzf "$BACKUP/controller-data.tar.gz" >/dev/null
+   (
+     if [ ! -f "$BACKUP/docker-running-services.txt" ]; then
+       echo "Stop the writers first: the record of running services is missing" >&2
+       exit 1
+     fi
+     docker compose run --rm --no-deps -T --entrypoint tar controller \
+       -C /data -czf - . > "$BACKUP/controller-data.tar.gz"
+     chmod 600 "$BACKUP/controller-data.tar.gz"
+     tar -tzf "$BACKUP/controller-data.tar.gz" >/dev/null
+   )
    ```
 
 2. Copy the host files:
@@ -747,8 +753,8 @@ command with the same project name.
    ```
 
    Check that the restore name is unused, then create the new project volumes
-   without starting services. If this prints an error, it created nothing:
-   choose a different name and run it again.
+   without starting services. If it refuses because the name is in use, it
+   created nothing: choose a different name and run it again.
 
    ```bash
    (
