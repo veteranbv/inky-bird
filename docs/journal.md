@@ -32,7 +32,7 @@ configuration and data.
   - **Birds and sources**: **Sources**, where your birds come from and when
     each was last checked.
   - **Plates**: **In the works**, which plates are being made, what is waiting,
-    new plates to look at and plates that **Needs a hand**. See
+    new plates to look at and plates that need a hand (**Needs a hand**). See
     [owner actions](owner-operations.md).
   - **Frame and displays**: **Wall frame**, what your wall frame shows, when it
     last changed and the screens you have paired.
@@ -58,7 +58,10 @@ way. Inky asks you to confirm first only when Undo could not put things back:
 when the bird has no plate yet, so it could not be added again, or when the
 change would also move other birds. **Add every bird with a plate**, on
 **On my frame · added by you**, also shows what will change and waits for
-**Change my frame**. A change reaches the wall frame at its next refresh. If
+**Change my frame**. A change reaches the wall frame at its next refresh while
+it shows **On my frame** or **On my frame · added by you**; a
+[selected wall view](presentation.md#choose-the-physical-wall-view) does not
+change. If
 another tab or device made the same change first, the page says so and sends
 nothing.
 

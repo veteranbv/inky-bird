@@ -195,10 +195,11 @@ a job that it is running. Before stopping it, check its log: the newest
    )
    ```
 
-3. Stop the scheduler and the controller, if they were running. This first
-   checks that no job is still running and stops nothing if one is. Then wait
-   for the job to finish and run this step again. Do not go back to step 1:
-   its new record would miss the timers that step 2 stopped.
+3. Stop the scheduler and the controller, if they were running. This checks
+   the separate job services and stops nothing if one is still running; on an
+   app-managed install, first check the scheduler log as described above. If a
+   job is running, wait for it to finish and run this step again. Do not go
+   back to step 1: its new record would miss the timers that step 2 stopped.
 
    ```bash
    (
@@ -259,8 +260,11 @@ a job that it is running. Before stopping it, check its log: the newest
    ```
 
 2. Unload the recorded agents. Unloading an agent can end a job that is
-   running, so this first checks that no job is running and unloads nothing if
-   one is. Then wait for the job to finish and run this step again:
+   running. This checks the separate job services and unloads nothing if one is
+   running; on an app-managed install, first check the scheduler log as
+   described above. Use `bootout` only when no job is running and the scheduler
+   log shows no unfinished job. If a job is running, wait for it to finish and
+   run this step again:
 
    ```bash
    (
@@ -340,7 +344,7 @@ put credentials into that note.
 
 ### 5. Restart and verify
 
-Start only what step 3 recorded.
+Start only what step 1 of section 3 recorded.
 
 #### On systemd Linux
 

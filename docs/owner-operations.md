@@ -31,7 +31,8 @@ allowance or incur costs.
 
 **In the works** updates automatically. It shows what is being drawn now, what
 is next up, birds Inky will try again on its own, **New plates** waiting for
-you, plates that **Needs a hand** and your recent requests to try again. A next-check time is a scheduler observation, not a
+you, plates that need a hand (**Needs a hand**) and your recent requests to try
+again. A next-check time is a scheduler observation, not a
 promised start or finish time. Recorded failures show safe categories and, when
 available, retained attempt counts and numeric review scores. Raw provider or
 model errors stay in private operator evidence.
@@ -71,7 +72,8 @@ a plate** always shows what will change and waits for **Change my frame**. Each
 change is checked against the configuration and the frame's revision it was
 previewed with; a change made in another tab, or a newly approved plate, sends
 you back to look again. These changes use the CLI's collection operation and
-reach the wall frame at its next refresh. They never record a bird as noted or
+reach the wall frame at its next refresh while it shows **On my frame** or
+**On my frame · added by you**. They never record a bird as noted or
 start a model. Collections and Favorites stay separate.
 
 A notification test sends an actual external message to each configured

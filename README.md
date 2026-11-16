@@ -108,7 +108,7 @@ plate yet.
 | --- | --- |
 | **Your journal** | Everything you keep in Inky: your birds, their plates and your collections. |
 | **Plate** | One illustrated bird, checked against references and approved before it is shown. |
-| **New plate** | A plate Inky made for you; it waits for your look before it joins your journal. |
+| **New plate** | A plate Inky made that is waiting for you to look at it. |
 | **On my frame** | The birds your wall frame and Play show: birds noted recently plus the birds you added. |
 | **More plates** | Plates you could add to your frame. |
 | **In the works** | Plates being made, and what is waiting to be made next. |

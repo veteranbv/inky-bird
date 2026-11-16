@@ -792,6 +792,29 @@ def test_backup_guide_gives_short_numbered_steps() -> None:
     assert longest <= 16, longest
 
 
+def test_backup_job_check_names_only_the_separate_job_services() -> None:
+    # An app-managed install runs every job inside the scheduler, which the
+    # pasted check cannot see, so the step must send the owner to its log.
+    guide = " ".join((ROOT / "docs/backup.md").read_text(encoding="utf-8").split())
+    assert "first checks that no job" not in guide
+    assert guide.count("This checks the separate job services") == 2
+    assert guide.count("on an app-managed install, first check the scheduler log") == 2
+    assert "and the scheduler log shows no unfinished job" in guide
+
+
+def test_owner_guides_use_plain_grammar_and_wall_view_limits() -> None:
+    def text(name: str) -> str:
+        return " ".join((ROOT / name).read_text(encoding="utf-8").split())
+
+    readme = text("README.md")
+    assert "A plate Inky made that is waiting for you to look at it." in readme
+    journal, operations = text("docs/journal.md"), text("docs/owner-operations.md")
+    for guide in (journal, operations):
+        assert "plates that **Needs a hand**" not in guide
+        assert "at its next refresh while it shows **On my frame**" in guide
+    assert "Start only what step 3 recorded." not in text("docs/backup.md")
+
+
 def test_backup_snippets_that_can_fail_run_in_a_subshell() -> None:
     guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
     blocks = re.findall(r"^( *)```bash\n(.*?)^\1```$", guide, re.MULTILINE | re.DOTALL)
