@@ -74,7 +74,14 @@ from .errors import (
 )
 from .http import _fsync_directory, write_bytes_atomic
 from .images import prepare_uploaded_image
-from .installation import InstallationRole, doctor, native_tls_environment, setup
+from .installation import (
+    InstallationRole,
+    doctor,
+    load_private_environment,
+    native_tls_environment,
+    private_environment_path,
+    setup,
+)
 from .journal import JournalError
 from .notifications import (
     check_display_heartbeat,
@@ -845,6 +852,7 @@ def catalog_validate_command(args: argparse.Namespace) -> int:
 
 def config_validate_command(args: argparse.Namespace) -> int:
     config = _config(args)
+    private_file = private_environment_path()
     destinations = validate_notification_destinations(config)
     deprecations: list[dict[str, str]] = []
     if config.discovery.latitude is not None:
@@ -868,6 +876,7 @@ def config_validate_command(args: argparse.Namespace) -> int:
         {
             "config": str(args.config),
             "valid": True,
+            "private_environment_file": str(private_file) if private_file else None,
             "deprecations": deprecations,
             "unknown_keys": list(config.unknown_keys),
             "warnings": config_warnings,
@@ -1805,7 +1814,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     previous_ca = os.environ.get("SSL_CERT_FILE")
     tls_environment: dict[str, str] = {}
+    private_names: list[str] = []
     try:
+        # Before configuration is read; settings already in the environment win.
+        private_names = load_private_environment()
         config_path = getattr(args, "config", None)
         if config_path is not None:
             tls_environment = native_tls_environment(config_path)
@@ -1819,6 +1831,8 @@ def main(argv: list[str] | None = None) -> int:
                 os.environ.pop("SSL_CERT_FILE", None)
             else:
                 os.environ["SSL_CERT_FILE"] = previous_ca
+        for name in private_names:
+            os.environ.pop(name, None)
 
 
 if __name__ == "__main__":

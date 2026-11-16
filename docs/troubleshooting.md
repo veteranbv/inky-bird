@@ -101,6 +101,9 @@ and table this version does not use, for example `[notification]` instead of
 a key is ignored, so the setting you meant has no effect. `warnings` reports
 other problems, such as overlapping workspace, catalog and state directories.
 `configuration_ownership` and `generation_enabled` show what this file will do.
+`private_environment_file` shows the path of the
+[private environment file](installation.md#private-environment-file) the
+command read, or `null` when none is set; it never shows its contents.
 Unknown keys are deprecated: they are accepted in 1.x and will be rejected in
 2.0 (see [Deprecations](operations.md#deprecations)).
 
@@ -115,6 +118,9 @@ settings again. Delete the kept copy once the new configuration works.
 - `config_unknown_keys` (warn): the configuration has settings this version does
   not use. The detail lists their names, never their values. Fix typos and
   remove settings you no longer need.
+- `private_environment` (pass or fail): appears only when `INKY_BIRD_ENV_FILE`
+  is set. A pass names the file in use. A fail says what is wrong with it; fix
+  the file or unset the variable.
 - `notification_dead_letters` (warn): some notifications stopped retrying and
   were not delivered. Fix the destination, then run
   `"$IBF" notifications retry --config "$CONFIG"`.
