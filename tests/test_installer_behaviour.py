@@ -186,6 +186,12 @@ def coreutil_wrapper(name: str, real: str) -> str:
     )
     return f"""#!/bin/sh
 {fake_tools.DEPTH_GUARD}lock="$FAKE/steps.lock"
+# A stop signal in here would leave the lock and hang every later step: hold
+# it until the lock is released, then die of it as the real command would.
+stopped=""
+trap 'stopped=HUP' HUP
+trap 'stopped=INT' INT
+trap 'stopped=TERM' TERM
 while ! {mkdir} "$lock" 2>/dev/null; do :; done
 index=0
 if [ -f "$FAKE/steps" ]; then
@@ -197,6 +203,10 @@ fi
   printf '\n'
 }} >> "$FAKE/steps"
 {rmdir} "$lock"
+trap - HUP INT TERM
+if [ -n "$stopped" ]; then
+  kill -s "$stopped" $$
+fi
 mode=""
 if [ -f "$FAKE/inject" ]; then
   while read -r at injected; do
@@ -559,6 +569,31 @@ def wait_until(condition: Callable[[], bool], what: str, timeout: float = 60.0) 
         if time.monotonic() >= deadline:
             pytest.fail(f"timed out after {timeout:.0f}s waiting for {what}")
         time.sleep(0.05)
+
+
+@pytest.mark.parametrize(
+    "stop", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP], ids=["INT", "TERM", "HUP"]
+)
+def test_a_stopped_step_never_leaves_the_step_lock(tmp_path: Path, stop: signal.Signals) -> None:
+    """A stop signal that reaches a numbered file command while it holds the
+    step lock is delivered once the lock is released; a lock left behind would
+    hang every later step of the run and of its rerun."""
+    host = Host(tmp_path, "Linux", number_file_commands=True)
+    lock = host.fake / "steps.lock"
+    lock.mkdir()
+    step = subprocess.Popen(
+        [str(host.bin / "mkdir"), str(tmp_path / "made")],
+        env=host.environment(),
+        start_new_session=True,
+    )
+    time.sleep(0.5)
+    os.kill(step.pid, stop)
+    time.sleep(0.2)
+    assert step.poll() is None, "the step died while it waited for the lock"
+    lock.rmdir()
+    assert step.wait(timeout=30) == -stop
+    assert not lock.exists()
+    assert not (tmp_path / "made").exists()
 
 
 # Uninstallers ----------------------------------------------------------------
@@ -1224,6 +1259,24 @@ def test_a_health_check_that_never_answers_is_stopped(tmp_path: Path, system: st
     assert result.returncode == 1
     assert "web service failed its health check" in result.stderr
     assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_lock_holder_that_ignores_a_stop_is_forced_and_the_run_still_ends(
+    tmp_path: Path, system: str
+) -> None:
+    """Cleanup never waits without a bound for a helper it started."""
+    host = controller_host(tmp_path, system)
+    host.fail("holder-ignores-term", "new:heredoc" if system == "Darwin" else "new:refresh")
+    started = time.monotonic()
+    result = run_controller(host)
+    assert time.monotonic() - started < 90
+    assert result.returncode == 1
+    assert_previous_running(host)
+    helpers = subprocess.run(
+        ["/bin/ps", "-ww", "-ax", "-o", "command="], capture_output=True, text=True, check=True
+    ).stdout
+    assert str(tmp_path) not in helpers
 
 
 def hook_calls(host: Host) -> list[list[str]]:

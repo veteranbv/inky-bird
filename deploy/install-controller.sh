@@ -235,6 +235,8 @@ hold_writer_locks() {
   local python="${app_dir}/.venv/bin/python"
   local ready
   local status=0
+  # The helper gives up at the timeout; one that never answers is stopped.
+  local deadline=$((SECONDS + quiesce_timeout_seconds + 60))
   writer_lock_holds=$((writer_lock_holds + 1))
   ready="${work_dir}/writer-locks-held.${writer_lock_holds}"
   if [ ! -x "${python}" ] || [ "${writer_locks_unavailable}" = true ]; then
@@ -244,9 +246,15 @@ hold_writer_locks() {
     "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" hold-writer-locks \
     "${config_path}" "${ready}" "${quiesce_timeout_seconds}"
   until [ -e "${ready}" ]; do
-    if ! kill -0 "${writer_lock_pid}" 2>/dev/null; then
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      stop_group "${writer_lock_pid}"
+      writer_lock_pid=""
+      status=1
+    elif ! kill -0 "${writer_lock_pid}" 2>/dev/null; then
       wait "${writer_lock_pid}" || status=$?
       writer_lock_pid=""
+    fi
+    if [ -z "${writer_lock_pid}" ]; then
       if [ "${status}" -eq 0 ]; then
         # The installed code could not be loaded; it said so once.
         writer_locks_unavailable=true
@@ -278,8 +286,7 @@ hold_writer_locks() {
 
 release_writer_locks() {
   if [ -n "${writer_lock_pid}" ]; then
-    kill "${writer_lock_pid}" 2>/dev/null || true
-    wait "${writer_lock_pid}" 2>/dev/null || true
+    stop_group "${writer_lock_pid}"
     writer_lock_pid=""
   fi
   writer_locks_held=false
@@ -333,21 +340,25 @@ run_bounded() {
   return "${status}"
 }
 
-# Stop what run_bounded started, its whole process group, and wait until it
-# has gone: ask, then force.
-stop_bounded() {
+# Stop a process start_background started, with its whole process group,
+# and wait until it has gone: ask, then after at most 10 seconds force.
+stop_group() {
   local deadline=$((SECONDS + 10))
-  if [ -z "${bounded_pid}" ]; then
-    return 0
-  fi
-  kill -TERM -- "-${bounded_pid}" 2>/dev/null || true
-  while kill -0 "${bounded_pid}" 2>/dev/null && [ "${SECONDS}" -lt "${deadline}" ]; do
+  kill -TERM -- "-$1" 2>/dev/null || kill -TERM "$1" 2>/dev/null || true
+  while kill -0 "$1" 2>/dev/null && [ "${SECONDS}" -lt "${deadline}" ]; do
     sleep "${poll_seconds}"
   done
   # Whatever of the group is left, the command itself or what it started.
-  kill -KILL -- "-${bounded_pid}" 2>/dev/null || true
-  wait "${bounded_pid}" 2>/dev/null || true
-  bounded_pid=""
+  kill -KILL -- "-$1" 2>/dev/null || kill -KILL "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
+# Stop what run_bounded started.
+stop_bounded() {
+  if [ -n "${bounded_pid}" ]; then
+    stop_group "${bounded_pid}"
+    bounded_pid=""
+  fi
 }
 
 # Run the owner's --stopped-hook, once: services are stopped, the writer

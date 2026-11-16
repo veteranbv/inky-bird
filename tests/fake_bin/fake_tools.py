@@ -70,17 +70,27 @@ def _step_lock() -> Path:
 
 def step(tool: str, arguments: list[str], *, action: bool) -> str:
     """Number this call and return what the matrix injects at it, if anything."""
+    import signal
+
     steps = FAKE / "steps"
     if not FAKE.is_dir():
         return ""
-    lock = _step_lock()
+    # A stop signal while the lock is held would leave it and hang every
+    # later step; it is delivered once the lock is released.
+    stops = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    signal.pthread_sigmask(signal.SIG_BLOCK, stops)
     try:
-        index = len(steps.read_text().splitlines()) if steps.exists() else 0
-        with steps.open("a") as handle:
-            kind = "action" if action else "query"
-            handle.write("\t".join([str(index), kind, tool, *arguments]).replace("\n", " ") + "\n")
+        lock = _step_lock()
+        try:
+            index = len(steps.read_text().splitlines()) if steps.exists() else 0
+            with steps.open("a") as handle:
+                kind = "action" if action else "query"
+                line = "\t".join([str(index), kind, tool, *arguments]).replace("\n", " ")
+                handle.write(line + "\n")
+        finally:
+            lock.rmdir()
     finally:
-        lock.rmdir()
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
     inject = FAKE / "inject"
     if not action or not inject.exists():
         return ""
@@ -982,6 +992,11 @@ def _upgrade_gate(tag: str, script: str, arguments: list[str], environment: dict
     real = [sys.executable, "-S", "-P", script, *arguments]
     if KILL and command == "hold-writer-locks":
         return _hold_then_stop(real, environment, Path(arguments[2]))
+    if command == "hold-writer-locks" and "holder-ignores-term" in _rules():
+        import signal
+
+        # Ignored across exec: the helper outlives an installer's polite stop.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     return _exec(real, environment)
 
 
