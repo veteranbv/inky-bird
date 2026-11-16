@@ -42,7 +42,7 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 241 cases, beside 75 recording
+both controllers and on a shared Pi's display: 253 cases, beside 79 recording
 runs, 21 busy-plate runs and 21 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
@@ -272,6 +272,17 @@ SCENARIOS = {
                 CHECKOUT,
             ),
             "uninstall-display-local.sh",
+        ),
+        # The owner asks for a first display cycle right away: the installer
+        # starts the display service itself, which must run the new version.
+        Scenario(
+            "display-initial",
+            "install-display-local.sh",
+            "display",
+            "Linux",
+            (*DISPLAY_ENVIRONMENT, ("INKY_BIRD_RUN_INITIAL_DISPLAY", "true")),
+            ("fresh", "staged", "renamed", RELEASE),
+            start="display",
         ),
         Scenario(
             "remote-display",

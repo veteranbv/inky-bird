@@ -645,16 +645,78 @@ def _python_path(venv: Path, runtime: Path) -> str:
     return os.pathsep.join(entries)
 
 
+def _package_paths(venv: Path, name: str) -> list[Path]:
+    """What a distribution put in site-packages: the renamed one a regular
+    package or the release's editable path, today's its editable path."""
+    site = site_packages(venv)
+    if name == "inky-bird-frame":
+        return [site / "inky_bird_frame", site / "_inky_bird_frame.pth"]
+    return [site / "_inky_bird.pth"]
+
+
 def _remove(venv: Path, name: str) -> None:
     import shutil
 
-    site = site_packages(venv)
-    if name == "inky-bird-frame":
-        # A regular install, or the release's editable one.
-        shutil.rmtree(site / "inky_bird_frame", ignore_errors=True)
-        (site / "_inky_bird_frame.pth").unlink(missing_ok=True)
-    else:
-        (site / "_inky_bird.pth").unlink(missing_ok=True)
+    for path in _package_paths(venv, name):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _remove_distribution(venv: Path, removed: str, kept: str, backup: Path | None) -> int:
+    """Remove one distribution's files, except the commands the other one also
+    installed; with ``backup``, move them there behind a plan to put them back."""
+    import shutil
+
+    _log("remove-distribution", removed, kept)
+    dists = _state("pip")
+    gone = dists.pop(removed, None)
+
+    # An install made elsewhere names no commands of its own.
+    def scripts(dist: object) -> set[str]:
+        return set(dist.get("scripts", ())) if isinstance(dist, dict) else set()
+
+    paths = _package_paths(venv, removed)
+    paths += [venv / "bin" / script for script in sorted(scripts(gone) - scripts(dists.get(kept)))]
+    paths = [path for path in paths if path.exists() or path.is_symlink()]
+    if backup is not None:
+        backup.mkdir(exist_ok=True)
+        plan = {
+            "distribution": [removed, gone],
+            "files": [[str(path), str(backup / str(number))] for number, path in enumerate(paths)],
+        }
+        (backup / "plan.json").write_text(json.dumps(plan))
+    _save("pip", dists)
+    for number, path in enumerate(paths):
+        if backup is not None:
+            shutil.move(str(path), str(backup / str(number)))
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    return 0
+
+
+def _restore_distribution(venv: Path, backup: Path) -> int:
+    """Put back what ``_remove_distribution`` moved aside, as its plan lists."""
+    import shutil
+
+    plan_path = backup / "plan.json"
+    _log("restore-distribution", backup.name)
+    if not plan_path.exists():
+        return 0
+    plan = json.loads(plan_path.read_text())
+    for original, saved in plan["files"]:
+        if Path(saved).exists() or Path(saved).is_symlink():
+            Path(original).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(saved, original)
+    name, record = plan["distribution"]
+    if record is not None:
+        dists = _state("pip")
+        dists[name] = record
+        _save("pip", dists)
+    return 0
 
 
 def _pip(venv: Path, arguments: list[str]) -> int:
@@ -720,20 +782,10 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         program = arguments[1]
         if "distribution(" in program:
             removed, kept = arguments[2:4]
-            _log("remove-distribution", removed, kept)
-            dists = _state("pip")
-            gone = dists.pop(removed, None)
-            _save("pip", dists)
-            _remove(venv, removed)
-
-            # The commands this pip installed go too, except those the kept one
-            # also installed; an install made elsewhere names none.
-            def scripts(dist: object) -> set[str]:
-                return set(dist.get("scripts", ())) if isinstance(dist, dict) else set()
-
-            for script in scripts(gone) - scripts(dists.get(kept)):
-                (venv / "bin" / script).unlink(missing_ok=True)
-            return 0
+            backup = Path(arguments[4]) if len(arguments) > 4 else None
+            return _remove_distribution(venv, removed, kept, backup)
+        if "plan.json" in program:
+            return _restore_distribution(venv, Path(arguments[2]))
         _log("python-c", tag)
         # -S keeps the test interpreter's own site-packages out of the import path.
         command = [sys.executable, "-S", "-c", program, *arguments[2:]]
