@@ -326,6 +326,92 @@ services stop after 30 minutes, and the display service after 15. A first
 publication of a large catalog over a slow upload link may stop at the 30-minute
 limit; it starts again at the next timer run.
 
+### Linux controller as a system service
+
+Use this mode on a server where Inky should run as its own account rather than
+as the person who installs it, and where that account must not be able to
+change the code it runs. The installer then runs as root, builds and keeps the
+code, writes the service definitions, and runs everything that reads the
+account's data or runs the application as that account. It is chosen only
+with `--service-account`; without it, the installer works as described above.
+
+Create the account first. The installer checks it and never creates or
+changes it. On Debian-family systems:
+
+```bash
+sudo groupadd --system inky-bird
+sudo useradd --system --gid inky-bird --home-dir /srv/inky-bird/home --shell /usr/sbin/nologin inky-bird
+```
+
+The account must not be root's, must not be in the `sudo`, `wheel`, `admin` or
+`root` group, must have the shell `nologin` or `false`, and must have
+`<install root>/home` as its home directory. The account's name must be
+`inky-bird` or start with `inky-bird-`, because it also names the services:
+`inky-bird` gets the usual `inky-bird-controller.service` and timers, and a
+second account such as `inky-bird-qa` gets `inky-bird-qa-controller.service`,
+so two installations on one machine never share a service, a folder or a lock.
+
+The install root is `/srv/<account>` unless you give `--install-root`. It
+holds:
+
+| Folder | Owner | Holds |
+| --- | --- | --- |
+| `app` | root | runtimes, the active `.venv` link, the managed catalog and installer copy |
+| `config` | the account (mode `0700`) | `config.toml` and the private environment file `private.env` |
+| `home` | the account | its home directory, for example Codex sign-in |
+| `state`, `logs` | the account | suggested places for `workspace_dir`, `catalog_dir` and `state_dir` |
+
+Create the configuration as the account owns it, then install from a checkout
+that only root can change:
+
+```bash
+sudo install -d -m 0755 /srv/inky-bird
+sudo install -d -o inky-bird -g inky-bird -m 0700 /srv/inky-bird/config
+sudo install -o inky-bird -g inky-bird -m 0600 config.example.toml /srv/inky-bird/config/config.toml
+sudo git clone https://github.com/veteranbv/inky-bird.git /opt/inky-bird-source
+cd /opt/inky-bird-source
+sudo git checkout --detach "$INKY_VERSION"
+sudo env UV_BIN="$(command -v uv)" ./deploy/install-controller-systemd.sh --service-account inky-bird
+```
+
+Before it changes anything, the installer refuses, with one line ending in
+"No changes made.", an account that fails a check above, an install root that
+anyone but root can change (or any folder above it), a checkout the account
+can change, and a layout folder that is a link or has the wrong owner. It also
+refuses services the user installer made under the same names: remove those
+with `deploy/uninstall-controller-systemd.sh` run as their account first. It
+does not move an installation from one mode to the other. Run without
+`--service-account` as root where system services exist, it names the account
+to use. `setup controller --service-account NAME --config ...` previews the
+same configuration checks; it does not install.
+
+Keep secrets in `config/private.env`, not in the service definitions: each
+unit names the file in `INKY_BIRD_ENV_FILE` and the application loads it (see
+[Private environment file](#private-environment-file)). Provider keys,
+notification URLs (`url_env`), the OIDC client secret and a GitHub token for
+`gh` can all live there. Put a custom CA bundle there as `SSL_CERT_FILE`; a
+system service refuses `native-access.env` and `native-tls.env`. The installer
+creates the file empty when it is missing and never prints or rewrites it.
+
+The units run as the account and its group. The web service also gets
+`ProtectSystem=strict` and may write only to the configuration folder, the
+home directory and the configured workspace, catalog and state folders; jobs
+that start Codex keep their own sandbox. Before it switches to a new version,
+the installer checks that the account cannot change any part of the code
+under `app`, and stops if it can.
+
+To upgrade, check out the new tag and run the same command. Everything under
+[Update](#update) applies. `--stopped-hook` runs as root, with the environment
+described there; treat `INKY_BIRD_HOOK_STATE_DIR` as a path the account
+controls. With a hook, the installer first waits up to 30 seconds until no
+process of the account runs, other than its own lock holder; if any still
+does, it says "Processes of `ACCOUNT` still run after its services stopped"
+and starts the previous version again, without running the hook.
+
+To remove it, take out the units by hand as shown under [Uninstall](#uninstall),
+with the account's name in place of `inky-bird`, then delete the install root
+and the account (`sudo userdel inky-bird`) once you no longer need the data.
+
 ### Docker controller
 
 Use the [Docker controller guide](docker.md) on an AMD64 or ARM64 Docker host.
@@ -642,8 +728,9 @@ is not a valid setting. The error names the file and the line number, never a
 value. `config validate` shows the path in `private_environment_file`, and
 `doctor` adds a `private_environment` check.
 
-The setup installers do not write this file yet. Existing installations keep
-working as before.
+The user installers do not write this file. A [system
+service](#linux-controller-as-a-system-service) creates it and names it in
+every unit. Existing installations keep working as before.
 
 ## Update
 
