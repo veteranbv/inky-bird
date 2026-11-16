@@ -278,11 +278,16 @@ report_units() {
     if [ "${units_recorded}" != true ]; then
       continue
     fi
+    # Enabled and running are restored separately; either can be left wrong.
     if contains "${unit}" ${enabled_before[@]+"${enabled_before[@]}"}; then
       systemctl is-enabled --quiet "${unit}" || differ+=("${unit}")
     elif systemctl is-enabled --quiet "${unit}"; then
       differ+=("${unit}")
-    elif contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
+    fi
+    if contains "${unit}" ${differ[@]+"${differ[@]}"}; then
+      continue
+    fi
+    if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
       systemctl is-active --quiet "${unit}" || differ+=("${unit}")
     elif systemctl is-active --quiet "${unit}"; then
       differ+=("${unit}")

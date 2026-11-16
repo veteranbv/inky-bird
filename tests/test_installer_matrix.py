@@ -11,8 +11,8 @@ to its whole process group as Ctrl-C does), and checks the invariants in
 never failed: a failed query is indistinguishable from a different answer.
 
 A second pass fails an upgrade twice: first right after the switch to the new
-version, or at its last service start, then at each step of the cleanup that
-follows, or stops it there. Rollback commands appear only in these runs.
+version, at its last service start or at the next call after it, then at each
+step of the cleanup that follows, or stops it there. Rollback commands appear only in these runs.
 
 With one fault every rollback command works, so every unit must be exactly as
 it was. A unit may differ only when its own rollback failed (sudo expired, or
@@ -26,7 +26,8 @@ source, installer and project files of a single-directory install.
 
 Upgrades start from what each layout's own installers left: the frozen
 installers of the last release (``release-0.9.8``, under the inky-bird-frame
-names), of the single-directory layout, or today's.
+names), of the single-directory layout, or today's; in ``checkout`` the
+application directory is the owner's source checkout, changed since.
 
 The recording runs are tests too, ``<scenario>/<state>/recording`` (and
 ``-after<step>`` for a cleanup): the run without a fault must succeed and pass
@@ -41,7 +42,7 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 232 cases, beside 69 recording
+both controllers and on a shared Pi's display: 241 cases, beside 75 recording
 runs, 21 busy-plate runs and 21 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
@@ -1196,6 +1197,13 @@ def excused(case: Case, unit: str, named: dict[str, set[str]], statements: set[s
     return unrestorable(case, unit) and bool(named.get(unit, set()) & statements)
 
 
+def short_and_stopped(unit: str, before: tuple[bool, bool], now: tuple[bool, bool]) -> bool:
+    """A run-once service that has finished, enabled as it was: nothing to restore."""
+    return (
+        unit.endswith(".service") and not long_running(unit) and before[0] == now[0] and not now[1]
+    )
+
+
 def check_install(
     machine: Machine,
     scenario: Scenario,
@@ -1225,6 +1233,18 @@ def check_install(
         if stopped or not tolerated:
             report.append("I8: the run reported success although it was failed or stopped")
     named = named_units(output)
+    # A claim that the previous version is back, or that nothing changed,
+    # holds for every unit, whatever could not be restored.
+    if claims_previous(outcome) or "unchanged" in claims(output):
+        for unit, state in before.role.units.items():
+            now = after.units[unit]
+            if (now != state and not short_and_stopped(unit, state, now)) or (
+                after.files[unit] != before.role.files[unit]
+            ):
+                report.append(
+                    f"I2: the output says the previous version is back, but {unit} "
+                    f"was {state} and is now {now}"
+                )
     if "unchanged" in claims(output) and (
         after.units != before.role.units
         or after.files != before.role.files
@@ -1278,12 +1298,7 @@ def check_install(
     agent = machine.system == "Darwin"
     for unit, state in before.role.units.items() if not completed(outcome) else ():
         now = after.units[unit]
-        if (
-            unit.endswith(".service")
-            and not long_running(unit)
-            and state[0] == now[0]
-            and not now[1]
-        ):
+        if short_and_stopped(unit, state, now):
             continue
         file_changed = after.files[unit] != before.role.files[unit]
         if now == state and not file_changed:
@@ -1976,8 +1991,9 @@ def second_pass(kind: str, scenario: str, state: str) -> bool:
 
 
 def first_failures(steps: list[list[str]]) -> list[int]:
-    """Two failures with the most to undo: the call right after the switch to
-    the new version, and the last service start before the run completes."""
+    """Failures with the most to undo: the call right after the switch to the
+    new version, the last service start before the run completes, and the
+    next call that is not a removal, when every unit runs the new version."""
     actions = [int(index) for index, kind_of_call, *_ in steps if kind_of_call == "action"]
     switch = [
         int(index)
@@ -1998,6 +2014,14 @@ def first_failures(steps: list[list[str]]) -> list[int]:
         after = [index for index in actions if index > switch[-1]]
         found.update(after[:1])
     found.update(starts[-1:])
+    if starts:
+        # A removal after the last start is cleanup the run survives, not a failure.
+        later = [
+            int(index)
+            for index, kind_of_call, tool, *_ in steps
+            if kind_of_call == "action" and int(index) > starts[-1] and tool not in ("rm", "rmdir")
+        ]
+        found.update(later[:1])
     return sorted(found)
 
 
