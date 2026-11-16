@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -1757,9 +1758,17 @@ def freeze(root: Path) -> Template:
 def clone_tree(source: Path, target: Path) -> None:
     """Copy a tree with a filesystem clone where the filesystem offers one."""
     option = "-c" if platform.system() == "Darwin" else "--reflink=auto"
-    result = subprocess.run(
-        ["/bin/cp", option, "-pR", str(source), str(target)], capture_output=True, check=False
-    )
+    command = ["/bin/cp", option, "-pR", str(source), str(target)]
+    # Python 3.11 on Linux can fail to start a process with EFAULT while other
+    # worker threads start theirs (its vfork path); nothing here shares state
+    # with them, so starting it again is the whole remedy.
+    for attempt in range(3):
+        try:
+            result = subprocess.run(command, capture_output=True, check=False)
+            break
+        except OSError as error:
+            if error.errno != errno.EFAULT or attempt == 2:
+                raise
     if result.returncode != 0:
         shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(source, target, symlinks=True)
