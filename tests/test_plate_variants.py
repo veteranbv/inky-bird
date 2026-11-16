@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from PIL import Image
 from starlette.testclient import TestClient
 
@@ -12,6 +14,7 @@ from inky_bird_frame.access import AccessStore
 from inky_bird_frame.config import ControllerConfig
 from inky_bird_frame.http import write_json_atomic
 from inky_bird_frame.journal import JournalService
+from inky_bird_frame.plate_variants import PlateThumbnails
 from inky_bird_frame.web import STATIC_PAGES, create_app
 
 ORIGIN = "https://inky.example.test"
@@ -198,6 +201,46 @@ def test_a_plate_replaced_mid_request_is_never_cached_as_the_old_revision(
         assert isinstance(pixel, tuple)
         red, green, blue = pixel
         assert red > blue and green > blue
+
+
+def test_the_catalog_index_is_read_again_only_after_it_changes(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    first = _publish(config, _plate((40, 40, 200)))
+    journal = JournalService(config)
+    thumbnails = PlateThumbnails(config.state_dir, journal)
+    with patch.object(journal, "catalog", wraps=journal.catalog) as reads:
+        assert thumbnails.cached(1) is None
+        made = thumbnails.generate(1)
+        cached = thumbnails.cached(1)
+        assert cached is not None
+        assert made.portrait_sha256 == cached.portrait_sha256 == first
+        # One read for the thumbnails, one for the portrait's own integrity check.
+        assert reads.call_count == 2
+
+        second = _publish(config, _plate((200, 200, 40)))
+        assert thumbnails.cached(1) is None
+        assert thumbnails.generate(1).portrait_sha256 == second
+        assert reads.call_count == 4
+
+
+def test_an_unwritable_thumbnail_cache_is_reported_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _config(tmp_path)
+    digest = _publish(config, _plate((40, 40, 200)))
+    thumbnails = PlateThumbnails(config.state_dir, JournalService(config))
+    with (
+        patch(
+            "inky_bird_frame.plate_variants.write_bytes_atomic",
+            side_effect=PermissionError("denied"),
+        ),
+        caplog.at_level(logging.WARNING, logger="inky_bird_frame.plate_variants"),
+    ):
+        for _ in range(3):
+            assert thumbnails.generate(1).portrait_sha256 == digest
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "thumbnail cache" in warnings[0].getMessage()
 
 
 def test_an_undecodable_plate_fails_without_revealing_paths(tmp_path: Path) -> None:

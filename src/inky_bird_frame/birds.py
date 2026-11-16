@@ -211,7 +211,7 @@ def parse_inaturalist_species_counts(payload: object) -> list[BirdSpecies]:
         count = item.get("count")
         if not isinstance(common, str) or not isinstance(scientific, str):
             continue
-        if not isinstance(taxon_id, int) or not isinstance(count, int):
+        if not isinstance(taxon_id, int) or type(count) is not int or count < 0:
             continue
         species.append(
             BirdSpecies(

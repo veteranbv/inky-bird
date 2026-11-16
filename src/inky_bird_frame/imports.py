@@ -488,7 +488,9 @@ class HistoryImports:
         impact = cast(dict[str, object], preview["impact"])
         stats = cast(dict[str, object], preview["stats"])
         if (
-            impact.get("affected_collections") or stats.get("removed_checklists")
+            impact.get("affected_collections")
+            or stats.get("removed_checklists")
+            or stats.get("removed")
         ) and not allow_reduction:
             raise OwnerOperationError(
                 "Confirm the removal or changed evidence shown in the preview before importing"
