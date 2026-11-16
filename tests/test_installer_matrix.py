@@ -154,7 +154,8 @@ def display_systemd_units(config, *, executable, app_dir, config_path, user):
 TIMER_UNITS = "controller.service refresh.service refresh.timer generate.service generate.timer"
 APP_UNITS = "controller.service scheduler.service"
 AGENTS = "serve refresh catalog-publish"
-SECRET = "synthetic-matrix-secret"
+# A made-up marker planted in the synthetic config: installer output must never show it.
+CONFIG_CANARY = "synthetic-matrix-canary"
 KILL_STRIDE = 3
 STOP_MODES = ("kill", "interrupt", "hangup")
 
@@ -340,7 +341,7 @@ class Machine(Host):
         self.scenario = scenario
         self.key = root / "synthetic-key"
         if create:
-            self.config.write_text(f"synthetic private config {SECRET}\n")
+            self.config.write_text(f"synthetic private config {CONFIG_CANARY}\n")
             self.key.write_text("synthetic key\n")
             display_venv(self)
             if family == RELEASE_FAMILY:
@@ -902,7 +903,7 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
             state = "running" if active else "enabled"
             report.append(f"I7: {unit} is still {state} but its definition was deleted")
     # I9: nothing private is printed.
-    if SECRET in output or "synthetic private config" in output or "synthetic key" in output:
+    if CONFIG_CANARY in output or "synthetic private config" in output or "synthetic key" in output:
         report.append("I9: private configuration or key content was printed")
     roots = allowed_output_roots(machine)
     for match in PATH_PATTERN.findall(output):
