@@ -1076,8 +1076,12 @@ def test_unusual_name_on_a_matched_history_row_still_shows_like_before(tmp_path:
     bird = cast(list[dict[str, object]], snapshot["birds"])[0]
     assert bird["common_name"] == "Robin"
     assert [row["count"] for row in cast(list[dict[str, object]], bird["retained_evidence"])] == [1]
-    # Such a summary is rebuilt on each read, the full parse every read did before.
+    # The summary is rebuilt once from that history, then read as it is.
+    summary = controller.state_dir / "ebird-archive-observations-summary.json"
+    built = summary.stat()
     assert service.snapshot() == snapshot
+    again = summary.stat()
+    assert (again.st_ino, again.st_mtime_ns) == (built.st_ino, built.st_mtime_ns)
 
 
 def test_unreadable_crosswalk_marks_only_its_source_unavailable(tmp_path: Path) -> None:

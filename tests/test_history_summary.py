@@ -687,3 +687,37 @@ def test_a_failed_trip_evidence_read_is_retried_on_the_next_snapshot(tmp_path: P
     with patch.object(ebird_archive, "read_ebird_checklists", side_effect=DataSourceError("busy")):
         assert status() == "unavailable"
     assert status() == "linked"
+
+
+def test_odd_name_kept_in_the_history_is_summarized_once(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    ebird_import(state, tmp_path, [("S1", "Robin", "Turdus migratorius", "2019-03-12")])
+    history = state / EBIRD
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        checklist["species"][0]["common_name"] = "Rob‍in"
+    write_json_atomic(history, payload, mode=0o600)
+    with patch.object(ebird_archive, "_read_state", wraps=ebird_archive._read_state) as reader:
+        first = read_ebird_archive_summary(state)
+        second = read_ebird_archive_summary(state)
+    assert reader.call_count == 1
+    assert first == second
+    assert [row.common_name for row in first] == ["Rob‍in"]
+
+    # A summary written before this rule was kept is rebuilt once, then trusted.
+    path = summary_path(history)
+    old = json.loads(path.read_text())
+    old.pop("body_sha256")
+    write_json_atomic(path, old, mode=0o600)
+    with patch.object(ebird_archive, "_read_state", wraps=ebird_archive._read_state) as reader:
+        assert read_ebird_archive_summary(state) == first
+        assert read_ebird_archive_summary(state) == first
+    assert reader.call_count == 1
+
+    # Changing a name in the summary alone is still caught and rebuilt.
+    edited = json.loads(path.read_text())
+    edited["species"][0]["common_name"] = "Bad\nname"
+    write_json_atomic(path, edited, mode=0o600)
+    with patch.object(ebird_archive, "_read_state", wraps=ebird_archive._read_state) as reader:
+        assert read_ebird_archive_summary(state) == first
+    assert reader.call_count == 1
