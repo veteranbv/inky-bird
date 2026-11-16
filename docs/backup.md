@@ -187,14 +187,18 @@ a job that it is running. Before stopping it, check its log: the newest
 
    ```bash
    (
-     grep '\.timer$' "$BACKUP/native-active-systemd-units.txt" |
-       while IFS= read -r unit; do sudo systemctl stop "$unit" || exit 1; done
+     while IFS= read -r unit; do
+       case "$unit" in
+         *.timer) sudo systemctl stop "$unit" || exit 1 ;;
+       esac
+     done < "$BACKUP/native-active-systemd-units.txt"
    )
    ```
 
-3. Check that no job is still running. If one is, wait for it to finish and run
-   this step again. Do not go back to step 1: its new record would miss the
-   timers that step 2 stopped.
+3. Stop the scheduler and the controller, if they were running. This first
+   checks that no job is still running and stops nothing if one is. Then wait
+   for the job to finish and run this step again. Do not go back to step 1:
+   its new record would miss the timers that step 2 stopped.
 
    ```bash
    (
@@ -205,13 +209,6 @@ a job that it is running. Before stopping it, check its log: the newest
          *) echo "A job is still running: $FAMILY-$job.service ($state)" >&2; exit 1 ;;
        esac
      done
-   )
-   ```
-
-4. Stop the scheduler and the controller, if they were running:
-
-   ```bash
-   (
      for unit in "$FAMILY-scheduler.service" "$FAMILY-controller.service"; do
        if grep -Fxq "$unit" "$BACKUP/native-active-systemd-units.txt"; then
          sudo systemctl stop "$unit" || exit 1
@@ -220,11 +217,18 @@ a job that it is running. Before stopping it, check its log: the newest
    )
    ```
 
-5. Confirm that everything recorded has stopped. Do not copy until this step
-   prints nothing:
+4. Confirm that no job is running and everything recorded has stopped. Do not
+   copy until this step prints nothing:
 
    ```bash
    (
+     for job in refresh generate catalog-publish notifications; do
+       state=$(systemctl is-active "$FAMILY-$job.service" 2>/dev/null || true)
+       case "$state" in
+         inactive | failed | unknown) ;;
+         *) echo "A job is still running: $FAMILY-$job.service ($state)" >&2; exit 1 ;;
+       esac
+     done
      while IFS= read -r unit; do
        state=$(systemctl is-active "$unit" 2>/dev/null || true)
        case "$state" in
@@ -254,8 +258,9 @@ a job that it is running. Before stopping it, check its log: the newest
    )
    ```
 
-2. Check that no job is still running. Unloading an agent can end a job that
-   is running. If one is, wait for it to finish and run this step again:
+2. Unload the recorded agents. Unloading an agent can end a job that is
+   running, so this first checks that no job is running and unloads nothing if
+   one is. Then wait for the job to finish and run this step again:
 
    ```bash
    (
@@ -265,20 +270,13 @@ a job that it is running. Before stopping it, check its log: the newest
          echo "A job is still running: com.$FAMILY.$label" >&2; exit 1
        fi
      done
-   )
-   ```
-
-3. Unload the recorded agents:
-
-   ```bash
-   (
      while IFS= read -r label; do
        launchctl bootout "gui/$(id -u)/com.$FAMILY.$label" || exit 1
      done < "$BACKUP/native-loaded-launchagents.txt"
    )
    ```
 
-4. Confirm that none is still loaded. Do not copy until this step prints
+3. Confirm that none is still loaded. Do not copy until this step prints
    nothing:
 
    ```bash
@@ -346,10 +344,12 @@ Start only what step 3 recorded.
 
 #### On systemd Linux
 
-1. Check that the record names only Inky's own units:
+1. Start the recorded units, in the recorded order. This first checks that
+   the record names only Inky's own units and starts nothing if it does not:
 
    ```bash
    (
+     RECORD="$BACKUP/native-active-systemd-units.txt"
      while IFS= read -r unit; do
        case "$unit" in
          "$FAMILY"-controller.service | "$FAMILY"-scheduler.service | \
@@ -357,21 +357,12 @@ Start only what step 3 recorded.
            "$FAMILY"-catalog-publish.timer | "$FAMILY"-notifications.timer) ;;
          *) echo "Unexpected unit in the record: $unit" >&2; exit 1 ;;
        esac
-     done < "$BACKUP/native-active-systemd-units.txt"
+     done < "$RECORD"
+     while IFS= read -r unit; do sudo systemctl start "$unit" || exit 1; done < "$RECORD"
    )
    ```
 
-2. Start them, in the recorded order:
-
-   ```bash
-   (
-     while IFS= read -r unit; do
-       sudo systemctl start "$unit" || exit 1
-     done < "$BACKUP/native-active-systemd-units.txt"
-   )
-   ```
-
-3. Confirm that each one is running:
+2. Confirm that each one is running:
 
    ```bash
    (
@@ -383,34 +374,29 @@ Start only what step 3 recorded.
 
 #### On macOS
 
-1. Check that the record names only Inky's own agents and that each is still
-   installed:
+1. Load the recorded agents again. This first checks that the record names
+   only Inky's own agents and that each is still installed, and loads nothing
+   if not:
 
    ```bash
    (
+     RECORD="$BACKUP/native-loaded-launchagents.txt"
+     AGENTS="$HOME/Library/LaunchAgents"
      while IFS= read -r label; do
        case "$label" in
          serve | scheduler | refresh | generate | catalog-publish | notifications) ;;
          *) echo "Unexpected label in the record: $label" >&2; exit 1 ;;
        esac
-       plist="$HOME/Library/LaunchAgents/com.$FAMILY.$label.plist"
+       plist="$AGENTS/com.$FAMILY.$label.plist"
        [ -f "$plist" ] || { echo "Recorded LaunchAgent is missing: $plist" >&2; exit 1; }
-     done < "$BACKUP/native-loaded-launchagents.txt"
-   )
-   ```
-
-2. Load them again:
-
-   ```bash
-   (
+     done < "$RECORD"
      while IFS= read -r label; do
-       plist="$HOME/Library/LaunchAgents/com.$FAMILY.$label.plist"
-       launchctl bootstrap "gui/$(id -u)" "$plist" || exit 1
-     done < "$BACKUP/native-loaded-launchagents.txt"
+       launchctl bootstrap "gui/$(id -u)" "$AGENTS/com.$FAMILY.$label.plist" || exit 1
+     done < "$RECORD"
    )
    ```
 
-3. Confirm that each one is loaded:
+2. Confirm that each one is loaded:
 
    ```bash
    (
@@ -470,34 +456,27 @@ wildcard bind such as `0.0.0.0` is checked through `127.0.0.1`.
 2. On an existing host, find the installation's names and stop the
    controller and scheduled jobs as described above. A new host has no
    installed services to stop.
-3. Move any existing files and folders at the recorded paths aside. This check
-   refuses to restore over anything still there:
+3. Move any existing files and folders at the recorded paths aside, then
+   restore as the controller account. This refuses to restore, and copies
+   nothing, while anything is still at a recorded path:
 
    ```bash
    (
+     dir=$(dirname "$CONFIG")
      for target in "$CONFIG" "$WORKSPACE" "$CATALOG" "$STATE" \
-       "$(dirname "$CONFIG")/native-access.env" "$(dirname "$CONFIG")/native-tls.env"; do
-       if [ -e "$target" ] || [ -L "$target" ]; then
-         echo "Move this aside before restoring: $target" >&2; exit 1
-       fi
+       "$dir/native-access.env" "$dir/native-tls.env"; do
+       [ ! -e "$target" ] && [ ! -L "$target" ] ||
+         { echo "Move this aside before restoring: $target" >&2; exit 1; }
      done
+     mkdir -p "$dir" "$WORKSPACE" "$CATALOG" "$STATE"
+     rsync -a "$BACKUP/config/config.toml" "$CONFIG" && chmod 600 "$CONFIG"
+     for name in native-access.env native-tls.env; do
+       [ ! -f "$BACKUP/config/$name" ] ||
+         { rsync -a "$BACKUP/config/$name" "$dir/$name" && chmod 600 "$dir/$name"; }
+     done
+     rsync -a "$BACKUP/workspace/" "$WORKSPACE/" && rsync -a "$BACKUP/catalog/" "$CATALOG/" &&
+       rsync -a "$BACKUP/state/" "$STATE/"
    )
-   ```
-
-   Only when that prints nothing, restore as the controller account:
-
-   ```bash
-   mkdir -p "$(dirname "$CONFIG")" "$WORKSPACE" "$CATALOG" "$STATE"
-   rsync -a "$BACKUP/config/config.toml" "$CONFIG" && chmod 600 "$CONFIG"
-   for name in native-access.env native-tls.env; do
-     if [ -f "$BACKUP/config/$name" ]; then
-       rsync -a "$BACKUP/config/$name" "$(dirname "$CONFIG")/$name"
-       chmod 600 "$(dirname "$CONFIG")/$name"
-     fi
-   done
-   rsync -a "$BACKUP/workspace/" "$WORKSPACE/"
-   rsync -a "$BACKUP/catalog/" "$CATALOG/"
-   rsync -a "$BACKUP/state/" "$STATE/"
    ```
 
 4. Confirm that the controller account owns the restored paths. If a privileged
@@ -591,9 +570,9 @@ Run each block on its own and stop at the first error.
    HEALTH_URL=http://127.0.0.1:8793/health
    ```
 
-2. Record which services are running. A running `bootstrap` is still writing
-   the catalog: wait for it to exit and run this step again instead of
-   interrupting it.
+2. Record which services are running, then stop the writers. A running
+   `bootstrap` is still writing the catalog, so this stops nothing while it
+   runs: wait for it to exit and run this step again instead of interrupting it.
 
    ```bash
    (
@@ -608,17 +587,11 @@ Run each block on its own and stop at the first error.
          *) echo "Unexpected running service in $DOCKER_STATE: $service" >&2; exit 1 ;;
        esac
      done < "$DOCKER_STATE"
+     docker compose stop scheduler controller bootstrap && docker compose ps --all
    )
    ```
 
-3. Stop the writers:
-
-   ```bash
-   docker compose stop scheduler controller bootstrap
-   docker compose ps --all
-   ```
-
-4. Confirm that none of them is still running. Do not continue until this step
+3. Confirm that none of them is still running. Do not continue until this step
    prints nothing:
 
    ```bash
@@ -769,8 +742,9 @@ command with the same project name.
    RESTORE_PROJECT=inky-bird-frame-restore
    ```
 
-   Check that the restore name is unused. If this prints an error, choose a
-   different name:
+   Check that the restore name is unused, then create the new project volumes
+   without starting services. If this prints an error, it created nothing:
+   choose a different name and run it again.
 
    ```bash
    (
@@ -784,13 +758,8 @@ command with the same project name.
          echo "Restore volume already exists: ${RESTORE_PROJECT}_${volume}" >&2; exit 1
        fi
      done
+     docker compose -p "$RESTORE_PROJECT" create
    )
-   ```
-
-   Then create the new project volumes without starting services:
-
-   ```bash
-   docker compose -p "$RESTORE_PROJECT" create
    ```
 
 3. Restore the controller archive through the project image:

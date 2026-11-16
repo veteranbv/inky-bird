@@ -275,7 +275,9 @@ FAKE_LAUNCHCTL = r"""#!/usr/bin/env bash
 # Synthetic launchctl: "$FAKE/loaded" lists loaded labels.
 touch "$FAKE/loaded"
 case "$1" in
-  print) grep -Fxq "${2##*/}" "$FAKE/loaded" ;;
+  print)
+    grep -Fxq "${2##*/}" "$FAKE/loaded" || exit 113
+    if grep -Fxq "${2##*/}" "$FAKE/running" 2>/dev/null; then echo "state = running"; fi ;;
   bootout)
     label=${2##*/}
     grep -Fxq "$label" "$FAKE/loaded" || exit 3
@@ -291,6 +293,19 @@ esac
 """
 
 FAKE_SUDO = '#!/usr/bin/env bash\nexec "$@"\n'
+
+FAKE_DOCKER = r"""#!/usr/bin/env bash
+# Synthetic docker: "$FAKE/running", "$FAKE/containers" and "$FAKE/volumes" list names.
+echo "docker $*" >> "$FAKE/log"
+[ "$1" = compose ] && shift
+case "$*" in
+  *"ps --status running --services"*) cat "$FAKE/running" 2>/dev/null ;;
+  *"ps --all --quiet"*) cat "$FAKE/containers" 2>/dev/null ;;
+  "stop "*) : > "$FAKE/running" ;;
+  "volume ls"*) cat "$FAKE/volumes" 2>/dev/null ;;
+  "volume inspect "*) grep -Fxq "$3" "$FAKE/volumes" 2>/dev/null ;;
+esac
+"""
 
 
 def _bash_blocks(section: str) -> list[str]:
@@ -340,6 +355,7 @@ class _NativeHost:
             ("systemctl", FAKE_SYSTEMCTL),
             ("launchctl", FAKE_LAUNCHCTL),
             ("sudo", FAKE_SUDO),
+            ("docker", FAKE_DOCKER),
         ):
             path = self.fake / "bin" / name
             path.write_text(script)
@@ -360,13 +376,16 @@ class _NativeHost:
             "".join(f"com.{self.family}.{label}\n" for label in loaded)
         )
 
-    def run(self, block: str, *, family: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, block: str, *, family: str | None = None, **variables: str
+    ) -> subprocess.CompletedProcess[str]:
         environment = {
             "PATH": f"{self.fake / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.home),
             "FAKE": str(self.fake),
             "BACKUP": str(self.backup),
             "FAMILY": family or self.family,
+            **variables,
         }
         return subprocess.run(
             ["bash", "-c", f"{block}\nprintf 'block-status=%s\\n' \"$?\""],
@@ -387,6 +406,14 @@ class _NativeHost:
             if self.status(result) != 0:
                 break
         return result
+
+    def paste(
+        self, blocks: list[str], *, family: str | None = None, **variables: str
+    ) -> subprocess.CompletedProcess[str]:
+        # An operator who pastes a whole section into one shell runs every block,
+        # including the ones after a check that failed.
+        assert blocks
+        return self.run("\n".join(blocks), family=family, **variables)
 
     @staticmethod
     def status(result: subprocess.CompletedProcess[str]) -> int:
@@ -592,6 +619,169 @@ def test_native_restart_refuses_a_missing_launch_agent_and_bootstraps_nothing(
     assert host.status(result) != 0
     assert "Recorded LaunchAgent is missing" in result.stderr
     assert host.calls() == []
+
+
+def _guide_part(start: str, end: str) -> str:
+    guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
+    return guide.split(start, 1)[1].split(end, 1)[0]
+
+
+@BASH
+def test_pasted_systemd_quiesce_stops_nothing_more_while_a_job_is_active(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(
+        **{
+            "controller.service": "active",
+            "generate.timer": "active",
+            "generate.service": "active",
+        }
+    )
+
+    result = host.paste(_NativeSteps().systemd_stop)
+
+    assert host.status(result) != 0
+    assert "A job is still running: inky-bird-generate.service" in result.stderr
+    assert host.calls() == ["stop inky-bird-generate.timer"]
+
+
+@BASH
+def test_pasted_launch_agent_quiesce_unloads_nothing_while_a_job_is_active(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "generate", loaded=("serve", "generate"))
+    (host.fake / "running").write_text("com.inky-bird.generate\n")
+
+    result = host.paste(_NativeSteps().launchd_stop)
+
+    assert host.status(result) != 0
+    assert "A job is still running: com.inky-bird.generate" in result.stderr
+    assert host.calls() == []
+
+
+@BASH
+def test_pasted_restart_starts_nothing_from_a_record_with_a_foreign_entry(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "inactive", "other.service": "inactive"})
+    (host.backup / "native-active-systemd-units.txt").write_text(
+        "inky-bird-controller.service\ninky-bird-other.service\n"
+    )
+    host.install_agents("serve", "other", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nother\n")
+
+    for blocks in (_NativeSteps().systemd_start, _NativeSteps().launchd_start):
+        result = host.paste(blocks)
+        assert host.status(result) != 0
+        assert "Unexpected " in result.stderr
+    assert host.calls() == []
+
+
+def _native_restore_blocks() -> list[str]:
+    return _bash_blocks(_guide_part("3. Move any existing files", "4. Confirm that the controller"))
+
+
+def _restore_paths(root: Path) -> dict[str, str]:
+    return {
+        "CONFIG": str(root / "live/config/config.toml"),
+        "WORKSPACE": str(root / "live/workspace"),
+        "CATALOG": str(root / "live/catalog"),
+        "STATE": str(root / "live/state"),
+    }
+
+
+def _saved_backup(backup: Path) -> None:
+    for part in ("config", "workspace", "catalog", "state"):
+        (backup / part).mkdir()
+    (backup / "config/config.toml").write_text("saved config\n")
+    (backup / "state/journal.json").write_text("old\n")
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("rsync") is None, reason="requires bash and rsync"
+)
+def test_pasted_native_restore_copies_nothing_over_an_existing_path(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    _saved_backup(host.backup)
+    paths = _restore_paths(tmp_path)
+    live_journal = Path(paths["STATE"]) / "journal.json"
+    live_journal.parent.mkdir(parents=True)
+    live_journal.write_text("LIVE\n")
+
+    result = host.paste(_native_restore_blocks(), **paths)
+
+    assert host.status(result) != 0
+    assert "Move this aside before restoring" in result.stderr
+    assert live_journal.read_text() == "LIVE\n"
+    assert not Path(paths["CONFIG"]).exists()
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("rsync") is None, reason="requires bash and rsync"
+)
+def test_pasted_native_restore_fills_empty_paths_privately(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    _saved_backup(host.backup)
+    paths = _restore_paths(tmp_path)
+
+    result = host.paste(_native_restore_blocks(), **paths)
+
+    assert host.status(result) == 0, result.stderr
+    assert (Path(paths["STATE"]) / "journal.json").read_text() == "old\n"
+    assert Path(paths["CONFIG"]).read_text() == "saved config\n"
+    assert Path(paths["CONFIG"]).stat().st_mode & 0o777 == 0o600
+
+
+def _docker_blocks(start: str, end: str, backup: Path) -> list[str]:
+    part = _guide_part(start, end).replace("/path/to/private-backup/inky-bird-docker", str(backup))
+    return _bash_blocks(part)
+
+
+def _docker_writes(host: _NativeHost) -> list[str]:
+    return [call for call in host.calls() if re.search(r" (stop|create|start|up|run) ", call + " ")]
+
+
+@BASH
+def test_pasted_docker_stop_leaves_a_running_bootstrap_alone(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "running").write_text("controller\nbootstrap\n")
+    blocks = _docker_blocks("### 1. Stop writers", "\n### 2.", host.backup)
+
+    result = host.paste(blocks)
+
+    assert host.status(result) != 0
+    assert "Bootstrap is still running" in result.stderr
+    assert _docker_writes(host) == []
+
+
+@BASH
+def test_pasted_docker_stop_stops_the_writers_and_confirms_it(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "running").write_text("controller\nscheduler\n")
+    blocks = _docker_blocks("### 1. Stop writers", "\n### 2.", host.backup)
+
+    result = host.paste(blocks)
+
+    assert host.status(result) == 0, result.stderr
+    assert _docker_writes(host) == ["docker compose stop scheduler controller bootstrap"]
+
+
+@BASH
+def test_pasted_docker_restore_creates_nothing_in_a_project_that_exists(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "volumes").write_text("inky-bird-frame-restore_controller-data\n")
+    blocks = _docker_blocks(
+        "2. Choose a restore project name", "3. Restore the controller archive", host.backup
+    )
+
+    result = host.paste(blocks)
+
+    assert host.status(result) != 0
+    assert "inky-bird-frame-restore" in result.stderr
+    assert _docker_writes(host) == []
 
 
 def test_backup_guide_gives_short_numbered_steps() -> None:
