@@ -99,11 +99,11 @@ node --test tests/web/*.test.mjs
 Run `uv run ruff format .` before the checks when Python files need formatting.
 `uv run pytest` reads the committed catalog images; without them, run
 `uv run pytest -m "not repository_catalog"`. CI runs all of the checks above
-on Python 3.11. It also lints workflows with actionlint and `deploy/*.sh` with
+on Python 3.14. It also lints workflows with actionlint and `deploy/*.sh` with
 ShellCheck, checks that workflow actions are pinned, rejects changes to approved
 catalog entries, validates the Compose files, builds and smoke-tests the
-controller container, and runs the tests without catalog images on Python 3.12
-to 3.14. Browser interaction regressions use Node.js 20 or newer's built-in
+controller container, and runs the tests without catalog images on Python 3.11
+to 3.13. Browser interaction regressions use Node.js 20 or newer's built-in
 test runner; there is no Node service or frontend package installation in the
 user runtime.
 

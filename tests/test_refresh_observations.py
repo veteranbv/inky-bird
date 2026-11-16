@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from inky_bird_frame.birds import BirdSpecies
+from inky_bird_frame.cli import error_code
 from inky_bird_frame.config import AppConfig, load_config
 from inky_bird_frame.controller import (
     DiscoveryResult,
@@ -17,7 +18,7 @@ from inky_bird_frame.controller import (
     refresh_observations,
     run_generation_cycle,
 )
-from inky_bird_frame.errors import CatalogError, DataSourceError
+from inky_bird_frame.errors import BusyError, CatalogError, DataSourceError
 from inky_bird_frame.geo import DiscoveryLocation
 
 CONFIG = """
@@ -101,6 +102,35 @@ class RefreshFailureTests(unittest.TestCase):
 
         degraded.assert_not_called()
         recovered.assert_not_called()
+
+    def test_refresh_already_running_is_a_busy_data_source_error(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                exclusive_refresh_lock(config.controller.state_dir),
+                self.assertRaises(BusyError) as raised,
+            ):
+                refresh_observations(config)
+
+        self.assertIsInstance(raised.exception, DataSourceError)
+        self.assertEqual(error_code(raised.exception), "busy")
+
+    def test_a_failure_caused_by_a_would_block_error_is_still_a_degradation(self) -> None:
+        failure = DataSourceError("provider socket would block")
+        failure.__cause__ = BlockingIOError(35, "Resource temporarily unavailable")
+        with TemporaryDirectory() as temporary:
+            config = load(temporary)
+            with (
+                patch("inky_bird_frame.controller.discover_species", side_effect=failure),
+                patch("inky_bird_frame.controller.safe_record_degradation") as degraded,
+                self.assertRaises(DataSourceError),
+            ):
+                refresh_observations(config)
+
+        self.assertEqual(
+            [call.kwargs["key"] for call in degraded.call_args_list], ["observation-refresh"]
+        )
+        self.assertEqual(error_code(failure), "data_source")
 
 
 class ScheduledOutputPrivacyTests(unittest.TestCase):

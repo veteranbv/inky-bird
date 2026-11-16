@@ -133,16 +133,7 @@ UNEXPECTED_ERROR_MESSAGE = "The command stopped on an unexpected error. Check th
 def _is_busy(exc: BaseException) -> bool:
     from .owner_operations import OwnerOperationBusyError
 
-    if isinstance(exc, BusyError | OwnerOperationBusyError):
-        return True
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        if isinstance(current, BlockingIOError):
-            return True
-        seen.add(id(current))
-        current = current.__cause__
-    return False
+    return isinstance(exc, BusyError | OwnerOperationBusyError | BlockingIOError)
 
 
 def error_code(exc: BaseException) -> str:

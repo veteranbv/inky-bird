@@ -1,0 +1,25 @@
+{
+  "description": "Fixed species panel for plate prompt evaluation. Tune on dev; accept only on holdout.",
+  "species": [
+    {"taxon_id": 9083, "common_name": "Northern Cardinal", "stratum": "perching-songbird", "split": "dev"},
+    {"taxon_id": 9100, "common_name": "Song Sparrow", "stratum": "perching-songbird", "split": "dev"},
+    {"taxon_id": 7428, "common_name": "Cedar Waxwing", "stratum": "perching-songbird", "split": "holdout"},
+    {"taxon_id": 6930, "common_name": "Mallard", "stratum": "swimmer", "split": "dev"},
+    {"taxon_id": 4626, "common_name": "Common Loon", "stratum": "swimmer", "split": "holdout"},
+    {"taxon_id": 792988, "common_name": "Downy Woodpecker", "stratum": "clinger", "split": "dev"},
+    {"taxon_id": 14801, "common_name": "White-breasted Nuthatch", "stratum": "clinger", "split": "holdout"},
+    {"taxon_id": 4956, "common_name": "Great Blue Heron", "stratum": "wader", "split": "dev"},
+    {"taxon_id": 3892, "common_name": "Greater Yellowlegs", "stratum": "wader", "split": "holdout"},
+    {"taxon_id": 5212, "common_name": "Red-tailed Hawk", "stratum": "raptor", "split": "dev"},
+    {"taxon_id": 19893, "common_name": "Barred Owl", "stratum": "raptor", "split": "holdout"},
+    {"taxon_id": 4496, "common_name": "Black Skimmer", "stratum": "long-billed", "split": "dev"},
+    {"taxon_id": 2548, "common_name": "Belted Kingfisher", "stratum": "long-billed", "split": "dev"},
+    {"taxon_id": 3751, "common_name": "White Ibis", "stratum": "long-billed", "split": "holdout"},
+    {"taxon_id": 11901, "common_name": "Barn Swallow", "stratum": "aerial", "split": "dev"},
+    {"taxon_id": 6571, "common_name": "Chimney Swift", "stratum": "aerial", "split": "holdout"},
+    {"taxon_id": 4793, "common_name": "Killdeer", "stratum": "ground", "split": "dev"},
+    {"taxon_id": 6432, "common_name": "Ruby-throated Hummingbird", "stratum": "tiny", "split": "dev"},
+    {"taxon_id": 117100, "common_name": "Golden-crowned Kinglet", "stratum": "tiny", "split": "holdout"},
+    {"taxon_id": 4328, "common_name": "Brown Pelican", "stratum": "large", "split": "dev"}
+  ]
+}

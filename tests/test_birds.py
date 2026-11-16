@@ -90,6 +90,26 @@ class InaturalistParsingTests(unittest.TestCase):
         self.assertEqual(species[0].observation_count, 26)
         self.assertEqual(species[0].source, "iNaturalist")
 
+    def test_parse_species_counts_skips_negative_and_boolean_counts(self) -> None:
+        def row(count: object, taxon_id: int, name: str) -> dict[str, object]:
+            return {
+                "count": count,
+                "taxon": {
+                    "id": taxon_id,
+                    "preferred_common_name": name,
+                    "name": f"Fixture {name.lower()}",
+                    "rank": "species",
+                },
+            }
+
+        species = parse_inaturalist_species_counts(
+            {"results": [row(-1, 1, "Negative"), row(True, 2, "Boolean"), row(0, 3, "Zero")]}
+        )
+
+        self.assertEqual([(item.taxon_id, item.observation_count) for item in species], [(3, 0)])
+        with self.assertRaises(DataSourceError):
+            parse_inaturalist_species_counts({"results": [row(-1, 1, "Negative")]})
+
     def test_parse_species_counts_rejects_empty_usable_results(self) -> None:
         with self.assertRaises(DataSourceError):
             parse_inaturalist_species_counts({"results": [{"taxon": {}}]})

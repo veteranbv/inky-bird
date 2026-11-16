@@ -86,6 +86,7 @@ from .codex_runner import CodexRunner, parse_species_profile
 from .config import AppConfig, DiscoveryProvider, NotificationEvent, discovery_source_label
 from .ebird_archive import read_ebird_archive_history
 from .errors import (
+    BusyError,
     CatalogError,
     DataSourceError,
     GenerationError,
@@ -295,6 +296,14 @@ class GenerationWork:
         }
 
 
+class ControllerCycleBusyError(GenerationError, BusyError):
+    """Raised when another controller cycle holds the cycle lock."""
+
+
+class ObservationRefreshBusyError(DataSourceError, BusyError):
+    """Raised when another observation refresh holds the refresh lock."""
+
+
 @contextmanager
 def exclusive_cycle_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -303,7 +312,7 @@ def exclusive_cycle_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise GenerationError("Another controller cycle is already running") from exc
+            raise ControllerCycleBusyError("Another controller cycle is already running") from exc
         try:
             yield
         finally:
@@ -317,7 +326,9 @@ def exclusive_refresh_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise DataSourceError("Another observation refresh is already running") from exc
+            raise ObservationRefreshBusyError(
+                "Another observation refresh is already running"
+            ) from exc
         try:
             yield
         finally:
