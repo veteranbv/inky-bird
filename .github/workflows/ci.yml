@@ -273,8 +273,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --locked
 
+      # The installer matrix runs in full in its own shards and in default form in
+      # Core quality. It tests shell installers against fakes, not this Python.
       - name: Run tests
-        run: uv run pytest -m "not repository_catalog"
+        run: uv run pytest -m "not repository_catalog" --ignore=tests/test_installer_matrix.py
 
   browser-acceptance:
     name: Browser acceptance
