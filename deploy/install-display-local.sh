@@ -318,9 +318,10 @@ cleanup() {
       new_runtime_in_use=true
     elif [ "${package_installed}" = true ] && ! restore_package; then
       new_runtime_in_use=true
-      # Python may still import the renamed distribution before the new one.
-      if [ "${installed}" = inky-bird-frame ] && [ "$("${venv}/bin/python" -I -c \
-          "${installed_source_program}" 2>/dev/null || true)" != "${new_runtime}" ]; then
+      # Python may still import the renamed distribution before the new one;
+      # if that cannot be checked, the new one is taken to be in use.
+      if [ "${installed}" = inky-bird-frame ] && imported=$("${venv}/bin/python" -I -c \
+          "${installed_source_program}" 2>/dev/null) && [ "${imported}" != "${new_runtime}" ]; then
         new_runtime_shadowed=true
       fi
     fi
