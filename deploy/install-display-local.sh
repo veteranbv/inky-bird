@@ -14,25 +14,36 @@ unit_root="/etc/systemd/system"
 
 # Remove one distribution's files, except those the other one also owns. With
 # a third argument, move them into that directory instead, listing every move
-# first, so restore_distribution_program can put them back.
+# first, so restore_distribution_program can put them back. Only files in this
+# environment's packages and commands are touched; any other stops it first.
 remove_distribution_program='
 import json
+import os
 import shutil
 import sys
+import sysconfig
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
+places = {os.path.realpath(sysconfig.get_path(name)) for name in ("purelib", "platlib", "scripts")}
+def inside(path):
+    real = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    return any(real.startswith(place + os.sep) for place in places)
 try:
     removed = distribution(sys.argv[1])
 except PackageNotFoundError:
     sys.exit(0)
 kept = distribution(sys.argv[2])
 backup = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+if backup is not None and (backup / "plan.json").exists():
+    sys.exit("Files from an earlier attempt are still set aside; nothing was moved.")
 owned = {kept.locate_file(path).resolve() for path in kept.files or ()}
 targets = []
 for path in removed.files or ():
     target = removed.locate_file(path)
     if target.resolve() in owned or not (target.is_file() or target.is_symlink()):
         continue
+    if not inside(str(target)):
+        sys.exit("The old package lists a file outside its environment; nothing was moved.")
     targets.append(target)
 if backup is not None:
     backup.mkdir(exist_ok=True)
@@ -53,15 +64,27 @@ for directory in sorted(directories, key=lambda item: len(item.parts), reverse=T
 '
 restore_distribution_program='
 import json
+import os
 import shutil
 import sys
+import sysconfig
 from pathlib import Path
-plan = Path(sys.argv[1]) / "plan.json"
-if plan.exists():
-    for original, saved in json.loads(plan.read_text()):
-        if Path(saved).exists() or Path(saved).is_symlink():
-            Path(original).parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(saved, original)
+places = {os.path.realpath(sysconfig.get_path(name)) for name in ("purelib", "platlib", "scripts")}
+def inside(path, roots):
+    real = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    return any(real.startswith(root + os.sep) for root in roots)
+backup = Path(sys.argv[1])
+plan = backup / "plan.json"
+if not plan.exists():
+    sys.exit(0)
+moves = json.loads(plan.read_text())
+for original, saved in moves:
+    if not inside(original, places) or not inside(saved, {os.path.realpath(backup)}):
+        sys.exit("The list of set-aside files names a place outside its environment; nothing was moved.")
+for original, saved in moves:
+    if Path(saved).exists() or Path(saved).is_symlink():
+        Path(original).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(saved, original)
 '
 validate_program='
 import sys
