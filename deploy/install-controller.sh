@@ -504,8 +504,10 @@ from inky_bird_frame.publisher import sync_public_catalog
     config_path,
     log_dir,
 ) = map(Path, sys.argv[1:])
-executable = app_dir / ".venv/bin/inky-bird"
 service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+# The command named like the services: 0.9 installs had only inky-bird-frame,
+# so a service whose definition a failed upgrade could not put back still starts.
+executable = app_dir / ".venv/bin" / service_prefix
 config = load_config(config_path)
 environment_credentials = []
 if config.discovery.geoapify_api_key_env:

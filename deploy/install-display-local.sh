@@ -412,7 +412,10 @@ from inky_bird_frame.installation import display_systemd_units
 
 unit_dir, app_dir, config_path, venv = map(Path, sys.argv[1:5])
 user = sys.argv[5]
-executable = venv / "bin/inky-bird"
+service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+# The command named like the services: 0.9 installs had only inky-bird-frame,
+# so a service whose definition a failed upgrade could not put back still starts.
+executable = venv / "bin" / service_prefix
 config = load_config(config_path)
 units = display_systemd_units(
     config,
@@ -420,7 +423,7 @@ units = display_systemd_units(
     app_dir=app_dir,
     config_path=config_path,
     user=user,
-    service_prefix=os.environ["INKY_BIRD_SERVICE_PREFIX"],
+    service_prefix=service_prefix,
 )
 for name, content in units.items():
     (unit_dir / name).write_text(content)

@@ -654,7 +654,10 @@ with catalog_state_lock(config.controller.state_dir):
         retain_independent_approvals=True,
     )
 
-executable = app_dir / ".venv/bin/inky-bird"
+service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+# The command named like the services: 0.9 installs had only inky-bird-frame,
+# so a service whose definition a failed upgrade could not put back still starts.
+executable = app_dir / ".venv/bin" / service_prefix
 units = controller_systemd_units(
     config,
     executable=executable,
@@ -662,7 +665,7 @@ units = controller_systemd_units(
     config_path=config_path,
     home=home,
     user=user,
-    service_prefix=os.environ["INKY_BIRD_SERVICE_PREFIX"],
+    service_prefix=service_prefix,
 )
 for name, content in units.items():
     (unit_dir / name).write_text(content)
