@@ -27,6 +27,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tests/fake_bin/fake_tools.py"
+UPGRADE_GATES = ROOT / "src/inky_bird_frame/upgrade_gates.py"
 _spec = importlib.util.spec_from_file_location("fake_tools", TOOLS)
 assert _spec is not None and _spec.loader is not None
 fake_tools = importlib.util.module_from_spec(_spec)
@@ -309,6 +310,8 @@ class Host:
         (package / "native_names.py").write_text("# replaced by the synthetic python3\n")
         (package / "config.py").write_text(FAKE_CONFIG_MODULE)
         (package / "installation.py").write_text(FAKE_INSTALLATION_MODULE)
+        # The installers' upgrade helper runs for real against the synthetic config.
+        (package / "upgrade_gates.py").write_text(UPGRADE_GATES.read_text())
         (directory / "src/runtime-tag").write_text(f"{tag}\n")
         (directory / "catalog").mkdir(exist_ok=True)
         (directory / "deploy").mkdir(exist_ok=True)
@@ -321,6 +324,7 @@ class Host:
         name: str,
         quiesce_timeout: int = 3,
         *,
+        health_timeout: int = 5,
         source: Path | None = None,
         text: str | None = None,
         system_paths: tuple[str, ...] | None = None,
@@ -339,6 +343,7 @@ class Host:
         text = text.replace(
             "quiesce_timeout_seconds=1800", f"quiesce_timeout_seconds={quiesce_timeout}"
         )
+        text = text.replace("health_timeout_seconds=90", f"health_timeout_seconds={health_timeout}")
         # Polling for the cycle lock helper is only a wait; a short one keeps runs quick.
         text = text.replace("poll_seconds=1\n", "poll_seconds=0.05\n")
         # So is the helper's own watch for its installer to end, and its wait for a
@@ -349,6 +354,23 @@ class Host:
         target.write_text(text)
         target.chmod(0o755)
         return target
+
+    def stopped_hook(self) -> Path:
+        """An owner's --stopped-hook, which reaches the fake tools without the
+        installer's environment: it runs with only the variables it is given."""
+        path = self.support / "stopped-hook"
+        exports = "".join(
+            f"{name}={shlex.quote(value)}; export {name}\n"
+            for name, value in (
+                ("FAKE", str(self.fake)),
+                ("FAKE_STATE_DIR", str(self.state)),
+                ("FAKE_LAYOUT_APP_DIR", str(self.app)),
+            )
+        )
+        shebang, body = tool_wrapper("stopped-hook").split("\n", 1)
+        path.write_text(f"{shebang}\n{exports}{body}")
+        path.chmod(0o755)
+        return path
 
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
@@ -378,6 +400,19 @@ class Host:
             [shell, str(self.script(name, quiesce_timeout))], self.environment(**extra)
         )
 
+    def run_with(
+        self,
+        name: str,
+        options: tuple[str, ...],
+        *,
+        shell: str = "bash",
+        health_timeout: int = 5,
+        **extra: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a script with command-line options and its health check's time limit."""
+        script = self.script(name, health_timeout=health_timeout)
+        return run_contained([shell, str(script), *options], self.environment(**extra))
+
     def start(
         self,
         name: str,
@@ -385,12 +420,13 @@ class Host:
         *,
         shell: str = "bash",
         quiesce_timeout: int = 3,
+        options: tuple[str, ...] = (),
         **extra: str,
     ) -> subprocess.Popen[str]:
         """Start a script in the background with stdout and stderr in ``output``."""
         with output.open("w") as handle:
             return subprocess.Popen(
-                [shell, str(self.script(name, quiesce_timeout))],
+                [shell, str(self.script(name, quiesce_timeout)), *options],
                 env=self.environment(**extra),
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -480,8 +516,9 @@ def bootstraps(host: Host) -> list[list[str]]:
 
 
 @contextmanager
-def running_generation(host: Host) -> Iterator[Callable[[], None]]:
-    """Hold the controller cycle lock the way a running generation does.
+def running_generation(host: Host, lock: str = "controller.lock") -> Iterator[Callable[[], None]]:
+    """Hold a writer lock the way a running writer does: by default the
+    controller cycle lock, as a plate being made holds it.
 
     The lock is held until the yielded ``release`` is called or the block ends.
     """
@@ -494,7 +531,7 @@ def running_generation(host: Host) -> Iterator[Callable[[], None]]:
             "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
             "print('locked', flush=True)\n"
             "sys.stdin.read()\n",
-            str(host.state / "controller.lock"),
+            str(host.state / lock),
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -1057,6 +1094,296 @@ def test_macos_failure_after_install_says_the_new_version_is_running(tmp_path: P
     assert host.loaded_agents()["serve"]["generation"] == "new"
     assert "new version is installed and running" in result.stderr
     assert "started again" not in result.stderr
+
+
+# Writer locks, the health check and the stopped-boundary hook ---------------
+
+
+def controller_host(tmp_path: Path, system: str) -> Host:
+    if system == "Darwin":
+        return macos_host(tmp_path, "serve", "refresh")
+    return linux_host(tmp_path)
+
+
+def run_controller(
+    host: Host, *, options: tuple[str, ...] = (), health_timeout: int = 5
+) -> subprocess.CompletedProcess[str]:
+    if host.system == "Darwin":
+        return host.run_with(
+            "install-controller.sh",
+            options,
+            shell=MACOS_BASH,
+            health_timeout=health_timeout,
+            FAKE_AGENTS="serve refresh",
+        )
+    return host.run_with(
+        "install-controller-systemd.sh",
+        options,
+        health_timeout=health_timeout,
+        FAKE_UNITS=TIMER_UNITS,
+    )
+
+
+def assert_previous_running(host: Host) -> None:
+    assert host.installed_version() == "old"
+    if host.system == "Darwin":
+        assert {label: value["generation"] for label, value in host.loaded_agents().items()} == {
+            "serve": "old",
+            "refresh": "old",
+        }
+    else:
+        assert "# old" in host.unit_text("controller.service")
+        for unit in ("controller.service", "refresh.timer", "generate.timer"):
+            assert host.unit_state(unit)["active"] is True
+
+
+def stops(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] == "stopped"]
+
+
+SYSTEMS = ["Darwin", "Linux"]
+
+
+@pytest.mark.parametrize("lock", ["refresh.lock", "notifications.lock", "catalog-state.lock"])
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_an_upgrade_waits_for_every_writer_and_changes_nothing_if_one_runs_on(
+    tmp_path: Path, system: str, lock: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    with running_generation(host, lock):
+        result = run_controller(host)
+    assert result.returncode == 3, result.stderr
+    assert "Waiting for" in result.stderr
+    assert "Other work is still running" in result.stderr and "No changes made" in result.stderr
+    assert not stops(host)
+    assert_previous_running(host)
+
+
+def test_linux_upgrade_stops_the_scheduler_only_once_a_writer_finishes(tmp_path: Path) -> None:
+    host = linux_host(tmp_path, mode="app")
+    output = tmp_path / "installer.out"
+    with running_generation(host, "notifications-dispatch.lock") as release:
+        installer = host.start(
+            "install-controller-systemd.sh", output, quiesce_timeout=120, FAKE_UNITS=APP_UNITS
+        )
+        try:
+            wait_until(
+                lambda: (
+                    "Waiting for notification delivery to finish" in output.read_text()
+                    or installer.poll() is not None
+                ),
+                "the installer to wait for notification delivery",
+            )
+            assert installer.poll() is None, output.read_text()
+            assert not stops(host)
+            release()
+            returncode = installer.wait(timeout=120)
+        finally:
+            if installer.poll() is None:
+                installer.kill()
+                installer.wait()
+            assert not end_group(installer.pid)
+    assert returncode == 0, output.read_text()
+    assert [call[2] for call in stops(host)] == ["lock-held"]
+    assert host.installed_version() == "new"
+
+
+def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_path: Path) -> None:
+    """The check takes the publisher's own locks; every agent stops while the
+    installer holds them all."""
+    host = macos_host(tmp_path, "serve", "refresh", "catalog-publish")
+    result = run_macos(host, "serve refresh catalog-publish")
+    assert result.returncode == 0, result.stderr
+    held = [call for call in host.calls() if call[0] == "upgrade-gate"]
+    assert [call[1] for call in held] == ["hold-writer-locks", "hold-writer-locks", "check-serve"]
+    assert {label for _, label, *_ in stops(host)} == {
+        f"com.{host.family}.{label}" for label in ("serve", "refresh", "catalog-publish")
+    }
+    assert {call[2] for call in stops(host)} == {"lock-held"}
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_failed_health_check_switches_back(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("health-fail")
+    result = run_controller(host)
+    assert result.returncode == 1
+    assert "web service failed its health check" in result.stderr
+    assert "started again on the previous version" in result.stderr
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_health_check_that_never_answers_is_stopped(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("health-hang")
+    started = time.monotonic()
+    # run_contained also fails if the check outlives the run.
+    result = run_controller(host, health_timeout=1)
+    assert time.monotonic() - started < 60
+    assert result.returncode == 1
+    assert "web service failed its health check" in result.stderr
+    assert_previous_running(host)
+
+
+def hook_calls(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] == "stopped-hook"]
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_the_stopped_hook_runs_once_with_everything_stopped_and_locked(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    result = run_controller(host, options=("--stopped-hook", str(hook)))
+    assert result.returncode == 0, result.stderr
+    assert "synthetic hook output" in result.stdout
+    ((_, held, active, running, given, extra),) = hook_calls(host)
+    assert (held, active, extra) == ("lock-held", "old", "[]")
+    family = {f"com.{host.family}.serve", f"com.{host.family}.refresh"}
+    family |= {f"{host.family}-{name}" for name in TIMER_UNITS.split()}
+    assert not set(json.loads(running)) & family
+    variables = json.loads(given)
+    assert variables["INKY_BIRD_HOOK_CONFIG"] == str(host.config)
+    assert variables["INKY_BIRD_HOOK_STATE_DIR"] == str(host.state)
+    assert Path(variables["INKY_BIRD_HOOK_PREVIOUS_RUNTIME"]).resolve() == host.app.resolve()
+    assert (
+        Path(variables["INKY_BIRD_HOOK_NEW_RUNTIME"]).parent.resolve()
+        == (host.app / ".runtimes").resolve()
+    )
+    assert host.installed_version() == "new"
+    if system == "Linux":
+        # The web service stopped for the hook runs again, on the new version.
+        assert host.unit_state("controller.service") == {"active": True, "enabled": True}
+        assert "lock-held" in [call[2] for call in stops(host)]
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        ("hook-fail", "failed with exit status 7"),
+        ("hook-killed", "failed with exit status 137"),
+        ("health-fail", "web service failed its health check"),
+    ],
+)
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_failed_hook_or_a_later_failure_switches_back(
+    tmp_path: Path, system: str, rule: str, message: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail(rule)
+    result = run_controller(host, options=("--stopped-hook", str(hook)))
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "started again on the previous version" in result.stderr
+    assert len(hook_calls(host)) == 1
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_hook_past_its_time_limit_is_stopped(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail("hook-hang")
+    started = time.monotonic()
+    result = run_controller(
+        host, options=("--stopped-hook", str(hook), "--stopped-hook-timeout", "1")
+    )
+    assert time.monotonic() - started < 60
+    assert result.returncode == 1
+    assert "did not finish within 1 seconds and was stopped" in result.stderr
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_stopped_installer_stops_its_hook_before_starting_services_again(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail("hook-hang")
+    output = tmp_path / "installer.out"
+    if system == "Darwin":
+        installer = host.start(
+            "install-controller.sh",
+            output,
+            shell=MACOS_BASH,
+            options=("--stopped-hook", str(hook)),
+            FAKE_AGENTS="serve refresh",
+        )
+    else:
+        installer = host.start(
+            "install-controller-systemd.sh",
+            output,
+            options=("--stopped-hook", str(hook)),
+            FAKE_UNITS=TIMER_UNITS,
+        )
+    try:
+        wait_until(lambda: bool(hook_calls(host)), "the hook to start")
+        installer.send_signal(signal.SIGTERM)
+        returncode = installer.wait(timeout=60)
+    finally:
+        if installer.poll() is None:
+            installer.kill()
+            installer.wait()
+        survivors = end_group(installer.pid)
+    assert not survivors, survivors
+    assert returncode == 143, output.read_text()
+    assert "started again on the previous version" in output.read_text()
+    assert_previous_running(host)
+
+
+def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
+    """Hooks the installers refuse before they change anything."""
+    good = host.stopped_hook()
+    writable = tmp_path / "writable-hook"
+    writable.write_text(good.read_text())
+    writable.chmod(0o775)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    in_shared = shared / "hook"
+    in_shared.write_text(good.read_text())
+    in_shared.chmod(0o755)
+    link = tmp_path / "linked-hook"
+    link.symlink_to(good)
+    plain = tmp_path / "plain-hook"
+    plain.write_text(good.read_text())
+    return {
+        "relative": "stopped-hook",
+        "missing": str(tmp_path / "missing"),
+        "group-writable": str(writable),
+        "in a shared directory": str(in_shared),
+        "a link": str(link),
+        "not executable": str(plain),
+        "a directory": str(tmp_path),
+    }
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_unsafe_hooks_and_bad_options_are_refused_before_any_change(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path / "machine", system)
+    refusals: list[tuple[tuple[str, ...], str]] = [
+        (("--stopped-hook", hook), "--stopped-hook must name")
+        for hook in unsafe_hooks(host, tmp_path).values()
+    ]
+    refusals += [
+        (("--stopped-hook",), "--stopped-hook needs a value"),
+        (("--stopped-hook-timeout", "soon"), "must be a whole number of seconds"),
+        (("--stopped-hook-timeout", "5"), "--stopped-hook-timeout needs --stopped-hook"),
+        (("--later",), "Unknown option: --later."),
+    ]
+    for options, message in refusals:
+        (host.fake / "log").write_text("")
+        result = run_controller(host, options=options)
+        assert result.returncode == 1, options
+        assert message in result.stderr and "No changes made" in result.stderr, options
+        assert not uv_calls(host) and not hook_calls(host), options
+        assert_previous_running(host)
 
 
 # Display node installer -----------------------------------------------------

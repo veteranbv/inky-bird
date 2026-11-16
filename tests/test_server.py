@@ -41,6 +41,7 @@ from inky_bird_frame.server import (
     rebuild_index_logging_failures,
     serve_catalog,
 )
+from inky_bird_frame.upgrade_gates import runtime_id
 from inky_bird_frame.web import create_app
 
 if TYPE_CHECKING:
@@ -1388,6 +1389,7 @@ class ServerTests(unittest.TestCase):
                 "active_species": 1,
                 "notification_dead_letters": 0,
                 "version": __version__,
+                "runtime": runtime_id(),
                 "schema_version": 1,
             },
         )
@@ -1409,6 +1411,7 @@ class ServerTests(unittest.TestCase):
                 "active_species": 0,
                 "notification_dead_letters": 0,
                 "version": __version__,
+                "runtime": runtime_id(),
                 "schema_version": 1,
             },
         )

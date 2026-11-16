@@ -502,6 +502,8 @@ def test_native_oidc_secret_is_serving_only_in_systemd_and_private_launchd(tmp_p
         str(tmp_path),
         str(config_path),
         str(tmp_path),
+        # Whether the installer holds the writer locks.
+        "false",
     ]
     bundle = tmp_path / "roots.pem"
     bundle.write_text("synthetic certificate")

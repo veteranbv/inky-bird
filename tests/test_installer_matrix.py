@@ -24,6 +24,16 @@ and every enabled or running unit; an installer's own success line is such a
 claim. The previous version is hashed whole: its runtime directory, or the
 source, installer and project files of a single-directory install.
 
+A controller upgrade holds every writer lock before it stops anything that
+writes; the fakes record whether it did at each stop, and a command the
+installer runs that takes those locks itself fails while they are held, as
+it would wait forever. The ``-hook`` scenarios pass ``--stopped-hook``: the
+owner's hook must run once, with every service stopped, every writer lock
+held and the previous version still active, given only its names (I11). The
+web service health check after the switch answers from the runtime the fake
+serving process runs. The full matrix stops the installer at each of these
+steps in all three ways, and fails each.
+
 Upgrades start from what each layout's own installers left: the frozen
 installers of the last release (``release-0.9.8``, under the inky-bird-frame
 names), of the single-directory layout, or today's; in ``checkout`` the
@@ -42,8 +52,9 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 262 cases, beside 82 recording
-runs, 21 busy-plate runs and 21 tests of the matrix itself. Run every case,
+both controllers and on a shared Pi's display: 291 cases, beside 88 recording
+runs, 26 busy runs (each holding one writer lock, chosen from the group's
+name) and 20 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
@@ -180,6 +191,8 @@ class Scenario:
     # The scenario whose installer built the starting state, when it differs:
     # switching between timers and the app-managed scheduler.
     start: str = ""
+    # Options the installer is run with; ``{machine}`` is the machine's root.
+    arguments: tuple[str, ...] = ()
 
     @property
     def shell(self) -> str:
@@ -187,6 +200,8 @@ class Scenario:
 
 
 DISPLAY_ENVIRONMENT = (("INKY_BIRD_NONINTERACTIVE_SUDO", "true"),)
+# The owner's --stopped-hook, which ``Host.stopped_hook`` writes.
+HOOK_ARGUMENTS = ("--stopped-hook", "{machine}/home/support/stopped-hook")
 SCENARIOS = {
     scenario.name: scenario
     for scenario in (
@@ -237,6 +252,37 @@ SCENARIOS = {
                 "shared-both",
             ),
             "uninstall-controller-systemd.sh",
+        ),
+        # An owner's hook runs once every service is stopped, before the switch.
+        Scenario(
+            "macos-hook",
+            "install-controller.sh",
+            "controller",
+            "Darwin",
+            (("FAKE_AGENTS", AGENTS),),
+            ("fresh", "single", "staged"),
+            start="macos",
+            arguments=HOOK_ARGUMENTS,
+        ),
+        Scenario(
+            "linux-timers-hook",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            (("FAKE_UNITS", TIMER_UNITS),),
+            ("single", "staged"),
+            start="linux-timers",
+            arguments=HOOK_ARGUMENTS,
+        ),
+        Scenario(
+            "linux-app-hook",
+            "install-controller-systemd.sh",
+            "controller",
+            "Linux",
+            (("FAKE_UNITS", APP_UNITS),),
+            ("staged",),
+            start="linux-app",
+            arguments=HOOK_ARGUMENTS,
         ),
         Scenario(
             "linux-timers-to-app",
@@ -407,8 +453,9 @@ class Machine(Host):
         """Run under the account-wide process ceiling and this run's own budget."""
         caps = limits()
         command = [scenario.shell, "-c", 'ulimit -u "$0" && exec "$@"', str(caps.ceiling)]
+        options = [on_machine(argument, self.root) for argument in scenario.arguments]
         return run_contained(
-            [*command, scenario.shell, str(script)],
+            [*command, scenario.shell, str(script), *options],
             self.environment_for(scenario, **extra),
             watch=caps.watch,
         )
@@ -1046,6 +1093,18 @@ CLAIMS = {
     "Stop the existing display timer and let its service finish before updating its "
     "runtime. Preserve a recoverable runtime backup first. No changes made.": "unchanged",
     "The new version cannot use this configuration. No changes made.": "unchanged",
+    "Other work is still running. Run the upgrade again after it finishes. No changes made.": (
+        "unchanged"
+    ),
+    "$1 needs a value. No changes made.": "unchanged",
+    "Unknown option: $1. No changes made.": "unchanged",
+    "--stopped-hook-timeout must be a whole number of seconds. No changes made.": "unchanged",
+    "--stopped-hook-timeout needs --stopped-hook. No changes made.": "unchanged",
+    "--stopped-hook must name, by absolute path, an executable file that only you or root can "
+    "change. No changes made.": "unchanged",
+    "Could not read the state directory for the stopped-boundary hook. No changes made.": (
+        "unchanged"
+    ),
     "Uninstall was stopped. No changes made.": "unchanged",
     # uninstalled
     "Controller LaunchAgents uninstalled.": "uninstalled",
@@ -1137,6 +1196,18 @@ CLAIMS = {
     "Uninstall did not finish. Could not stop or remove: ${failures[*]}.": "neutral",
     "Uninstall was stopped before it finished; still installed: ${remaining[*]-none}.": ("neutral"),
     "uv is not executable. Install uv or set UV_BIN.": "neutral",
+    "Work that started during the upgrade did not finish in time; the upgrade stopped before "
+    "switching to the new version.": "neutral",
+    "Could not hold the writer locks again; the upgrade stopped before switching to the new "
+    "version.": "neutral",
+    "Running the stopped-boundary hook: ${stopped_hook}": "neutral",
+    "The stopped-boundary hook is no longer safe to run; the upgrade did not switch to the new "
+    "version.": "neutral",
+    "The stopped-boundary hook did not finish within ${stopped_hook_timeout} seconds and was "
+    "stopped; the upgrade did not switch to the new version.": "neutral",
+    "The stopped-boundary hook failed with exit status ${status}; the upgrade did not switch to "
+    "the new version.": "neutral",
+    "The new version started, but its web service failed its health check.": "neutral",
 }
 CLAIM_CLASSES = ("installed", "new", "previous", "unchanged", "uninstalled", "neutral")
 # A shell expansion in a printed line: ${name}, ${name[*]-default}, $name or $1.
@@ -1349,6 +1420,7 @@ def check_install(
             report.append(f"I2: {unit} would run {found[0]}, not {expected}")
     if claims_new(outcome):
         check_previous_kept(machine, scenario, before, report, output)
+    check_quiet_writers(machine, scenario, before, outcome)
     if not failed:
         check_success(machine, scenario, case, before, after, report, output)
         return
@@ -1414,6 +1486,65 @@ def check_install(
     for path in sorted(stray_paths(machine) - before.stray):
         if os.path.realpath(path) not in left and not removal_failed(case, path, machine.root):
             report.append(f"I10: {path} was left behind")
+
+
+def check_quiet_writers(
+    machine: Machine, scenario: Scenario, before: Snapshot, outcome: Outcome
+) -> None:
+    """I11: before the switch, a service running the previous version is
+    stopped only while every writer lock is held, so nothing it writes is cut
+    off. (After the switch a rollback stops what the run started, or tried to
+    restart, without them.) The owner's
+    stopped-boundary hook runs at most once, and on success exactly once: with
+    every service of the role stopped, every writer lock held (there are none
+    to hold without an installed version) and the previous version still
+    active, given only the names it is promised."""
+    report = outcome.violations
+    calls = machine.calls()
+    previous = before.role.tag
+    names = set(unit_names(machine, scenario.role))
+    switches = [number for number, call in enumerate(calls) if call[0] == "switch"]
+    forward = calls[: switches[0]] if switches else calls
+    for _, unit, held, runtime in (call for call in forward if call[0] == "stopped"):
+        if unit in names and previous is not None and runtime == previous:
+            outcome.covered.add("I11")
+            if held != "lock-held":
+                report.append(f"I11: {unit} running {runtime} was stopped without the writer locks")
+    hooks = [call for call in calls if call[0] == "stopped-hook"]
+    if not scenario.arguments:
+        if hooks:
+            report.append("I11: a hook ran that was not asked for")
+        return
+    outcome.covered.add("I11")
+    if len(hooks) > 1:
+        report.append(f"I11: the stopped-boundary hook ran {len(hooks)} times")
+    if outcome.returncode == 0 and not hooks:
+        report.append("I11: the run succeeded without running the stopped-boundary hook")
+    for _, held, active, running, given, extra in hooks[:1]:
+        if previous is not None and held != "lock-held":
+            report.append("I11: the hook ran without every writer lock held")
+        if active != (previous or "none"):
+            report.append(f"I11: the hook ran with {active} active, not the previous {previous}")
+        if still := sorted(set(json.loads(running)) & names):
+            report.append(f"I11: the hook ran while {still} ran")
+        variables = json.loads(given)
+        expected = {
+            "INKY_BIRD_HOOK_CONFIG": str(machine.config),
+            "INKY_BIRD_HOOK_STATE_DIR": str(machine.state),
+        }
+        for name, value in expected.items():
+            if variables[name] != value:
+                report.append(f"I11: the hook was given {name}={variables[name]!r}")
+        new = Path(variables["INKY_BIRD_HOOK_NEW_RUNTIME"])
+        if new.parent != (machine.app / ".runtimes").resolve() and new.parent != (
+            machine.app / ".runtimes"
+        ):
+            report.append(f"I11: the hook was given new runtime {new}")
+        kept = variables["INKY_BIRD_HOOK_PREVIOUS_RUNTIME"]
+        if bool(kept) != (previous is not None):
+            report.append(f"I11: the hook was given previous runtime {kept!r}")
+        if json.loads(extra):
+            report.append(f"I11: the hook was given more than its names: {json.loads(extra)}")
 
 
 # Where an installer says a directory stays: kept, or left for the owner.
@@ -2031,12 +2162,15 @@ class Group:
         return outcome
 
     def busy(self, slot: Path) -> Outcome:
-        """I8: a plate being made stops an upgrade with exit 3 and no change."""
+        """I8: a writer that is still running, a plate being made or other
+        work, stops an upgrade with exit 3 and no change; no hook runs."""
         machine = self.machine(slot)
         before = snapshot(machine, self.scenario)
-        with running_generation(machine):
+        with running_generation(machine, busy_lock(self.scenario.name, self.state)):
             outcome, _ = self.run(machine, None)
         outcome.covered.add("I8")
+        if any(call[0] == "stopped-hook" for call in machine.calls()):
+            outcome.violations.append("I11: a busy run ran the stopped-boundary hook")
         survivors = machine.survivors()
         if survivors:
             outcome.violations.append(f"processes outlived the run: {survivors}")
@@ -2143,6 +2277,15 @@ def survivable(tool: str, arguments: list[str]) -> bool:
     return tool in ("rm", "rmdir") or (tool == "inky-bird" and arguments[:2] == ["access", "setup"])
 
 
+def boundary(tool: str, arguments: tuple[str, ...]) -> bool:
+    """A step that waits for writers, runs the owner's stopped-boundary hook,
+    or checks the new version's health: the full matrix stops the installer
+    at each of them in every way."""
+    return tool == "stopped-hook" or (
+        tool == "venv-python" and any(item.endswith("upgrade_gates.py") for item in arguments)
+    )
+
+
 def switches_back(tool: str, arguments: list[str]) -> bool:
     """A cleanup file command that moves, links or removes a runtime: these
     always run in the second pass, where earlier rollback defects were found."""
@@ -2156,6 +2299,14 @@ def default_stop_mode(key: GroupKey) -> str:
     name alone, so a case keeps its id whatever else is selected."""
     number = int.from_bytes(hashlib.sha256(group_name(key).encode()).digest()[:4], "big")
     return STOP_MODES[number % len(STOP_MODES)]
+
+
+def busy_lock(scenario: str, state: str) -> str:
+    """The writer lock a group's busy run holds: each one in some group, from
+    the group's name alone."""
+    locks: tuple[str, ...] = fake_tools.writer_locks()
+    number = int.from_bytes(hashlib.sha256(busy_id(scenario, state).encode()).digest()[:4], "big")
+    return locks[number % len(locks)]
 
 
 def busy_checked(scenario: str, state: str) -> bool:
@@ -2219,6 +2370,7 @@ def fingerprint() -> str:
         *sorted(RELEASE_DIRECTORY.glob("*.sh")),
         ROOT / "tests/test_installer_matrix.py",
         ROOT / "tests/test_installer_behaviour.py",
+        ROOT / "src/inky_bird_frame/upgrade_gates.py",
     ]
     for path in sources:
         hasher.update(str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes())
@@ -2485,6 +2637,12 @@ class Matrix:
                     chosen = position in (0, middle)
                     stop = position == middle
                     signal_mode = default_stop_mode((kind, scenario, state))
+                if FULL and boundary(tool, called):
+                    # Each way to stop the installer at each step around the switch.
+                    call = (kind, scenario, state, index)
+                    found.append(Case(*call, "fail", tool, called))
+                    found.extend(Case(*call, mode, tool) for mode in STOP_MODES)
+                    continue
                 if not chosen:
                     continue
                 call = (kind, scenario, state, index)
@@ -2654,6 +2812,8 @@ def prepare(machine: Machine, key: GroupKey) -> None:
         machine.script(scenario.script, source=machine.app)
     elif kind == "install":
         machine.script(scenario.script)
+        if scenario.arguments:
+            machine.stopped_hook()
         if scenario.name == "remote-display":
             machine.script("install-display-local.sh")
     else:

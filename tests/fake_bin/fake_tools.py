@@ -195,10 +195,25 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
         helper.wait()
 
 
-def _cycle_lock_held() -> bool:
+# The application's own list of writer locks, which installers must hold.
+UPGRADE_GATES = TOOLS.parents[2] / "src/inky_bird_frame/upgrade_gates.py"
+
+
+def writer_locks() -> tuple[str, ...]:
+    import ast
+
+    tree = ast.parse(UPGRADE_GATES.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "WRITER_LOCKS":
+            value = ast.literal_eval(node.value)
+            assert isinstance(value, dict)
+            return tuple(value)
+    raise AssertionError("upgrade_gates.py names no WRITER_LOCKS")
+
+
+def _lock_held(lock: Path) -> bool:
     import fcntl
 
-    lock = Path(os.environ["FAKE_STATE_DIR"]) / "controller.lock"
     if not lock.exists():
         return False
     with lock.open("a+") as handle:
@@ -208,6 +223,19 @@ def _cycle_lock_held() -> bool:
             return True
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     return False
+
+
+def _cycle_lock_held() -> bool:
+    """Whether something holds every writer lock, as an installer must
+    before it stops anything that writes."""
+    state = Path(os.environ["FAKE_STATE_DIR"])
+    return all(_lock_held(state / name) for name in writer_locks())
+
+
+def _process_runtime(name: str) -> str:
+    """The runtime a recorded service process runs, or ``none``."""
+    process = _state("processes").get(name)
+    return str(process["runtime"]) if isinstance(process, dict) else "none"
 
 
 def runtime_tag(executable: str) -> str:
@@ -333,6 +361,9 @@ def system_python(arguments: list[str]) -> int:
         for name in ("service_prefix", "app_dir", "support_dir", "config_path"):
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
+    if any(argument.endswith(".venv.next") for argument in arguments):
+        # Points the active link at a runtime: the switch, or a switch back.
+        _log("switch")
     return _exec([sys.executable, *arguments])
 
 
@@ -348,7 +379,9 @@ def launchctl(arguments: list[str]) -> int:
         label = arguments[1].split("/")[-1]
         if label not in loaded:
             return 3
-        _log("launchctl", "bootout", label, "lock-held" if _cycle_lock_held() else "lock-free")
+        held = "lock-held" if _cycle_lock_held() else "lock-free"
+        _log("launchctl", "bootout", label, held)
+        _log("stopped", label, held, _process_runtime(label))
         if f"bootout:{label}" in _rules():
             return 5
         del loaded[label]
@@ -519,8 +552,11 @@ def systemctl(arguments: list[str]) -> int:
                 _start_cycle(unit)
         record["active"] = True
     elif verb == "stop":
+        held = "lock-held" if _cycle_lock_held() else "lock-free"
         if unit.endswith("scheduler.service") or unit.endswith("generate.service"):
-            _log("lock-at-stop", unit, "lock-held" if _cycle_lock_held() else "lock-free")
+            _log("lock-at-stop", unit, held)
+        if unit.endswith(".service") and (record["active"] or unit in _state("busy")):
+            _log("stopped", unit, held, _process_runtime(unit))
         record["active"] = False
         _record_process(unit, running=False)
         if _oneshot(unit):
@@ -832,8 +868,13 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         # PYTHON* variables cannot shadow the installed package.
         print("inline program run without -I", file=sys.stderr)
         return 64
+    if arguments[:1] and arguments[0].endswith(".py"):
+        print("helper script run without -I", file=sys.stderr)
+        return 64
     if arguments[:1] == ["-I"]:
         arguments = arguments[1:]
+    if arguments[:1] and arguments[0].endswith(".py"):
+        return _upgrade_gate(tag, arguments[0], arguments[1:], environment)
     if arguments[:1] == ["-c"]:
         program = arguments[1]
         if "distribution(" in program:
@@ -852,6 +893,10 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     if arguments[:1] == ["-"]:
         source = sys.stdin.read()
         _log("heredoc", tag)
+        # The real program takes the catalog lock unless told the installer holds it.
+        if "catalog_state_lock" in source and _cycle_lock_held() and arguments[-1] != "true":
+            print("waiting forever for the catalog lock the installer holds", file=sys.stderr)
+            return 75
         if f"{tag}:heredoc" in rules:
             print("synthetic configuration rejection", file=sys.stderr)
             return 1
@@ -925,9 +970,103 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     return 0
 
 
+def _upgrade_gate(tag: str, script: str, arguments: list[str], environment: dict[str, str]) -> int:
+    """The application's upgrade helper: it runs for real against the
+    synthetic configuration, except the web service health check, which asks
+    which runtime the recorded serving process runs."""
+    command = arguments[0]
+    _log("upgrade-gate", command, tag)
+    if command == "check-serve":
+        return _check_serve(tag)
+    # -P keeps the helper's own directory, which shadows standard modules, off the path.
+    real = [sys.executable, "-S", "-P", script, *arguments]
+    if KILL and command == "hold-writer-locks":
+        return _hold_then_stop(real, environment, Path(arguments[2]))
+    return _exec(real, environment)
+
+
+def _check_serve(tag: str) -> int:
+    """``health-fail`` fails the check and ``health-hang`` never answers."""
+    import time
+
+    rules = _rules()
+    if "health-hang" in rules:
+        time.sleep(3600)
+    prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird")
+    serving = {
+        _process_runtime(f"com.{prefix}.serve"),
+        _process_runtime(f"{prefix}-controller.service"),
+    }
+    if "health-fail" in rules or tag not in serving:
+        print("The web service health check failed: synthetic failure.", file=sys.stderr)
+        return 1
+    return 0
+
+
+# What an installer tells its --stopped-hook.
+HOOK_VARIABLES = (
+    "INKY_BIRD_HOOK_PREVIOUS_RUNTIME",
+    "INKY_BIRD_HOOK_NEW_RUNTIME",
+    "INKY_BIRD_HOOK_CONFIG",
+    "INKY_BIRD_HOOK_STATE_DIR",
+)
+
+
+def stopped_hook(arguments: list[str]) -> int:
+    """An owner's --stopped-hook: record what it finds, then succeed, or as
+    the rules say fail (``hook-fail``), die (``hook-killed``) or never end
+    (``hook-hang``)."""
+    import signal
+    import time
+
+    rules = _rules()
+    held = "lock-held" if _cycle_lock_held() else "lock-free"
+    venv = Path(os.environ["FAKE_LAYOUT_APP_DIR"]) / ".venv"
+    tag = Path(os.path.realpath(venv)) / "tag"
+    active = tag.read_text().strip() if tag.exists() else "none"
+    systemd = _state("systemd")
+    running = {
+        name
+        for name, record in systemd.items()
+        if isinstance(record, dict) and record.get("active")
+    }
+    running |= set(_state("launchd")) | set(_state("busy"))
+    given = {name: os.environ.get(name, "") for name in HOOK_VARIABLES}
+    # The shell that runs this fake sets PWD, SHLVL and _, its wrapper exports
+    # FAKE*, Python sets LC_CTYPE for a C locale, and macOS adds its own.
+    shell = {"PATH", "HOME", "PWD", "OLDPWD", "SHLVL", "_", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    extra = sorted(
+        name
+        for name in set(os.environ) - set(HOOK_VARIABLES) - shell
+        if not name.startswith("FAKE")
+    )
+    _log(
+        "stopped-hook",
+        held,
+        active,
+        json.dumps(sorted(running)),
+        json.dumps(given),
+        json.dumps(extra),
+    )
+    if "hook-killed" in rules:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if "hook-hang" in rules:
+        time.sleep(3600)
+    if "hook-fail" in rules:
+        print("synthetic hook failure", file=sys.stderr)
+        return 7
+    print("synthetic hook output")
+    return 0
+
+
 def inky_bird(executable: str, arguments: list[str]) -> int:
     tag = runtime_tag(executable)
     _log("inky-bird", tag, *arguments)
+    # These take writer locks themselves: run while an installer holds them,
+    # they would wait for it forever.
+    if arguments[:1] in (["refresh"], ["catalog-publish"]) and _cycle_lock_held():
+        print("waiting forever for a writer lock the installer holds", file=sys.stderr)
+        return 75
     rules = _rules()
     # ``tag:command`` fails as a configuration error; ``tag:command:type`` names the type.
     kinds = [rule.rpartition(":")[2] for rule in rules if rule.startswith(f"{tag}:{arguments[0]}:")]
@@ -998,6 +1137,7 @@ def main() -> int:
             "sudo": sudo,
             "rsync": rsync,
             "ssh": ssh,
+            "stopped-hook": stopped_hook,
         }
         status = handlers[tool](arguments)
     if KILL:

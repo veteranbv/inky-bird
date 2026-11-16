@@ -6,6 +6,28 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 1
 fi
 
+# Whether $1 is safe to run: an absolute path to an executable regular file,
+# not a link, in a directory, each owned by this account or root and writable
+# by no one else.
+stopped_hook_is_safe() {
+  python3 -I -c '
+import os, stat, sys
+path = sys.argv[1]
+def owned(info, kind):
+    return kind(info.st_mode) and info.st_uid in (os.getuid(), 0) and not info.st_mode & 0o022
+try:
+    safe = (
+        os.path.isabs(path)
+        and owned(os.lstat(path), stat.S_ISREG)
+        and os.access(path, os.X_OK)
+        and owned(os.lstat(os.path.dirname(path)), stat.S_ISDIR)
+    )
+except OSError:
+    safe = False
+sys.exit(0 if safe else 1)
+' "$1"
+}
+
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The managed directory's copy of this script reinstalls the active runtime.
 # An environment moved out of the single-directory layout has no source of its
@@ -29,6 +51,44 @@ for family in inky-bird inky-bird-frame; do
     fi
   done
 done
+stopped_hook=""
+stopped_hook_timeout=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stopped-hook | --stopped-hook-timeout)
+      if [ "$#" -lt 2 ]; then
+        echo "$1 needs a value. No changes made." >&2
+        exit 1
+      fi
+      if [ "$1" = --stopped-hook ]; then
+        stopped_hook=$2
+      else
+        stopped_hook_timeout=$2
+      fi
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1. No changes made." >&2
+      exit 1
+      ;;
+  esac
+done
+case "${stopped_hook_timeout}" in
+  "" | *[!0-9]*)
+    echo "--stopped-hook-timeout must be a whole number of seconds. No changes made." >&2
+    exit 1
+    ;;
+esac
+stopped_hook_timeout=$((10#${stopped_hook_timeout}))
+if [ -n "${stopped_hook}" ] && ! stopped_hook_is_safe "${stopped_hook}"; then
+  echo "--stopped-hook must name, by absolute path, an executable file that only you or root can change. No changes made." >&2
+  exit 1
+fi
+if [ -z "${stopped_hook}" ] && [ "${stopped_hook_timeout}" -gt 0 ]; then
+  echo "--stopped-hook-timeout needs --stopped-hook. No changes made." >&2
+  exit 1
+fi
+
 native_names=$(python3 "${root}/src/inky_bird_frame/native_names.py")
 service_prefix="" app_dir="" support_dir="" config_path=""
 eval "${native_names}"
@@ -40,6 +100,7 @@ fi
 python_version=${INKY_BIRD_PYTHON_VERSION:-3.11}
 quiesce_timeout_seconds=1800
 poll_seconds=1
+health_timeout_seconds=90
 log_dir="${support_dir}/logs"
 agents_dir="${HOME}/Library/LaunchAgents"
 serve_plist="${agents_dir}/com.${service_prefix}.serve.plist"
@@ -58,50 +119,6 @@ catalog_root=${root}
 if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && pwd || true)" ]; then
   catalog_root=${app_dir}
 fi
-
-# Run by the installed version's Python: hold its controller cycle lock so no
-# plate is being made while agents stop. Exit 3 if a cycle is still running at
-# the deadline. If the installed code cannot be loaded or cannot read the
-# config, the lock cannot be found: say so and exit 0 without waiting, so a
-# broken or older install can still be upgraded or repaired.
-cycle_lock_program='
-import fcntl, os, sys, time
-from pathlib import Path
-config_path, ready, timeout = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
-try:
-    from inky_bird_frame.config import load_config
-    try:
-        config = load_config(config_path, load_secrets=False)
-    except TypeError:
-        config = load_config(config_path)
-    state_dir = config.controller.state_dir
-except Exception:
-    print(
-        "The installed version cannot be loaded with this configuration, so the "
-        "upgrade cannot check for a plate being made.",
-        file=sys.stderr,
-    )
-    sys.exit(0)
-state_dir.mkdir(parents=True, exist_ok=True)
-handle = (state_dir / "controller.lock").open("a+")
-deadline = time.monotonic() + timeout
-announced = False
-while True:
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() >= deadline:
-            sys.exit(3)
-        if not announced:
-            print("Waiting for the plate being made to finish.", file=sys.stderr)
-            announced = True
-        time.sleep(2)
-ready.touch()
-parent = os.getppid()
-while os.getppid() == parent:
-    time.sleep(1)
-'
 
 restore_catalog_publisher_schedule() {
   local uid=$1
@@ -190,7 +207,14 @@ legacy_runtime=""
 venv_before=""
 runtime_activated=false
 installation_complete=false
-cycle_lock_pid=""
+writer_lock_pid=""
+writer_lock_holds=0
+writer_locks_held=false
+writer_locks_unavailable=false
+bounded_pid=""
+bounded_timed_out=false
+stopped_hook_ran=false
+stopped_hook_state_dir=""
 agents_recorded=false
 previously_loaded_labels=()
 stopped_labels=()
@@ -200,25 +224,48 @@ still_running=()
 leftovers=()
 new_runtime_linked=false
 
-hold_cycle_lock() {
+# Hold every lock a writer takes, so nothing is mid-write while services
+# stop: the installed version's Python runs the new version's helper, so the
+# installed code finds the state directory. It waits up to
+# quiesce_timeout_seconds and says what it waits for. If the installed code
+# cannot be loaded or cannot read the config, it says so and holds nothing, so
+# a broken or older install can still be upgraded or repaired. $1 is true once
+# this run has stopped something.
+hold_writer_locks() {
   local python="${app_dir}/.venv/bin/python"
-  local ready="${work_dir}/cycle-lock-held"
+  local ready
   local status=0
-  if [ ! -x "${python}" ]; then
+  writer_lock_holds=$((writer_lock_holds + 1))
+  ready="${work_dir}/writer-locks-held.${writer_lock_holds}"
+  if [ ! -x "${python}" ] || [ "${writer_locks_unavailable}" = true ]; then
     return 0
   fi
-  "${python}" -I -c "${cycle_lock_program}" "${config_path}" "${ready}" \
-    "${quiesce_timeout_seconds}" &
-  cycle_lock_pid=$!
+  start_background writer_lock_pid "${python}" -I \
+    "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" hold-writer-locks \
+    "${config_path}" "${ready}" "${quiesce_timeout_seconds}"
   until [ -e "${ready}" ]; do
-    if ! kill -0 "${cycle_lock_pid}" 2>/dev/null; then
-      wait "${cycle_lock_pid}" || status=$?
-      cycle_lock_pid=""
+    if ! kill -0 "${writer_lock_pid}" 2>/dev/null; then
+      wait "${writer_lock_pid}" || status=$?
+      writer_lock_pid=""
       if [ "${status}" -eq 0 ]; then
+        # The installed code could not be loaded; it said so once.
+        writer_locks_unavailable=true
         return 0
+      fi
+      if [ "$1" = true ]; then
+        if [ "${status}" -eq 3 ] || [ "${status}" -eq 4 ]; then
+          echo "Work that started during the upgrade did not finish in time; the upgrade stopped before switching to the new version." >&2
+          exit 3
+        fi
+        echo "Could not hold the writer locks again; the upgrade stopped before switching to the new version." >&2
+        exit 1
       fi
       if [ "${status}" -eq 3 ]; then
         echo "A plate is still being made. Run the upgrade again after it finishes. No changes made." >&2
+        exit 3
+      fi
+      if [ "${status}" -eq 4 ]; then
+        echo "Other work is still running. Run the upgrade again after it finishes. No changes made." >&2
         exit 3
       fi
       echo "Could not check whether a plate is being made. No changes made." >&2
@@ -226,6 +273,128 @@ hold_cycle_lock() {
     fi
     sleep "${poll_seconds}"
   done
+  writer_locks_held=true
+}
+
+release_writer_locks() {
+  if [ -n "${writer_lock_pid}" ]; then
+    kill "${writer_lock_pid}" 2>/dev/null || true
+    wait "${writer_lock_pid}" 2>/dev/null || true
+    writer_lock_pid=""
+  fi
+  writer_locks_held=false
+}
+
+# Start a command in the background, in a process group of its own, and
+# record its process ID in the variable named $1. A stop signal that arrives
+# before the ID is recorded waits until it is, so cleanup can still stop it.
+start_background() {
+  local name=$1
+  shift
+  stop_status=""
+  trap 'stop_status=129' HUP
+  trap 'stop_status=130' INT
+  trap 'stop_status=143' TERM
+  set -m
+  "$@" </dev/null &
+  printf -v "${name}" '%s' "$!"
+  set +m
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -n "${stop_status}" ]; then
+    exit "${stop_status}"
+  fi
+}
+
+# Run a command in the background, in a process group of its own, so a stop
+# signal is handled while it runs and everything it started can be stopped,
+# and wait for it. With a limit of $1 seconds (0: none), stop it once the
+# limit passes and return 124 with bounded_timed_out=true.
+run_bounded() {
+  local limit=$1
+  local deadline=$((SECONDS + $1))
+  local status=0
+  shift
+  bounded_timed_out=false
+  start_background bounded_pid "$@"
+  if [ "${limit}" -gt 0 ]; then
+    while kill -0 "${bounded_pid}" 2>/dev/null; do
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        stop_bounded
+        bounded_timed_out=true
+        return 124
+      fi
+      sleep "${poll_seconds}"
+    done
+  fi
+  wait "${bounded_pid}" || status=$?
+  bounded_pid=""
+  return "${status}"
+}
+
+# Stop what run_bounded started, its whole process group, and wait until it
+# has gone: ask, then force.
+stop_bounded() {
+  local deadline=$((SECONDS + 10))
+  if [ -z "${bounded_pid}" ]; then
+    return 0
+  fi
+  kill -TERM -- "-${bounded_pid}" 2>/dev/null || true
+  while kill -0 "${bounded_pid}" 2>/dev/null && [ "${SECONDS}" -lt "${deadline}" ]; do
+    sleep "${poll_seconds}"
+  done
+  # Whatever of the group is left, the command itself or what it started.
+  kill -KILL -- "-${bounded_pid}" 2>/dev/null || true
+  wait "${bounded_pid}" 2>/dev/null || true
+  bounded_pid=""
+}
+
+# Run the owner's --stopped-hook, once: services are stopped, the writer
+# locks are held, and the previous version is still the active one. It gets
+# only names: the runtimes, the config path and the state directory.
+run_stopped_hook() {
+  local previous=""
+  local status=0
+  if [ -z "${stopped_hook}" ] || [ "${stopped_hook_ran}" = true ]; then
+    return 0
+  fi
+  stopped_hook_ran=true
+  if ! stopped_hook_is_safe "${stopped_hook}"; then
+    echo "The stopped-boundary hook is no longer safe to run; the upgrade did not switch to the new version." >&2
+    exit 1
+  fi
+  if [ -L "${app_dir}/.venv" ]; then
+    previous=$(cd -P "${app_dir}/.venv/.." 2>/dev/null && pwd || true)
+  elif [ -e "${app_dir}/.venv" ]; then
+    previous=${app_dir}
+  fi
+  echo "Running the stopped-boundary hook: ${stopped_hook}" >&2
+  run_bounded "${stopped_hook_timeout}" env -i "PATH=${PATH}" "HOME=${HOME}" \
+    "INKY_BIRD_HOOK_PREVIOUS_RUNTIME=${previous}" \
+    "INKY_BIRD_HOOK_NEW_RUNTIME=${new_runtime}" \
+    "INKY_BIRD_HOOK_CONFIG=${config_path}" \
+    "INKY_BIRD_HOOK_STATE_DIR=${stopped_hook_state_dir}" \
+    "${stopped_hook}" || status=$?
+  if [ "${bounded_timed_out}" = true ]; then
+    echo "The stopped-boundary hook did not finish within ${stopped_hook_timeout} seconds and was stopped; the upgrade did not switch to the new version." >&2
+    exit 1
+  fi
+  if [ "${status}" -ne 0 ]; then
+    echo "The stopped-boundary hook failed with exit status ${status}; the upgrade did not switch to the new version." >&2
+    exit 1
+  fi
+}
+
+# Loaded is not working: the new web service must answer its health check
+# from the new runtime, on this machine.
+check_new_serve() {
+  if ! run_bounded "$((health_timeout_seconds + 15))" "${new_runtime}/.venv/bin/python" -I \
+      "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" check-serve "${config_path}" \
+      "${health_timeout_seconds}"; then
+    echo "The new version started, but its web service failed its health check." >&2
+    exit 1
+  fi
 }
 
 replace_venv_link() {
@@ -295,13 +464,6 @@ remove_next_link() {
   fi
 }
 
-release_cycle_lock() {
-  if [ -n "${cycle_lock_pid}" ]; then
-    kill "${cycle_lock_pid}" 2>/dev/null || true
-    wait "${cycle_lock_pid}" 2>/dev/null || true
-    cycle_lock_pid=""
-  fi
-}
 
 # An agent this run stopped or loaded must not run while the runtime switches
 # back; an agent it never touched keeps running.
@@ -358,7 +520,9 @@ cleanup() {
   trap 'cleanup_stop=129' HUP
   trap 'cleanup_stop=130' INT
   trap 'cleanup_stop=143' TERM
-  release_cycle_lock
+  # Nothing this run started may still run while it puts things back.
+  stop_bounded
+  release_writer_locks
   if [ "${installation_complete}" != true ]; then
     runtime_restored=true
     # A stop signal can arrive once an agent is out but before it is recorded.
@@ -462,8 +626,13 @@ except (ValueError, KeyError, TypeError):
 ' "${validation}" >&2
   exit 1
 fi
+if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$("${new_runtime}/.venv/bin/python" -I \
+    "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" state-dir "${config_path}"); then
+  echo "Could not read the state directory for the stopped-boundary hook. No changes made." >&2
+  exit 1
+fi
 
-hold_cycle_lock
+hold_writer_locks false
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
@@ -479,10 +648,11 @@ agents_recorded=true
 "${new_runtime}/.venv/bin/python" - \
   "${serve_plist}" "${refresh_plist}" "${generation_plist}" "${catalog_publish_plist}" \
   "${notifications_plist}" "${scheduler_plist}" \
-  "${catalog_root}" "${app_dir}" "${config_path}" "${log_dir}" <<'PY'
+  "${catalog_root}" "${app_dir}" "${config_path}" "${log_dir}" "${writer_locks_held}" <<'PY'
 import plistlib
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from inky_bird_frame.catalog import catalog_state_lock
@@ -504,7 +674,9 @@ from inky_bird_frame.publisher import sync_public_catalog
     app_dir,
     config_path,
     log_dir,
-) = map(Path, sys.argv[1:])
+) = map(Path, sys.argv[1:11])
+# The installer holds every writer lock, the catalog's among them.
+writer_locks_held = sys.argv[11] == "true"
 service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
 # The command named like the services: 0.9 installs had only inky-bird-frame,
 # so a service whose definition a failed upgrade could not put back still starts.
@@ -542,7 +714,7 @@ tls_environment = native_tls_environment(config_path)
 schedule = config.schedule
 config.controller.workspace_dir.mkdir(parents=True, exist_ok=True)
 config.controller.catalog_dir.parent.mkdir(parents=True, exist_ok=True)
-with catalog_state_lock(config.controller.state_dir):
+with nullcontext() if writer_locks_held else catalog_state_lock(config.controller.state_dir):
     source_catalog = root / "catalog"
     managed_catalog = app_dir / "catalog"
     if root != app_dir and managed_catalog.resolve() != config.controller.catalog_dir.resolve():
@@ -681,8 +853,11 @@ if [ -f "${catalog_publish_plist}" ]; then
     stopped_labels+=("catalog-publish")
     stopping_label=""
   fi
+  # The check takes the publisher's own locks.
+  release_writer_locks
   # A failure here puts the publisher back, without RunAtLoad, on exit.
   "${new_runtime}/.venv/bin/inky-bird" catalog-publish --config "${config_path}" --dry-run
+  hold_writer_locks true
 fi
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
@@ -693,7 +868,8 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
     stopping_label=""
   fi
 done
-release_cycle_lock
+run_stopped_hook
+release_writer_locks
 activate_runtime
 launchctl bootstrap "gui/${uid}" "${serve_plist}"
 if [ -f "${refresh_plist}" ]; then
@@ -726,6 +902,9 @@ if [ -f "${catalog_publish_plist}" ]; then
 fi
 if [ -f "${notifications_plist}" ]; then
   launchctl print "gui/${uid}/com.${service_prefix}.notifications" >/dev/null
+fi
+if [ -f "${serve_plist}" ]; then
+  check_new_serve
 fi
 
 installation_complete=true
