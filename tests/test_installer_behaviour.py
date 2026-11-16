@@ -56,7 +56,7 @@ TAG = (Path(__file__).resolve().parents[1] / "runtime-tag").read_text().strip()
 
 def display_systemd_units(config, *, executable, app_dir, config_path, user, service_prefix):
     service = f"# new\\n# rendered by {TAG}\\n[Service]\\nUser={user}\\nExecStart={executable}\\n"
-    timer = "# new\\n"
+    timer = f"# new\\n# rendered by {TAG}\\n"
     return {f"{service_prefix}-display.service": service, f"{service_prefix}-display.timer": timer}
 """
 # 0.9.x rendered display units without a service prefix argument.

@@ -17,14 +17,22 @@ follows, or stops it there. Rollback commands appear only in these runs.
 With one fault every rollback command works, so every unit must be exactly as
 it was. A unit may differ only when its own rollback failed (sudo expired, or
 the second fault was one of that unit's calls), and only in the way the output
-says it does. Claims that the previous or the new version runs must hold for
-the active link, every service and every enabled or running unit.
+says it does. Every definition records the version that rendered it, so one
+left from the new version differs from the one it replaced. Claims that the
+previous or the new version runs must hold for the active link, every service
+and every enabled or running unit; an installer's own success line is such a
+claim. The previous version is hashed whole: its runtime directory, or the
+source, installer and project files of a single-directory install.
+
+The recording runs are tests too, ``<scenario>/<state>/recording`` (and
+``-after<step>`` for a cleanup): the run without a fault must succeed and pass
+every check, and a run with its first fault must fail.
 
 The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call, and fails every cleanup
 step that moves, links or removes a runtime after a failed upgrade from the
 single-directory layout on both controllers and on a shared Pi's display;
-about 200 tests. Run every case, and the second pass of every upgrade, with::
+about 270 tests. Run every case, and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
 
@@ -43,12 +51,15 @@ Each starting state is built once and cloned for every run (a filesystem clone
 where there is one), with the absolute paths it records pointed at the clone.
 Every run has its own process group, a time limit and a process budget, and
 starts under an account-wide process ceiling; nothing it starts may outlive it.
+A run removes the machines of any earlier run that was killed. Tests of the
+matrix itself, rather than its cases, run in the first shard only.
 """
 
 from __future__ import annotations
 
 import atexit
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -217,16 +228,22 @@ SCENARIOS = {
 # Machine state -----------------------------------------------------------------
 
 
-def digest(path: Path) -> str:
-    """Hash a tree's names, kinds, link targets and bytes; skip bytecode caches."""
+def digest(path: Path, *, inside: str = "") -> str:
+    """Hash a tree's names, kinds, link targets and bytes; skip bytecode caches.
+
+    With ``inside``, hash it as the only entry of a directory, under that name.
+    """
     hasher = hashlib.sha256()
     if not path.exists() and not path.is_symlink():
         return "absent"
-    paths = [path] if not path.is_dir() else sorted(path.rglob("*"))
-    for item in paths:
+    items = [(".", path)] if not path.is_dir() or path.is_symlink() else []
+    if path.is_dir() and not path.is_symlink():
+        items = [(str(item.relative_to(path)), item) for item in sorted(path.rglob("*"))]
+    if inside:
+        items = [(inside, path)] + [(f"{inside}/{name}", item) for name, item in items]
+    for name, item in items:
         if "__pycache__" in item.parts:
             continue
-        name = str(item.relative_to(path)) if item != path else "."
         if item.is_symlink():
             hasher.update(f"L {name} {os.readlink(item)}\n".encode())
         elif item.is_file():
@@ -468,11 +485,6 @@ class RoleView:
     files: dict[str, str]
     processes: dict[str, dict[str, object]]
     runtimes: frozenset[str]
-    # Where the active version's environment and source are, and their hashes.
-    venv_path: Path | None = None
-    venv_code: str = "absent"
-    source_path: Path | None = None
-    source_code: str = "absent"
 
 
 def runtime_of(executable: Path) -> tuple[str, Path] | None:
@@ -544,6 +556,36 @@ def code_digest(code: Code) -> str:
     return (digest(code.venv) if code.venv else "") + (digest(code.source) if code.source else "")
 
 
+def same_path(first: Path, second: Path) -> bool:
+    return os.path.realpath(first) == os.path.realpath(second)
+
+
+def runtime_tree(machine: Machine, role: str) -> dict[str, Path]:
+    """Everything the active version runs and reinstalls from, by part.
+
+    A runtime of its own is hashed whole. A single-directory install keeps
+    its source, installer and project files in the managed directory, beside
+    catalogs and other state that are not part of it. A controller venv moved
+    out of that directory is a runtime that holds only the venv. The display's
+    environment is shared by every version and is not part of one.
+    """
+    code = controller_runtime(machine) if role == "controller" else display_runtime(machine)
+    if code.tag in (None, "regular", "missing") or code.source is None:
+        return {}
+    home = code.source.parent
+    parts: dict[str, Path] = {}
+    if same_path(home, machine.app):
+        for name in ("src", "deploy", "pyproject.toml", "uv.lock"):
+            parts[name] = home / name
+    else:
+        parts["runtime"] = home
+    if role == "controller" and code.venv is not None and not same_path(code.venv.parent, home):
+        parts["venv runtime"] = code.venv.parent
+    elif role == "controller" and code.venv is not None and same_path(home, machine.app):
+        parts[".venv"] = code.venv
+    return parts
+
+
 def unit_names(machine: Machine, role: str) -> list[str]:
     if machine.system == "Darwin":
         return [
@@ -592,18 +634,7 @@ def view(machine: Machine, role: str) -> RoleView:
         frozenset(str(path) for path in directory.iterdir()) if directory.is_dir() else frozenset()
     )
     active = controller_runtime(machine) if role == "controller" else display_runtime(machine)
-    return RoleView(
-        active.tag,
-        code_digest(active),
-        units,
-        files,
-        processes,
-        runtimes,
-        active.venv,
-        digest(active.venv) if active.venv else "absent",
-        active.source,
-        digest(active.source) if active.source else "absent",
-    )
+    return RoleView(active.tag, code_digest(active), units, files, processes, runtimes)
 
 
 def long_running(unit: str) -> bool:
@@ -649,11 +680,17 @@ class Snapshot:
     tree: str
     # The display's pre-1.0 regular install, which a shared environment holds.
     regular: str = "absent"
+    # Each part of the version installed before the run: where it is, its hash.
+    previous: dict[str, tuple[Path, str]] = field(default_factory=dict)
+    # A single-directory venv hashed as the only entry of a runtime, as an
+    # upgrade moves it.
+    venv_alone: str = "absent"
 
 
 def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
     other_role = "display" if scenario.role == "controller" else "controller"
     other = view(machine, other_role)
+    tree = runtime_tree(machine, scenario.role)
     return Snapshot(
         view(machine, scenario.role),
         other,
@@ -665,6 +702,8 @@ def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
             [machine.state_of(name) for name in ("systemd", "launchd", "pip")], sort_keys=True
         ),
         digest(machine.venv / "lib/python3/site-packages/inky_bird_frame"),
+        {name: (path, digest(path)) for name, path in tree.items()},
+        digest(tree[".venv"], inside=".venv") if ".venv" in tree else "absent",
     )
 
 
@@ -776,26 +815,47 @@ def check_common(machine: Machine, scenario: Scenario, before: Snapshot, outcome
             report.append(f"I9: a private path was printed: {match}")
 
 
+# Each installer's own last word on success, as its final lines begin. A run
+# that prints one says the new version is installed, whatever else it says.
+SUCCESS_LINES = (
+    "Controller installed from ",
+    "Display node installed from ",
+    "Display node deployed to ",
+)
+
+
+def says_installed(output: str) -> bool:
+    return any(line.startswith(SUCCESS_LINES) for line in output.splitlines())
+
+
 def claims_new(outcome: Outcome) -> bool:
-    return outcome.returncode == 0 or any(
-        phrase in outcome.output
-        for phrase in (
-            "new version is installed",
-            "uses the new version",
-            "the new one stays active",
-            "the new one is kept in",
+    return (
+        outcome.returncode == 0
+        or says_installed(outcome.output)
+        or any(
+            phrase in outcome.output
+            for phrase in (
+                "new version is installed",
+                "uses the new version",
+                "the new one stays active",
+                "the new one is kept in",
+            )
         )
     )
 
 
 def completed(outcome: Outcome) -> bool:
     """The run finished installing the new version; only a step after that failed."""
-    return outcome.returncode == 0 or any(
-        phrase in outcome.output
-        for phrase in (
-            "is installed and running, but a final step failed",
-            "new version is installed, but a final step failed",
-            "Stopped while finishing",
+    return (
+        outcome.returncode == 0
+        or says_installed(outcome.output)
+        or any(
+            phrase in outcome.output
+            for phrase in (
+                "is installed and running, but a final step failed",
+                "new version is installed, but a final step failed",
+                "Stopped while finishing",
+            )
         )
     )
 
@@ -916,7 +976,7 @@ def check_install(
         covered.add("I4")
     # I8: an injected failure never reports success, and a kill is never silent.
     stopped = case.mode in STOP_MODES
-    if outcome.returncode == 0:
+    if outcome.returncode == 0 and case.mode != "none":
         # The new version runs; only owner setup, or a leftover the output names, remains.
         tolerated = (case.tool == "inky-bird" and "owner setup is incomplete" in output) or (
             case.tool in ("rm", "ssh")
@@ -991,14 +1051,18 @@ def check_install(
             + (", its definition changed" if file_changed else "")
             + (f"; the output says {sorted(statements)}" if statements else ", and it is not named")
         )
-    # I6: until the output says the new version is in use, the previous one is intact.
+    # I6: until the output says the new version is in use, the previous one is
+    # intact: what runs now, and every part of the version that ran before.
     if (
         before.role.tag is not None
-        and after.code != before.role.code
         and not claims_new(outcome)
         and not shadowed_leftover(machine, case, before, outcome)
     ):
-        report.append("I6: the previous version's runtime, environment or source changed")
+        if after.code != before.role.code:
+            report.append("I6: the previous version's runtime, environment or source changed")
+        for name, (part, code) in before.previous.items():
+            if digest(part) != code:
+                report.append(f"I6: the previous version's {name} changed")
     # I10: nothing staged is left behind unless the output names it, or it is
     # the runtime the output says is now in use.
     in_use = active_runtime(machine, scenario.role) if claims_new(outcome) else None
@@ -1038,21 +1102,22 @@ def check_previous_kept(
 ) -> None:
     """I6 once the new version is in use: the version it replaced is still
     byte-for-byte what ran before, wherever its environment now lives."""
-    previous = before.role
-    if previous.tag is None or previous.tag == "regular":
-        return
-    if previous.source_path is not None and digest(previous.source_path) != previous.source_code:
-        report.append("I6: the previous version's source changed after the upgrade")
-    if scenario.role != "controller" or previous.venv_path is None:
-        # The display's environment is shared and is the one the new version uses.
-        return
-    venv = previous.venv_path
     kept = KEPT.search(output)
-    if (not venv.is_dir() or Path(os.path.realpath(venv)) != venv) and kept is not None:
-        # A single-directory environment moves into a runtime of its own.
-        venv = Path(kept.group(1)) / ".venv"
-    if digest(venv) != previous.venv_code:
-        report.append("I6: the previous version's environment changed after the upgrade")
+    for name, (path, code) in before.previous.items():
+        if name == "deploy":
+            # The managed directory's installer is replaced: it reinstalls the
+            # active version, and the kept one is found from the venv link.
+            continue
+        if name == ".venv" and not (path.is_dir() and not path.is_symlink()):
+            # A single-directory environment moves into a runtime of its own,
+            # which holds nothing else.
+            if kept is None:
+                report.append("I6: the previous version's environment moved and is not named")
+            elif digest(Path(kept.group(1))) != before.venv_alone:
+                report.append("I6: the runtime the previous environment moved into differs")
+            continue
+        if digest(path) != code:
+            report.append(f"I6: the previous version's {name} changed after the upgrade")
 
 
 def active_runtime(machine: Machine, role: str) -> str | None:
@@ -1449,17 +1514,40 @@ class Group:
         (machine.fake / "inject").unlink(missing_ok=True)
         return outcome, steps
 
-    def record(self, slot: Path, injection: str | None = None) -> list[list[str]]:
-        """The calls of one run: a clean one, or the cleanup after a first failure."""
+    def record(
+        self, slot: Path, injection: str | None = None
+    ) -> tuple[list[list[str]], list[str], bool]:
+        """The calls of one run, a clean one or the cleanup after a first
+        failure; what was wrong with it; and whether it ended as it must for
+        its calls to be failed in turn."""
         machine = self.machine(slot)
+        before = snapshot(machine, self.scenario)
         outcome, steps = self.run(machine, injection)
-        if injection is None:
-            assert outcome.returncode == 0 and not outcome.violations, outcome
-        else:
-            assert outcome.returncode != 0 and not outcome.violations, outcome
-        assert not machine.survivors()
+        if injection is None and not outcome.violations:
+            # The run without a fault is checked like any other.
+            clean = Case(self.kind, self.scenario.name, self.state, -1, "none", "none")
+            if self.kind == "install":
+                check_install(machine, self.scenario, clean, before, outcome)
+            else:
+                check_uninstall(machine, self.scenario, before, outcome)
+        problems = list(outcome.violations)
+        usable = outcome.returncode != -1
+        if injection is None and outcome.returncode != 0:
+            usable = False
+            problems.append(f"I8: the run without a fault exited {outcome.returncode}")
+        if injection is not None and outcome.returncode == 0:
+            usable = False
+            step = injection.split()[0]
+            problems.append(f"I8: the run whose call {step} failed exited 0")
+        survivors = machine.survivors()
+        if survivors:
+            usable = False
+            problems.append(f"processes outlived the run: {survivors}")
+        if problems:
+            problems.append(outcome.output[-3000:])
         # Recordings are made in any worker's directory and used in every other.
-        return [[off_machine(part, slot) for part in step] for step in steps]
+        recorded = [[off_machine(part, slot) for part in step] for step in steps]
+        return recorded, problems, usable
 
     def rerun(self, machine: Machine, outcome: Outcome) -> None:
         try:
@@ -1616,6 +1704,16 @@ def plan_groups() -> list[GroupKey]:
     return groups
 
 
+def in_first_shard() -> bool:
+    """Tests of the matrix itself, rather than its cases, run in one shard only."""
+    return not SHARD or SHARD.startswith("1/")
+
+
+def first_shard_only() -> None:
+    if not in_first_shard():
+        pytest.skip(f"runs in shard 1, not {SHARD}")
+
+
 def shard(items: list[str]) -> set[str]:
     """The ids of this shard: every n-th of the sorted ids, from the i-th."""
     if not SHARD:
@@ -1672,6 +1770,44 @@ def cleanup_name(key: CleanupKey) -> str:
     return ":".join((*key[:3], str(key[3])))
 
 
+def group_key(name: str) -> GroupKey:
+    kind, scenario, state = name.split(":")
+    return (kind, scenario, state)
+
+
+def cleanup_key(name: str) -> CleanupKey:
+    kind, scenario, state, first = name.split(":")
+    return (kind, scenario, state, int(first))
+
+
+ROOT_PREFIX = "installer-matrix-"
+OWNER_LOCK = "owner.lock"
+# A directory without a lock is from before runs took one, or is being set up.
+UNLOCKED_ROOT_AGE_SECONDS = 3600
+
+
+def remove_stale_roots() -> None:
+    """Remove this account's matrix directories that no running matrix owns,
+    as a run that was killed leaves them."""
+    for path in Path(tempfile.gettempdir()).glob(f"{ROOT_PREFIX}*"):
+        try:
+            if not path.is_dir() or path.is_symlink() or path.stat().st_uid != os.getuid():
+                continue
+            lock = path / OWNER_LOCK
+            if not lock.exists():
+                if time.time() - path.stat().st_mtime > UNLOCKED_ROOT_AGE_SECONDS:
+                    shutil.rmtree(path, ignore_errors=True)
+                continue
+            with lock.open("a") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 class Matrix:
     """Build each starting state once and run cases from clones of it, in parallel.
 
@@ -1685,7 +1821,12 @@ class Matrix:
         # it, so every interrupt case would pass through; Ctrl-C never finds that.
         if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
             signal.signal(signal.SIGINT, signal.default_int_handler)
-        self.root = Path(tempfile.mkdtemp(prefix="installer-matrix-"))
+        remove_stale_roots()
+        self.root = Path(tempfile.mkdtemp(prefix=ROOT_PREFIX))
+        # Held until this process ends, however it ends: a later run that can
+        # take it knows this directory is no one's.
+        self.owner = (self.root / OWNER_LOCK).open("w")
+        fcntl.flock(self.owner.fileno(), fcntl.LOCK_EX)
         # Collecting alone records every group; remove them even if no case runs.
         atexit.register(shutil.rmtree, self.root, True)
         self.pool = ThreadPoolExecutor(WORKERS, thread_name_prefix="matrix")
@@ -1701,6 +1842,9 @@ class Matrix:
         self.fresh: dict[object, list[list[str]]] = {}
         self.futures: dict[str, Future[Outcome]] = {}
         self.cases_by_id: dict[str, Case] = {}
+        # Every recording run made, by id, with what was wrong with it.
+        self.recorded: dict[str, list[str]] = {}
+        self.verifying: dict[str, Future[str]] = {}
         self.fingerprint = fingerprint()
         self.cache_path = STATE_DIRECTORY / "recordings.json"
         self.results_path = STATE_DIRECTORY / "results.json"
@@ -1731,8 +1875,26 @@ class Matrix:
         for cleanup in wanted:
             self.cleanups[cleanup] = cleanups[cleanup_name(cleanup)]
         if missing or missing_cleanups:
-            cache = {"fingerprint": self.fingerprint, "groups": groups, "cleanups": cleanups}
+            # A run that went wrong is recorded, and checked, again next time.
+            broken = {name for name, problems in self.recorded.items() if problems}
+            cache = {
+                "fingerprint": self.fingerprint,
+                "groups": {
+                    name: steps
+                    for name, steps in groups.items()
+                    if steps and recording_id(group_key(name)) not in broken
+                },
+                "cleanups": {
+                    name: steps
+                    for name, steps in cleanups.items()
+                    if steps and recording_id(cleanup_key(name)) not in broken
+                },
+            }
             write_json(self.cache_path, cache)
+        for key in planned:
+            self.recorded.setdefault(recording_id(key), [])
+        for cleanup in wanted:
+            self.recorded.setdefault(recording_id(cleanup), [])
 
     # Machines.
     def slot(self) -> Path:
@@ -1783,13 +1945,23 @@ class Matrix:
 
     # Recordings.
     def record(self, key: GroupKey) -> list[list[str]]:
-        steps = self.group(key).record(self.slot())
-        self.verified[key] = ""
-        self.fresh[key] = steps
-        return steps
+        return self.keep(key, *self.group(key).record(self.slot()))
 
     def record_cleanup(self, key: CleanupKey) -> list[list[str]]:
-        steps = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
+        return self.keep(key, *self.group(key[:3]).record(self.slot(), f"{key[3]} fail"))
+
+    def keep(
+        self,
+        key: GroupKey | CleanupKey,
+        steps: list[list[str]],
+        problems: list[str],
+        usable: bool,
+    ) -> list[list[str]]:
+        """A recording's calls, unless the run did not end as it must; then
+        the group has no cases, only its recording's test."""
+        self.recorded[recording_id(key)] = problems
+        if not usable:
+            return []
         self.verified[key] = ""
         self.fresh[key] = steps
         return steps
@@ -1798,16 +1970,20 @@ class Matrix:
         """Record again what a cached recording says; a difference is the reason."""
         with self.once(("verify", key)):
             if key not in self.verified:
-                if len(key) == 3:
-                    fresh = self.group(key[:3]).record(self.slot())
-                else:
-                    fresh = self.group(key[:3]).record(self.slot(), f"{key[3]} fail")
+                injection = None if len(key) == 3 else f"{key[3]} fail"
+                fresh, problems, usable = self.group(key[:3]).record(self.slot(), injection)
                 self.fresh[key] = fresh
-                self.verified[key] = (
-                    ""
-                    if signature(fresh) == signature(cached)
-                    else f"the recording of {key} changed since it was cached; run again"
-                )
+                self.recorded[recording_id(key)] = problems
+                if not usable:
+                    self.verified[key] = f"the recording run of {key} went wrong: " + "\n".join(
+                        problems
+                    )
+                elif signature(fresh) != signature(cached):
+                    self.verified[key] = (
+                        f"the recording of {key} changed since it was cached; run again"
+                    )
+                else:
+                    self.verified[key] = ""
             return self.verified[key]
 
     # Cases.
@@ -1902,7 +2078,7 @@ class Matrix:
                 checks[(*key, case.first)] = self.cleanups[(*key, case.first)]
         for check, recorded in checks.items():
             if check not in self.verified:
-                self.pool.submit(self.verify, check, recorded)
+                self.verifying[recording_id(check)] = self.pool.submit(self.verify, check, recorded)
         for name in wanted:
             if name in self.futures:
                 continue
@@ -1917,6 +2093,12 @@ class Matrix:
 
     def outcome(self, name: str) -> Outcome:
         return self.futures[name].result()
+
+    def recording_problems(self, name: str) -> list[str]:
+        """What was wrong with a recording run, once this session's last one is made."""
+        if name in self.verifying:
+            self.verifying[name].result()
+        return self.recorded[name]
 
     def evaluate(self, case: Case) -> Outcome:
         key = (case.kind, case.scenario, case.state)
@@ -1957,10 +2139,19 @@ class Matrix:
         if self.futures:
             write_json(self.results_path, {"fingerprint": self.fingerprint, "cases": stored})
         shutil.rmtree(self.root, ignore_errors=True)
+        self.owner.close()
 
 
 def busy_id(scenario: str, state: str) -> str:
     return f"{scenario}/{state}/busy"
+
+
+def recording_id(key: GroupKey | CleanupKey) -> str:
+    """``<scenario>/<state>/recording``, ``-after<step>`` for a failed run's cleanup."""
+    kind, scenario, state = key[:3]
+    name = scenario if kind == "install" else f"{scenario}-uninstall"
+    after = f"-after{key[3]:03d}" if len(key) == 4 else ""
+    return f"{name}/{state}/recording{after}"
 
 
 MATRIX: Matrix | None = None
@@ -1980,6 +2171,9 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "busy_group" in metafunc.fixturenames:
         names = matrix().busy_groups()
         metafunc.parametrize("busy_group", names, ids=[busy_id(*name) for name in names])
+    if "recording" in metafunc.fixturenames:
+        recorded = sorted(shard(list(matrix().recorded)))
+        metafunc.parametrize("recording", recorded, ids=recorded)
 
 
 @pytest.fixture(scope="module")
@@ -1996,7 +2190,12 @@ def executed(request: pytest.FixtureRequest) -> Iterator[Matrix]:
             wanted.append(value.id)
         elif "busy_group" in callspec.params and isinstance(value, tuple):
             wanted.append(busy_id(*value))
-        elif "key" in callspec.params and isinstance(value, tuple) and not (TOUCHING or ONLY):
+        elif (
+            "key" in callspec.params
+            and isinstance(value, tuple)
+            and not (TOUCHING or ONLY)
+            and in_first_shard()
+        ):
             wanted.append(clone_id(value))
     runner.start(wanted)
     yield runner
@@ -2021,6 +2220,14 @@ def test_installer_case(case: Case, executed: Matrix) -> None:
     )
 
 
+def test_recording_run(recording: str, executed: Matrix) -> None:
+    """The run every case of a group is made from: without a fault it
+    succeeds and leaves what every invariant asks, and with its first fault
+    it fails."""
+    problems = executed.recording_problems(recording)
+    assert not problems, "\n".join(problems)
+
+
 def test_busy_plate_changes_nothing(busy_group: tuple[str, str], executed: Matrix) -> None:
     name = busy_id(*busy_group)
     outcome = executed.outcome(name)
@@ -2030,6 +2237,7 @@ def test_busy_plate_changes_nothing(busy_group: tuple[str, str], executed: Matri
 
 def test_matrix_covers_every_action_step(executed: Matrix) -> None:
     """The recording runs saw the layout's own steps, so the cases exercise them."""
+    first_shard_only()
     if ONLY:
         pytest.skip("only some groups were recorded")
     tools: set[str] = set()
@@ -2090,6 +2298,7 @@ def machine_tree(root: Path) -> list[tuple[str, str]]:
 def test_a_cloned_machine_is_the_machine_built_fresh(key: GroupKey, executed: Matrix) -> None:
     """A clone has the same tree as a fresh build and behaves the same: a clean
     run and a failed one leave the same calls, output and machine."""
+    first_shard_only()
     if TOUCHING or ONLY:
         pytest.skip("a targeted run")
     executed.outcome(clone_id(key))
@@ -2144,6 +2353,7 @@ def compare_clone(executed: Matrix, key: GroupKey) -> Outcome:
 
 def test_a_run_over_its_process_budget_is_killed() -> None:
     """The watchdog ends a run with more processes than its budget, and all of them."""
+    first_shard_only()
     caps = Limits(budget=3)
     command = "for n in 1 2 3 4 5; do sleep 60 & done; wait"
     started = time.monotonic()
@@ -2153,6 +2363,7 @@ def test_a_run_over_its_process_budget_is_killed() -> None:
 
 
 def test_runs_start_under_the_process_ceiling(tmp_path: Path) -> None:
+    first_shard_only()
     machine = Machine(tmp_path / "machine", SCENARIOS["linux-timers"])
     script = tmp_path / "limit.sh"
     script.write_text("ulimit -u\n")
@@ -2160,8 +2371,39 @@ def test_runs_start_under_the_process_ceiling(tmp_path: Path) -> None:
     assert result.returncode == 0 and result.stdout.strip() == str(limits().ceiling)
 
 
+# The last line of each installer that runs only once the new version is in
+# place: the switch to it is done and every service it starts has been checked.
+COMPLETION_MARKERS = {
+    "install-controller.sh": "installation_complete=true",
+    "install-controller-systemd.sh": "installation_complete=true",
+    "install-display-local.sh": "installation_complete=true",
+    # The display's own installer has finished on the remote machine.
+    "install-display-node.sh": "REMOTE",
+}
+
+
+@pytest.mark.parametrize("name", sorted(COMPLETION_MARKERS))
+def test_an_installer_says_it_succeeded_only_once_it_has(name: str) -> None:
+    """A success line before the switch could sit beside a rollback message;
+    the matrix reads it as a claim that the new version is installed."""
+    first_shard_only()
+    lines = (ROOT / "deploy" / name).read_text().splitlines()
+    success = [
+        number
+        for number, line in enumerate(lines)
+        if line.startswith('echo "') and line.removeprefix('echo "').startswith(SUCCESS_LINES)
+    ]
+    assert len(success) == 1, f"{name} has {len(success)} success lines"
+    (number,) = success
+    done = max(index for index, line in enumerate(lines) if line == COMPLETION_MARKERS[name])
+    assert number > done, f"{name} says it succeeded before the new version is in place"
+    printed = re.sub(r"\$\{[^}]+\}", "/x", lines[number].removeprefix('echo "').rstrip('"'))
+    assert claims_new(Outcome(1, f"{printed}\nThe upgrade failed.\n"))
+
+
 def test_single_directory_installers_are_the_pinned_copies() -> None:
     """Upgrades are tested from exactly these installers; a change must be deliberate."""
+    first_shard_only()
     found = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(SINGLE_DIRECTORY.glob("*.sh"))

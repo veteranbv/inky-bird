@@ -720,6 +720,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                         "ProgramArguments": [str(app_dir / ".venv/bin/inky-bird"), label],
                         "RunAtLoad": True,
                         "Comment": "new",
+                        # Which runtime rendered it, so a definition left
+                        # from the new version differs from the one it replaced.
+                        "RenderedBy": tag,
                     }
                     Path(path).write_bytes(plistlib.dumps(payload))
                 else:
@@ -727,7 +730,7 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         elif "controller_systemd_units" in source:
             unit_dir, app_dir, user = Path(arguments[1]), Path(arguments[3]), arguments[6]
             for name in os.environ["FAKE_UNITS"].split():
-                content = "[Unit]\n# new\n"
+                content = f"[Unit]\n# new\n# rendered by {tag}\n"
                 if name.endswith(".service"):
                     content += f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/inky-bird\n"
                 (unit_dir / f"{prefix}-{name}").write_text(content)
