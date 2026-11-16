@@ -721,3 +721,18 @@ def test_odd_name_kept_in_the_history_is_summarized_once(tmp_path: Path) -> None
     with patch.object(ebird_archive, "_read_state", wraps=ebird_archive._read_state) as reader:
         assert read_ebird_archive_summary(state) == first
     assert reader.call_count == 1
+
+
+def test_name_with_a_lone_surrogate_still_writes_its_summary(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    ebird_import(state, tmp_path, [("S1", "Robin", "Turdus migratorius", "2019-03-12")])
+    history = state / EBIRD
+    payload = json.loads(history.read_text())
+    for checklist in payload["checklists"].values():
+        checklist["species"][0]["common_name"] = "Rob\ud800in"
+    write_json_atomic(history, payload, mode=0o600)
+    with patch.object(ebird_archive, "_read_state", wraps=ebird_archive._read_state) as reader:
+        first = read_ebird_archive_summary(state)
+        assert read_ebird_archive_summary(state) == first
+    assert reader.call_count == 1
+    assert [row.common_name for row in first] == ["Rob\ud800in"]

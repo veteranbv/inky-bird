@@ -114,7 +114,7 @@ def _identity(info: os.stat_result) -> dict[str, int]:
 
 def _body_sha256(payload: dict[str, object]) -> str:
     body = {key: value for key, value in payload.items() if key not in _ENVELOPE}
-    encoded = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
