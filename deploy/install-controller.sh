@@ -729,19 +729,25 @@ if [ -f "${notifications_plist}" ]; then
 fi
 
 installation_complete=true
-# Keep the previous runtime for rollback; nothing runs from anything older.
-for runtime in "${runtimes_dir}"/*; do
-  if [ -d "${runtime}" ] && [ "${runtime}" != "${new_runtime}" ] && \
-      [ "${runtime}" != "${previous_runtime}" ] && ! rm -rf "${runtime}"; then
-    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
-  fi
-done
 # The managed directory's copy of this script reinstalls the active runtime;
 # the mark tells it apart from a source checkout used as that directory.
 if [ ! "${root}/deploy" -ef "${app_dir}/deploy" ]; then
   install -m 0755 "${root}/deploy/install-controller.sh" "${app_dir}/deploy/"
   : >"${app_dir}/deploy/.managed-copy"
 fi
+# Keep the previous runtime for rollback; nothing runs from anything older.
+for runtime in "${runtimes_dir}"/*; do
+  if [ ! -d "${runtime}" ] || [ "${runtime}" = "${new_runtime}" ] || \
+      [ "${runtime}" = "${previous_runtime}" ]; then
+    continue
+  fi
+  # This script and the files it reads are in the runtime it was run from.
+  if [ "${runtime}" -ef "${root}" ]; then
+    echo "The runtime this installer ran from is kept in ${runtime}." >&2
+  elif ! rm -rf "${runtime}"; then
+    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+  fi
+done
 # Remove the legacy single-agent layout only after the new agents verified,
 # so a failed upgrade leaves the previous controller runnable.
 if launchctl print "gui/${uid}/com.${service_prefix}.controller-cycle" >/dev/null 2>&1; then

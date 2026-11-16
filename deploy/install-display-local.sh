@@ -13,10 +13,14 @@ noninteractive_sudo=${INKY_BIRD_NONINTERACTIVE_SUDO:-false}
 unit_root="/etc/systemd/system"
 
 # Remove one distribution's files, except those the other one also owns. With
-# a third argument, move them into that directory instead, listing every move
-# first, so restore_distribution_program can put them back. Only files in this
-# environment's packages and commands are touched; any other stops it first.
+# a third argument, set them aside in that directory instead, listing every
+# file and what it holds first, so restore_distribution_program can put them
+# back. A file goes only once its copy is whole: a rename, or a checked copy
+# under a temporary name. Only files in this environment's packages and
+# commands are touched; any other stops it first.
 remove_distribution_program='
+import errno
+import hashlib
 import json
 import os
 import shutil
@@ -28,6 +32,35 @@ places = {os.path.realpath(sysconfig.get_path(name)) for name in ("purelib", "pl
 def inside(path):
     real = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
     return any(real.startswith(place + os.sep) for place in places)
+def identity(path):
+    if os.path.islink(path):
+        return "link:" + os.readlink(path)
+    if os.path.isfile(path):
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return None
+def place(source, destination, expected):
+    try:
+        os.rename(source, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    partial = os.path.join(os.path.dirname(destination), "." + os.path.basename(destination) + ".partial")
+    try:
+        if os.path.lexists(partial):
+            os.unlink(partial)
+        if os.path.islink(source):
+            os.symlink(os.readlink(source), partial)
+        else:
+            shutil.copy2(source, partial)
+        if identity(partial) != expected:
+            raise OSError("a copy did not match its original")
+        os.replace(partial, destination)
+    except BaseException:
+        if os.path.lexists(partial):
+            os.unlink(partial)
+        raise
+    os.unlink(source)
 try:
     removed = distribution(sys.argv[1])
 except PackageNotFoundError:
@@ -45,9 +78,13 @@ for path in removed.files or ():
     if not inside(str(target)):
         sys.exit("The old package lists a file outside its environment; nothing was moved.")
     targets.append(target)
+plan = []
 if backup is not None:
     backup.mkdir(exist_ok=True)
-    plan = [[str(target), str(backup / str(number))] for number, target in enumerate(targets)]
+    plan = [
+        {"original": str(target), "saved": str(backup / str(number)), "identity": identity(target)}
+        for number, target in enumerate(targets)
+    ]
     (backup / "plan.json.new").write_text(json.dumps(plan))
     os.replace(backup / "plan.json.new", backup / "plan.json")
 directories = set()
@@ -55,7 +92,8 @@ for number, target in enumerate(targets):
     if backup is None:
         target.unlink()
     else:
-        shutil.move(str(target), str(backup / str(number)))
+        entry = plan[number]
+        place(entry["original"], entry["saved"], entry["identity"])
     directories.add(target.parent)
 for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
     try:
@@ -63,7 +101,11 @@ for directory in sorted(directories, key=lambda item: len(item.parts), reverse=T
     except OSError:
         pass
 '
+# Put back what remove_distribution_program set aside. A file is back only when
+# it holds what the plan recorded; a missing or partial one is replaced whole.
 restore_distribution_program='
+import errno
+import hashlib
 import json
 import os
 import shutil
@@ -74,21 +116,58 @@ places = {os.path.realpath(sysconfig.get_path(name)) for name in ("purelib", "pl
 def inside(path, roots):
     real = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
     return any(real.startswith(root + os.sep) for root in roots)
+def identity(path):
+    if os.path.islink(path):
+        return "link:" + os.readlink(path)
+    if os.path.isfile(path):
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return None
+def place(source, destination, expected):
+    try:
+        os.rename(source, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    partial = os.path.join(os.path.dirname(destination), "." + os.path.basename(destination) + ".partial")
+    try:
+        if os.path.lexists(partial):
+            os.unlink(partial)
+        if os.path.islink(source):
+            os.symlink(os.readlink(source), partial)
+        else:
+            shutil.copy2(source, partial)
+        if identity(partial) != expected:
+            raise OSError("a copy did not match its original")
+        os.replace(partial, destination)
+    except BaseException:
+        if os.path.lexists(partial):
+            os.unlink(partial)
+        raise
+    os.unlink(source)
 backup = Path(sys.argv[1])
 plan = backup / "plan.json"
 if not plan.exists():
     sys.exit(0)
-moves = json.loads(plan.read_text())
-for original, saved in moves:
-    if not inside(original, places) or not inside(saved, {os.path.realpath(backup)}):
+entries = json.loads(plan.read_text())
+for entry in entries:
+    if not inside(entry["original"], places) or not inside(entry["saved"], {os.path.realpath(backup)}):
         sys.exit("The list of set-aside files names a place outside its environment; nothing was moved.")
-for original, saved in moves:
-    # A file still in place was never moved: a copy that did not finish is no use.
-    if Path(original).exists() or Path(original).is_symlink():
+missing = 0
+for entry in entries:
+    if identity(entry["original"]) == entry["identity"]:
         continue
-    if Path(saved).exists() or Path(saved).is_symlink():
-        Path(original).parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(saved, original)
+    if identity(entry["saved"]) != entry["identity"]:
+        missing += 1
+        continue
+    try:
+        os.makedirs(os.path.dirname(entry["original"]), exist_ok=True)
+        place(entry["saved"], entry["original"], entry["identity"])
+    except OSError as error:
+        print(error, file=sys.stderr)
+        missing += 1
+if missing:
+    sys.exit(f"{missing} set-aside files could not be put back; run this again once the cause is fixed.")
 '
 validate_program='
 import sys
@@ -237,6 +316,15 @@ stage_runtime_source() {
   done
 }
 
+# Whether anything of a unit is running. A oneshot service is "activating"
+# while it runs and never "active", so is-active alone misses it.
+running() {
+  case "$(systemctl show --property=ActiveState --value "$1" 2>/dev/null || true)" in
+    active | activating | deactivating | reloading) return 0 ;;
+  esac
+  return 1
+}
+
 contains() {
   local target=$1
   local item
@@ -284,7 +372,7 @@ restore_units() {
         fi
       elif [ -e "${unit_root}/${unit}" ]; then
         changed=true
-        if { systemctl is-active --quiet "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
+        if { running "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
             ! "${sudo_command[@]}" systemctl disable --now "${unit}"; then
           # Keep its file so a rerun or the uninstaller can still find and stop it.
           units_stuck=true
@@ -310,9 +398,10 @@ restore_units() {
       "${sudo_command[@]}" systemctl disable "${unit}" || true
     fi
     if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
-      systemctl is-active --quiet "${unit}" || "${sudo_command[@]}" systemctl start "${unit}" || true
-    elif systemctl is-active --quiet "${unit}"; then
-      "${sudo_command[@]}" systemctl stop "${unit}" || true
+      running "${unit}" || "${sudo_command[@]}" systemctl start "${unit}" || true
+    elif running "${unit}"; then
+      # A cycle that cannot be stopped still runs the new version.
+      "${sudo_command[@]}" systemctl stop "${unit}" || units_stuck=true
     fi
   done
 }
@@ -345,8 +434,8 @@ report_units() {
       continue
     fi
     if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
-      systemctl is-active --quiet "${unit}" || differ+=("${unit}")
-    elif systemctl is-active --quiet "${unit}"; then
+      running "${unit}" || differ+=("${unit}")
+    elif running "${unit}"; then
       differ+=("${unit}")
     fi
   done
@@ -369,9 +458,9 @@ cleanup() {
   trap 'cleanup_stop=143' TERM
   if [ "${installation_complete}" != true ]; then
     restore_units
-    # A fresh install's unit that could not be stopped or disabled keeps the
-    # new package to run, not a missing one.
-    if [ "${package_installed}" = true ] && [ -z "${installed}" ] && [ "${units_stuck}" = true ]; then
+    # A unit that could not be stopped or disabled keeps the new package and
+    # runtime it runs, rather than having them taken out from under it.
+    if [ "${package_installed}" = true ] && [ "${units_stuck}" = true ]; then
       new_runtime_in_use=true
     elif [ "${package_installed}" = true ] && ! restore_package; then
       new_runtime_in_use=true
@@ -465,7 +554,7 @@ for unit in "${service}" "${timer}"; do
   if systemctl is-enabled --quiet "${unit}"; then
     enabled_before+=("${unit}")
   fi
-  if systemctl is-active --quiet "${unit}"; then
+  if running "${unit}"; then
     active_before+=("${unit}")
   fi
 done
@@ -543,18 +632,24 @@ if [ -n "${installed_source}" ] && \
     [ "$(cd -P "${installed_source}/.." 2>/dev/null && pwd || true)" = "${runtimes_dir}" ]; then
   previous_runtime=${installed_source}
 fi
-for runtime in "${runtimes_dir}"/*; do
-  if [ -d "${runtime}" ] && [ "${runtime}" != "${new_runtime}" ] && \
-      [ "${runtime}" != "${previous_runtime}" ] && ! rm -rf "${runtime}"; then
-    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
-  fi
-done
 # The managed directory's copy of this script reinstalls the active runtime;
 # the mark tells it apart from a source checkout used as that directory.
 if [ ! "${root}/deploy" -ef "${app_dir}/deploy" ]; then
   install -m 0755 "${root}/deploy/install-display-local.sh" "${app_dir}/deploy/"
   : >"${app_dir}/deploy/.managed-copy"
 fi
+for runtime in "${runtimes_dir}"/*; do
+  if [ ! -d "${runtime}" ] || [ "${runtime}" = "${new_runtime}" ] || \
+      [ "${runtime}" = "${previous_runtime}" ]; then
+    continue
+  fi
+  # This script and the files it reads are in the runtime it was run from.
+  if [ "${runtime}" -ef "${root}" ]; then
+    echo "The runtime this installer ran from is kept in ${runtime}." >&2
+  elif ! rm -rf "${runtime}"; then
+    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+  fi
+done
 echo "Display node installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
 if [ -n "${previous_runtime}" ]; then

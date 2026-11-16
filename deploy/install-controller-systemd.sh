@@ -192,6 +192,15 @@ long_running() {
   return 1
 }
 
+# Whether anything of a unit is running. A oneshot service is "activating"
+# while it runs and never "active", so is-active alone misses it.
+running() {
+  case "$(systemctl show --property=ActiveState --value "$1" 2>/dev/null || true)" in
+    active | activating | deactivating | reloading) return 0 ;;
+  esac
+  return 1
+}
+
 hold_cycle_lock() {
   local python="${app_dir}/.venv/bin/python"
   local ready="${work_dir}/cycle-lock-held"
@@ -346,7 +355,7 @@ restore_units() {
         fi
       elif [ -e "${unit_root}/${unit}" ]; then
         changed=true
-        if { systemctl is-active --quiet "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
+        if { running "${unit}" || systemctl is-enabled --quiet "${unit}"; } && \
             ! sudo systemctl disable --now "${unit}"; then
           # Keep its file so a rerun or the uninstaller can still find and stop it.
           stuck_units+=("${unit}")
@@ -365,7 +374,7 @@ restore_units() {
     for unit in "${managed_units[@]}"; do
       case "${unit}" in
         *.service)
-          if [ -e "${unit_root}/${unit}" ] && systemctl is-active --quiet "${unit}" && \
+          if [ -e "${unit_root}/${unit}" ] && running "${unit}" && \
               { ! long_running "${unit}" || contains "${unit}" ${started_units[@]+"${started_units[@]}"}; }; then
             sudo systemctl stop "${unit}" || stuck_units+=("${unit}")
           fi
@@ -406,9 +415,9 @@ restore_units() {
     fi
     if long_running "${unit}"; then
       if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
-        [ "${startable}" = false ] || systemctl is-active --quiet "${unit}" || \
+        [ "${startable}" = false ] || running "${unit}" || \
           sudo systemctl start "${unit}" || true
-      elif systemctl is-active --quiet "${unit}"; then
+      elif running "${unit}"; then
         sudo systemctl stop "${unit}" || true
       fi
     fi
@@ -437,6 +446,8 @@ report_restore() {
     elif [ -f "${unit_backup_dir}/${unit}" ]; then
       changed+=("${unit}")
     fi
+    # A oneshot cycle running now was started by a timer put back on the
+    # previous version; one that kept running the new version is in stuck_units.
     if contains "${unit}" ${active_before[@]+"${active_before[@]}"}; then
       systemctl is-active --quiet "${unit}" || stopped+=("${unit}")
     elif { long_running "${unit}" || [ "${runtime_activated}" = true ]; } && \
@@ -780,19 +791,25 @@ if [ -f "${unit_dir}/${service_prefix}-notifications.timer" ]; then
 fi
 
 installation_complete=true
-# Keep the previous runtime for rollback; nothing runs from anything older.
-for runtime in "${runtimes_dir}"/*; do
-  if [ -d "${runtime}" ] && [ "${runtime}" != "${new_runtime}" ] && \
-      [ "${runtime}" != "${previous_runtime}" ] && ! rm -rf "${runtime}"; then
-    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
-  fi
-done
 # The managed directory's copy of this script reinstalls the active runtime;
 # the mark tells it apart from a source checkout used as that directory.
 if [ ! "${root}/deploy" -ef "${app_dir}/deploy" ]; then
   install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${app_dir}/deploy/"
   : >"${app_dir}/deploy/.managed-copy"
 fi
+# Keep the previous runtime for rollback; nothing runs from anything older.
+for runtime in "${runtimes_dir}"/*; do
+  if [ ! -d "${runtime}" ] || [ "${runtime}" = "${new_runtime}" ] || \
+      [ "${runtime}" = "${previous_runtime}" ]; then
+    continue
+  fi
+  # This script and the files it reads are in the runtime it was run from.
+  if [ "${runtime}" -ef "${root}" ]; then
+    echo "The runtime this installer ran from is kept in ${runtime}." >&2
+  elif ! rm -rf "${runtime}"; then
+    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+  fi
+done
 echo "Controller installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
 if [ -n "${previous_runtime}" ]; then
