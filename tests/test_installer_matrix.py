@@ -399,7 +399,7 @@ class Machine(Host):
     def survivors(self) -> list[str]:
         """Kill and name any process still running from this machine's directory."""
         listing = subprocess.run(
-            ["/bin/ps", "-ax", "-o", "pid=", "-o", "stat=", "-o", "command="],
+            ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "stat=", "-o", "command="],
             capture_output=True,
             text=True,
             check=True,
@@ -1674,7 +1674,7 @@ class Limits:
                     return
                 watched = dict(self.remote)
             listing = subprocess.run(
-                ["/bin/ps", "-ax", "-o", "pgid=", "-o", "command="],
+                ["/bin/ps", "-ww", "-ax", "-o", "pgid=", "-o", "command="],
                 capture_output=True,
                 text=True,
                 check=False,

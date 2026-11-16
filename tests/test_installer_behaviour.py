@@ -85,7 +85,7 @@ RUN_TIMEOUT_SECONDS = 120
 def group_members(group: int) -> list[str]:
     """Live processes in one process group, as ``pid command`` lines."""
     listing = subprocess.run(
-        ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
+        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
         capture_output=True,
         text=True,
         check=True,
@@ -218,6 +218,23 @@ case "$mode" in
     exit "$status"
     ;;
 esac
+# GNU install and cp refuse to copy a file onto itself; the BSD tools on macOS
+# accept it, so the fakes refuse it the GNU way everywhere.
+if [ "{name}" = install ] || [ "{name}" = cp ]; then
+  source=""
+  target=""
+  for argument in "$@"; do
+    source=$target
+    target=$argument
+  done
+  if [ -d "$target" ] && [ -n "$source" ]; then
+    target="$target/${{source##*/}}"
+  fi
+  if [ -n "$source" ] && [ -e "$source" ] && [ "$source" -ef "$target" ]; then
+    echo "{name}: '$source' and '$target' are the same file" >&2
+    exit 1
+  fi
+fi
 # macOS mktemp ignores TMPDIR without a template; keep temporary files in the test root.
 if [ "{name}" = mktemp ] && [ "$*" = "-d" ]; then
   exec {shlex.quote(real)} -d "$TMPDIR/tmp.XXXXXXXXXX"

@@ -105,7 +105,7 @@ def _installer_pid(*, outermost: bool = False) -> int | None:
 
     def parent_and_command(pid: int) -> tuple[int, str]:
         output = subprocess.run(
-            ["/bin/ps", "-o", "ppid=", "-o", "command=", "-p", str(pid)],
+            ["/bin/ps", "-ww", "-o", "ppid=", "-o", "command=", "-p", str(pid)],
             capture_output=True,
             text=True,
             check=False,
@@ -557,7 +557,7 @@ def _remote_installers(group: int) -> list[int]:
     import subprocess
 
     listing = subprocess.run(
-        ["/bin/ps", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "command="],
+        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "command="],
         capture_output=True,
         text=True,
         check=False,
