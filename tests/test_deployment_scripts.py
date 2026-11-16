@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
+import re
+import shutil
+import stat
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -318,3 +326,356 @@ def test_local_display_uninstaller_removes_units_and_preserves_data() -> None:
     assert "Pimoroni Python environment" in script
     assert "rm -rf" not in script
     assert 'rm -f "${config_path}"' not in script
+
+
+# The display installer's distribution programs, run for real in a real venv.
+
+DISPLAY_INSTALLER = Path(__file__).resolve().parents[1] / "deploy/install-display-local.sh"
+
+
+def display_program(name: str) -> str:
+    """A Python program the display installer keeps in a shell variable, as it runs it."""
+    found = re.search(
+        rf"^{name}='(.*?)^'$", DISPLAY_INSTALLER.read_text(), re.MULTILINE | re.DOTALL
+    )
+    assert found is not None, name
+    return found.group(1)
+
+
+@dataclass(frozen=True)
+class Venv:
+    root: Path
+    python: Path
+    site: Path
+    bin: Path
+
+    def run(
+        self, program: str, *arguments: str, flags: tuple[str, ...] = ()
+    ) -> subprocess.CompletedProcess[str]:
+        """Run as the installer does: ``python -I -c <program> <arguments>``."""
+        return subprocess.run(
+            [str(self.python), "-I", *flags, "-c", program, *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": os.defpath},
+        )
+
+    def imported(self) -> tuple[str | None, str]:
+        """The inky-bird-frame distribution's version, if any, and the version
+        of the package Python imports."""
+        probe = (
+            "import importlib.metadata as m, inky_bird_frame as p\n"
+            "try:\n    print(m.version('inky-bird-frame'))\n"
+            "except m.PackageNotFoundError:\n    print('none')\n"
+            "print(p.VERSION)\n"
+        )
+        # Without bytecode: a cache left in a package directory would keep it.
+        result = self.run(probe, flags=("-B",))
+        assert result.returncode == 0, result.stderr
+        distribution, package = result.stdout.split()
+        return (None if distribution == "none" else distribution), package
+
+
+def make_venv(root: Path) -> Venv:
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(root)], check=True)
+    python = root / "bin/python"
+    site = subprocess.run(
+        [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return Venv(root, python, Path(site), root / "bin")
+
+
+def record_line(site: Path, path: Path) -> str:
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    return f"{os.path.relpath(path, site)},sha256={digest},{len(data)}"
+
+
+def write_distribution(
+    venv: Venv, name: str, version: str, files: dict[str, str], scripts: tuple[str, ...]
+) -> Path:
+    """A distribution as pip leaves it: its files, console scripts and a RECORD of them."""
+    written = []
+    for relative, content in files.items():
+        path = venv.site / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        written.append(path)
+    for script in scripts:
+        path = venv.bin / script
+        path.write_text(f"#!{venv.python}\n# {name} {version}\nimport sys\n")
+        path.chmod(0o755)
+        written.append(path)
+    info = venv.site / f"{name.replace('-', '_')}-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    (info / "INSTALLER").write_text("pip\n")
+    entry_points = "".join(f"{script} = inky_bird_frame.entrypoint:main\n" for script in scripts)
+    (info / "entry_points.txt").write_text(f"[console_scripts]\n{entry_points}")
+    written += [info / "METADATA", info / "INSTALLER", info / "entry_points.txt"]
+    lines = [record_line(venv.site, path) for path in written]
+    (info / "RECORD").write_text("\n".join([*lines, f"{info.name}/RECORD,,"]) + "\n")
+    return info
+
+
+@dataclass(frozen=True)
+class Upgrade:
+    """A Pimoroni environment mid-upgrade: the renamed release installed
+    regularly, the new one editable from a runtime outside it."""
+
+    venv: Venv
+    old: Path
+    new: Path
+    backup: Path
+
+
+def make_upgrade(tmp_path: Path) -> Upgrade:
+    venv = make_venv(tmp_path / "pimoroni")
+    old = write_distribution(
+        venv,
+        "inky-bird-frame",
+        "0.9.8",
+        {
+            "inky_bird_frame/__init__.py": "VERSION = '0.9.8'\n",
+            "inky_bird_frame/cli.py": "def main():\n    pass\n",
+        },
+        ("inky-bird-frame",),
+    )
+    source = tmp_path / "runtime/src"
+    (source / "inky_bird_frame").mkdir(parents=True)
+    (source / "inky_bird_frame/__init__.py").write_text("VERSION = '1.0.0'\n")
+    new = write_distribution(
+        venv,
+        "inky-bird",
+        "1.0.0",
+        {"_inky_bird.pth": f"{source}\n"},
+        ("inky-bird", "inky-bird-frame"),
+    )
+    # The installer's own temporary directory, which holds the backup.
+    (tmp_path / "work").mkdir()
+    return Upgrade(venv, old, new, tmp_path / "work/previous-package")
+
+
+def tree(root: Path) -> dict[str, str]:
+    """Every entry below ``root``: kind, mode and content or link target."""
+    found = {}
+    for path in sorted(root.rglob("*")):
+        if "__pycache__" in path.parts:
+            continue
+        name = str(path.relative_to(root))
+        if path.is_symlink():
+            found[name] = f"link {os.readlink(path)}"
+        elif path.is_dir():
+            found[name] = "directory"
+        else:
+            content = hashlib.sha256(path.read_bytes()).hexdigest()
+            found[name] = f"file {stat.S_IMODE(path.stat().st_mode):o} {content}"
+    return found
+
+
+def old_files(upgrade: Upgrade) -> set[str]:
+    """What the old distribution's RECORD names that the new one does not, from the venv root."""
+
+    def named(info: Path) -> set[str]:
+        return {
+            os.path.relpath(os.path.normpath(info.parent / line.split(",")[0]), upgrade.venv.root)
+            for line in (info / "RECORD").read_text().splitlines()
+        }
+
+    return named(upgrade.old) - named(upgrade.new)
+
+
+REMOVE = "remove_distribution_program"
+RESTORE = "restore_distribution_program"
+
+
+def test_display_removal_sets_the_old_distribution_aside_and_restore_puts_it_back(
+    tmp_path: Path,
+) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    assert venv.imported() == ("0.9.8", "0.9.8")
+    before = tree(venv.root)
+    planned = old_files(upgrade)
+    assert "bin/inky-bird-frame" not in planned
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+
+    plan = json.loads((upgrade.backup / "plan.json").read_text())
+    moved = {os.path.relpath(os.path.normpath(original), venv.root) for original, _ in plan}
+    assert moved == planned
+    for original, saved in plan:
+        assert not Path(original).exists() and Path(saved).is_file()
+        assert Path(saved).parent == upgrade.backup
+    after = tree(venv.root)
+    emptied = {str(Path(name).parent) for name in planned}
+    assert {name: value for name, value in before.items() if name not in planned | emptied} == after
+    assert venv.imported() == (None, "1.0.0")
+
+    result = venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_removal_without_a_backup_takes_out_the_new_distribution(
+    tmp_path: Path,
+) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    before = tree(venv.root)
+    gone = {
+        f"lib/{venv.site.parent.name}/site-packages/_inky_bird.pth",
+        "bin/inky-bird",
+        *(str(path.relative_to(venv.root)) for path in [upgrade.new, *upgrade.new.iterdir()]),
+    }
+
+    result = venv.run(display_program(REMOVE), "inky-bird", "inky-bird-frame")
+    assert result.returncode == 0, result.stderr
+
+    assert {name: value for name, value in before.items() if name not in gone} == tree(venv.root)
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_removal_skips_a_file_already_gone(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    (venv.site / "inky_bird_frame/cli.py").unlink()
+    before = tree(venv.root)
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+    plan = json.loads((upgrade.backup / "plan.json").read_text())
+    assert not any(original.endswith("cli.py") for original, _ in plan)
+
+    assert venv.run(display_program(RESTORE), str(upgrade.backup)).returncode == 0
+    assert tree(venv.root) == before
+
+
+def test_display_removal_falls_back_to_copying_across_filesystems(tmp_path: Path) -> None:
+    """A rename that fails as it does between filesystems makes every move a copy
+    and a delete; the result must be the same. (No second filesystem is
+    available to a test; this makes the environment's own rename fail.)"""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    (venv.site / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "def rename(*arguments, **options):\n"
+        "    raise OSError(errno.EXDEV, 'Invalid cross-device link')\n"
+        "os.rename = rename\n"
+    )
+    before = tree(venv.root)
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+    assert venv.imported() == (None, "1.0.0")
+    assert venv.run(display_program(RESTORE), str(upgrade.backup)).returncode == 0
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+@pytest.mark.parametrize("entry", ["escaping", "absolute", "linked-directory"])
+def test_display_removal_moves_nothing_outside_the_environment(tmp_path: Path, entry: str) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not the environment's\n")
+    if entry == "escaping":
+        name = os.path.relpath(outside / "keep.txt", venv.site)
+    elif entry == "absolute":
+        name = str(outside / "keep.txt")
+    else:
+        (venv.site / "inky_bird_frame/linked").symlink_to(outside)
+        name = "inky_bird_frame/linked/keep.txt"
+    record = upgrade.old / "RECORD"
+    record.write_text(record.read_text() + f"{name},,\n")
+    before = tree(venv.root)
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+
+    assert (outside / "keep.txt").read_text() == "not the environment's\n"
+    assert result.returncode != 0
+    assert tree(venv.root) == before
+    assert not (upgrade.backup / "plan.json").exists()
+
+
+def test_display_removal_moves_a_link_not_what_it_points_to(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not the environment's\n")
+    link = venv.site / "inky_bird_frame/data.txt"
+    link.symlink_to(outside)
+    record = upgrade.old / "RECORD"
+    record.write_text(record.read_text() + "inky_bird_frame/data.txt,,\n")
+    before = tree(venv.root)
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+    assert not link.is_symlink() and outside.read_text() == "not the environment's\n"
+    assert venv.run(display_program(RESTORE), str(upgrade.backup)).returncode == 0
+    assert tree(venv.root) == before
+
+
+def test_display_removal_refuses_a_backup_that_already_holds_a_plan(tmp_path: Path) -> None:
+    """A second removal into the same backup would replace the plan and the
+    files the first one set aside; it changes nothing instead."""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    first = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert first.returncode == 0, first.stderr
+    plan = json.loads((upgrade.backup / "plan.json").read_text())
+    # A partial run: the metadata is back, the package files are still aside.
+    for original, saved in plan:
+        if ".dist-info" in original:
+            Path(original).parent.mkdir(exist_ok=True)
+            shutil.move(saved, original)
+    saved_before = tree(upgrade.backup)
+    before = tree(venv.root)
+
+    result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+
+    assert result.returncode != 0
+    assert tree(upgrade.backup) == saved_before
+    assert tree(venv.root) == before
+
+
+def test_display_restore_without_a_plan_changes_nothing(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    upgrade.backup.mkdir()
+    before = tree(upgrade.venv.root)
+    result = upgrade.venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert result.returncode == 0, result.stderr
+    assert tree(upgrade.venv.root) == before
+
+
+@pytest.mark.parametrize("field", ["original", "saved"])
+def test_display_restore_refuses_a_plan_outside_its_places(tmp_path: Path, field: str) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    upgrade.backup.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    saved = upgrade.backup / "0"
+    saved.write_text("set aside\n")
+    original = venv.site / "inky_bird_frame/extra.py"
+    if field == "original":
+        original = elsewhere / "planted.py"
+    else:
+        saved = elsewhere / "0"
+        saved.write_text("not set aside by the installer\n")
+    (upgrade.backup / "plan.json").write_text(json.dumps([[str(original), str(saved)]]))
+    before = tree(venv.root)
+
+    result = venv.run(display_program(RESTORE), str(upgrade.backup))
+
+    assert result.returncode != 0
+    assert tree(venv.root) == before
+    assert not (elsewhere / "planted.py").exists()
+    assert saved.exists()
