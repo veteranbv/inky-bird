@@ -48,7 +48,8 @@ for path in removed.files or ():
 if backup is not None:
     backup.mkdir(exist_ok=True)
     plan = [[str(target), str(backup / str(number))] for number, target in enumerate(targets)]
-    (backup / "plan.json").write_text(json.dumps(plan))
+    (backup / "plan.json.new").write_text(json.dumps(plan))
+    os.replace(backup / "plan.json.new", backup / "plan.json")
 directories = set()
 for number, target in enumerate(targets):
     if backup is None:
@@ -82,6 +83,9 @@ for original, saved in moves:
     if not inside(original, places) or not inside(saved, {os.path.realpath(backup)}):
         sys.exit("The list of set-aside files names a place outside its environment; nothing was moved.")
 for original, saved in moves:
+    # A file still in place was never moved: a copy that did not finish is no use.
+    if Path(original).exists() or Path(original).is_symlink():
+        continue
     if Path(saved).exists() or Path(saved).is_symlink():
         Path(original).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(saved, original)
@@ -192,6 +196,8 @@ active_before=()
 units_recorded=false
 package_installed=false
 old_package_removed=false
+package_backup_dir=""
+package_restored=false
 units_replaced=false
 units_stuck=false
 installation_complete=false
@@ -254,6 +260,7 @@ restore_package() {
       if [ "${old_package_removed}" = true ]; then
         "${venv}/bin/python" -I -c "${restore_distribution_program}" "${package_backup_dir}" || \
           return 1
+        package_restored=true
       fi
       "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird inky-bird-frame
       ;;
@@ -400,6 +407,20 @@ cleanup() {
       echo "Previous version kept for rollback: ${previous_runtime}" >&2
     fi
   fi
+  if [ -n "${package_backup_dir}" ]; then
+    if [ "${installation_complete}" != true ] && [ "${old_package_removed}" = true ] && \
+        [ "${package_restored}" != true ]; then
+      echo "The previous version's package files could not be put back and are kept in ${package_backup_dir}." >&2
+      echo "Put them back with: ${venv}/bin/python -I ${package_backup_dir}/restore.py ${package_backup_dir}" >&2
+    elif ! rm -rf "${package_backup_dir}"; then
+      echo "Could not remove the previous version's set-aside package files; remove them by hand: ${package_backup_dir}" >&2
+    fi
+  fi
+  for kept in "${support_dir}"/previous-package.*; do
+    if [ -d "${kept}" ] && [ "${kept}" != "${package_backup_dir}" ]; then
+      echo "Package files an earlier upgrade could not put back are still kept in ${kept}." >&2
+    fi
+  done
   if [ -n "${work_dir}" ] && ! rm -rf "${work_dir}"; then
     echo "Could not remove temporary files; remove them by hand: ${work_dir}" >&2
   fi
@@ -417,7 +438,6 @@ trap 'exit 143' TERM
 make_temp_dir work_dir
 unit_dir="${work_dir}/units"
 unit_backup_dir="${work_dir}/previous-units"
-package_backup_dir="${work_dir}/previous-package"
 mkdir "${unit_dir}" "${unit_backup_dir}"
 
 chmod 600 "${config_path}"
@@ -501,7 +521,11 @@ units_replaced=true
 # it goes before anything starts; it is kept aside until the upgrade is done.
 # Both list some of the same files, such as the inky-bird command; only the
 # files the new one does not also own go.
+# Set aside beside the configuration, not with the temporary files: if they
+# cannot be put back, they stay, with a program that puts them back.
 if [ "${installed}" = inky-bird-frame ]; then
+  make_temp_dir package_backup_dir "${support_dir}/previous-package.XXXXXX"
+  printf '%s' "${restore_distribution_program}" >"${package_backup_dir}/restore.py"
   old_package_removed=true
   "${venv}/bin/python" -I -c "${remove_distribution_program}" inky-bird-frame inky-bird \
     "${package_backup_dir}"
