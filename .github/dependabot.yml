@@ -29,3 +29,10 @@ updates:
       container-images:
         patterns:
           - "*"
+    ignore:
+      # The image's Python series is a release decision, changed by hand once
+      # the test matrix passes on it. Patch releases still update.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
