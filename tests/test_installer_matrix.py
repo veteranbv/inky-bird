@@ -42,7 +42,7 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 253 cases, beside 79 recording
+both controllers and on a shared Pi's display: 262 cases, beside 82 recording
 runs, 21 busy-plate runs and 21 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
@@ -125,6 +125,9 @@ RELEASE = "release-0.9.8"
 # The application directory is the owner's source checkout: setup run there
 # installs whatever is checked out now.
 CHECKOUT = "checkout"
+# The owner rolls back by running the installer kept in an older runtime: the
+# version ``mid`` is active and the retained runtime holds ``new``.
+RETAINED = "retained"
 RELEASE_DIRECTORY = ROOT / "tests/fake_bin/release_0_9_8"
 RELEASE_SHA256 = {
     "install-controller-systemd.sh": (
@@ -193,7 +196,7 @@ SCENARIOS = {
             "controller",
             "Darwin",
             (("FAKE_AGENTS", AGENTS),),
-            ("fresh", "single", "staged", "disabled", "rolled-back", RELEASE, CHECKOUT),
+            ("fresh", "single", "staged", "disabled", "rolled-back", RELEASE, CHECKOUT, RETAINED),
             "uninstall-controller.sh",
         ),
         Scenario(
@@ -213,6 +216,7 @@ SCENARIOS = {
                 "shared-both",
                 RELEASE,
                 CHECKOUT,
+                RETAINED,
             ),
             "uninstall-controller-systemd.sh",
         ),
@@ -270,6 +274,7 @@ SCENARIOS = {
                 "shared-both",
                 RELEASE,
                 CHECKOUT,
+                RETAINED,
             ),
             "uninstall-display-local.sh",
         ),
@@ -440,6 +445,7 @@ class Machine(Host):
         script = self.script(name, source=source, text=text, system_paths=system_paths)
         result = self.execute(script, scenario)
         assert result.returncode == 0, result.stdout + result.stderr
+        self.finish_cycles()
         if scenario.role == "display":
             # An upgrade needs the timer stopped first.
             self.set_unit(f"{self.family}-display.timer", active=False)
@@ -455,6 +461,17 @@ class Machine(Host):
             processes = self.state_of("processes")
             processes.pop(unit, None)
             self.save_state("processes", processes)
+            busy = self.state_of("busy")
+            busy.pop(unit, None)
+            self.save_state("busy", busy)
+
+    def finish_cycles(self) -> None:
+        """Let every cycle a timer started run to its end, as before an owner upgrades."""
+        processes = self.state_of("processes")
+        for unit in [name for name in processes if fake_tools._oneshot(name)]:
+            processes.pop(unit)
+        self.save_state("processes", processes)
+        self.save_state("busy", {})
 
     def install_renamed_display(self) -> None:
         """The pre-1.0 renamed distribution as a regular install, timer stopped."""
@@ -481,6 +498,9 @@ class Machine(Host):
             self.install(scenario, state, "old")
         elif state == RELEASE:
             self.install(scenario, "release", "old")
+        elif state == RETAINED:
+            self.install(scenario, "staged", "new")
+            self.install(scenario, "staged", "mid")
         elif state == CHECKOUT:
             Host.write_source(self.app, "old")
             result = self.execute(self.script(scenario.script, source=self.app), scenario)
@@ -516,6 +536,7 @@ class Machine(Host):
             self.install(scenario, "staged", "old")
         else:
             raise AssertionError(state)
+        self.finish_cycles()
         self.check_built(scenario, state)
 
     def install_rolled_back(self, scenario: Scenario) -> None:
@@ -561,6 +582,7 @@ class Machine(Host):
             "fresh": None,
             "shared-staged": None,
             "renamed": "regular",
+            RETAINED: "mid",
         }.get(state, "old")
         assert role.tag == expected, (state, role.tag)
         for name, process in role.processes.items():
@@ -576,7 +598,7 @@ class Machine(Host):
             assert other.tag in tags, (state, other.tag)
 
     def reset_run(self) -> None:
-        for name in ("steps", "inject", "sudo-expired", "sudo-validations", "fail"):
+        for name in ("steps", "inject", "sudo-expired", "sudo-validations", "fail", "runs.json"):
             (self.fake / name).unlink(missing_ok=True)
         (self.fake / "log").write_text("")
 
@@ -1066,6 +1088,7 @@ CLAIMS = {
     "Could not remove the previous version's set-aside package files; remove them by hand: "
     "${package_backup_dir}": "neutral",
     "Package files an earlier upgrade could not put back are still kept in ${kept}.": "neutral",
+    "The runtime this installer ran from is kept in ${runtime}.": "neutral",
     "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
     "${new_runtime}": "neutral",
     "Display deployment key is missing: ${ssh_key}": "neutral",
@@ -1484,6 +1507,9 @@ def removal_failed(case: Case, path: str, root: Path) -> bool:
     return case.tool == "rm" and case.mode == "fail" and os.path.realpath(path) in targets
 
 
+RAN_FROM = re.compile(r"^The runtime this installer ran from is kept in (\S+)\.$", re.MULTILINE)
+
+
 def check_success(
     machine: Machine,
     scenario: Scenario,
@@ -1496,6 +1522,10 @@ def check_success(
     """I4 and I8 for a run that exited 0: the intended final state, exactly."""
     if after.tag != "new":
         report.append(f"I8: success reported but the active version is {after.tag}")
+    # A service the installer started and waited for ran the new version.
+    for unit, ran in machine.state_of("runs").items():
+        if unit in after.units and any(runtime != "new" for runtime in ran):
+            report.append(f"I2: the installer ran {unit} on {sorted(set(ran))}, not new")
     check_final_units(machine, scenario, after, report)
     for process in after.processes.values():
         if process["runtime"] != "new":
@@ -1517,6 +1547,9 @@ def check_success(
         for path in after.runtimes
         if removal_failed(case, path, machine.root) and any(path in line for line in by_hand)
     }
+    # The runtime the installer itself ran from stays, and is named.
+    ran_from = {os.path.realpath(found) for found in RAN_FROM.findall(output)}
+    named |= {path for path in after.runtimes if os.path.realpath(path) in ran_from}
     if len(after.runtimes - named) != expected:
         report.append(f"I10: after success {len(after.runtimes)} runtimes remain, not {expected}")
     for path in sorted(stray_paths(machine) - before.stray):
@@ -1611,6 +1644,8 @@ def left_installed(role: RoleView) -> list[str]:
 def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
     """I3: the installer the installed command would pick works once the fault is gone."""
     machine.reset_run()
+    # Cycles the failed run left running have ended by the time the owner reruns.
+    machine.finish_cycles()
     outcome.covered.add("I3")
     script = installed_script(machine, scenario)
     kept = sorted(machine.support.glob("previous-package.*"))
@@ -1900,6 +1935,8 @@ class Group:
         source = (
             machine.app if self.kind == "install" and self.state == CHECKOUT else machine.source
         )
+        if self.kind == "install" and self.state == RETAINED:
+            source = retained_runtime(machine, self.scenario.role)
         return source / "deploy" / name
 
     def run(self, machine: Machine, injection: str | None) -> tuple[Outcome, list[list[str]]]:
@@ -2589,6 +2626,18 @@ class Matrix:
             write_json(self.results_path, {"fingerprint": self.fingerprint, "cases": stored})
         shutil.rmtree(self.root, ignore_errors=True)
         self.owner.close()
+
+
+def retained_runtime(machine: Machine, role: str) -> Path:
+    """The kept runtime that holds the ``new`` source, which the owner runs."""
+    directory = machine.app / (".runtimes" if role == "controller" else ".display-runtimes")
+    (found,) = (
+        path
+        for path in directory.iterdir()
+        if (path / "src/runtime-tag").is_file()
+        and (path / "src/runtime-tag").read_text().strip() == "new"
+    )
+    return found
 
 
 def prepare(machine: Machine, key: GroupKey) -> None:

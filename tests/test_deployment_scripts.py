@@ -489,6 +489,27 @@ def old_files(upgrade: Upgrade) -> set[str]:
     return named(upgrade.old) - named(upgrade.new)
 
 
+def moves(backup: Path) -> list[tuple[str, str]]:
+    """Each file a removal set aside, as the plan lists it: where it was, where it is kept."""
+    plan = json.loads((backup / "plan.json").read_text())
+    return [(entry["original"], entry["saved"]) for entry in plan]
+
+
+def identity(path: Path) -> str:
+    """What the programs record a file as: a link's target or a file's hash."""
+    if path.is_symlink():
+        return f"link:{os.readlink(path)}"
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_plan(backup: Path, entries: list[tuple[Path, Path, str]]) -> None:
+    plan = [
+        {"original": str(original), "saved": str(saved), "identity": recorded}
+        for original, saved, recorded in entries
+    ]
+    (backup / "plan.json").write_text(json.dumps(plan))
+
+
 REMOVE = "remove_distribution_program"
 RESTORE = "restore_distribution_program"
 
@@ -506,7 +527,7 @@ def test_display_removal_sets_the_old_distribution_aside_and_restore_puts_it_bac
     result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
     assert result.returncode == 0, result.stderr
 
-    plan = json.loads((upgrade.backup / "plan.json").read_text())
+    plan = moves(upgrade.backup)
     moved = {os.path.relpath(os.path.normpath(original), venv.root) for original, _ in plan}
     assert moved == planned
     for original, saved in plan:
@@ -550,8 +571,7 @@ def test_display_removal_skips_a_file_already_gone(tmp_path: Path) -> None:
 
     result = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
     assert result.returncode == 0, result.stderr
-    plan = json.loads((upgrade.backup / "plan.json").read_text())
-    assert not any(original.endswith("cli.py") for original, _ in plan)
+    assert not any(original.endswith("cli.py") for original, _ in moves(upgrade.backup))
 
     assert venv.run(display_program(RESTORE), str(upgrade.backup)).returncode == 0
     assert tree(venv.root) == before
@@ -630,7 +650,7 @@ def test_display_removal_refuses_a_backup_that_already_holds_a_plan(tmp_path: Pa
     venv = upgrade.venv
     first = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
     assert first.returncode == 0, first.stderr
-    plan = json.loads((upgrade.backup / "plan.json").read_text())
+    plan = moves(upgrade.backup)
     # A partial run: the metadata is back, the package files are still aside.
     for original, saved in plan:
         if ".dist-info" in original:
@@ -670,7 +690,7 @@ def test_display_restore_refuses_a_plan_outside_its_places(tmp_path: Path, field
     else:
         saved = elsewhere / "0"
         saved.write_text("not set aside by the installer\n")
-    (upgrade.backup / "plan.json").write_text(json.dumps([[str(original), str(saved)]]))
+    write_plan(upgrade.backup, [(original, saved, "sha256:" + hashlib.sha256(b"x").hexdigest())])
     before = tree(venv.root)
 
     result = venv.run(display_program(RESTORE), str(upgrade.backup))
@@ -690,7 +710,7 @@ def test_display_restore_leaves_a_file_that_was_never_moved(tmp_path: Path) -> N
     original = venv.site / "inky_bird_frame/cli.py"
     partial = upgrade.backup / "0"
     partial.write_text("def ma")
-    (upgrade.backup / "plan.json").write_text(json.dumps([[str(original), str(partial)]]))
+    write_plan(upgrade.backup, [(original, partial, identity(original))])
     before = tree(venv.root)
 
     result = venv.run(display_program(RESTORE), str(upgrade.backup))
@@ -745,3 +765,111 @@ def test_display_restore_stopped_part_way_finishes_when_run_again(tmp_path: Path
     assert second.returncode == 0, second.stderr
     assert tree(venv.root) == before
     assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+# Every rename fails as it does across filesystems, so each move is a copy; a
+# copy can be made to stop half-way, as a full disk or a lost mount stops it.
+CROSS_DEVICE = """import errno, os, shutil
+from pathlib import Path
+RULE = Path(__file__).with_name("break-copy")
+def rename(*arguments, **options):
+    raise OSError(errno.EXDEV, "Invalid cross-device link")
+os.rename = rename
+copy2 = shutil.copy2
+def broken(source, destination, **options):
+    rule = RULE.read_text().strip() if RULE.exists() else ""
+    names = {os.path.basename(source), os.path.basename(destination)}
+    if rule and rule in names:
+        data = Path(source).read_bytes()
+        Path(destination).write_bytes(data[: len(data) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device")
+    return copy2(source, destination, **options)
+shutil.copy2 = broken
+"""
+
+
+def cross_device(upgrade: Upgrade) -> Path:
+    """Make the environment's renames fail across devices; return the file that
+    names which copy stops half-way."""
+    (upgrade.venv.site / "sitecustomize.py").write_text(CROSS_DEVICE)
+    return upgrade.venv.site / "break-copy"
+
+
+def test_display_set_aside_keeps_a_file_whose_copy_failed(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    rule = cross_device(upgrade)
+    rule.write_text("cli.py\n")
+    original = (venv.site / "inky_bird_frame/cli.py").read_bytes()
+    before = tree(venv.root)
+
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+
+    assert removal.returncode != 0
+    assert (venv.site / "inky_bird_frame/cli.py").read_bytes() == original
+    assert not [path for path in upgrade.backup.iterdir() if path.name.endswith(".partial")]
+    rule.unlink()
+    restore = venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert restore.returncode == 0, restore.stderr
+    assert {name: value for name, value in tree(venv.root).items() if name != rule.name} == {
+        name: value for name, value in before.items() if not name.endswith("break-copy")
+    }
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_restore_whose_copy_failed_fails_and_a_retry_repairs(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    rule = cross_device(upgrade)
+    before = tree(venv.root)
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert removal.returncode == 0, removal.stderr
+    rule.write_text(".cli.py.partial\n")
+
+    failed = venv.run(display_program(RESTORE), str(upgrade.backup))
+
+    assert failed.returncode != 0
+    assert "could not be put back" in failed.stderr
+    assert not (venv.site / "inky_bird_frame/cli.py").exists()
+    assert not (venv.site / "inky_bird_frame/.cli.py.partial").exists()
+    rule.unlink()
+    retry = venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert retry.returncode == 0, retry.stderr
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_restore_replaces_a_truncated_original(tmp_path: Path) -> None:
+    """A copy back that stopped half-way, before restores were made whole, left
+    a truncated file in place beside the complete saved one."""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    before = tree(venv.root)
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert removal.returncode == 0, removal.stderr
+    cli = venv.site / "inky_bird_frame/cli.py"
+    cli.parent.mkdir(exist_ok=True)
+    cli.write_text("def ma")
+
+    result = venv.run(display_program(RESTORE), str(upgrade.backup))
+
+    assert result.returncode == 0, result.stderr
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_restore_fails_loudly_for_a_damaged_saved_copy(tmp_path: Path) -> None:
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert removal.returncode == 0, removal.stderr
+    saved = next(
+        Path(saved) for original, saved in moves(upgrade.backup) if original.endswith("cli.py")
+    )
+    saved.write_text("damaged\n")
+
+    result = venv.run(display_program(RESTORE), str(upgrade.backup))
+
+    assert result.returncode != 0
+    assert "could not be put back" in result.stderr
+    assert not (venv.site / "inky_bird_frame/cli.py").exists()

@@ -425,6 +425,50 @@ def _record_process(unit: str, running: bool) -> None:
     _save("processes", processes)
 
 
+# How many state queries a cycle a timer starts is seen as running for.
+CYCLE_POLLS = 3
+
+
+def _oneshot(unit: str) -> bool:
+    """A service that runs to its end: Type=oneshot without RemainAfterExit,
+    never "active", "activating" while it runs."""
+    return unit.endswith(".service") and not unit.endswith(
+        ("-controller.service", "-scheduler.service")
+    )
+
+
+def _end_cycle(unit: str) -> None:
+    busy = _state("busy")
+    busy.pop(unit, None)
+    _save("busy", busy)
+    _record_process(unit, running=False)
+
+
+def _start_cycle(timer: str) -> None:
+    """A timer that starts may fire at once: its service runs, "activating"."""
+    service = timer.removesuffix(".timer") + ".service"
+    if not (_units_dir() / service).exists():
+        return
+    busy = _state("busy")
+    busy[service] = CYCLE_POLLS
+    _save("busy", busy)
+    _record_process(service, running=True)
+
+
+def _record_run(unit: str) -> None:
+    """A oneshot service started and waited for: which version that run was."""
+    path = _units_dir() / unit
+    executable = ""
+    for line in path.read_text().splitlines() if path.exists() else ():
+        if line.startswith("ExecStart="):
+            executable = line.partition("=")[2].split()[0]
+    runs = _state("runs")
+    ran = runs.setdefault(unit, [])
+    assert isinstance(ran, list)
+    ran.append(str(resolve_runtime(executable)["runtime"]) if executable else "missing")
+    _save("runs", runs)
+
+
 def systemctl(arguments: list[str]) -> int:
     units = _state("systemd")
     verb = arguments[0]
@@ -441,6 +485,9 @@ def systemctl(arguments: list[str]) -> int:
                 busy[unit] = remaining - 1
                 _save("busy", busy)
                 _log("busy-poll", unit, remaining - 1)
+                if remaining == 1 and _oneshot(unit):
+                    # The cycle ends after this answer.
+                    _record_process(unit, running=False)
                 print("activating")
             else:
                 print("active" if record["active"] else "inactive")
@@ -461,16 +508,23 @@ def systemctl(arguments: list[str]) -> int:
         return 5
     if verb == "disable" and not exists:
         return 1
-    if verb in ("start", "restart"):
+    if verb in ("start", "restart") and _oneshot(unit):
+        _record_run(unit)
+        record["active"] = False
+    elif verb in ("start", "restart"):
         # start leaves an already running process, and its runtime, alone.
         if verb == "restart" or not record["active"]:
             _record_process(unit, running=True)
+            if unit.endswith(".timer"):
+                _start_cycle(unit)
         record["active"] = True
     elif verb == "stop":
         if unit.endswith("scheduler.service") or unit.endswith("generate.service"):
             _log("lock-at-stop", unit, "lock-held" if _cycle_lock_held() else "lock-free")
         record["active"] = False
         _record_process(unit, running=False)
+        if _oneshot(unit):
+            _end_cycle(unit)
     elif verb == "enable":
         record["enabled"] = True
     elif verb == "disable":
@@ -478,6 +532,8 @@ def systemctl(arguments: list[str]) -> int:
         if "--now" in arguments:
             record["active"] = False
             _record_process(unit, running=False)
+            if _oneshot(unit):
+                _end_cycle(unit)
     _save("systemd", units)
     return 0
 
