@@ -435,6 +435,9 @@ def test_native_oidc_cache_rejects_unsafe_or_invalid_state(tmp_path: Path, kind:
         native_oidc_environment(config, path)
     assert "private-synthetic" not in str(error.value)
     assert "not-json-private-detail" not in str(error.value)
+    if kind == "invalid":
+        # Nothing is written while the cache is read, so the message must not say so.
+        assert str(error.value) == "Native access cache is invalid or cannot be read"
 
 
 def test_native_oidc_missing_secret_and_failed_replacement_are_safe(tmp_path: Path) -> None:
