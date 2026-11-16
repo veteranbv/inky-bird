@@ -679,3 +679,69 @@ def test_display_restore_refuses_a_plan_outside_its_places(tmp_path: Path, field
     assert tree(venv.root) == before
     assert not (elsewhere / "planted.py").exists()
     assert saved.exists()
+
+
+def test_display_restore_leaves_a_file_that_was_never_moved(tmp_path: Path) -> None:
+    """A move that stopped while copying leaves the original and part of a copy;
+    the original is the file to keep."""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    upgrade.backup.mkdir()
+    original = venv.site / "inky_bird_frame/cli.py"
+    partial = upgrade.backup / "0"
+    partial.write_text("def ma")
+    (upgrade.backup / "plan.json").write_text(json.dumps([[str(original), str(partial)]]))
+    before = tree(venv.root)
+
+    result = venv.run(display_program(RESTORE), str(upgrade.backup))
+
+    assert result.returncode == 0, result.stderr
+    assert tree(venv.root) == before
+
+
+def test_display_restore_runs_as_the_kept_file_the_installer_names(tmp_path: Path) -> None:
+    """The command an operator is given after a failed restore: the program,
+    saved beside the files as the installer saves it, run as a file."""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    before = tree(venv.root)
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert removal.returncode == 0, removal.stderr
+    (upgrade.backup / "restore.py").write_text(display_program(RESTORE))
+
+    result = subprocess.run(
+        [str(venv.python), "-I", str(upgrade.backup / "restore.py"), str(upgrade.backup)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": os.defpath},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")
+
+
+def test_display_restore_stopped_part_way_finishes_when_run_again(tmp_path: Path) -> None:
+    """A restore that fails after putting some files back keeps the rest and its
+    plan; once the cause is gone, running it again puts back the remainder."""
+    upgrade = make_upgrade(tmp_path)
+    venv = upgrade.venv
+    before = tree(venv.root)
+    removal = venv.run(display_program(REMOVE), "inky-bird-frame", "inky-bird", str(upgrade.backup))
+    assert removal.returncode == 0, removal.stderr
+    # Something now stands where the metadata goes back, the last files listed.
+    blocker = upgrade.old
+    blocker.write_text("in the way\n")
+
+    first = venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert first.returncode != 0
+    assert (venv.site / "inky_bird_frame/__init__.py").is_file()
+    assert (upgrade.backup / "plan.json").exists()
+    assert any(path.name.isdigit() for path in upgrade.backup.iterdir())
+
+    blocker.unlink()
+    second = venv.run(display_program(RESTORE), str(upgrade.backup))
+    assert second.returncode == 0, second.stderr
+    assert tree(venv.root) == before
+    assert venv.imported() == ("0.9.8", "0.9.8")

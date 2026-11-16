@@ -778,6 +778,7 @@ def stray_paths(machine: Machine) -> set[str]:
     found = {str(path) for path in machine.tmp.iterdir()}
     found |= {str(path) for path in machine.support.glob("install.*")}
     found |= {str(path) for path in machine.support.glob("catalog-publish-recovery.*")}
+    found |= {str(path) for path in machine.support.glob("previous-package.*")}
     if machine.app.parent.is_dir():
         found |= {str(path) for path in machine.app.parent.glob(".inky-bird-stage.*")}
     if (machine.app / ".venv.next").is_symlink():
@@ -799,6 +800,9 @@ class Snapshot:
     # A single-directory venv hashed as the only entry of a runtime, as an
     # upgrade moves it.
     venv_alone: str = "absent"
+    # The display's installed package files in the shared environment, by
+    # path: what an upgrade sets aside and must put back or keep.
+    package: dict[str, str] = field(default_factory=dict)
 
 
 def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
@@ -818,7 +822,24 @@ def snapshot(machine: Machine, scenario: Scenario) -> Snapshot:
         digest(machine.venv / "lib/python3/site-packages/inky_bird_frame"),
         {name: (path, digest(path)) for name, path in tree.items()},
         digest(tree[".venv"], inside=".venv") if ".venv" in tree else "absent",
+        package_files(machine),
     )
+
+
+def package_files(machine: Machine) -> dict[str, str]:
+    """Every file of the renamed distribution in the environment, with its hash:
+    what an upgrade sets aside. (Today's editable install of the same name is
+    replaced by pip itself and reinstalled from its runtime, which I6 hashes.)"""
+    site = machine.venv / "lib/python3/site-packages"
+    found = {}
+    for path in sorted(site.rglob("*")) if site.is_dir() else ():
+        if path.name == "_inky_bird.pth":
+            continue
+        if path.is_file() and "__pycache__" not in path.parts:
+            found[str(path.relative_to(machine.venv))] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+    return found
 
 
 # Invariants -------------------------------------------------------------------
@@ -1038,6 +1059,13 @@ CLAIMS = {
     "Could not remove temporary files; remove them by hand: ${work_dir}": "neutral",
     "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
     "${leftovers[*]}": "neutral",
+    "The previous version's package files could not be put back and are kept in "
+    "${package_backup_dir}.": "neutral",
+    "Put them back with: ${venv}/bin/python -I ${package_backup_dir}/restore.py "
+    "${package_backup_dir}": "neutral",
+    "Could not remove the previous version's set-aside package files; remove them by hand: "
+    "${package_backup_dir}": "neutral",
+    "Package files an earlier upgrade could not put back are still kept in ${kept}.": "neutral",
     "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
     "${new_runtime}": "neutral",
     "Display deployment key is missing: ${ssh_key}": "neutral",
@@ -1337,6 +1365,19 @@ def check_install(
         for name, (part, code) in before.previous.items():
             if digest(part) != code:
                 report.append(f"I6: the previous version's {name} changed")
+    # I6 for the display's shared environment: a package file the failed run
+    # took out is back as it was, or kept where the output says it is.
+    if not completed(outcome):
+        kept_files = {
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            for directory in named_left(output)
+            for path in Path(directory).rglob("*")
+            if path.is_file()
+        }
+        files_now = package_files(machine)
+        for name, code in before.package.items():
+            if files_now.get(name) != code and code not in kept_files:
+                report.append(f"I6: the previous package file {name} is lost")
     # I10: nothing staged is left behind unless the output says it is kept or
     # to be removed by hand, or it is the runtime the output says is now in use.
     in_use = active_runtime(machine, scenario.role) if claims_new(outcome) else None
@@ -1572,6 +1613,7 @@ def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
     machine.reset_run()
     outcome.covered.add("I3")
     script = installed_script(machine, scenario)
+    kept = sorted(machine.support.glob("previous-package.*"))
     if scenario.role == "display":
         # setup asks the owner to stop the display timer before an upgrade.
         machine.set_unit(f"{machine.family}-display.timer", active=False)
@@ -1586,6 +1628,16 @@ def check_rerun(machine: Machine, scenario: Scenario, outcome: Outcome) -> None:
             + (result.stdout + result.stderr)[-1500:]
         )
         return
+    # Package files an earlier run kept stay where they are, and today's
+    # installer names them (a release's own installer knows nothing of them).
+    names_kept = "previous-package" in script.read_text()
+    for directory in kept:
+        if not directory.is_dir() or (
+            names_kept and not is_named_left(str(directory), result.stderr)
+        ):
+            outcome.violations.append(
+                f"I3: the rerun lost or did not name {directory.name}: " + result.stderr[-800:]
+            )
     tag = (controller_code if scenario.role == "controller" else display_code)(machine)[0]
     for name, process in machine.state_of("processes").items():
         if name in unit_names(machine, scenario.role) and process["runtime"] != tag:
