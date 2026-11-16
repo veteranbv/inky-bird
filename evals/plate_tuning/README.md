@@ -127,9 +127,15 @@ and `tune` also take `--calibration FILE` (another run's
 | --- | --- | --- | --- |
 | `cache-references` | none | none | downloads reference photos |
 | `judge-smoke` | none | one per judge | |
-| `calibrate` | none | (3 per species + anchors) x 2 orders x judges | |
-| `compare` | missing plates, at most `--max-generations` | pairs x judges | |
-| `tune` | at most `--max-generations` | per new pair x judges | one reflection call per proposal |
+| `calibrate` | none | (3 per species + anchors) x 2 orders x judges judgments | |
+| `compare` | missing plates, at most `--max-generations` | pairs x judges judgments | |
+| `tune` | at most `--max-generations` | per new pair x judges judgments | one reflection call per proposal |
+
+A judgment is one judge's verdict on one pair; a failed call is retried, so
+each judgment makes at most `judge_attempts` (default 2) paid calls. The dry
+runs print both: `judgments_needed_at_most` (`judgments_at_most` for
+`calibrate`) counts judgments, `judge_calls_at_most` the paid calls including
+retries.
 
 `--max-generations` has no default: a paid command does
 not start without it. The cap is for the whole run directory: every generation
@@ -148,15 +154,20 @@ logged in `generations.jsonl`, `judgments.jsonl` or `reflections.jsonl`. Judge c
 
 For the orchestrated first run (3 judges): `judge-smoke` makes 3 judge calls.
 `calibrate` with 6 planted species and A anchor plates makes (18 + A) x 2
-pairs, so (36 + 2A) x 3 judge calls, and no generations. `compare` of v9
+pairs, so (36 + 2A) x 3 judgments (up to twice that in paid calls with
+retries), and no generations. `compare` of v9
 against v8 on all 20 species at 3 samples needs 120 generations
-(`--max-generations 120`) and 60 pairs, 180 judge calls. `tune --budget 150` needs at most 150
+(`--max-generations 120`) and 60 pairs, 180 judgments (at most 360 paid judge
+calls). `tune --budget 150` needs at most 150
 + 12 dev baselines + 48 reserved (24 candidate and 24 baseline held-out
-plates) = 210 generations, at most one judged pair (3 judge calls) per
-candidate plate, 72 judge calls for the held-out test, and one reflection per
-proposal.
+plates) = 210 generations, at most one judged pair (3 judgments) per
+candidate plate, 72 judgments for the held-out test (each judgment up to two
+paid calls), and one reflection per proposal.
 A resumed `tune` subtracts the candidate plates earlier attempts already made
 on the dev species, which count as used, so resuming never needs a higher cap.
+The candidate chosen for the held-out test is recorded (`tune/selection.json`)
+before the test starts; a tune resumed after that does not run the optimiser
+again and needs only the held-out plates still missing.
 
 Every finished call records the tokens its tool reported in its ledger entry
 (`usage`): Claude's JSON result gives input, output and cache tokens and a
@@ -272,6 +283,16 @@ attribution, intact reference numbering, unchanged tool request and output
 path). A rejected candidate scores zero and costs nothing. GEPA keeps its own
 state in `gepa/` and resumes from it.
 
+The first `tune` in a run directory records what its scores mean in
+`tune/evaluation.json`: the rubric and judging-contract digests, the judges
+that score (name, kind and model), the score weights, the generation model and
+attempts, the candidate length cap, the panel's dev and held-out species and
+their facts, and the held-out samples. A later `tune` (its dry run included)
+under any other value is refused with "use a new run directory", so saved
+scores, GEPA's state and the selection are never mixed across objectives. A
+run directory tuned before this record existed adopts the current
+configuration.
+
 ## Not included
 
 Tuning the review instructions is not part of this tool yet.
@@ -376,6 +397,8 @@ verdicts/<pair>/<judge>.json   stamped with the rubric and judging-prompt digest
 compare/<first>-vs-<second>/summary.json and pairs.json (unblinded, run-relative paths)
 .lock                     held by the command using the run directory
 smoke/                    judge-smoke logs and summary
+tune/evaluation.json      the tuning configuration this run's scores and GEPA state belong to
+tune/selection.json       the candidate chosen for the held-out test
 calibration/, tune/, gepa/, report/
 ```
 

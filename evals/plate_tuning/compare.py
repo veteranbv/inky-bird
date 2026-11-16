@@ -55,13 +55,16 @@ def pair_specs(
 class ComparePlan:
     generations_needed: int
     pairs_possible: int
+    # One per pair and judge; each may take up to judge_attempts paid calls.
     judgments_needed: int
+    judge_calls: int
 
     def as_dict(self) -> dict[str, int]:
         return {
             "generations_needed": self.generations_needed,
             "pairs_possible": self.pairs_possible,
             "judgments_needed_at_most": self.judgments_needed,
+            "judge_calls_at_most": self.judge_calls,
         }
 
 
@@ -72,12 +75,14 @@ def plan(
     species: Sequence[PanelSpecies],
     samples: int,
     judges: int,
+    attempts: int,
 ) -> ComparePlan:
     pairs = len(species) * samples
     return ComparePlan(
         generations_needed=missing_samples(run, [first, second], species, samples),
         pairs_possible=pairs,
         judgments_needed=pairs * judges,
+        judge_calls=pairs * judges * attempts,
     )
 
 

@@ -189,6 +189,19 @@ def test_a_finished_plate_left_by_a_crash_is_prepared_without_paying_again(
     assert completed_sample(run, arm, panel[0], 1) == done[("base", panel[0].taxon_id, 1)]
 
 
+def test_a_finished_plate_left_by_a_crash_is_not_counted_as_still_to_pay(
+    tmp_path: Path,
+) -> None:
+    run, panel, _downloader = make_run(tmp_path)
+    arm = parse_arm("base=default", base=tmp_path)
+    _leave_plate(run, arm, panel[0], "generation-started", "generation-finished")
+    assert missing_samples(run, [arm], [panel[0]], 1) == 0
+
+    unfinished = parse_arm("other=default", base=tmp_path)
+    _leave_plate(run, unfinished, panel[0], "generation-started")
+    assert missing_samples(run, [unfinished], [panel[0]], 1) == 1
+
+
 def test_a_plate_whose_agent_may_not_have_finished_is_generated_again(tmp_path: Path) -> None:
     run, panel, _downloader = make_run(tmp_path)
     arm = parse_arm("base=default", base=tmp_path)

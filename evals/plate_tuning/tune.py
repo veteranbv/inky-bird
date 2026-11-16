@@ -20,7 +20,7 @@ from inky_bird_frame.prompts import PLATE_INSTRUCTION_FIELDS, PLATE_INSTRUCTIONS
 from .blind import JudgedPair, Vote, judge_pairs
 from .compare import compare, pair_specs
 from .config import BudgetExhaustedError, EvalConfig, HarnessError
-from .gate import CalibrationGate
+from .gate import CalibrationGate, judged_with
 from .generate import (
     GENERATIONS_LEDGER,
     Arm,
@@ -28,6 +28,7 @@ from .generate import (
     Sample,
     generate_samples,
     missing_samples,
+    profile_sha256,
 )
 from .judges import (
     CLAUDE_ISOLATION,
@@ -55,6 +56,8 @@ from .stats import pair_outcome, win_score
 PLATE_COMPONENT: Final = "plate_instructions"
 _CANDIDATE_ARM: Final = re.compile(r"cand-[0-9a-f]{12}")
 BASELINE_ARM: Final = "baseline"
+EVALUATION_RECORD: Final = ("tune", "evaluation.json")
+SELECTION_RECORD: Final = ("tune", "selection.json")
 
 ReflectionLM = Callable[[str], str]
 
@@ -447,14 +450,140 @@ def candidate_generations(run: Run, dev: Sequence[PanelSpecies]) -> int:
     )
 
 
-def holdout_reservation(
-    run: Run, baseline: Arm, holdout: Sequence[PanelSpecies], samples: int
-) -> int:
-    """Generations the held-out test needs: every candidate plate, plus missing baselines.
+def evaluation_fingerprint(
+    config: EvalConfig, panel: Sequence[PanelSpecies], holdout_samples: int
+) -> dict[str, object]:
+    """Everything that changes what a tuning score, the optimiser's state or the selection means.
 
-    The candidate is not known yet, so none of its plates can be cached.
+    config is the judging configuration: with a passing calibration, only its
+    calibrated judges.
     """
-    return len(holdout) * samples + missing_samples(run, [baseline], holdout, samples)
+    return {
+        **judged_with(config),
+        "score_weights": {
+            "anatomy": config.anatomy_weight,
+            "lettering": config.lettering_weight,
+            "acceptable": config.acceptable_weight,
+        },
+        "generation_model": config.generation_model,
+        "generation_attempts": config.generation_attempts,
+        "max_candidate_characters": config.max_candidate_characters,
+        "species": [
+            {"key": entry.key, "split": entry.split, "profile_sha256": profile_sha256(entry)}
+            for entry in panel
+            if entry.split in ("dev", "holdout")
+        ],
+        "holdout_samples": holdout_samples,
+    }
+
+
+def bind_evaluation(run: Run, fingerprint: dict[str, object], *, record: bool) -> None:
+    """Refuse to continue tuning in a run directory scored under another configuration.
+
+    The first tune records the fingerprint (record=True); a run directory
+    tuned before fingerprints were recorded adopts the current one.
+    """
+    path = run.path(*EVALUATION_RECORD)
+    if not path.exists():
+        if record:
+            write_json(path, fingerprint)
+        return
+    stored = read_object(path)
+    changed = sorted(
+        key for key in {*stored, *fingerprint} if stored.get(key) != fingerprint.get(key)
+    )
+    if changed:
+        raise HarnessError(
+            "This run directory was tuned under another evaluation configuration"
+            f" ({', '.join(changed)} changed), so its scores, optimiser state and selection"
+            " do not apply; use a new run directory"
+        )
+
+
+def selected_candidate(run: Run) -> tuple[str, float | None, str | None] | None:
+    """The candidate an earlier tune in this run selected for the held-out test, if any."""
+    path = run.path(*SELECTION_RECORD)
+    if not path.exists():
+        return None
+    stored = read_object(path)
+    text, score, stopped = (
+        stored.get("text"),
+        stored.get("best_dev_score"),
+        stored.get("stopped_early"),
+    )
+    if (
+        not isinstance(text, str)
+        or stored.get("sha256") != sha256_text(text)
+        or not (score is None or isinstance(score, float | int))
+        or not (stopped is None or isinstance(stopped, str))
+    ):
+        raise HarnessError(f"{path.name} is not a usable selection record")
+    return text, None if score is None else float(score), stopped
+
+
+def holdout_reservation(
+    run: Run,
+    baseline: Arm,
+    holdout: Sequence[PanelSpecies],
+    samples: int,
+    selected: str | None = None,
+) -> int:
+    """Generations the held-out test still needs.
+
+    Before a candidate is selected none of its plates can be cached, so every
+    candidate plate is counted; once one is selected (selected), only its and
+    the baseline's missing plates are. The current prompt needs no test.
+    """
+    if selected is None:
+        return len(holdout) * samples + missing_samples(run, [baseline], holdout, samples)
+    if selected == PLATE_INSTRUCTIONS:
+        return 0
+    return missing_samples(run, [candidate_arm(selected), baseline], holdout, samples)
+
+
+def _optimise(
+    run: Run,
+    config: EvalConfig,
+    adapter: PlateTuningAdapter,
+    dev: Sequence[PanelSpecies],
+    holdout: Sequence[PanelSpecies],
+    *,
+    optimizer: Optimizer,
+    reflection_lm: ReflectionLM,
+    budget: Budget,
+    metric_calls: int,
+    holdout_samples: int,
+) -> tuple[str, float | None, str | None, int]:
+    """Run the optimiser with the held-out test's generations held back.
+
+    Returns the best text, its mean dev score, why tuning stopped early (or
+    None) and the generations held back.
+    """
+    reserved = holdout_reservation(run, adapter.baseline, holdout, holdout_samples)
+    keys = [entry.key for entry in dev]
+    stopped: str | None = None
+    with budget.holding(reserved):
+        try:
+            best = optimizer(
+                seed_candidate={PLATE_COMPONENT: PLATE_INSTRUCTIONS},
+                trainset=list(dev),
+                valset=list(dev),
+                adapter=adapter,
+                reflection_lm=reflection_lm,
+                max_metric_calls=metric_calls,
+                minibatch_size=config.tune_minibatch_size,
+                run_dir=run.path("gepa"),
+                seed=run.derived("gepa") % 2**31,
+            )
+            best_text = best.get(PLATE_COMPONENT, PLATE_INSTRUCTIONS)
+            best_score = adapter.scores.mean(best_text, keys)
+            if best_score is None:
+                # The optimiser's pick was never scored on every dev species here.
+                best_text, best_score = adapter.scores.best(keys, PLATE_INSTRUCTIONS)
+        except BudgetExhaustedError as exc:
+            stopped = str(exc)
+            best_text, best_score = adapter.scores.best(keys, PLATE_INSTRUCTIONS)
+    return best_text, best_score, stopped, reserved
 
 
 def tune_plate(
@@ -479,42 +608,44 @@ def tune_plate(
     so however the optimiser spends its share (GEPA can finish an iteration
     past max_metric_calls), the held-out comparison runs in full. When the
     optimiser's share runs out it stops, and the best candidate scored on
-    every dev species is tested.
+    every dev species is tested. The selection is recorded before the test,
+    so a resumed tune goes straight to the test of the same candidate.
     """
+    bind_evaluation(run, evaluation_fingerprint(config, panel, holdout_samples), record=True)
     dev = [entry for entry in panel if entry.split == "dev"]
     holdout = [entry for entry in panel if entry.split == "holdout"]
     references = {entry.taxon_id: frozen_references(run, entry) for entry in panel}
     adapter = PlateTuningAdapter(
         run, config, generator, judges, references, budget=budget, parallel=parallel
     )
-    reserved = holdout_reservation(run, adapter.baseline, holdout, holdout_samples)
-    stopped: str | None = None
-    with budget.holding(reserved):
-        try:
-            best = optimizer(
-                seed_candidate={PLATE_COMPONENT: PLATE_INSTRUCTIONS},
-                trainset=list(dev),
-                valset=list(dev),
-                adapter=adapter,
-                reflection_lm=reflection_lm,
-                max_metric_calls=metric_calls,
-                minibatch_size=config.tune_minibatch_size,
-                run_dir=run.path("gepa"),
-                seed=run.derived("gepa") % 2**31,
-            )
-            best_text = best.get(PLATE_COMPONENT, PLATE_INSTRUCTIONS)
-            best_score = adapter.scores.mean(best_text, [entry.key for entry in dev])
-            if best_score is None:
-                # The optimiser's pick was never scored on every dev species here.
-                best_text, best_score = adapter.scores.best(
-                    [entry.key for entry in dev], PLATE_INSTRUCTIONS
-                )
-        except BudgetExhaustedError as exc:
-            stopped = str(exc)
-            best_text, best_score = adapter.scores.best(
-                [entry.key for entry in dev], PLATE_INSTRUCTIONS
-            )
+    selection = selected_candidate(run)
+    if selection is not None:
+        best_text, best_score, stopped = selection
+        reserved = holdout_reservation(run, adapter.baseline, holdout, holdout_samples, best_text)
+    else:
+        best_text, best_score, stopped, reserved = _optimise(
+            run,
+            config,
+            adapter,
+            dev,
+            holdout,
+            optimizer=optimizer,
+            reflection_lm=reflection_lm,
+            budget=budget,
+            metric_calls=metric_calls,
+            holdout_samples=holdout_samples,
+        )
     validate_candidate(best_text, max_characters=config.max_candidate_characters)
+    if selection is None:
+        write_json(
+            run.path(*SELECTION_RECORD),
+            {
+                "text": best_text,
+                "sha256": sha256_text(best_text),
+                "best_dev_score": best_score,
+                "stopped_early": stopped,
+            },
+        )
     write_text(run.path("tune", "best-plate-instructions.txt"), best_text + "\n")
     holdout_result: dict[str, object] | None = None
     decision: dict[str, object] | None = None

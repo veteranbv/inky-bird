@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from collections.abc import Sequence
@@ -11,7 +12,7 @@ from PIL import Image
 from plate_tuning.cli import Tools, main, spread
 from plate_tuning.config import EvalConfig, load_config
 from plate_tuning.generate import Generator
-from plate_tuning.judges import Judge
+from plate_tuning.judges import BlindVerdict, Judge, JudgeRequest
 from plate_tuning.panel import frozen_references, load_panel
 from plate_tuning.report import usage_totals
 from plate_tuning.rundir import Budget, Ledger, Run
@@ -148,6 +149,8 @@ def test_cache_compare_and_report_end_to_end(
         "generations_needed": 16,
         "pairs_possible": 8,
         "judgments_needed_at_most": 24,
+        # Each judgment may be retried once (judge_attempts = 2), so up to 48 paid calls.
+        "judge_calls_at_most": 48,
     }
     assert {key: _at(out, "data", key) for key in ("cap", "used", "remaining")} == {
         "cap": 40,
@@ -259,6 +262,95 @@ def test_a_resumed_tune_counts_the_candidate_plates_already_made(
     code, out = _invoke([*tune, "--max-generations", "24"], tools, capsys)
     assert code == 0, out
     assert _at(out, "data", "plan", "generations_at_most") == 20
+
+
+GREY = PLATE_INSTRUCTIONS.replace("warm aged cream", "pale grey")
+
+
+def _picks_grey(
+    *,
+    seed_candidate: dict[str, str],
+    trainset: list[object],
+    valset: list[object],
+    adapter: TuningAdapter,
+    reflection_lm: ReflectionLM,
+    max_metric_calls: int,
+    minibatch_size: int,
+    run_dir: Path,
+    seed: int,
+) -> dict[str, str]:
+    """Scores the seed and one rewrite on every dev species and picks the rewrite."""
+    adapter.evaluate(valset, seed_candidate)
+    adapter.evaluate(valset, {adapter.component: GREY})
+    return {adapter.component: GREY}
+
+
+class _Stopped(BaseException):
+    """Stands in for the harness being stopped part way through judging."""
+
+
+class _StopsAfter(PixelJudge):
+    def __init__(self, name: str, calls: list[int], limit: int) -> None:
+        super().__init__(name)
+        self.calls, self.limit = calls, limit
+
+    def judge(self, request: JudgeRequest) -> BlindVerdict:
+        self.calls.append(1)
+        if len(self.calls) > self.limit:
+            raise _Stopped
+        return super().judge(request)
+
+
+def test_a_tune_resumed_while_judging_its_held_out_plates_needs_no_more_generations(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = _common(tmp_path)
+    tools = Offline()
+    tools.optimizer = lambda: _picks_grey
+    tools.reflector = lambda run, config: str
+    assert _invoke(["cache-references", *common], tools, capsys)[0] == 0
+    _calibrated(tmp_path)
+    calls: list[int] = []
+    # 12 dev judgments (2 candidates x 2 dev species x 3 judges), then a stop
+    # once the held-out plates are all made and their judging has begun.
+    tools.judges = lambda config: [_StopsAfter(spec.name, calls, 13) for spec in config.judges]
+    tune = ["tune", *common, "--budget", "4"]
+    # 4 candidate plates, 2 dev baselines and 12 held-out plates.
+    with pytest.raises(_Stopped):
+        main([*tune, "--max-generations", "18"], tools=tools)
+    capsys.readouterr()
+    assert len(tools.colour.calls) == 18
+
+    calls.clear()
+    tools.judges = lambda config: [PixelJudge(spec.name) for spec in config.judges]
+    code, out = _invoke([*tune, "--max-generations", "18"], tools, capsys)
+
+    assert code == 0, out
+    assert _at(out, "data", "plan", "generations_at_most") == 0
+    assert _at(out, "data", "plan", "holdout_generations_reserved") == 0
+    assert _at(out, "data", "plan", "candidate_selected") is True
+    assert len(tools.colour.calls) == 18
+    assert _at(out, "data", "best_sha256") == hashlib.sha256(GREY.encode()).hexdigest()
+    assert _at(out, "data", "decision") == {"accept": True, "reasons": []}
+
+
+def test_the_calibration_plan_counts_each_judgment_with_its_retries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = _common(tmp_path)
+
+    code, out = _invoke(
+        ["calibrate", *common, "--planted-species", "2", "--dry-run"], Offline(), capsys
+    )
+
+    assert code == 0, out
+    # 2 species x 3 planted kinds x 2 orders = 12 pairs, 3 judges, 2 attempts each.
+    assert _at(out, "data", "plan") == {
+        "pairs": 12,
+        "judgments_at_most": 36,
+        "judge_calls_at_most": 72,
+        "generations": 0,
+    }
 
 
 def test_spread_takes_one_species_per_body_plan_first(tmp_path: Path) -> None:

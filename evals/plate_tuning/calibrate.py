@@ -426,6 +426,12 @@ def calibrate(
     return results
 
 
-def calibration_plan(species: int, anchors: int, judges: int) -> dict[str, int]:
+def calibration_plan(species: int, anchors: int, judges: int, attempts: int) -> dict[str, int]:
+    """Judgments are one per pair and judge; each may take up to attempts paid calls."""
     pairs = (species * len(PLANTED_KINDS) + anchors) * 2
-    return {"pairs": pairs, "judgments_at_most": pairs * judges, "generations": 0}
+    return {
+        "pairs": pairs,
+        "judgments_at_most": pairs * judges,
+        "judge_calls_at_most": pairs * judges * attempts,
+        "generations": 0,
+    }

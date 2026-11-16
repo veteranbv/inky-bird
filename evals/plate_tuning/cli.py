@@ -45,8 +45,11 @@ from .tune import (
     ClaudeReflector,
     Optimizer,
     ReflectionLM,
+    bind_evaluation,
     candidate_generations,
+    evaluation_fingerprint,
     holdout_reservation,
+    selected_candidate,
     tune_plate,
 )
 
@@ -233,7 +236,7 @@ def _calibrate(
         if args.anchors is not None
         else ()
     )
-    estimate = calibration_plan(len(chosen), anchors, len(config.judges))
+    estimate = calibration_plan(len(chosen), anchors, len(config.judges), config.judge_attempts)
     if args.dry_run:
         return {
             "plan": estimate,
@@ -291,7 +294,9 @@ def _compare(
         raise HarnessError("The two arms need different names")
     species = select(panel, split=args.split, taxa=args.species)
     samples = args.samples or config.samples_per_species
-    estimate = plan(run, first, second, species, samples, len(config.judges)).as_dict()
+    estimate = plan(
+        run, first, second, species, samples, len(config.judges), config.judge_attempts
+    ).as_dict()
     budget = _run_budget(run, cap)
     gate = _gate(args, run, config)
     exploratory = not gate.passed and args.allow_uncalibrated
@@ -329,22 +334,33 @@ def _tune(
     holdout = [entry for entry in panel if entry.split == "holdout"]
     holdout_samples = args.holdout_samples or config.samples_per_species
     baseline = Arm(BASELINE_ARM, PLATE_INSTRUCTIONS, PROMPT_VERSION)
+    gate = _gate(args, run, config)
+    # Without a passing calibration tuning either refuses below or explores with every judge.
+    judging = _calibrated_only(config, gate) if gate.passed else config
+    bind_evaluation(run, evaluation_fingerprint(judging, panel, holdout_samples), record=False)
     # The held-out test's plates are set aside first; the optimiser gets the rest.
     # Its share is planned as one plate per metric call plus the dev baselines.
     # A resumed tune already paid for its earlier candidate plates; they count as used.
-    reserved = holdout_reservation(run, baseline, holdout, holdout_samples)
+    # Once a candidate is selected the optimiser does not run again, and only
+    # the held-out plates still missing are needed.
+    selection = selected_candidate(run)
+    selected = None if selection is None else selection[0]
+    reserved = holdout_reservation(run, baseline, holdout, holdout_samples, selected)
     done = min(candidate_generations(run, dev), args.budget)
-    needed = args.budget - done + missing_samples(run, [baseline], dev, 1) + reserved
+    optimiser = (
+        0 if selected is not None else args.budget - done + missing_samples(run, [baseline], dev, 1)
+    )
+    needed = optimiser + reserved
     estimate = {
         "generations_at_most": needed,
         "holdout_generations_reserved": reserved,
         "metric_calls": args.budget,
         "candidate_generations_done": done,
+        "candidate_selected": selected is not None,
         "dev_species": len(dev),
         "holdout_species": len(holdout),
     }
     budget = _run_budget(run, cap)
-    gate = _gate(args, run, config)
     if args.dry_run:
         return {"plan": estimate, **_cap_report(budget), "calibration": gate.as_dict()}
     if budget.remaining < needed:
@@ -356,7 +372,6 @@ def _tune(
     exploratory = _require_gate(args, gate)
     for entry in panel:
         frozen_references(run, entry)
-    judging = config if exploratory else _calibrated_only(config, gate)
     result = tune_plate(
         run,
         judging,

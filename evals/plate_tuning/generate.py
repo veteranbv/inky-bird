@@ -586,10 +586,20 @@ def generate_samples(
 def missing_samples(
     run: Run, arms: Sequence[Arm], species: Sequence[PanelSpecies], samples: int
 ) -> int:
+    """The plates still to be paid for.
+
+    A plate whose generation the ledger shows finished is prepared again
+    without paying (as generate_samples does), so it is not counted.
+    """
+    latest = Ledger(run.path(GENERATIONS_LEDGER)).latest("arm", "taxon_id", "index")
     return sum(
         1
         for arm in arms
         for entry in species
         for index in range(1, samples + 1)
         if completed_sample(run, arm, entry, index) is None
+        and not (
+            latest.get((arm.name, entry.taxon_id, index)) == "generation-finished"
+            and (sample_dir(run, arm, entry, index) / GENERATED).is_file()
+        )
     )

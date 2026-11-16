@@ -9,7 +9,7 @@ from typing import Protocol
 
 import pytest
 from PIL import Image
-from plate_tuning.config import HarnessError
+from plate_tuning.config import EvalConfig, HarnessError, JudgeSpec
 from plate_tuning.generate import GenerationRequest
 from plate_tuning.gepa_integration import gepa_optimizer
 from plate_tuning.panel import (
@@ -517,3 +517,41 @@ def test_a_candidate_whose_plate_cannot_be_made_keeps_its_completed_scores(
     best, mean = adapter.scores.best(items, PLATE_INSTRUCTIONS)
     assert best == GREY
     assert mean == pytest.approx(11 / 12)
+
+
+def test_tuning_refuses_to_resume_under_another_evaluation_configuration(
+    tmp_path: Path,
+) -> None:
+    run, panel, _ = make_run(tmp_path)
+
+    def tune(chosen: EvalConfig, holdout_samples: int = 1) -> object:
+        return tune_plate(
+            run,
+            chosen,
+            InstructionColourGenerator(),
+            [PixelJudge(spec.name) for spec in chosen.judges],
+            panel,
+            optimizer=stand_in_optimizer,
+            reflection_lm=ScriptedReflection(),
+            budget=Budget(100),
+            metric_calls=2,
+            holdout_samples=holdout_samples,
+            gate=passing_gate(chosen),
+        )
+
+    tune(config())
+    tune(config())
+    reweighted = replace(config(), anatomy_weight=0.6, lettering_weight=0.2)
+    other_model = replace(
+        config(), judges=(*config().judges[:2], JudgeSpec("fake-3", "codex", "model-y"))
+    )
+    fewer_judges = replace(config(), judges=config().judges[1:])
+    for changed, samples in ((reweighted, 1), (other_model, 1), (fewer_judges, 1), (config(), 2)):
+        with pytest.raises(HarnessError, match="use a new run directory"):
+            tune(changed, samples)
+
+    # A run directory tuned before fingerprints were recorded adopts the current one.
+    run.path("tune", "evaluation.json").unlink()
+    tune(reweighted)
+    with pytest.raises(HarnessError, match="score_weights changed"):
+        tune(config())

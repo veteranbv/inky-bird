@@ -239,8 +239,19 @@ def prepare_pair(
     Returns the pair id and, per judge, the letter the first plate carries.
     The key is written before any folder; each folder is published by one
     rename. A crash before a rename leaves a key and no folder, and the next
-    run rebuilds the folder from the key. A judge added later gets its own
-    draw, added to the key before its folder is built.
+    run rebuilds the folder from the key.
+    """
+    pair_id, sides = seal_pair(run, spec, judges)
+    for judge in judges:
+        _publish_folder(blind_folder(run, spec.identity, judge), spec, sides[judge], rubric)
+    return pair_id, sides
+
+
+def seal_pair(run: Run, spec: PairSpec, judges: Sequence[str]) -> tuple[str, dict[str, Side]]:
+    """Create (or reuse) the pair's key alone, building no folder.
+
+    A judge added later gets its own draw, added to the key before its folder
+    is built.
     """
     pair_id = run.opaque_id(spec.identity)
     sealed = key_path(run, spec.identity)
@@ -282,8 +293,6 @@ def prepare_pair(
         for judge in missing:
             sides[judge] = spec.first_sides.get(judge) or draw_side(run, spec.identity, judge)
         write_json(sealed, {**key, "sides": dict(sorted(sides.items()))})
-    for judge in judges:
-        _publish_folder(blind_folder(run, spec.identity, judge), spec, sides[judge], rubric)
     return pair_id, {judge: sides[judge] for judge in judges}
 
 
@@ -368,8 +377,20 @@ def judge_pairs(
     rubric = config.rubric()
     stamps = {judge.name: verdict_stamp(config, judge.name, rubric) for judge in judges}
     names = [judge.name for judge in judges]
-    prepared = [(spec, *prepare_pair(run, spec, rubric, names)) for spec in specs]
+    prepared = [(spec, *seal_pair(run, spec, names)) for spec in specs]
     ledger = Ledger(run.path("judgments.jsonl"))
+    pending = [
+        (spec, pair_id, sides, judge)
+        for spec, pair_id, sides in prepared
+        for judge in judges
+        if _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name]) is None
+    ]
+    # Only a judgment still to be made needs its folder; a stored verdict's
+    # folder was removed after judging and is not rebuilt.
+    for spec, _pair_id, sides, judge in pending:
+        _publish_folder(
+            blind_folder(run, spec.identity, judge.name), spec, sides[judge.name], rubric
+        )
     run_tasks(
         [
             functools.partial(
@@ -382,9 +403,7 @@ def judge_pairs(
                 ledger,
                 stamps[judge.name],
             )
-            for spec, pair_id, _side in prepared
-            for judge in judges
-            if _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name]) is None
+            for spec, pair_id, _sides, judge in pending
         ],
         parallel,
     )
