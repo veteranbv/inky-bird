@@ -193,6 +193,7 @@ cycle_lock_pid=""
 agents_recorded=false
 previously_loaded_labels=()
 stopped_labels=()
+stopping_label=""
 unrestored=()
 still_running=()
 leftovers=()
@@ -359,6 +360,11 @@ cleanup() {
   release_cycle_lock
   if [ "${installation_complete}" != true ]; then
     runtime_restored=true
+    # A stop signal can arrive once an agent is out but before it is recorded.
+    if [ -n "${stopping_label}" ] && \
+        ! launchctl print "gui/${uid}/com.${service_prefix}.${stopping_label}" >/dev/null 2>&1; then
+      stopped_labels+=("${stopping_label}")
+    fi
     if [ "${agents_recorded}" = true ]; then
       for label in serve refresh generate catalog-publish notifications scheduler; do
         stop_agent_for_restore "${label}"
@@ -667,8 +673,10 @@ PY
 
 if [ -f "${catalog_publish_plist}" ]; then
   if launchctl print "gui/${uid}/com.${service_prefix}.catalog-publish" >/dev/null 2>&1; then
+    stopping_label=catalog-publish
     launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"
     stopped_labels+=("catalog-publish")
+    stopping_label=""
   fi
   # A failure here puts the publisher back, without RunAtLoad, on exit.
   "${new_runtime}/.venv/bin/inky-bird" catalog-publish --config "${config_path}" --dry-run
@@ -676,8 +684,10 @@ fi
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "gui/${uid}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
+    stopping_label=${label}
     launchctl bootout "gui/${uid}/com.${service_prefix}.${label}"
     stopped_labels+=("${label}")
+    stopping_label=""
   fi
 done
 release_cycle_lock
