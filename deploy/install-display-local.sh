@@ -53,8 +53,10 @@ if spec is not None and spec.origin:
         print(project)
 '
 
-# The managed directory's copy of this script reinstalls the active runtime.
-if [ -d "${root}/.display-runtimes" ] && [ -x "${venv}/bin/python" ]; then
+# The managed directory's copy of this script reinstalls the active runtime; a
+# source checkout used as that directory installs what it holds.
+if [ -d "${root}/.display-runtimes" ] && [ -f "${root}/deploy/.managed-copy" ] && \
+    [ -x "${venv}/bin/python" ]; then
   active=$("${venv}/bin/python" -I -c "${installed_source_program}" 2>/dev/null || true)
   if [ -n "${active}" ] && [ "$(cd -P "${active}/.." 2>/dev/null && pwd || true)" = \
       "$(cd -P "${root}/.display-runtimes" && pwd)" ]; then
@@ -465,8 +467,12 @@ for runtime in "${runtimes_dir}"/*; do
     echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
   fi
 done
-# The managed directory's copy of this script reinstalls the active runtime.
-install -m 0755 "${root}/deploy/install-display-local.sh" "${app_dir}/deploy/"
+# The managed directory's copy of this script reinstalls the active runtime;
+# the mark tells it apart from a source checkout used as that directory.
+if [ ! "${root}/deploy" -ef "${app_dir}/deploy" ]; then
+  install -m 0755 "${root}/deploy/install-display-local.sh" "${app_dir}/deploy/"
+  : >"${app_dir}/deploy/.managed-copy"
+fi
 echo "Display node installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
 if [ -n "${previous_runtime}" ]; then

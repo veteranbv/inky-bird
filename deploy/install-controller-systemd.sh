@@ -14,7 +14,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The managed directory's copy of this script reinstalls the active runtime.
 # An environment moved out of the single-directory layout has no source of its
 # own; it still imports ${root}/src, so reinstall from there.
-if [ -L "${root}/.venv" ]; then
+# A source checkout used as the managed directory installs what it holds.
+if [ -L "${root}/.venv" ] && [ -f "${root}/deploy/.managed-copy" ]; then
   active_root=$(cd -P "${root}/.venv/.." 2>/dev/null && pwd || true)
   if [ -n "${active_root}" ] && [ -d "${active_root}/src" ]; then
     root=${active_root}
@@ -786,8 +787,12 @@ for runtime in "${runtimes_dir}"/*; do
     echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
   fi
 done
-# The managed directory's copy of this script reinstalls the active runtime.
-install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${app_dir}/deploy/"
+# The managed directory's copy of this script reinstalls the active runtime;
+# the mark tells it apart from a source checkout used as that directory.
+if [ ! "${root}/deploy" -ef "${app_dir}/deploy" ]; then
+  install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${app_dir}/deploy/"
+  : >"${app_dir}/deploy/.managed-copy"
+fi
 echo "Controller installed from ${root} into ${app_dir}."
 echo "Configuration: ${config_path}"
 if [ -n "${previous_runtime}" ]; then

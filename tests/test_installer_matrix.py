@@ -120,6 +120,9 @@ SINGLE_DIRECTORY_SHA256 = {
 # The installers of the last public release, v0.9.8, which owners upgrade from:
 # the inky-bird-frame names throughout, and no service prefix or runtimes.
 RELEASE = "release-0.9.8"
+# The application directory is the owner's source checkout: setup run there
+# installs whatever is checked out now.
+CHECKOUT = "checkout"
 RELEASE_DIRECTORY = ROOT / "tests/fake_bin/release_0_9_8"
 RELEASE_SHA256 = {
     "install-controller-systemd.sh": (
@@ -188,7 +191,7 @@ SCENARIOS = {
             "controller",
             "Darwin",
             (("FAKE_AGENTS", AGENTS),),
-            ("fresh", "single", "staged", "disabled", "rolled-back", RELEASE),
+            ("fresh", "single", "staged", "disabled", "rolled-back", RELEASE, CHECKOUT),
             "uninstall-controller.sh",
         ),
         Scenario(
@@ -207,6 +210,7 @@ SCENARIOS = {
                 "shared-staged",
                 "shared-both",
                 RELEASE,
+                CHECKOUT,
             ),
             "uninstall-controller-systemd.sh",
         ),
@@ -263,6 +267,7 @@ SCENARIOS = {
                 "shared-staged",
                 "shared-both",
                 RELEASE,
+                CHECKOUT,
             ),
             "uninstall-display-local.sh",
         ),
@@ -463,6 +468,12 @@ class Machine(Host):
             self.install(scenario, state, "old")
         elif state == RELEASE:
             self.install(scenario, "release", "old")
+        elif state == CHECKOUT:
+            Host.write_source(self.app, "old")
+            result = self.execute(self.script(scenario.script, source=self.app), scenario)
+            assert result.returncode == 0, result.stdout + result.stderr
+            if scenario.role == "display":
+                self.set_unit(f"{self.family}-display.timer", active=False)
         elif state == "disabled":
             self.install(scenario, "single", "old")
             if scenario.system == "Darwin":
@@ -541,7 +552,7 @@ class Machine(Host):
         assert role.tag == expected, (state, role.tag)
         for name, process in role.processes.items():
             assert process["runtime"] == expected, (state, name, process)
-        if state in ("staged", "shared-both", "shared"):
+        if state in ("staged", "shared-both", "shared", CHECKOUT):
             active = active_runtime(self, scenario.role)
             assert active is not None and (Path(active) / "src").is_dir(), state
             assert (Path(active) / "deploy" / installed_script(self, scenario).name).is_file()
@@ -1799,7 +1810,10 @@ class Group:
 
     def script(self, machine: Machine) -> Path:
         name = self.scenario.script if self.kind == "install" else self.scenario.uninstall
-        return machine.source / "deploy" / name
+        source = (
+            machine.app if self.kind == "install" and self.state == CHECKOUT else machine.source
+        )
+        return source / "deploy" / name
 
     def run(self, machine: Machine, injection: str | None) -> tuple[Outcome, list[list[str]]]:
         if injection is not None:
@@ -2480,7 +2494,11 @@ def prepare(machine: Machine, key: GroupKey) -> None:
     """
     kind, name, state = key
     scenario = SCENARIOS[name]
-    if kind == "install":
+    if kind == "install" and state == CHECKOUT:
+        # The owner checks out the new version where the old one was installed from.
+        Host.write_source(machine.app, "new")
+        machine.script(scenario.script, source=machine.app)
+    elif kind == "install":
         machine.script(scenario.script)
         if scenario.name == "remote-display":
             machine.script("install-display-local.sh")
