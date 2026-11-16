@@ -23,7 +23,7 @@ These guides describe `main`. If you run a tagged version, start with the
 - [Browse birds and keep collections](journal.md).
 - [Connect sources](discovery.md) or [import trips and history](history-imports.md).
 - [Choose a screen, wall view, or dashboard](presentation.md).
-- [Manage plate work and retries](owner-operations.md) or [set up notifications](notifications.md).
+- [Manage the plates in the works and retries](owner-operations.md) or [set up notifications](notifications.md).
 - [Change browser settings](settings.md) when your configuration is app-managed.
 
 ## Maintain an installation

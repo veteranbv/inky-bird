@@ -202,7 +202,7 @@ def test_historical_homepage_images_are_not_presented_as_current() -> None:
 
 def test_journal_screenshots_are_generic_demo_images_without_metadata() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "public approved artwork" in readme
+    assert "public plates" in readme
     assert "a sample collection" in readme
     for name, size in (
         ("journal-home.png", (430, 1200)),
@@ -275,7 +275,9 @@ FAKE_LAUNCHCTL = r"""#!/usr/bin/env bash
 # Synthetic launchctl: "$FAKE/loaded" lists loaded labels.
 touch "$FAKE/loaded"
 case "$1" in
-  print) grep -Fxq "${2##*/}" "$FAKE/loaded" ;;
+  print)
+    grep -Fxq "${2##*/}" "$FAKE/loaded" || exit 113
+    if grep -Fxq "${2##*/}" "$FAKE/running" 2>/dev/null; then echo "state = running"; fi ;;
   bootout)
     label=${2##*/}
     grep -Fxq "$label" "$FAKE/loaded" || exit 3
@@ -292,19 +294,52 @@ esac
 
 FAKE_SUDO = '#!/usr/bin/env bash\nexec "$@"\n'
 
+FAKE_DOCKER = r"""#!/usr/bin/env bash
+# Synthetic docker: "$FAKE/running", "$FAKE/containers" and "$FAKE/volumes" list names.
+echo "docker $*" >> "$FAKE/log"
+[ "$1" = compose ] && shift
+case "$*" in
+  *"ps --status running --services"*) cat "$FAKE/running" 2>/dev/null ;;
+  *"ps --all --quiet"*) cat "$FAKE/containers" 2>/dev/null ;;
+  "stop "*) : > "$FAKE/running" ;;
+  "volume ls"*) cat "$FAKE/volumes" 2>/dev/null ;;
+  "volume inspect "*) grep -Fxq "$3" "$FAKE/volumes" 2>/dev/null ;;
+esac
+"""
+
 
 def _bash_blocks(section: str) -> list[str]:
-    return re.findall(r"^```bash\n(.*?)^```$", section, re.MULTILINE | re.DOTALL)
+    blocks = re.findall(r"^( *)```bash\n(.*?)^\1```$", section, re.MULTILINE | re.DOTALL)
+    return [
+        "".join(line.removeprefix(indent) for line in block.splitlines(keepends=True))
+        for indent, block in blocks
+    ]
 
 
-def _native_backup_blocks() -> tuple[list[str], list[str]]:
-    guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
-    backup = guide.split("## Native controller backup", 1)[1].split(
-        "\n## Native controller restore", 1
-    )[0]
-    quiesce = backup.split("### 3. Quiesce scheduled work", 1)[1].split("\n### 4.", 1)[0]
-    restart = backup.split("### 5. Restart and verify", 1)[1]
-    return _bash_blocks(quiesce), _bash_blocks(restart)
+class _NativeSteps:
+    """The numbered backup steps for each service manager, in the order the guide gives them."""
+
+    def __init__(self) -> None:
+        guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
+        backup = guide.split("## Native controller backup", 1)[1].split(
+            "\n## Native controller restore", 1
+        )[0]
+        quiesce = backup.split("### 3. Quiesce scheduled work", 1)[1].split("\n### 4.", 1)[0]
+        restart = backup.split("### 5. Restart and verify", 1)[1]
+        self.systemd_stop = self._platform(quiesce, "systemd Linux")
+        self.launchd_stop = self._platform(quiesce, "macOS")
+        self.systemd_start = self._platform(restart, "systemd Linux")
+        self.launchd_start = self._platform(restart, "macOS")
+
+    @staticmethod
+    def _platform(section: str, name: str) -> list[str]:
+        blocks = _bash_blocks(section.split(f"#### On {name}", 1)[1].split("\n#### ", 1)[0])
+        assert blocks, name
+        return blocks
+
+    @staticmethod
+    def step(blocks: list[str], command: str) -> str:
+        return next(block for block in blocks if command in block)
 
 
 class _NativeHost:
@@ -320,6 +355,7 @@ class _NativeHost:
             ("systemctl", FAKE_SYSTEMCTL),
             ("launchctl", FAKE_LAUNCHCTL),
             ("sudo", FAKE_SUDO),
+            ("docker", FAKE_DOCKER),
         ):
             path = self.fake / "bin" / name
             path.write_text(script)
@@ -340,13 +376,16 @@ class _NativeHost:
             "".join(f"com.{self.family}.{label}\n" for label in loaded)
         )
 
-    def run(self, block: str, *, family: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, block: str, *, family: str | None = None, **variables: str
+    ) -> subprocess.CompletedProcess[str]:
         environment = {
             "PATH": f"{self.fake / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.home),
             "FAKE": str(self.fake),
             "BACKUP": str(self.backup),
             "FAMILY": family or self.family,
+            **variables,
         }
         return subprocess.run(
             ["bash", "-c", f"{block}\nprintf 'block-status=%s\\n' \"$?\""],
@@ -356,6 +395,25 @@ class _NativeHost:
             check=False,
             timeout=30,
         )
+
+    def run_steps(
+        self, blocks: list[str], *, family: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        # An operator runs the steps in order and stops at the first one that fails.
+        assert blocks
+        for block in blocks:
+            result = self.run(block, family=family)
+            if self.status(result) != 0:
+                break
+        return result
+
+    def paste(
+        self, blocks: list[str], *, family: str | None = None, **variables: str
+    ) -> subprocess.CompletedProcess[str]:
+        # An operator who pastes a whole section into one shell runs every block,
+        # including the ones after a check that failed.
+        assert blocks
+        return self.run("\n".join(blocks), family=family, **variables)
 
     @staticmethod
     def status(result: subprocess.CompletedProcess[str]) -> int:
@@ -371,18 +429,20 @@ class _NativeHost:
         return (self.backup / name).read_text().splitlines()
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+BASH = pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+
+
+@BASH
 @pytest.mark.parametrize("family", ["inky-bird", "inky-bird-frame"])
 def test_native_backup_quiesces_and_restores_an_app_managed_systemd_install(
     tmp_path: Path, family: str
 ) -> None:
-    (record, quiesce, *_), (start, _) = _native_backup_blocks()
+    steps = _NativeSteps()
     host = _NativeHost(tmp_path, family)
     host.install_units(**{"controller.service": "active", "scheduler.service": "active"})
 
-    for block in (record, quiesce):
-        result = host.run(block)
-        assert host.status(result) == 0, result.stderr
+    result = host.run_steps(steps.systemd_stop)
+    assert host.status(result) == 0, result.stderr
 
     assert host.recorded("native-active-systemd-units.txt") == [
         f"{family}-controller.service",
@@ -393,7 +453,7 @@ def test_native_backup_quiesces_and_restores_an_app_managed_systemd_install(
         f"stop {family}-controller.service",
     ]
 
-    result = host.run(start)
+    result = host.run_steps(steps.systemd_start)
     assert host.status(result) == 0, result.stderr
     assert host.calls()[2:] == [
         f"start {family}-controller.service",
@@ -401,11 +461,10 @@ def test_native_backup_quiesces_and_restores_an_app_managed_systemd_install(
     ]
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_backup_stops_timers_before_the_controller_and_skips_missing_units(
     tmp_path: Path,
 ) -> None:
-    (record, quiesce, *_), _ = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_units(
         **{
@@ -417,9 +476,8 @@ def test_native_backup_stops_timers_before_the_controller_and_skips_missing_unit
         }
     )
 
-    for block in (record, quiesce):
-        result = host.run(block)
-        assert host.status(result) == 0, result.stderr
+    result = host.run_steps(_NativeSteps().systemd_stop)
+    assert host.status(result) == 0, result.stderr
 
     assert host.recorded("native-active-systemd-units.txt") == [
         "inky-bird-controller.service",
@@ -428,22 +486,20 @@ def test_native_backup_stops_timers_before_the_controller_and_skips_missing_unit
     assert host.calls() == ["stop inky-bird-refresh.timer", "stop inky-bird-controller.service"]
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_backup_refuses_a_family_that_is_not_installed(tmp_path: Path) -> None:
-    (record, *_), _ = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_units(**{"controller.service": "active"})
 
-    result = host.run(record, family="inky-bird-frame")
+    result = host.run_steps(_NativeSteps().systemd_stop, family="inky-bird-frame")
 
     assert host.status(result) != 0
     assert "No installed inky-bird-frame-controller.service" in result.stderr
     assert host.calls() == []
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_backup_leaves_services_running_while_a_job_is_active(tmp_path: Path) -> None:
-    (record, quiesce, *_), _ = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_units(
         **{
@@ -453,31 +509,30 @@ def test_native_backup_leaves_services_running_while_a_job_is_active(tmp_path: P
         }
     )
 
-    assert host.status(host.run(record)) == 0
-    result = host.run(quiesce)
+    result = host.run_steps(_NativeSteps().systemd_stop)
 
     assert host.status(result) != 0
-    assert "One-shot service is not quiesced: inky-bird-generate.service" in result.stderr
+    assert "A job is still running" in result.stderr
+    assert "inky-bird-generate.service" in result.stderr
     assert host.calls() == ["stop inky-bird-generate.timer"]
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 @pytest.mark.parametrize("family", ["inky-bird", "inky-bird-frame"])
 def test_native_backup_quiesces_and_restores_app_managed_launch_agents(
     tmp_path: Path, family: str
 ) -> None:
-    (_, _, inspect, bootout), (_, bootstrap) = _native_backup_blocks()
+    steps = _NativeSteps()
     host = _NativeHost(tmp_path, family)
     host.install_agents("serve", "scheduler", loaded=("serve", "scheduler"))
 
-    for block in (inspect, bootout):
-        result = host.run(block)
-        assert host.status(result) == 0, result.stderr
+    result = host.run_steps(steps.launchd_stop)
+    assert host.status(result) == 0, result.stderr
 
     assert host.recorded("native-loaded-launchagents.txt") == ["serve", "scheduler"]
     assert host.calls() == [f"bootout com.{family}.serve", f"bootout com.{family}.scheduler"]
 
-    result = host.run(bootstrap)
+    result = host.run_steps(steps.launchd_start)
     assert host.status(result) == 0, result.stderr
     assert host.calls()[2:] == [
         f"bootstrap com.{family}.serve",
@@ -485,75 +540,279 @@ def test_native_backup_quiesces_and_restores_app_managed_launch_agents(
     ]
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_backup_refuses_launch_agents_of_another_family(tmp_path: Path) -> None:
-    (_, _, inspect, _), _ = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_agents("serve", loaded=("serve",))
 
-    result = host.run(inspect, family="inky-bird-frame")
+    result = host.run_steps(_NativeSteps().launchd_stop, family="inky-bird-frame")
 
     assert host.status(result) != 0
     assert "No installed com.inky-bird-frame.serve LaunchAgent" in result.stderr
+    assert host.calls() == []
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_backup_bootout_stops_at_the_first_agent_that_fails(tmp_path: Path) -> None:
-    (_, _, _, bootout), _ = _native_backup_blocks()
+    steps = _NativeSteps()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_agents("serve", "scheduler", loaded=("scheduler",))
     (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
 
-    result = host.run(bootout)
+    result = host.run(steps.step(steps.launchd_stop, "launchctl bootout"))
 
     assert host.status(result) != 0
     assert host.calls() == []
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_restart_refuses_a_foreign_unit_and_starts_nothing(tmp_path: Path) -> None:
-    _, (start, _) = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_units(**{"controller.service": "inactive", "other.service": "inactive"})
     (host.backup / "native-active-systemd-units.txt").write_text(
         "inky-bird-controller.service\ninky-bird-other.service\n"
     )
 
-    result = host.run(start)
+    result = host.run_steps(_NativeSteps().systemd_start)
 
     assert host.status(result) != 0
     assert "Unexpected unit in" in result.stderr
     assert host.calls() == []
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
+def test_native_restart_refuses_a_unit_without_the_family_prefix(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "inactive"})
+    (host.backup / "native-active-systemd-units.txt").write_text("controller.service\n")
+
+    result = host.run_steps(_NativeSteps().systemd_start)
+
+    assert host.status(result) != 0
+    assert "Unexpected unit in" in result.stderr
+    assert host.calls() == []
+
+
+@BASH
 def test_native_restart_refuses_a_foreign_label_and_bootstraps_nothing(tmp_path: Path) -> None:
-    _, (_, bootstrap) = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_agents("serve", "other", loaded=())
     (host.backup / "native-loaded-launchagents.txt").write_text("serve\nother\n")
 
-    result = host.run(bootstrap)
+    result = host.run_steps(_NativeSteps().launchd_start)
 
     assert host.status(result) != 0
     assert "Unexpected label in" in result.stderr
     assert host.calls() == []
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
+@BASH
 def test_native_restart_refuses_a_missing_launch_agent_and_bootstraps_nothing(
     tmp_path: Path,
 ) -> None:
-    _, (_, bootstrap) = _native_backup_blocks()
     host = _NativeHost(tmp_path, "inky-bird")
     host.install_agents("serve", loaded=())
     (host.backup / "native-loaded-launchagents.txt").write_text("serve\nscheduler\n")
 
-    result = host.run(bootstrap)
+    result = host.run_steps(_NativeSteps().launchd_start)
 
     assert host.status(result) != 0
     assert "Recorded LaunchAgent is missing" in result.stderr
     assert host.calls() == []
+
+
+def _guide_part(start: str, end: str) -> str:
+    guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
+    return guide.split(start, 1)[1].split(end, 1)[0]
+
+
+@BASH
+def test_pasted_systemd_quiesce_stops_nothing_more_while_a_job_is_active(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(
+        **{
+            "controller.service": "active",
+            "generate.timer": "active",
+            "generate.service": "active",
+        }
+    )
+
+    result = host.paste(_NativeSteps().systemd_stop)
+
+    assert host.status(result) != 0
+    assert "A job is still running: inky-bird-generate.service" in result.stderr
+    assert host.calls() == ["stop inky-bird-generate.timer"]
+
+
+@BASH
+def test_pasted_launch_agent_quiesce_unloads_nothing_while_a_job_is_active(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_agents("serve", "generate", loaded=("serve", "generate"))
+    (host.fake / "running").write_text("com.inky-bird.generate\n")
+
+    result = host.paste(_NativeSteps().launchd_stop)
+
+    assert host.status(result) != 0
+    assert "A job is still running: com.inky-bird.generate" in result.stderr
+    assert host.calls() == []
+
+
+@BASH
+def test_pasted_restart_starts_nothing_from_a_record_with_a_foreign_entry(
+    tmp_path: Path,
+) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    host.install_units(**{"controller.service": "inactive", "other.service": "inactive"})
+    (host.backup / "native-active-systemd-units.txt").write_text(
+        "inky-bird-controller.service\ninky-bird-other.service\n"
+    )
+    host.install_agents("serve", "other", loaded=())
+    (host.backup / "native-loaded-launchagents.txt").write_text("serve\nother\n")
+
+    for blocks in (_NativeSteps().systemd_start, _NativeSteps().launchd_start):
+        result = host.paste(blocks)
+        assert host.status(result) != 0
+        assert "Unexpected " in result.stderr
+    assert host.calls() == []
+
+
+def _native_restore_blocks() -> list[str]:
+    return _bash_blocks(_guide_part("3. Move any existing files", "4. Confirm that the controller"))
+
+
+def _restore_paths(root: Path) -> dict[str, str]:
+    return {
+        "CONFIG": str(root / "live/config/config.toml"),
+        "WORKSPACE": str(root / "live/workspace"),
+        "CATALOG": str(root / "live/catalog"),
+        "STATE": str(root / "live/state"),
+    }
+
+
+def _saved_backup(backup: Path) -> None:
+    for part in ("config", "workspace", "catalog", "state"):
+        (backup / part).mkdir()
+    (backup / "config/config.toml").write_text("saved config\n")
+    (backup / "state/journal.json").write_text("old\n")
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("rsync") is None, reason="requires bash and rsync"
+)
+def test_pasted_native_restore_copies_nothing_over_an_existing_path(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    _saved_backup(host.backup)
+    paths = _restore_paths(tmp_path)
+    live_journal = Path(paths["STATE"]) / "journal.json"
+    live_journal.parent.mkdir(parents=True)
+    live_journal.write_text("LIVE\n")
+
+    result = host.paste(_native_restore_blocks(), **paths)
+
+    assert host.status(result) != 0
+    assert "Move this aside before restoring" in result.stderr
+    assert live_journal.read_text() == "LIVE\n"
+    assert not Path(paths["CONFIG"]).exists()
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("rsync") is None, reason="requires bash and rsync"
+)
+def test_pasted_native_restore_fills_empty_paths_privately(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    _saved_backup(host.backup)
+    paths = _restore_paths(tmp_path)
+
+    result = host.paste(_native_restore_blocks(), **paths)
+
+    assert host.status(result) == 0, result.stderr
+    assert (Path(paths["STATE"]) / "journal.json").read_text() == "old\n"
+    assert Path(paths["CONFIG"]).read_text() == "saved config\n"
+    assert Path(paths["CONFIG"]).stat().st_mode & 0o777 == 0o600
+
+
+def _docker_blocks(start: str, end: str, backup: Path) -> list[str]:
+    part = _guide_part(start, end).replace("/path/to/private-backup/inky-bird-docker", str(backup))
+    return _bash_blocks(part)
+
+
+def _docker_writes(host: _NativeHost) -> list[str]:
+    return [call for call in host.calls() if re.search(r" (stop|create|start|up|run) ", call + " ")]
+
+
+@BASH
+def test_pasted_docker_stop_leaves_a_running_bootstrap_alone(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "running").write_text("controller\nbootstrap\n")
+    blocks = _docker_blocks("### 1. Stop writers", "\n### 2.", host.backup)
+
+    result = host.paste(blocks)
+
+    assert host.status(result) != 0
+    assert "Bootstrap is still running" in result.stderr
+    assert _docker_writes(host) == []
+
+
+@BASH
+def test_pasted_docker_stop_stops_the_writers_and_confirms_it(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "running").write_text("controller\nscheduler\n")
+    blocks = _docker_blocks("### 1. Stop writers", "\n### 2.", host.backup)
+
+    result = host.paste(blocks)
+
+    assert host.status(result) == 0, result.stderr
+    assert _docker_writes(host) == ["docker compose stop scheduler controller bootstrap"]
+
+
+@BASH
+def test_pasted_docker_restore_creates_nothing_in_a_project_that_exists(tmp_path: Path) -> None:
+    host = _NativeHost(tmp_path, "inky-bird")
+    (host.fake / "volumes").write_text("inky-bird-frame-restore_controller-data\n")
+    blocks = _docker_blocks(
+        "2. Choose a restore project name", "3. Restore the controller archive", host.backup
+    )
+
+    result = host.paste(blocks)
+
+    assert host.status(result) != 0
+    assert "inky-bird-frame-restore" in result.stderr
+    assert _docker_writes(host) == []
+
+
+def test_backup_guide_gives_short_numbered_steps() -> None:
+    guide = (ROOT / "docs/backup.md").read_text(encoding="utf-8")
+    blocks = _bash_blocks(guide)
+    assert blocks
+    longest = max(len(block.splitlines()) for block in blocks)
+    assert longest <= 16, longest
+
+
+def test_backup_job_check_names_only_the_separate_job_services() -> None:
+    # An app-managed install runs every job inside the scheduler, which the
+    # pasted check cannot see, so the step must send the owner to its log.
+    guide = " ".join((ROOT / "docs/backup.md").read_text(encoding="utf-8").split())
+    assert "first checks that no job" not in guide
+    assert guide.count("This checks the separate job services") == 2
+    assert guide.count("on an app-managed install, first check the scheduler log") == 2
+    assert "and the scheduler log shows no unfinished job" in guide
+
+
+def test_owner_guides_use_plain_grammar_and_wall_view_limits() -> None:
+    def text(name: str) -> str:
+        return " ".join((ROOT / name).read_text(encoding="utf-8").split())
+
+    readme = text("README.md")
+    assert "A plate Inky made that is waiting for you to look at it." in readme
+    journal, operations = text("docs/journal.md"), text("docs/owner-operations.md")
+    for guide in (journal, operations):
+        assert "plates that **Needs a hand**" not in guide
+        assert "at its next refresh while it shows **On my frame**" in guide
+    assert "Start only what step 3 recorded." not in text("docs/backup.md")
 
 
 def test_backup_snippets_that_can_fail_run_in_a_subshell() -> None:
@@ -907,15 +1166,19 @@ def test_docs_say_head_answers_like_get() -> None:
     assert "Every `GET` route answers `HEAD`" in reference
 
 
-def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+def _owner_page_literals() -> list[str]:
     web = ROOT / "src/inky_bird_frame/web"
-    literals = [
+    return [
         next(group for group in match.groups() if group is not None).strip()
         for path in sorted(web.iterdir())
         if path.suffix in {".js", ".html"}
         for match in UI_TEXT.finditer(path.read_text(encoding="utf-8"))
     ]
+
+
+def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    literals = _owner_page_literals()
     # Text a person reads starts with a capital; identifiers, classes and routes do not.
     shown = [text for text in literals if text[:1].isupper() and "/" not in text]
     rows = _markdown_table(readme, "| Word | Meaning |")
@@ -923,6 +1186,23 @@ def test_readme_glossary_uses_words_the_owner_page_shows() -> None:
     for word, _meaning in rows:
         label = re.compile(rf"\b{re.escape(word.strip('*'))}s?\b", re.IGNORECASE)
         assert any(label.search(text) for text in shown), word
+    words = {word.strip("*") for word, _meaning in rows}
+    for name in (
+        "Your journal",
+        "Plate",
+        "New plate",
+        "On my frame",
+        "Favorite",
+        "Collections",
+        "More plates",
+        "Play",
+        "Wall frame",
+        "Sources",
+        "In the works",
+        "Needs a hand",
+        "Noted",
+    ):
+        assert name in words, name
 
 
 def test_operations_guide_says_upgraded_birds_get_twelve_counted_tries() -> None:
@@ -948,3 +1228,89 @@ def test_notifications_guide_says_the_new_species_record_fails_quietly() -> None
     guide = " ".join((ROOT / "docs/notifications.md").read_text(encoding="utf-8").split())
     assert "A notice or health record that cannot be saved" not in guide
     assert "A queued notice or health record that cannot be saved leaves a warning" in guide
+
+
+RETIRED_SCREEN_NAMES = (
+    "Saved birds",
+    "Current and saved",
+    "current selection",
+    "Plate work",
+    "Available artwork",
+    "Recent owner operations",
+    "Refresh observations",
+    "Queue selected for the next scheduled check",
+    "Retry selected as soon as possible",
+    "Review missing-plate requests",
+    "Manage → Displays",
+    "Physical wall panel",
+    "Import or review history",
+    "Use retained history without an upload",
+    "Frame mode",
+    "Owner Frame",
+)
+
+
+def test_docs_use_the_names_the_owner_pages_show_now() -> None:
+    # The walkthrough transcribes a film recorded before the names changed.
+    for path in [path for path in _markdown_files() if path.name != "walkthrough.md"]:
+        text = " ".join(_without_fenced_code(path.read_text(encoding="utf-8")).split())
+        for retired in RETIRED_SCREEN_NAMES:
+            assert retired.lower() not in text.lower(), (path.name, retired)
+
+
+def test_documented_manage_paths_name_controls_the_pages_show() -> None:
+    literals = set(_owner_page_literals())
+    checked = 0
+    for path in _markdown_files():
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        for match in re.finditer(r"\*\*(Manage|Collections|Birds) → (.+?)\*\*", text):
+            for part in (match.group(1), *match.group(2).split(" → ")):
+                checked += 1
+                assert part in literals, (path.name, match.group(0), part)
+    assert checked
+
+
+def test_journal_guide_names_every_area_and_the_one_tap_frame_change() -> None:
+    guide = " ".join((ROOT / "docs/journal.md").read_text(encoding="utf-8").split())
+    literals = set(_owner_page_literals())
+    for name in (
+        "Home",
+        "Birds",
+        "Collections",
+        "Play",
+        "Manage",
+        "Your birds",
+        "More plates",
+        "On my frame",
+        "Favorites",
+        "Add to Favorites",
+        "Add to my frame",
+        "Remove from my frame",
+        "Undo",
+        "Change my frame",
+        "In the works",
+        "Needs a hand",
+        "Birds and sources",
+        "Plates",
+        "Frame and displays",
+        "Integrations",
+        "System",
+        "Wall frame",
+    ):
+        assert f"**{name}**" in guide, name
+        assert name in literals, name
+    assert "Preview changes to" not in guide
+
+
+def test_guides_state_the_accepted_limits() -> None:
+    def text(name: str) -> str:
+        return " ".join((ROOT / name).read_text(encoding="utf-8").split())
+
+    assert "may stop at the 30-minute limit" in text("docs/installation.md")
+    assert "the no-refetch check runs only in Chromium" in text("CONTRIBUTING.md")
+    assert "reads the whole history" in text("docs/journal.md")
+    presentation = text("docs/presentation.md")
+    assert "`panel_health` is `recent`, `stale` or `unknown`" in presentation
+    assert "can read `stale` while an empty wall view has paused" in presentation
+    assert "two refreshes finish at the same moment" in text("docs/notifications.md")
+    assert "Linux does not promise" in text("docs/discovery.md")

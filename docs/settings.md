@@ -29,7 +29,7 @@ starts the native services. Follow the [installation guide](installation.md)
 for operating-system prerequisites and service-account behavior.
 
 New configurations have no selected sources and generation off. You can create
-your owner account, browse approved artwork, save selections and open Frame
+your owner account, browse plates, save selections and open Play
 without Codex authentication or a paid generation. A refresh with no sources
 is healthy and makes no requests to observation services. To make new plates
 later, turn generation on in Settings. It uses your own Codex account, and that
