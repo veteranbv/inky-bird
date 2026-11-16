@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import shutil
 import ssl
 import stat
@@ -37,6 +38,11 @@ MAX_NATIVE_ACCESS_BYTES = 64 * 1024
 # One JSON-quoted path; the separate PEM bound leaves room for combined root sets.
 MAX_NATIVE_TLS_BYTES = 16 * 1024
 MAX_NATIVE_CA_BYTES = 4 * 1024 * 1024
+# Names a private KEY=VALUE file that every command loads before reading
+# configuration. The path itself is not secret, so service definitions may carry it.
+PRIVATE_ENVIRONMENT_FILE_ENV = "INKY_BIRD_ENV_FILE"
+MAX_PRIVATE_ENVIRONMENT_BYTES = 64 * 1024
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MANAGED_CONTROLLER_DEFAULT_EXECUTABLE_PATH = (
     "/usr/local/sbin",
     "/usr/local/bin",
@@ -216,7 +222,13 @@ def native_oidc_environment(config: AppConfig, config_path: Path) -> dict[str, s
     return {name: secret}
 
 
-def _read_native_trust_file(path: Path, maximum: int) -> bytes:
+class _OversizedFileError(ValueError):
+    """A protected file is larger than its reader accepts."""
+
+
+def _read_native_trust_file(path: Path, maximum: int, *, private: bool = False) -> bytes:
+    # Trust files may be readable by others; a private file is owner-only.
+    forbidden_mode = 0o077 if private else 0o022
     directory = path.parent.resolve(strict=True)
     for parent in (directory, *directory.parents):
         info = parent.stat()
@@ -232,12 +244,12 @@ def _read_native_trust_file(path: Path, maximum: int) -> bytes:
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
             or info.st_uid not in (0, os.getuid())
-            or stat.S_IMODE(info.st_mode) & 0o022
+            or stat.S_IMODE(info.st_mode) & forbidden_mode
         ):
             raise ValueError("Unsafe native trust file")
         body = handle.read(maximum + 1)
     if len(body) > maximum:
-        raise ValueError("Native trust file exceeds its supported size")
+        raise _OversizedFileError("Native trust file exceeds its supported size")
     return body
 
 
@@ -273,6 +285,99 @@ def native_tls_environment(config_path: Path) -> dict[str, str]:
             "Native TLS trust requires only SSL_CERT_FILE with a protected, readable PEM bundle"
         ) from None
     return {"SSL_CERT_FILE": str(bundle)}
+
+
+def private_environment_path() -> Path | None:
+    """Return the private environment file named by INKY_BIRD_ENV_FILE, if any."""
+    value = os.environ.get(PRIVATE_ENVIRONMENT_FILE_ENV, "")
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise ConfigurationError(
+            f"{PRIVATE_ENVIRONMENT_FILE_ENV} must be the absolute path of the private "
+            "environment file"
+        )
+    return path
+
+
+def _private_environment_value(value: str) -> str | None:
+    """Return one KEY=VALUE value without shell expansion, or None if malformed."""
+    if value.startswith('"'):
+        if len(value) < 2 or not value.endswith('"'):
+            return None
+        try:
+            decoded: object = json.loads(value)
+        except ValueError:
+            return None
+        return decoded if isinstance(decoded, str) else None
+    if value.startswith("'"):
+        inner = value[1:-1]
+        if len(value) < 2 or not value.endswith("'") or "'" in inner:
+            return None
+        return inner
+    return None if '"' in value or "'" in value else value
+
+
+def read_private_environment(path: Path) -> dict[str, str]:
+    """Read KEY=VALUE lines from an owner-only file; errors never contain values."""
+    try:
+        body = _read_native_trust_file(path, MAX_PRIVATE_ENVIRONMENT_BYTES, private=True)
+    except FileNotFoundError:
+        raise ConfigurationError(
+            f"The private environment file {path} does not exist; create it or unset "
+            f"{PRIVATE_ENVIRONMENT_FILE_ENV}"
+        ) from None
+    except _OversizedFileError:
+        raise ConfigurationError(
+            f"The private environment file {path} is larger than 64 KiB; keep only the "
+            "settings this service needs in it"
+        ) from None
+    except (OSError, ValueError):
+        raise ConfigurationError(
+            f"The private environment file {path} must be a regular file, not a link, owned "
+            "by this account or root, readable only by its owner (mode 0600), in folders "
+            "that only their owner or root can change"
+        ) from None
+    try:
+        text = body.decode("utf-8")
+    except UnicodeError:
+        raise ConfigurationError(f"The private environment file {path} is not UTF-8 text") from None
+    environment: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, raw_value = line.partition("=")
+        value = _private_environment_value(raw_value.strip()) if separator else None
+        if (
+            value is None
+            or _ENVIRONMENT_NAME.fullmatch(name) is None
+            or name in environment
+            or not value.isprintable()
+        ):
+            raise ConfigurationError(
+                f"Line {number} of the private environment file {path} is not a valid "
+                "setting; write each one once as NAME=value, NAME=\"value\" or NAME='value'"
+            )
+        environment[name] = value
+    return environment
+
+
+def load_private_environment() -> list[str]:
+    """Add the private environment file's settings that the process does not already have.
+
+    Returns the names that were added, so a caller can remove them again.
+    """
+    path = private_environment_path()
+    if path is None:
+        return []
+    added: list[str] = []
+    for name, value in read_private_environment(path).items():
+        if name not in os.environ:
+            os.environ[name] = value
+            added.append(name)
+    return added
 
 
 def generation_species_timeout_seconds(config: AppConfig) -> int:
@@ -507,6 +612,22 @@ def _supported_platform(role: InstallationRole) -> DiagnosticCheck:
 def _python_check() -> DiagnosticCheck:
     version = platform.python_version()
     return _pass("python", f"Python {version} satisfies the 3.11+ requirement")
+
+
+def _private_environment_check() -> DiagnosticCheck | None:
+    try:
+        path = private_environment_path()
+        if path is None:
+            return None
+        read_private_environment(path)
+    except ConfigurationError as exc:
+        return _fail(
+            "private_environment",
+            "The private environment file cannot be used",
+            detail=str(exc),
+            remediation=f"Fix the file, or unset {PRIVATE_ENVIRONMENT_FILE_ENV} to stop using it.",
+        )
+    return _pass("private_environment", f"Private environment file is in use: {path}")
 
 
 def _config_permissions(path: Path) -> DiagnosticCheck:
@@ -960,6 +1081,9 @@ def _display_boot_config_check() -> DiagnosticCheck:
 
 def doctor(role: InstallationRole, config_path: Path) -> DoctorReport:
     checks: list[DiagnosticCheck] = [_supported_platform(role), _python_check()]
+    private_environment = _private_environment_check()
+    if private_environment is not None:
+        checks.append(private_environment)
     try:
         config = load_config(config_path)
     except (ConfigurationError, OSError) as exc:
