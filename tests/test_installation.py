@@ -377,10 +377,19 @@ def test_native_managed_copy_preserves_required_package_inputs(
         path.write_text("synthetic package input\n")
     (source / "deploy" / installer).write_text("# synthetic staging input\n")
     script = (project / "deploy" / installer).read_text()
-    staging = script.split('if [ "${root}" != "${app_dir}" ]; then\n', 1)[1].split("\nfi\n", 1)[0]
+    start = script.index("stage_runtime_source() {\n")
+    staging = script[start : script.index("\n}\n", start) + 3]
     # Execute only real file staging, not an installer, service or package manager.
     subprocess.run(
-        ["bash", "-e", "-c", "root=$1; app_dir=$2\n" + staging, "stage", str(source), str(managed)],
+        [
+            "bash",
+            "-e",
+            "-c",
+            f'root=$1\n{staging}stage_runtime_source "$2"\n',
+            "stage",
+            str(source),
+            str(managed),
+        ],
         check=True,
         capture_output=True,
     )

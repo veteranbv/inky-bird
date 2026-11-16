@@ -3,19 +3,25 @@
 Every tool records its call in ``$FAKE/log`` and keeps its state under
 ``$FAKE``. Lines in ``$FAKE/fail`` name the calls that should fail. Nothing
 here contacts a network, a real service manager or a real package index.
+
+Every call is also numbered in ``$FAKE/steps``. Each line of ``$FAKE/inject``
+(``<step> <mode>``) makes the call with that number fail, makes it and every later sudo
+call fail (``expire``), or stops the installer once it completes: SIGTERM
+(``kill``), SIGHUP (``hangup``) or SIGINT to its whole process group
+(``interrupt``; a display installer run over ssh then gets SIGHUP at once, as
+when the connection drops). Status queries are numbered but never injected.
 """
 
 from __future__ import annotations
 
-import fcntl
+import contextlib
 import json
 import os
-import plistlib
-import shlex
-import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+# Every installer step starts a fresh interpreter; importing what only some
+# tools need where they use it takes about a quarter off each call.
 
 FAKE = Path(os.environ.get("FAKE", "/nonexistent"))
 TOOLS = Path(__file__).resolve()
@@ -41,7 +47,157 @@ def _save(name: str, value: dict[str, object]) -> None:
     (FAKE / f"{name}.json").write_text(json.dumps(value, sort_keys=True))
 
 
+STEP_LOCK_TIMEOUT_SECONDS = 30.0
+KILL = False
+# Which stop ``KILL`` sends once the call completes.
+STOP = "kill"
+
+
+def _step_lock() -> Path:
+    import time
+
+    lock = FAKE / "steps.lock"
+    deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            lock.mkdir()
+            return lock
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.001)
+
+
+def step(tool: str, arguments: list[str], *, action: bool) -> str:
+    """Number this call and return what the matrix injects at it, if anything."""
+    steps = FAKE / "steps"
+    if not FAKE.is_dir():
+        return ""
+    lock = _step_lock()
+    try:
+        index = len(steps.read_text().splitlines()) if steps.exists() else 0
+        with steps.open("a") as handle:
+            kind = "action" if action else "query"
+            handle.write("\t".join([str(index), kind, tool, *arguments]).replace("\n", " ") + "\n")
+    finally:
+        lock.rmdir()
+    inject = FAKE / "inject"
+    if not action or not inject.exists():
+        return ""
+    # One line per injected fault; a second one lands in the first one's cleanup.
+    for line in inject.read_text().splitlines():
+        at_text, mode = line.split()
+        at = int(at_text)
+        if mode == "expire" and tool == "sudo" and index >= at:
+            (FAKE / "sudo-expired").touch()
+            return "fail"
+        if index == at:
+            return "fail" if mode == "expire" else mode
+    return ""
+
+
+def _installer_pid(*, outermost: bool = False) -> int | None:
+    """The nearest installer script above this call, not one of its subshells,
+    or with ``outermost`` the one the owner started (a remote display deploy
+    runs the local installer on the other end of ssh)."""
+
+    import subprocess
+
+    def parent_and_command(pid: int) -> tuple[int, str]:
+        output = subprocess.run(
+            ["/bin/ps", "-ww", "-o", "ppid=", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if not output:
+            return 0, ""
+        parent, _, command = output.partition(" ")
+        return int(parent), command.strip()
+
+    pid = os.getppid()
+    found = None
+    while pid > 1:
+        parent, command = parent_and_command(pid)
+        if "/deploy/install-" in command or "/deploy/uninstall-" in command:
+            while parent > 1 and parent_and_command(parent)[1] == command:
+                pid = parent
+                parent = parent_and_command(pid)[0]
+            if not outermost:
+                return pid
+            found = pid
+        pid = parent
+    if found is not None:
+        return found
+    return None
+
+
+STOP_SIGNALS = {"kill": "SIGTERM", "hangup": "SIGHUP", "interrupt": "SIGINT"}
+
+
+def kill_installer(mode: str = "kill") -> None:
+    """Stop the installer: TERM or HUP to the script itself, or INT to its whole
+    process group as Ctrl-C does. This call ignores the interrupt it sends."""
+    import signal
+
+    pid = _installer_pid(outermost=mode == "interrupt")
+    if pid is None:
+        return
+    if mode == "interrupt":
+        nearest = _installer_pid()
+        if nearest is not None and nearest != pid:
+            # The call ran on the display: the connection drops while its
+            # installer waits for this call, not once it has gone on.
+            os.kill(nearest, signal.SIGHUP)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        os.killpg(os.getpgid(pid), signal.SIGINT)
+    else:
+        os.kill(pid, getattr(signal, STOP_SIGNALS[mode]))
+
+
+def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> int:
+    """Replace this process, or run and wait when the installer is stopped after."""
+    environment = dict(os.environ) if environment is None else environment
+    if KILL:
+        import subprocess
+
+        return subprocess.run(arguments, env=environment, check=False).returncode
+    os.execvpe(arguments[0], arguments, environment)
+    return 1
+
+
+def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path) -> int:
+    """The cycle lock helper runs in the background until the installer ends it;
+    stop the installer once the helper holds the lock, and end with it."""
+    import signal
+    import subprocess
+    import time
+
+    global KILL
+    KILL = False
+    helper = subprocess.Popen(command, env=environment)
+
+    def finish(signum: int, frame: object) -> None:
+        # Only unwind here; waiting inside a handler can deadlock on Popen's lock.
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, finish)
+    try:
+        deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
+        while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        kill_installer(STOP)
+        return helper.wait()
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if helper.poll() is None:
+            helper.terminate()
+        helper.wait()
+
+
 def _cycle_lock_held() -> bool:
+    import fcntl
+
     lock = Path(os.environ["FAKE_STATE_DIR"]) / "controller.lock"
     if not lock.exists():
         return False
@@ -60,22 +216,97 @@ def runtime_tag(executable: str) -> str:
     return tag.read_text().strip() if tag.exists() else "missing"
 
 
-def wrapper(tool: str) -> str:
-    """A venv executable that passes its own path so the fake knows its runtime."""
-    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} {tool}"
-    return f'#!/bin/sh\nexec {command} "$0" "$@"\n'
+def resolve_runtime(executable: str) -> dict[str, object]:
+    """Which code a command started from ``executable`` runs, and from where.
+
+    A controller venv carries its runtime's tag; the display's shared venv
+    runs the source its editable install names, or a regular install's copy.
+    """
+    venv = Path(executable).parent.parent
+    site = site_packages(venv)
+    source = editable_source(site)
+    # A controller venv carries its tag; it runs from the venv directory itself.
+    if (Path(os.path.realpath(venv)) / "tag").exists():
+        tag, directory = runtime_tag(executable), Path(os.path.realpath(venv))
+    # A regular install in site-packages is imported before any editable one.
+    elif (site / "inky_bird_frame").is_dir():
+        tag, directory = "regular", site / "inky_bird_frame"
+    elif source is not None:
+        tag_file = source / "runtime-tag"
+        tag = tag_file.read_text().strip() if tag_file.exists() else "missing"
+        directory = Path(os.path.realpath(source))
+    else:
+        tag, directory = runtime_tag(executable), Path(os.path.realpath(venv))
+    inode = directory.stat().st_ino if directory.exists() else 0
+    return {"runtime": tag, "directory": str(directory), "inode": inode}
+
+
+def editable_source(site: Path) -> Path | None:
+    """The source an editable install makes Python import: of the ``.pth``
+    entries, in the order Python reads them, the first that holds the
+    package, else the first (whose source is gone)."""
+    sources = [Path(pth.read_text().split()[0]) for pth in sorted(site.glob("*.pth"))]
+    found = [source for source in sources if (source / "inky_bird_frame").is_dir()]
+    return next(iter(found or sources), None)
+
+
+def distribution_name(project: Path) -> str:
+    """The distribution a project builds: the last release's, or today's."""
+    import re
+
+    pyproject = project / "pyproject.toml"
+    text = pyproject.read_text() if pyproject.exists() else ""
+    found = re.search(r'^name = "([^"]+)"', text, re.MULTILINE)
+    return found.group(1) if found else "inky-bird"
+
+
+# The commands each distribution installs: the release had only the old name.
+SCRIPTS = {"inky-bird": ("inky-bird", "inky-bird-frame"), "inky-bird-frame": ("inky-bird-frame",)}
+
+
+# Fakes reach each other through PATH (sudo runs systemctl, ssh runs an
+# installer); one that found itself again would nest without end, so every
+# wrapper counts how deep it is and refuses past the limit.
+DEPTH_LIMIT = 3
+DEPTH_GUARD = f"""depth=$(( ${{FAKE_DEPTH:-0}} + 1 ))
+if [ "$depth" -gt {DEPTH_LIMIT} ]; then
+  echo "fake tools nested more than {DEPTH_LIMIT} deep" >&2
+  exit 70
+fi
+export FAKE_DEPTH=$depth
+"""
+
+
+def wrapper(tool: str, *, own_path: bool = True) -> str:
+    """A stand-in executable for ``tool``; ``own_path`` passes its path so a
+    venv's fake knows which runtime it belongs to."""
+    import shlex
+
+    # Imported, not run as a script, so its compiled form is cached; -I keeps the
+    # caller's directory and PYTHON* settings out of the fake's own imports.
+    program = f"import sys; sys.path.insert(0, {str(TOOLS.parent)!r}); import fake_tools; "
+    program += "raise SystemExit(fake_tools.main())"
+    command = f"{shlex.quote(sys.executable)} -I -S -c {shlex.quote(program)} {tool}"
+    own = ' "$0"' if own_path else ""
+    return f'#!/bin/sh\n{DEPTH_GUARD}exec {command}{own} "$@"\n'
 
 
 def build_venv(project: Path) -> None:
     """Create the synthetic venv ``uv sync`` would build for ``project``."""
     bin_dir = project / ".venv/bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for name, tool in (("python", "venv-python"), ("inky-bird", "inky-bird")):
+    scripts = SCRIPTS[distribution_name(project)]
+    for name, tool in (("python", "venv-python"), *((script, "inky-bird") for script in scripts)):
         path = bin_dir / name
         path.write_text(wrapper(tool))
         path.chmod(0o755)
     tag = project / "src/runtime-tag"
     (project / ".venv/tag").write_text(tag.read_text() if tag.exists() else "missing\n")
+    # uv installs the project editable: the venv imports this source tree by
+    # absolute path, wherever the venv itself is later moved.
+    site = site_packages(project / ".venv")
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "_inky_bird.pth").write_text(f"{os.path.abspath(project)}/src\n")
 
 
 def uname(arguments: list[str]) -> int:
@@ -97,14 +328,17 @@ def identity(arguments: list[str]) -> int:
 
 def system_python(arguments: list[str]) -> int:
     if arguments and arguments[0].endswith("native_names.py"):
+        import shlex
+
         for name in ("service_prefix", "app_dir", "support_dir", "config_path"):
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
-    os.execv(sys.executable, [sys.executable, *arguments])
-    return 1
+    return _exec([sys.executable, *arguments])
 
 
 def launchctl(arguments: list[str]) -> int:
+    import plistlib
+
     loaded = _state("launchd")
     verb = arguments[0]
     if verb == "print":
@@ -119,6 +353,9 @@ def launchctl(arguments: list[str]) -> int:
             return 5
         del loaded[label]
         _save("launchd", loaded)
+        processes = _state("processes")
+        processes.pop(label, None)
+        _save("processes", processes)
         return 0
     if verb == "bootstrap":
         payload = plistlib.loads(Path(arguments[2]).read_bytes())
@@ -129,13 +366,17 @@ def launchctl(arguments: list[str]) -> int:
         if f"bootstrap-{generation}:{label.split('.')[-1]}" in _rules():
             _log("launchctl", "bootstrap-failed", label, generation)
             return 5
-        tag = runtime_tag(payload["ProgramArguments"][0])
+        process = resolve_runtime(payload["ProgramArguments"][0])
+        tag = str(process["runtime"])
         loaded[label] = {
             "generation": generation,
             "runtime": tag,
             "run_at_load": payload.get("RunAtLoad"),
         }
         _save("launchd", loaded)
+        processes = _state("processes")
+        processes[label] = process
+        _save("processes", processes)
         _log("launchctl", "bootstrap", label, generation, tag)
         return 0
     print(f"unexpected launchctl call: {arguments}", file=sys.stderr)
@@ -143,6 +384,8 @@ def launchctl(arguments: list[str]) -> int:
 
 
 def plutil(arguments: list[str]) -> int:
+    import plistlib
+
     assert arguments[:3] == ["-replace", "RunAtLoad", "-bool"], arguments
     path = Path(arguments[4])
     payload = plistlib.loads(path.read_bytes())
@@ -176,11 +419,54 @@ def _record_process(unit: str, running: bool) -> None:
             if line.startswith("ExecStart="):
                 executable = line.partition("=")[2].split()[0]
     if executable:
-        runtime = Path(os.path.realpath(executable)).parent.parent.parent
-        processes[unit] = {"runtime": runtime_tag(executable), "directory": str(runtime)}
+        processes[unit] = resolve_runtime(executable)
     else:
         processes.pop(unit, None)
     _save("processes", processes)
+
+
+# How many state queries a cycle a timer starts is seen as running for.
+CYCLE_POLLS = 3
+
+
+def _oneshot(unit: str) -> bool:
+    """A service that runs to its end: Type=oneshot without RemainAfterExit,
+    never "active", "activating" while it runs."""
+    return unit.endswith(".service") and not unit.endswith(
+        ("-controller.service", "-scheduler.service")
+    )
+
+
+def _end_cycle(unit: str) -> None:
+    busy = _state("busy")
+    busy.pop(unit, None)
+    _save("busy", busy)
+    _record_process(unit, running=False)
+
+
+def _start_cycle(timer: str) -> None:
+    """A timer that starts may fire at once: its service runs, "activating"."""
+    service = timer.removesuffix(".timer") + ".service"
+    if not (_units_dir() / service).exists():
+        return
+    busy = _state("busy")
+    busy[service] = CYCLE_POLLS
+    _save("busy", busy)
+    _record_process(service, running=True)
+
+
+def _record_run(unit: str) -> None:
+    """A oneshot service started and waited for: which version that run was."""
+    path = _units_dir() / unit
+    executable = ""
+    for line in path.read_text().splitlines() if path.exists() else ():
+        if line.startswith("ExecStart="):
+            executable = line.partition("=")[2].split()[0]
+    runs = _state("runs")
+    ran = runs.setdefault(unit, [])
+    assert isinstance(ran, list)
+    ran.append(str(resolve_runtime(executable)["runtime"]) if executable else "missing")
+    _save("runs", runs)
 
 
 def systemctl(arguments: list[str]) -> int:
@@ -199,6 +485,9 @@ def systemctl(arguments: list[str]) -> int:
                 busy[unit] = remaining - 1
                 _save("busy", busy)
                 _log("busy-poll", unit, remaining - 1)
+                if remaining == 1 and _oneshot(unit):
+                    # The cycle ends after this answer.
+                    _record_process(unit, running=False)
                 print("activating")
             else:
                 print("active" if record["active"] else "inactive")
@@ -219,16 +508,23 @@ def systemctl(arguments: list[str]) -> int:
         return 5
     if verb == "disable" and not exists:
         return 1
-    if verb in ("start", "restart"):
+    if verb in ("start", "restart") and _oneshot(unit):
+        _record_run(unit)
+        record["active"] = False
+    elif verb in ("start", "restart"):
         # start leaves an already running process, and its runtime, alone.
         if verb == "restart" or not record["active"]:
             _record_process(unit, running=True)
+            if unit.endswith(".timer"):
+                _start_cycle(unit)
         record["active"] = True
     elif verb == "stop":
         if unit.endswith("scheduler.service") or unit.endswith("generate.service"):
             _log("lock-at-stop", unit, "lock-held" if _cycle_lock_held() else "lock-free")
         record["active"] = False
         _record_process(unit, running=False)
+        if _oneshot(unit):
+            _end_cycle(unit)
     elif verb == "enable":
         record["enabled"] = True
     elif verb == "disable":
@@ -236,6 +532,8 @@ def systemctl(arguments: list[str]) -> int:
         if "--now" in arguments:
             record["active"] = False
             _record_process(unit, running=False)
+            if _oneshot(unit):
+                _end_cycle(unit)
     _save("systemd", units)
     return 0
 
@@ -247,6 +545,8 @@ def sudo(arguments: list[str]) -> int:
     rules = _rules()
     expired = FAKE / "sudo-expired"
     if arguments == ["-v"]:
+        if expired.exists():
+            return 1
         # ``sudo-v-expires-after:N`` lets the first N validations succeed.
         counter = FAKE / "sudo-validations"
         count = int(counter.read_text()) if counter.exists() else 0
@@ -276,11 +576,12 @@ def sudo(arguments: list[str]) -> int:
     if f"sudo:{arguments[0]}" in rules:
         print("sudo: a password is required", file=sys.stderr)
         return 1
-    os.execvp(arguments[0], arguments)
-    return 1
+    return _exec(arguments)
 
 
 def rsync(arguments: list[str]) -> int:
+    import shutil
+
     paths: list[str] = []
     skip = False
     for argument in arguments:
@@ -307,22 +608,80 @@ def rsync(arguments: list[str]) -> int:
     return 0
 
 
+def _remote_installers(group: int) -> list[int]:
+    """The installer scripts running in ``group``, not their subshells."""
+    import subprocess
+
+    listing = subprocess.run(
+        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    members: dict[int, tuple[int, str]] = {}
+    for line in listing.splitlines():
+        pid, parent, pgid, *command = line.split(None, 3)
+        if int(pgid) == group and command:
+            members[int(pid)] = (int(parent), command[0])
+    return [
+        pid
+        for pid, (parent, command) in members.items()
+        if "/deploy/install-" in command and members.get(parent, (0, ""))[1] != command
+    ]
+
+
 def ssh(arguments: list[str]) -> int:
+    """Run the command as the display would: in its own process group, which
+    a Ctrl-C on this side never reaches. Stopping this end drops the
+    connection: the installer running on the other end is told with a hangup,
+    finishes its own cleanup, and this end then fails as ssh does; any other
+    command there runs to its end."""
+    import signal
+    import subprocess
+
     command = arguments[-1]
     _log("ssh", command)
-    result = subprocess.run(
-        ["bash", "-c", command], stdin=sys.stdin, capture_output=True, text=True, check=False
+    group: list[int] = []
+    dropped: list[int] = []
+
+    def hang_up() -> None:
+        for pid in [installer for leader in group for installer in _remote_installers(leader)]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGHUP)
+
+    def drop(signum: int, frame: object) -> None:
+        dropped.append(signum)
+        hang_up()
+
+    # Caught signals return to their defaults in the command it starts.
+    for stop in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop, drop)
+    remote = subprocess.Popen(
+        [os.environ["FAKE_BASH"], "-c", command],
+        stdin=sys.stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        process_group=0,
     )
-    sys.stderr.write(result.stderr)
-    output = result.stdout
+    group.append(remote.pid)
+    # The test run kills this group too if anything in it outlives the run.
+    with (FAKE / "groups").open("a") as handle:
+        handle.write(f"{remote.pid}\n")
+    if dropped:
+        hang_up()
+    stdout, stderr = remote.communicate()
+    sys.stderr.write(stderr)
+    if dropped:
+        return 255
     if (
         "ssh-stage-noise" in _rules()
         and command.startswith("bash -s --")
-        and result.returncode == 0
+        and remote.returncode == 0
     ):
-        output = "Welcome to the synthetic display\n" + output
-    sys.stdout.write(output)
-    return result.returncode
+        stdout = "Welcome to the synthetic display\n" + stdout
+    sys.stdout.write(stdout)
+    return remote.returncode
 
 
 def site_packages(venv: Path) -> Path:
@@ -342,12 +701,78 @@ def _python_path(venv: Path, runtime: Path) -> str:
     return os.pathsep.join(entries)
 
 
-def _remove(venv: Path, name: str) -> None:
+def _package_paths(venv: Path, name: str) -> list[Path]:
+    """What a distribution put in site-packages: the renamed one a regular
+    package or the release's editable path, today's its editable path."""
     site = site_packages(venv)
     if name == "inky-bird-frame":
-        shutil.rmtree(site / "inky_bird_frame", ignore_errors=True)
-    else:
-        (site / "_inky_bird.pth").unlink(missing_ok=True)
+        return [site / "inky_bird_frame", site / "_inky_bird_frame.pth"]
+    return [site / "_inky_bird.pth"]
+
+
+def _remove(venv: Path, name: str) -> None:
+    import shutil
+
+    for path in _package_paths(venv, name):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _remove_distribution(venv: Path, removed: str, kept: str, backup: Path | None) -> int:
+    """Remove one distribution's files, except the commands the other one also
+    installed; with ``backup``, move them there behind a plan to put them back."""
+    import shutil
+
+    _log("remove-distribution", removed, kept)
+    dists = _state("pip")
+    gone = dists.pop(removed, None)
+
+    # An install made elsewhere names no commands of its own.
+    def scripts(dist: object) -> set[str]:
+        return set(dist.get("scripts", ())) if isinstance(dist, dict) else set()
+
+    paths = _package_paths(venv, removed)
+    paths += [venv / "bin" / script for script in sorted(scripts(gone) - scripts(dists.get(kept)))]
+    paths = [path for path in paths if path.exists() or path.is_symlink()]
+    if backup is not None:
+        backup.mkdir(exist_ok=True)
+        plan = {
+            "distribution": [removed, gone],
+            "files": [[str(path), str(backup / str(number))] for number, path in enumerate(paths)],
+        }
+        (backup / "plan.json").write_text(json.dumps(plan))
+    _save("pip", dists)
+    for number, path in enumerate(paths):
+        if backup is not None:
+            shutil.move(str(path), str(backup / str(number)))
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    return 0
+
+
+def _restore_distribution(venv: Path, backup: Path) -> int:
+    """Put back what ``_remove_distribution`` moved aside, as its plan lists."""
+    import shutil
+
+    plan_path = backup / "plan.json"
+    _log("restore-distribution", backup.name)
+    if not plan_path.exists():
+        return 0
+    plan = json.loads(plan_path.read_text())
+    for original, saved in plan["files"]:
+        if Path(saved).exists() or Path(saved).is_symlink():
+            Path(original).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(saved, original)
+    name, record = plan["distribution"]
+    if record is not None:
+        dists = _state("pip")
+        dists[name] = record
+        _save("pip", dists)
+    return 0
 
 
 def _pip(venv: Path, arguments: list[str]) -> int:
@@ -361,11 +786,16 @@ def _pip(venv: Path, arguments: list[str]) -> int:
             print("synthetic index failure", file=sys.stderr)
             return 1
         source = arguments[-1].split("[", 1)[0]
-        dists["inky-bird"] = {"source": source}
+        name = distribution_name(Path(source))
+        dists[name] = {"source": source, "scripts": list(SCRIPTS[name])}
         _save("pip", dists)
         site = site_packages(venv)
         site.mkdir(parents=True, exist_ok=True)
-        (site / "_inky_bird.pth").write_text(f"{source}/src\n")
+        (site / f"_{name.replace('-', '_')}.pth").write_text(f"{source}/src\n")
+        for script in SCRIPTS[name]:
+            path = venv / "bin" / script
+            path.write_text(wrapper("inky-bird"))
+            path.chmod(0o755)
         return 0
     if verb == "uninstall":
         dists.pop(arguments[-1], None)
@@ -373,6 +803,17 @@ def _pip(venv: Path, arguments: list[str]) -> int:
         _remove(venv, arguments[-1])
         return 0
     return 0
+
+
+def _executable(source: str, prefix: str) -> str:
+    """The command a controller program's services start, as it names it."""
+    import re
+
+    named = re.search(r'executable = app_dir / "\.venv/bin/([\w-]+)"', source)
+    if named is not None:
+        return named.group(1)
+    assert 'executable = app_dir / ".venv/bin" / service_prefix' in source, "unknown executable"
+    return prefix
 
 
 def venv_python(executable: str, arguments: list[str]) -> int:
@@ -397,33 +838,40 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         program = arguments[1]
         if "distribution(" in program:
             removed, kept = arguments[2:4]
-            _log("remove-distribution", removed, kept)
-            dists = _state("pip")
-            dists.pop(removed, None)
-            _save("pip", dists)
-            _remove(venv, removed)
-            return 0
+            backup = Path(arguments[4]) if len(arguments) > 4 else None
+            return _remove_distribution(venv, removed, kept, backup)
+        if "plan.json" in program:
+            return _restore_distribution(venv, Path(arguments[2]))
         _log("python-c", tag)
         # -S keeps the test interpreter's own site-packages out of the import path.
-        return subprocess.run(
-            [sys.executable, "-S", "-c", program, *arguments[2:]], env=environment, check=False
-        ).returncode
+        command = [sys.executable, "-S", "-c", program, *arguments[2:]]
+        if KILL and "controller.lock" in program:
+            return _hold_then_stop(command, environment, Path(arguments[3]))
+        # Replacing this process keeps the PID the installer waits on or kills.
+        return _exec(command, environment)
     if arguments[:1] == ["-"]:
         source = sys.stdin.read()
         _log("heredoc", tag)
         if f"{tag}:heredoc" in rules:
             print("synthetic configuration rejection", file=sys.stderr)
             return 1
-        prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
+        # The release named its services before the name was chosen at install.
+        prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird-frame")
+        # The macOS program takes one plist per agent, then the source and app.
+        plists = len([argument for argument in arguments if argument.endswith(".plist")])
         if "sync_public_catalog" in source:
             # The real program syncs the catalog from the install source first.
-            root = Path(arguments[7] if "plistlib" in source else arguments[2])
+            root = Path(arguments[plists + 1] if "plistlib" in source else arguments[2])
             if not (root / "catalog").is_dir():
                 print("synthetic catalog source is missing", file=sys.stderr)
                 return 1
+        if "plistlib" in source or "controller_systemd_units" in source:
+            executable = _executable(source, prefix)
         if "plistlib" in source:
-            paths = arguments[1:7]
-            app_dir = Path(arguments[8])
+            import plistlib
+
+            paths = arguments[1 : plists + 1]
+            app_dir = Path(arguments[plists + 2])
             order = (
                 "serve",
                 "refresh",
@@ -433,13 +881,22 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                 "scheduler",
             )
             wanted = os.environ.get("FAKE_AGENTS", "serve refresh").split()
-            for label, path in zip(order, paths, strict=True):
+            if plists == 5:
+                # The release always rendered these three agents.
+                wanted += ["serve", "refresh", "generate"]
+            for label, path in zip(order[: len(paths)], paths, strict=True):
                 if label in wanted:
                     payload = {
                         "Label": f"com.{prefix}.{label}",
-                        "ProgramArguments": [str(app_dir / ".venv/bin/inky-bird"), label],
+                        "ProgramArguments": [
+                            str(app_dir / ".venv/bin" / executable),
+                            label,
+                        ],
                         "RunAtLoad": True,
                         "Comment": "new",
+                        # Which runtime rendered it, so a definition left
+                        # from the new version differs from the one it replaced.
+                        "RenderedBy": tag,
                     }
                     Path(path).write_bytes(plistlib.dumps(payload))
                 else:
@@ -447,11 +904,15 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         elif "controller_systemd_units" in source:
             unit_dir, app_dir, user = Path(arguments[1]), Path(arguments[3]), arguments[6]
             for name in os.environ["FAKE_UNITS"].split():
-                content = "[Unit]\n# new\n"
+                content = f"[Unit]\n# new\n# rendered by {tag}\n"
                 if name.endswith(".service"):
-                    content += f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/inky-bird\n"
+                    content += (
+                        f"[Service]\nUser={user}\nExecStart={app_dir}/.venv/bin/{executable}\n"
+                    )
                 (unit_dir / f"{prefix}-{name}").write_text(content)
         elif "display_systemd_units" in source:
+            import subprocess
+
             # Render with whichever package the venv's import order selects.
             return subprocess.run(
                 [sys.executable, "-S", "-", *arguments[1:]],
@@ -482,28 +943,66 @@ def inky_bird(executable: str, arguments: list[str]) -> int:
     return 0
 
 
-def main() -> int:
-    tool, arguments = sys.argv[1], sys.argv[2:]
+def _is_query(tool: str, arguments: list[str]) -> bool:
+    """Calls that only read state; failing one would just be a different answer."""
+    if tool in ("uname", "id"):
+        return True
+    if tool == "launchctl":
+        return arguments[:1] == ["print"]
+    if tool == "systemctl":
+        return arguments[:1] in (["show"], ["is-active"], ["is-enabled"])
     if tool == "venv-python":
-        return venv_python(arguments[0], arguments[1:])
+        return arguments[1:4] == ["-m", "pip", "show"]
+    return False
+
+
+def _injected_failure(tool: str, arguments: list[str]) -> int:
+    if tool == "sudo":
+        print("sudo: a password is required", file=sys.stderr)
+        return 1
+    print(f"{tool}: synthetic failure", file=sys.stderr)
     if tool == "inky-bird":
-        return inky_bird(arguments[0], arguments[1:])
+        error = {"type": "internal", "message": "synthetic failure"}
+        print(json.dumps({"ok": False, "error": error, "schema_version": 1}))
+    return {"rsync": 23, "ssh": 255, "launchctl": 5}.get(tool, 1)
+
+
+def main() -> int:
+    global KILL, STOP
+    tool, arguments = sys.argv[1], sys.argv[2:]
     if tool == "build-venv":
         build_venv(Path(arguments[0]))
         return 0
-    handlers = {
-        "uname": uname,
-        "id": identity,
-        "python3": system_python,
-        "launchctl": launchctl,
-        "plutil": plutil,
-        "uv": uv,
-        "systemctl": systemctl,
-        "sudo": sudo,
-        "rsync": rsync,
-        "ssh": ssh,
-    }
-    return handlers[tool](arguments)
+    if tool == "kill-installer":
+        kill_installer(*arguments)
+        return 0
+    recorded = arguments[1:] if tool in ("venv-python", "inky-bird") else arguments
+    injected = step(tool, recorded, action=not _is_query(tool, arguments))
+    if injected == "fail":
+        return _injected_failure(tool, arguments)
+    KILL = injected in STOP_SIGNALS
+    STOP = injected if KILL else "kill"
+    if tool == "venv-python":
+        status = venv_python(arguments[0], arguments[1:])
+    elif tool == "inky-bird":
+        status = inky_bird(arguments[0], arguments[1:])
+    else:
+        handlers = {
+            "uname": uname,
+            "id": identity,
+            "python3": system_python,
+            "launchctl": launchctl,
+            "plutil": plutil,
+            "uv": uv,
+            "systemctl": systemctl,
+            "sudo": sudo,
+            "rsync": rsync,
+            "ssh": ssh,
+        }
+        status = handlers[tool](arguments)
+    if KILL:
+        kill_installer(STOP)
+    return status
 
 
 if __name__ == "__main__":

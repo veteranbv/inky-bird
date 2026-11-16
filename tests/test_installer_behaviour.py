@@ -8,11 +8,14 @@ test directory instead.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
 import json
 import os
 import plistlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -24,8 +27,14 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tests/fake_bin/fake_tools.py"
+_spec = importlib.util.spec_from_file_location("fake_tools", TOOLS)
+assert _spec is not None and _spec.loader is not None
+fake_tools = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(fake_tools)
 # macOS runs these scripts with its bundled Bash 3.2; exercise that when present.
 MACOS_BASH = "/bin/bash" if Path("/bin/bash").exists() else "bash"
+# The shell a display's ssh session runs, by absolute path.
+REMOTE_BASH = shutil.which("bash") or "/bin/bash"
 FAKE_CONFIG_MODULE = """import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,7 +56,7 @@ TAG = (Path(__file__).resolve().parents[1] / "runtime-tag").read_text().strip()
 
 def display_systemd_units(config, *, executable, app_dir, config_path, user, service_prefix):
     service = f"# new\\n# rendered by {TAG}\\n[Service]\\nUser={user}\\nExecStart={executable}\\n"
-    timer = "# new\\n"
+    timer = f"# new\\n# rendered by {TAG}\\n"
     return {f"{service_prefix}-display.service": service, f"{service_prefix}-display.timer": timer}
 """
 # 0.9.x rendered display units without a service prefix argument.
@@ -56,6 +65,8 @@ def display_systemd_units(config, *, executable, app_dir, config_path, user):
     names = ("inky-bird-frame-display.service", "inky-bird-frame-display.timer")
     return {name: "# old\\n" for name in names}
 """
+# The file commands installers use to build, switch and remove runtimes.
+FILE_COMMANDS = ("mv", "ln", "rm", "cp", "install", "mkdir", "mktemp", "rmdir")
 SYSTEM_PATHS = {
     "install-controller.sh": ("/Library/LaunchDaemons", "/usr/bin/plutil"),
     "uninstall-controller.sh": (),
@@ -67,10 +78,184 @@ SYSTEM_PATHS = {
 }
 
 
+# Every installer run gets this long, then its whole process group is killed.
+RUN_TIMEOUT_SECONDS = 120
+
+
+def group_members(group: int) -> list[str]:
+    """Live processes in one process group, as ``pid command`` lines."""
+    listing = subprocess.run(
+        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    members = []
+    for line in listing.splitlines():
+        pid, pgid, stat, *command = line.split(None, 3)
+        if int(pgid) == group and not stat.startswith("Z"):
+            members.append(f"{pid} {' '.join(command)}")
+    return members
+
+
+def end_group(group: int) -> list[str]:
+    """Kill whatever is left of a run's process group; return what had survived it."""
+    survivors = group_members(group)
+    if survivors:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(group, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while group_members(group) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    return survivors
+
+
+def run_contained(
+    command: list[str],
+    environment: dict[str, str],
+    timeout: int = RUN_TIMEOUT_SECONDS,
+    *,
+    watch: Callable[[int, Path], contextlib.AbstractContextManager[None]] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an installer in its own process group; nothing it starts outlives it.
+
+    A run that times out, or leaves a process behind, fails the test after the
+    whole group is killed and reaped. ``watch`` is entered with the group's ID
+    and the file listing the groups of the commands the fake ssh ran, for as
+    long as the run lasts.
+    """
+    assert timeout <= RUN_TIMEOUT_SECONDS
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    # Commands the fake ssh ran on the "display", each in a group of its own.
+    remote_groups = Path(environment.get("FAKE", "/nonexistent")) / "groups"
+
+    def end_all() -> list[str]:
+        survivors = end_group(process.pid)
+        if remote_groups.exists():
+            for group in remote_groups.read_text().split():
+                # A group that has ended may have its number reused by another
+                # one; only a group still running this machine's commands is ours.
+                if any(
+                    str(remote_groups.parent.parent) in member
+                    for member in group_members(int(group))
+                ):
+                    survivors += end_group(int(group))
+            remote_groups.unlink()
+        return survivors
+
+    with watch(process.pid, remote_groups) if watch is not None else contextlib.nullcontext():
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            end_all()
+            process.communicate()
+            raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        survivors = end_all()
+    assert not survivors, f"{command[-1]} left processes running: {survivors}"
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def system_tool(name: str) -> str:
+    """The real command, by absolute path, never a fake of the same name."""
+    found = shutil.which(name, path=f"/bin{os.pathsep}/usr/bin")
+    assert found is not None, name
+    return found
+
+
+def tool_wrapper(tool: str, *, own_path: bool = False) -> str:
+    """A shell stand-in that hands one fake tool its arguments."""
+    return str(fake_tools.wrapper(tool, own_path=own_path))
+
+
+def coreutil_wrapper(name: str, real: str) -> str:
+    """A shell stand-in that numbers a file command as a step before running it."""
+    mkdir, rmdir, wc, tr = (
+        shlex.quote(system_tool(tool)) for tool in ("mkdir", "rmdir", "wc", "tr")
+    )
+    return f"""#!/bin/sh
+{fake_tools.DEPTH_GUARD}lock="$FAKE/steps.lock"
+while ! {mkdir} "$lock" 2>/dev/null; do :; done
+index=0
+if [ -f "$FAKE/steps" ]; then
+  index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
+fi
+{{
+  printf '%s\taction\t{name}' "$index"
+  printf '\t%s' "$@" | {tr} '\n' ' '
+  printf '\n'
+}} >> "$FAKE/steps"
+{rmdir} "$lock"
+mode=""
+if [ -f "$FAKE/inject" ]; then
+  while read -r at injected; do
+    if [ "$at" = "$index" ]; then
+      mode=$injected
+    fi
+  done < "$FAKE/inject"
+fi
+case "$mode" in
+  fail | expire)
+    echo "{name}: synthetic failure" >&2
+    exit 1
+    ;;
+  kill | interrupt | hangup)
+    status=0
+    {shlex.quote(real)} "$@" || status=$?
+    # The interrupt goes to the whole process group; this call has completed.
+    trap '' INT
+    {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} kill-installer "$mode"
+    exit "$status"
+    ;;
+esac
+# GNU install and cp refuse to copy a file onto itself; the BSD tools on macOS
+# accept it, so the fakes refuse it the GNU way everywhere.
+if [ "{name}" = install ] || [ "{name}" = cp ]; then
+  source=""
+  target=""
+  for argument in "$@"; do
+    source=$target
+    target=$argument
+  done
+  if [ -d "$target" ] && [ -n "$source" ]; then
+    target="$target/${{source##*/}}"
+  fi
+  if [ -n "$source" ] && [ -e "$source" ] && [ "$source" -ef "$target" ]; then
+    echo "{name}: '$source' and '$target' are the same file" >&2
+    exit 1
+  fi
+fi
+# macOS mktemp ignores TMPDIR without a template; keep temporary files in the test root.
+if [ "{name}" = mktemp ] && [ "$*" = "-d" ]; then
+  exec {shlex.quote(real)} -d "$TMPDIR/tmp.XXXXXXXXXX"
+fi
+exec {shlex.quote(real)} "$@"
+"""
+
+
 class Host:
     """A temp HOME, a source checkout and synthetic system tools."""
 
-    def __init__(self, root: Path, system: str, family: str = "inky-bird") -> None:
+    def __init__(
+        self,
+        root: Path,
+        system: str,
+        family: str = "inky-bird",
+        *,
+        number_file_commands: bool = False,
+        create: bool = True,
+    ) -> None:
+        """``create=False`` names the paths of a host already on disk, such as a copy."""
         self.root = root
         self.system = system
         self.family = family
@@ -85,7 +270,10 @@ class Host:
         self.units = self.fake / "systemd-system"
         self.agents = self.home / "Library/LaunchAgents"
         self.venv = self.home / ".virtualenvs/pimoroni"
-        for directory in (self.bin, self.home, self.support, self.state, self.units):
+        self.tmp = root / "tmp"
+        if not create:
+            return
+        for directory in (self.bin, self.home, self.support, self.state, self.units, self.tmp):
             directory.mkdir(parents=True, exist_ok=True)
         (self.fake / "LaunchDaemons").mkdir()
         (self.fake / "log").write_text("")
@@ -103,11 +291,14 @@ class Host:
             "ssh",
         ):
             path = self.bin / tool
-            path.write_text(
-                f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} "
-                f'{tool} "$@"\n'
-            )
+            path.write_text(tool_wrapper(tool))
             path.chmod(0o755)
+        if number_file_commands:
+            # The matrix numbers and injects file changes as steps, too.
+            for command in FILE_COMMANDS:
+                path = self.bin / command
+                path.write_text(coreutil_wrapper(command, system_tool(command)))
+                path.chmod(0o755)
         self.write_source(self.source, "new")
 
     @staticmethod
@@ -125,20 +316,36 @@ class Host:
         for name in ("pyproject.toml", "uv.lock", "README.md", "LICENSE", "docs/browser-access.md"):
             (directory / name).write_text(f"synthetic {tag} {name}\n")
 
-    def script(self, name: str, quiesce_timeout: int = 3) -> Path:
-        text = (ROOT / "deploy" / name).read_text()
+    def script(
+        self,
+        name: str,
+        quiesce_timeout: int = 3,
+        *,
+        source: Path | None = None,
+        text: str | None = None,
+        system_paths: tuple[str, ...] | None = None,
+    ) -> Path:
+        """Copy an installer into a checkout with its system paths in this host;
+        ``system_paths`` names them for a ``text`` that is not today's script."""
+        text = (ROOT / "deploy" / name).read_text() if text is None else text
         replacements = {
             "/Library/LaunchDaemons": str(self.fake / "LaunchDaemons"),
             "/usr/bin/plutil": str(self.bin / "plutil"),
             "/etc/systemd/system": str(self.units),
         }
-        for path in SYSTEM_PATHS[name]:
+        for path in SYSTEM_PATHS[name] if system_paths is None else system_paths:
             assert path in text, f"{name} no longer names {path}"
             text = text.replace(path, replacements[path])
         text = text.replace(
             "quiesce_timeout_seconds=1800", f"quiesce_timeout_seconds={quiesce_timeout}"
         )
-        target = self.source / "deploy" / name
+        # Polling for the cycle lock helper is only a wait; a short one keeps runs quick.
+        text = text.replace("poll_seconds=1\n", "poll_seconds=0.05\n")
+        # So is the helper's own watch for its installer to end, and its wait for a
+        # plate; a run's output only closes once the helper has gone.
+        text = text.replace("\n    time.sleep(1)\n", "\n    time.sleep(0.05)\n")
+        text = text.replace("\n        time.sleep(2)\n", "\n        time.sleep(0.05)\n")
+        target = (self.source if source is None else source) / "deploy" / name
         target.write_text(text)
         target.chmod(0o755)
         return target
@@ -149,12 +356,14 @@ class Host:
             "HOME": str(self.home),
             "FAKE": str(self.fake),
             "FAKE_UNAME": self.system,
+            "FAKE_BASH": REMOTE_BASH,
             "FAKE_STATE_DIR": str(self.state),
             "FAKE_UNIT_DIR": str(self.units),
             "FAKE_LAYOUT_SERVICE_PREFIX": self.family,
             "FAKE_LAYOUT_APP_DIR": str(self.app),
             "FAKE_LAYOUT_SUPPORT_DIR": str(self.support),
             "FAKE_LAYOUT_CONFIG_PATH": str(self.config),
+            "TMPDIR": str(self.tmp),
             "INKY_BIRD_DISPLAY_VENV": str(self.venv),
             # A stray setting must not redirect the managed environment.
             "UV_PROJECT_ENVIRONMENT": str(self.root / "elsewhere"),
@@ -165,13 +374,8 @@ class Host:
     def run(
         self, name: str, *, shell: str = "bash", quiesce_timeout: int = 3, **extra: str
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [shell, str(self.script(name, quiesce_timeout))],
-            env=self.environment(**extra),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
+        return run_contained(
+            [shell, str(self.script(name, quiesce_timeout))], self.environment(**extra)
         )
 
     def start(
@@ -191,6 +395,7 @@ class Host:
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 text=True,
+                start_new_session=True,
             )
 
     def fail(self, *rules: str) -> None:
@@ -512,6 +717,15 @@ def uv_calls(host: Host) -> list[list[str]]:
     return [call for call in host.calls() if call[0] == "uv"]
 
 
+def assert_previous_runtime_untouched(host: Host) -> None:
+    """The new runtime is built beside the live one; a refused run leaves neither changed."""
+    assert host.installed_version() == "old"
+    assert (host.app / "src/runtime-tag").read_text() == "old\n"
+    assert not (host.app / ".venv").is_symlink()
+    runtimes = host.app / ".runtimes"
+    assert not runtimes.exists() or not any(runtimes.iterdir())
+
+
 def test_linux_upgrade_restarts_services_and_builds_the_managed_venv(tmp_path: Path) -> None:
     host = linux_host(tmp_path)
     result = run_linux(host)
@@ -549,7 +763,7 @@ def test_linux_failed_stop_aborts_before_the_runtime_changes(tmp_path: Path) -> 
     host.fail(f"systemctl:stop:{host.family}-generate.timer")
     result = run_linux(host)
     assert result.returncode == 1
-    assert not uv_calls(host)
+    assert_previous_runtime_untouched(host)
     assert host.installed_version() == "old"
     assert host.unit_state("refresh.timer")["active"] is True
     assert "started again" in result.stderr
@@ -583,7 +797,7 @@ def test_linux_asks_for_sudo_again_before_stopping_anything(tmp_path: Path) -> N
     assert result.returncode == 1
     assert "No changes made" in result.stderr
     assert not any(call[:3] == ["sudo", "systemctl", "stop"] for call in host.calls())
-    assert not uv_calls(host)
+    assert_previous_runtime_untouched(host)
     assert host.unit_state("generate.timer")["active"] is True
 
 
@@ -593,7 +807,7 @@ def test_linux_asks_for_sudo_again_after_waiting_for_jobs(tmp_path: Path) -> Non
     result = run_linux(host)
     assert result.returncode == 1
     # Nothing in the managed directory changed; the stopped timers are named.
-    assert not uv_calls(host)
+    assert_previous_runtime_untouched(host)
     assert host.installed_version() == "old"
     assert f"{host.family}-generate.timer" in result.stderr
     assert "sudo systemctl start" in result.stderr
@@ -632,16 +846,18 @@ def test_linux_keeps_an_optional_timer_it_could_not_disable(tmp_path: Path) -> N
     assert (host.units / timer).exists()
 
 
-def test_linux_failure_does_not_restart_a_timer_it_removed_on_purpose(tmp_path: Path) -> None:
+def test_linux_failure_puts_back_a_timer_the_new_version_removes(tmp_path: Path) -> None:
+    # A failed upgrade rolls back to the previous version, which still runs the timer.
     host = linux_host(tmp_path)
     host.fail(f"systemctl:restart:{host.family}-refresh.timer")
     result = run_linux(host, "controller.service refresh.service refresh.timer")
     assert result.returncode != 0
-    assert not (host.units / f"{host.family}-generate.timer").exists()
-    starts = [call for call in host.calls() if call[:2] == ["systemctl", "start"]]
-    assert starts == [["systemctl", "start", f"{host.family}-refresh.timer"]]
-    assert host.unit_state("refresh.timer")["active"] is True
+    assert "# old" in host.unit_text("generate.timer")
+    for unit in ("controller.service", "refresh.timer", "generate.timer"):
+        assert host.unit_state(unit) == {"active": True, "enabled": True}
+    assert host.installed_version() == "old"
     assert "are stopped" not in result.stderr
+    assert "started again on the previous version" in result.stderr
 
 
 def test_linux_app_owned_upgrade_stops_scheduler_only_between_plates(tmp_path: Path) -> None:
@@ -661,7 +877,7 @@ def test_linux_app_owned_upgrade_refuses_while_a_plate_is_being_made(tmp_path: P
     assert "still being made" in result.stderr and "No changes made" in result.stderr
     assert host.unit_state("scheduler.service")["active"] is True
     assert not any(call[:2] == ["systemctl", "stop"] for call in host.calls())
-    assert not uv_calls(host)
+    assert_previous_runtime_untouched(host)
     assert host.installed_version() == "old"
 
 
@@ -784,7 +1000,7 @@ def test_macos_upgrade_refuses_while_a_plate_is_being_made(tmp_path: Path) -> No
     assert result.returncode == 3
     assert "still being made" in result.stderr and "No changes made" in result.stderr
     assert not bootouts(host)
-    assert not uv_calls(host)
+    assert_previous_runtime_untouched(host)
     assert host.installed_version() == "old"
     assert (host.app / "src/runtime-tag").read_text() == "old\n"
     assert host.plist_generation("serve") == "old"
@@ -816,6 +1032,7 @@ def test_macos_upgrade_waits_for_a_plate_to_finish(tmp_path: Path) -> None:
             if installer.poll() is None:
                 installer.kill()
                 installer.wait()
+            assert not end_group(installer.pid)
     assert returncode == 0, output.read_text()
     assert [call[3] for call in bootouts(host)] == ["lock-held", "lock-held"]
     assert host.installed_version() == "new"
@@ -850,10 +1067,7 @@ def display_host(tmp_path: Path) -> Host:
     host = Host(tmp_path, "Linux")
     python = host.venv / "bin/python"
     python.parent.mkdir(parents=True)
-    python.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(TOOLS))} "
-        'venv-python "$0" "$@"\n'
-    )
+    python.write_text(tool_wrapper("venv-python", own_path=True))
     python.chmod(0o755)
     Host.write_source(host.app, "old")
     host.save_state("pip", {"inky-bird-frame": {"source": str(host.app)}})
@@ -894,5 +1108,7 @@ def test_display_failed_package_install_keeps_the_old_distribution(tmp_path: Pat
     assert result.returncode == 1
     assert set(host.state_of("pip")) == {"inky-bird-frame"}
     assert (host.venv / "lib/python3/site-packages/inky_bird_frame/installation.py").exists()
-    assert not any(call[0] == "remove-distribution" for call in host.calls())
+    # Only the new distribution may be taken back out; the renamed one stays.
+    removals = [call for call in host.calls() if call[0] == "remove-distribution"]
+    assert removals in ([], [["remove-distribution", "inky-bird", "inky-bird-frame"]])
     assert "# old" in host.unit_text("display.timer")

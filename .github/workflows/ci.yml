@@ -273,8 +273,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --locked
 
+      # The installer matrix runs in full in its own shards and in default form in
+      # Core quality. It tests shell installers against fakes, not this Python.
       - name: Run tests
-        run: uv run pytest -m "not repository_catalog"
+        run: uv run pytest -m "not repository_catalog" --ignore=tests/test_installer_matrix.py
 
   browser-acceptance:
     name: Browser acceptance
@@ -379,6 +381,156 @@ jobs:
             !${{ runner.temp }}/browser-evidence/*/catalog/**
           retention-days: 7
 
+  installer-matrix:
+    name: Installer matrix ${{ matrix.shard }}/8
+    runs-on: ubuntu-latest
+    # No run history yet: about 3x the expected 12 minutes per shard.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      # The matrix runs synthetic installs, not catalog data: skip the images.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/catalog/species/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # The job always reports, so it can be required; the matrix itself runs
+      # only when the installers, their tests or this workflow change.
+      - name: Check for installer changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          if [ "$EVENT_NAME" != pull_request ]; then
+            base="$BEFORE_SHA"
+          fi
+          run=true
+          if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null && \
+              git diff --quiet "$base" HEAD -- deploy tests/fake_bin \
+                tests/test_installer_matrix.py tests/test_installer_behaviour.py \
+                tests/test_deployment_scripts.py tests/test_installation.py \
+                src/inky_bird_frame/installation.py pyproject.toml uv.lock \
+                .github/workflows/ci.yml; then
+            run=false
+          fi
+          echo "run=${run}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        if: steps.changes.outputs.run == 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: "false"
+
+      - name: Install dependencies
+        if: steps.changes.outputs.run == 'true'
+        run: uv sync --extra dev --locked
+
+      - name: Run the full installer matrix shard
+        if: steps.changes.outputs.run == 'true'
+        env:
+          INKY_INSTALLER_MATRIX: full
+          INKY_MATRIX_SHARD: ${{ matrix.shard }}/8
+          INKY_MATRIX_WORKERS: "4"
+        run: uv run pytest tests/test_installer_matrix.py -p no:cacheprovider
+
+  # The macOS installers again under the Bash 3.2 that macOS ships, which the
+  # Linux shards do not have.
+  installer-matrix-macos:
+    name: Installer matrix macOS ${{ matrix.shard }}/2
+    runs-on: macos-latest
+    # No run history yet: both shards together take about 6 minutes on four
+    # local workers.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      # The matrix runs synthetic installs, not catalog data: skip the images.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/catalog/species/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # The job always reports, so it can be required; the matrix itself runs
+      # only when the installers, their tests or this workflow change.
+      - name: Check for installer changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          if [ "$EVENT_NAME" != pull_request ]; then
+            base="$BEFORE_SHA"
+          fi
+          run=true
+          if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null && \
+              git diff --quiet "$base" HEAD -- deploy tests/fake_bin \
+                tests/test_installer_matrix.py tests/test_installer_behaviour.py \
+                tests/test_deployment_scripts.py tests/test_installation.py \
+                src/inky_bird_frame/installation.py pyproject.toml uv.lock \
+                .github/workflows/ci.yml; then
+            run=false
+          fi
+          echo "run=${run}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        if: steps.changes.outputs.run == 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: "false"
+
+      - name: Install dependencies
+        if: steps.changes.outputs.run == 'true'
+        run: uv sync --extra dev --locked
+
+      - name: Check the macOS shell is Bash 3.2
+        if: steps.changes.outputs.run == 'true'
+        run: /bin/bash -c 'test "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2'
+
+      - name: Run the macOS groups of the full installer matrix
+        if: steps.changes.outputs.run == 'true'
+        env:
+          INKY_INSTALLER_MATRIX: full
+          INKY_INSTALLER_MATRIX_ONLY: "install:macos:*,uninstall:macos:*"
+          INKY_MATRIX_SHARD: ${{ matrix.shard }}/2
+          INKY_MATRIX_WORKERS: "4"
+        run: uv run pytest tests/test_installer_matrix.py -p no:cacheprovider
+
   quality:
     name: quality
     if: always()
@@ -386,6 +538,8 @@ jobs:
       - core-quality
       - python-compatibility
       - browser-acceptance
+      - installer-matrix
+      - installer-matrix-macos
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -394,7 +548,11 @@ jobs:
           CORE_RESULT: ${{ needs.core-quality.result }}
           COMPATIBILITY_RESULT: ${{ needs.python-compatibility.result }}
           BROWSER_RESULT: ${{ needs.browser-acceptance.result }}
+          MATRIX_RESULT: ${{ needs.installer-matrix.result }}
+          MACOS_MATRIX_RESULT: ${{ needs.installer-matrix-macos.result }}
         run: |
           test "$CORE_RESULT" = "success"
           test "$COMPATIBILITY_RESULT" = "success"
           test "$BROWSER_RESULT" = "success"
+          test "$MATRIX_RESULT" = "success"
+          test "$MACOS_MATRIX_RESULT" = "success"

@@ -103,7 +103,8 @@ on Python 3.14. It also lints workflows with actionlint and `deploy/*.sh` with
 ShellCheck, checks that workflow actions are pinned, rejects changes to approved
 catalog entries, validates the Compose files, builds and smoke-tests the
 controller container, and runs the tests without catalog images on Python 3.11
-to 3.13. Browser interaction regressions use Node.js 20 or newer's built-in
+to 3.13. The installer failure matrix runs in full in its own Linux and macOS
+jobs, and is left out of the Python 3.11 to 3.13 jobs. Browser interaction regressions use Node.js 20 or newer's built-in
 test runner; there is no Node service or frontend package installation in the
 user runtime.
 
