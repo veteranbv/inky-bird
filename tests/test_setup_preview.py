@@ -149,6 +149,39 @@ def test_unsafe_oidc_cache_is_refused_in_preview(tmp_path: Path) -> None:
         setup(InstallationRole.CONTROLLER, path, apply=False, source_dir=_source(tmp_path))
 
 
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("writable", "unsafe or cannot be read"),
+        ("wrong-key", "only SSL_CERT_FILE"),
+    ],
+)
+def test_unsafe_native_tls_file_is_refused_before_any_installer_step(
+    tmp_path: Path, system: str, apply: bool, case: str, message: str
+) -> None:
+    path = _config(tmp_path)
+    trust = tmp_path / "native-tls.env"
+    if case == "writable":
+        bundle = tmp_path / "roots.pem"
+        bundle.write_text("synthetic certificate")
+        bundle.chmod(0o644)
+        trust.write_text(f'SSL_CERT_FILE="{bundle}"\n')
+        trust.chmod(0o666)
+    else:
+        trust.write_text('UNRELATED_SECRET="sensitive-test-value"\n')
+        trust.chmod(0o644)
+    with (
+        patch("inky_bird_frame.installation.platform.system", return_value=system),
+        patch("inky_bird_frame.installation.subprocess.run") as run,
+        pytest.raises(InstallationError, match=message) as error,
+    ):
+        setup(InstallationRole.CONTROLLER, path, apply=apply, source_dir=_source(tmp_path))
+    run.assert_not_called()
+    assert "sensitive-test-value" not in str(error.value)
+
+
 @pytest.mark.parametrize("apply", [False, True])
 def test_environment_provider_credential_is_refused_before_any_installer_step(
     tmp_path: Path, apply: bool
