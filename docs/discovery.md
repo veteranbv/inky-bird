@@ -211,7 +211,10 @@ minutes to seed. Completed matches are cached atomically, so a transient error
 or rate limit preserves progress for the next run. The cache is saved after
 every 25 new lookups, and whenever a run is interrupted, and its lock is
 released at least every 30 seconds, so an interrupted first import keeps what
-it has already matched.
+it has already matched. The same job takes the lock straight back, though. On
+macOS a waiting import or refresh was seen to get its turn in that gap; Linux
+does not promise that, so on a Linux or Docker controller another job that
+needs name matching may wait until the first one finishes.
 Because the export supplies calendar dates rather than event instants, archive
 observations do not claim latest-detection rotation priority. Re-export and
 reimport periodically to include newly published eBird checklists; no eBird

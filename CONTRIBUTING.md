@@ -114,7 +114,7 @@ page helpers, module state and dispatch. Each area has its own module:
 `home.js`, `birds.js` (Birds list and bird page), `collections.js`
 (Collections, community search, editing, import and the collection view),
 `frame.js`, `candidate.js`, `manage.js` (Manage, outcomes, health, backups,
-Sources, plate work and notifications) and `keys.js` (idempotency keys and new
+Sources, In the works and notifications) and `keys.js` (idempotency keys and new
 collection IDs). Area modules receive shared state through the one context
 object built in `openJournal` and do not import `journal.js`. The other files
 in that folder serve the settings, screen and viewer pages or are shared
@@ -175,7 +175,9 @@ they do not prove live provider contracts, physical hardware or real-phone
 certificate trust.
 
 The test covers normal tasks, stale edits, interrupted responses, explicit
-work, scope withdrawal and revocation. Its community query is mocked, so it is
+work, scope withdrawal and revocation. Every browser checks the plate cache
+headers, but the no-refetch check runs only in Chromium, because it reads
+Chromium's own network events. Its community query is mocked, so it is
 not a live iNaturalist contract test.
 
 Chromium, Firefox and WebKit journeys and automated accessibility checks are
@@ -213,7 +215,7 @@ them to `docs/images/`. Publish only those images, not the fixture state.
 
 ### Record a sample walkthrough
 
-The same fixture can record Home, a sample collection, Frame mode and a manual
+The same fixture can record Home, a sample collection, Play and a manual
 Next action. Account creation happens before recording. The browser context
 keeps its synthetic session in memory; it does not export cookies.
 

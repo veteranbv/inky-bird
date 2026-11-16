@@ -1,10 +1,10 @@
 # Owner actions and saved outcomes
 
-In **Manage**, Sources offers **Refresh observations**. Plate work accepts up to
-32 birds for retry at once. Notifications offers a real delivery test
+In **Manage**, **Sources** offers **Check sources now**. **In the works** lets
+you choose up to 32 birds to try again at once. Notifications offers a real delivery test
 and, when needed, retry of existing dead letters. Each action has a separate
-confirmation. Host repair, advanced correction-source selection and replacement
-of approved art remain operator workflows.
+confirmation. Host repair, advanced correction-source selection and replacing a kept plate
+remain operator workflows.
 
 A refresh uses the same controller operation and notification bookkeeping as
 the CLI. Partial provider failures remain isolated. Existing generation policy
@@ -16,11 +16,11 @@ typed recovery function to retain correction guidance and archive earlier work.
 If discovery is missing, stale or from older source settings, requests stay
 queued without changing their recovery state. They continue after a usable
 refresh; you do not need to submit them again.
-Repeated pending requests for the same bird are deduplicated. Approved artwork
-is not replaced, and complete pending candidates still require review.
+Repeated pending requests for the same bird are deduplicated. A plate you kept
+is not redrawn, and a new plate still waits for you to look at it.
 
-Choose **Queue selected for the next scheduled check** to wait for the normal
-schedule. **Retry selected as soon as possible** asks the existing scheduler to
+Choose **Try at the next check** to wait for the normal schedule. **Try as soon
+as possible** asks the existing scheduler to
 refresh sources and check generation after its current job finishes. This action
 is available only while generation is enabled and Inky's scheduler is running.
 Installations that use separate system timers can use the scheduled queue.
@@ -29,9 +29,9 @@ Generation must be enabled, discovery must be healthy, and ordinary attempt,
 research and sourced-review limits still apply. Generation can use your AI
 allowance or incur costs.
 
-Plate work updates automatically. It separates the active cycle and stage,
-runnable order, automatic backoff, explicit holds, pending review and saved
-retry-request outcomes. A next-check time is a scheduler observation, not a
+**In the works** updates automatically. It shows what is being drawn now, what
+is next up, birds Inky will try again on its own, **New plates** waiting for
+you, plates that **Needs a hand** and your recent requests to try again. A next-check time is a scheduler observation, not a
 promised start or finish time. Recorded failures show safe categories and, when
 available, retained attempt counts and numeric review scores. Raw provider or
 model errors stay in private operator evidence.
@@ -47,27 +47,32 @@ If discovery merged several providers, the latest timestamp does not identify
 which provider supplied it. The UI labels that timestamp as merged and omits it
 from provider-specific detection times rather than inventing provenance.
 
-Named collections also offer **Review missing-plate requests**. The preview
-separates approved art, existing requests, holds and unresolved identities. Confirming
-adds only new requests to the existing queue. It does not add sightings, join
-Saved birds, clear a hold, start a model or change the wall.
+A collection with birds that have no plate offers **Ask for the missing
+plates**. The preview separates birds that already have a plate, existing
+requests, holds and names Inky could not match. Confirming with **Ask for these
+plates** adds only new requests to the existing queue. It does not record a
+bird as noted, put birds on your frame, clear a hold, start a model or change
+the wall.
 
-Complete pending candidates open for private inspection. The browser shows the
-uncropped plate, readable facts, saved review scores and cited sources. Local
-approval requires the same mandatory publication validation as the catalog and
+A **New plate** opens for private inspection. The browser shows the uncropped
+plate, readable facts, saved review scores and cited sources. **Keep this plate**
+requires the same mandatory publication validation as the catalog and
 applies only to the exact files inspected. Changed files need a new review.
 Approval can make art eligible for the existing publisher; published copies
-cannot be recalled. Rejection requires a reason and retains the artifact privately.
-It does not start another attempt. Incomplete assets remain visible as recovery
-work with operator guidance, not a false empty queue.
+cannot be recalled. **Send this plate back** requires a reason and keeps the plate privately. It
+does not start another attempt. An unfinished plate stays visible under **Needs
+a hand** with guidance for whoever runs Inky, not hidden as an empty queue.
 
-Saved birds has explicit add/remove and import-approved-art previews. The
-confirmation binds both the configuration and the saved-membership/catalog
-revision. Another tab or a newly approved plate invalidates an old preview.
-These actions use the existing collection operation, including its compatible
-legacy seed migration, and can change the active catalog and wall. The preview
-shows that migration separately. It never claims a personal sighting or starts
-a model. Named collections and Favorites remain separate.
+**Add to my frame** and **Remove from my frame** on a bird's page change one
+bird in one tap and offer **Undo**. Inky asks first only when Undo could not put
+things back: removing a bird that has no plate yet, or a change that also moves
+other birds, such as birds left in an older plate queue. **Add every bird with
+a plate** always shows what will change and waits for **Change my frame**. Each
+change is checked against the configuration and the frame's revision it was
+previewed with; a change made in another tab, or a newly approved plate, sends
+you back to look again. These changes use the CLI's collection operation and
+reach the wall frame at its next refresh. They never record a bird as noted or
+start a model. Collections and Favorites stay separate.
 
 A notification test sends an actual external message to each configured
 destination. Its outcome reports failed destinations separately from successful
@@ -79,7 +84,8 @@ destination accepted a message.
 
 Inky writes a private receipt before starting work. The receipt moves through
 pending and running to succeeded or failed. You can reload its outcome page or
-open Recent owner operations without repeating the request. The browser sends a
+open **Recent requests** on Sources, In the works or Notifications without
+repeating the request. The browser sends a
 new random request identifier for a deliberately new action. Reusing an
 identifier with the same choices returns the original operation. Different
 choices with that identifier fail.
@@ -100,7 +106,7 @@ source-file retention and trip recovery.
 Inspect the source, work or notification state before an explicit retry.
 Generation-off mode, review holds and existing retry rules remain in force.
 An interrupted receipt can coexist with an already-saved retry intent. Check
-Plate work before submitting again. If retry preparation itself was interrupted,
+In the works before submitting again. If retry preparation itself was interrupted,
 Inky holds the species for inspection rather than replaying archive operations
 or starting generation from ambiguous state. A new explicit request can resolve
 that hold after inspection.

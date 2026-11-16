@@ -32,7 +32,7 @@ I built Inky to keep birding present between outings.
   </tr>
 </table>
 
-Both screenshots are from the app on `main`, with public approved artwork and
+Both screenshots are from the app on `main`, with public plates and
 a sample collection. Open either image for the full-size view.
 
 https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f
@@ -74,7 +74,7 @@ No source is required to browse approved art, save collections or play plates.
 | --- | --- |
 | See the artwork, with nothing to install | [Browse the public gallery](https://henrysowell.com/birds). |
 | Keep a journal on a phone, tablet, or computer | Run the controller on an existing machine: [Docker or NAS](docs/docker.md) or [native installation](docs/installation.md). Open `/app` and [create your owner account](docs/browser-access.md). |
-| Put birds on a wall | Use a browser in [Frame mode](docs/presentation.md#owner-frame), [pair a read-only screen](docs/presentation.md#pair-a-read-only-screen), or build the [7.3-inch or 13.3-inch e-paper frame](docs/hardware.md). |
+| Put birds on a wall | Use [Play](docs/presentation.md#play) in a browser, [pair a read-only screen](docs/presentation.md#pair-a-read-only-screen), or build the [7.3-inch or 13.3-inch e-paper frame](docs/hardware.md). |
 | Connect a station, feeder, or observation account | [Choose a source](docs/discovery.md). Start with one, or keep using saved collections without any sources. |
 | Choose how I sign in and connect | Use built-in [username and password](docs/browser-access.md#ordinary-home-network-setup), or connect [single sign-on (OIDC)](docs/browser-access.md#advanced-authentik-and-other-openid-connect-providers). Add encrypted HTTPS [directly in Inky](docs/browser-access.md#advanced-supply-a-certificate) or [through your existing reverse proxy](docs/browser-access.md#advanced-https-through-a-reverse-proxy). |
 | Upgrade an existing installation | [Back up your controller](docs/backup.md), read the notes for the [target release](https://github.com/veteranbv/inky-bird/releases), and follow its update guide. |
@@ -108,6 +108,11 @@ plate yet.
 | --- | --- |
 | **Your journal** | Everything you keep in Inky: your birds, their plates and your collections. |
 | **Plate** | One illustrated bird, checked against references and approved before it is shown. |
+| **New plate** | A plate Inky made for you; it waits for your look before it joins your journal. |
+| **On my frame** | The birds your wall frame and Play show: birds noted recently plus the birds you added. |
+| **More plates** | Plates you could add to your frame. |
+| **In the works** | Plates being made, and what is waiting to be made next. |
+| **Needs a hand** | A plate that could not be finished on its own; whoever runs Inky can help it along. |
 | **Noted** | When a bird was recorded: a feeder photo, a microphone detection or a checklist. "Last noted" is the most recent. |
 | **Favorite** | A bird you saved with **Add to Favorites** on its page. |
 | **Collections** | Named groups of birds, such as a trip. |
@@ -123,7 +128,7 @@ or configure your own controller to generate it with Codex. Generation can
 use a subscription allowance or incur API costs. See the
 [review process](docs/architecture.md) and [owner controls](docs/owner-operations.md).
 
-Your sightings and selections stay separate from the shared catalog. See
+The birds you noted and your collections stay separate from the shared catalog. See
 [what stays private and what leaves the controller](docs/privacy.md). Keep
 the controller on a trusted network: owner sign-in does not protect the legacy
 catalog and display routes. Do not port-forward the controller to the internet.

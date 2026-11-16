@@ -1,12 +1,12 @@
 # Screens, wall views and dashboards
 
-Inky can show approved art in your browser, on a paired screen, in a dashboard
-or on the physical wall. They share approved artwork. A paired screen or status
+Inky can show plates in your browser, on a paired screen, in a dashboard or on
+your wall frame. They all use the same approved plates. A paired screen or status
 sensor does not get owner permissions.
 
 | Destination | Access | What it can do |
 | --- | --- | --- |
-| Owner Frame | Your normal Inky login | Play a chosen view; open its bird details |
+| Play | Your normal Inky login | Play a chosen view; open its bird details |
 | Paired browser screen | Separate read-only cookie | Show approved plates from one permitted view |
 | Dashboard art | Explicit trusted-network opt-in | Show selected approved art without owner cookies |
 | Status sensors | Separate header credential | Read aggregate readiness, version and counts |
@@ -16,10 +16,12 @@ Nothing here exposes Inky to the internet or changes router rules. Keep its
 legacy catalog, assets and display-health routes private. Owner sign-in is not
 protection for those older routes.
 
-## Owner Frame
+<a id="owner-frame"></a>
+
+## Play
 
 Open Home or a collection and choose **Play**. Previous, Next, Pause, Shuffle,
-Details and Exit work without changing the wall. Frame fits the complete
+Details and Exit Play work without changing the wall. Play fits the complete
 portrait. Zoom is deliberate and allows panning; it does not alter the artwork.
 Arrow keys and touch swipes change plates. Space toggles playback when focus is
 not on an interactive control. Opening Details pauses playback.
@@ -30,7 +32,7 @@ when battery policy changes, or when the page closes. Normal sleep settings
 apply when the request fails. Controls reappear on interaction and remain
 visible while focused. Background polling does not renew an owner session.
 
-After owner expiry, Frame clears private labels and freezes the last already
+After owner expiry, Play clears private labels and freezes the last already
 visible approved image. Sign in to continue. Explicit owner logout clears the
 presentation. For a tablet that should keep running, pair it instead.
 
@@ -39,9 +41,9 @@ presentation. For a tablet that should keep running, pair it instead.
 1. Finish owner setup first.
 2. Open the controller's HTTPS address followed by `/screen` on the intended
    screen. Genuine controller loopback also works for local testing. Plain LAN
-   HTTP can use owner Frame, but cannot issue or use a long-lived screen grant.
+   HTTP can use Play, but cannot issue or use a long-lived screen grant.
 3. Choose **Pair this screen**. It shows an eight-character recognition code.
-4. On your signed-in owner device, open **Manage → Displays**. Reload to see a
+4. On your signed-in owner device, open **Manage → Wall frame**. Reload to see a
    new request. Match its code on the actual screen.
 5. Give it a name, choose one view, choose its expiry and confirm the match.
 
@@ -61,7 +63,8 @@ browser storage or routine logs. Pairing and screen reads require HTTPS or
 genuine loopback, even when ordinary local owner login uses LAN HTTP.
 
 Access defaults to 90 days; choose 1–365 days. Polling does not extend expiry.
-Displays shows the permitted view, expiry and last connection at hour precision.
+**Wall frame** shows each screen's permitted view, expiry and last connection at
+hour precision.
 **Revoke screen** takes effect on its next request, normally within 15 seconds
 while visible. A revoked online screen clears its artwork. Deleted or newly
 empty views stay empty. A fresh view that withdraws a plate clears that plate
@@ -70,13 +73,13 @@ image whose permission has not been authoritatively withdrawn.
 
 An offline or suspended screen cannot receive revocation until it reconnects.
 Inky cannot erase already photographed, downloaded or offline pixels. **Forget
-this screen** removes its browser cookie. Also revoke the grant in Displays if
+this screen** removes its browser cookie. Also revoke the grant in Wall frame if
 the device was lost or its credential might have been copied.
 
 ## Choose the physical wall view
 
-Existing display configuration keeps using `/v1/catalog`, with its current and
-Saved birds meaning. Changing a named collection does not change that route.
+Existing display configuration keeps using `/v1/catalog`, which shows **On my
+frame**. Changing a named collection does not change that route.
 
 To opt into owner-selected wall views, the operator changes the display's
 configuration once:
@@ -113,11 +116,12 @@ serves `/wall/health`, `/wall/v1/catalog`, its selected assets and the existing
 narrow physical telemetry contract. Use matching controller and display releases
 for the selected-wall empty-state contract.
 
-Then choose and confirm the view in **Manage → Displays → Physical wall panel**.
+Then open **Manage → Wall frame → What your wall frame shows**, choose the view,
+tick the confirmation and choose **Show on my wall frame**.
 The display applies it at its next scheduled refresh. It still owns shuffle,
 rotation interval and panel rendering. A fixed trip does not admit unrelated
 home detections. No browser action claims an immediate panel update. Home and
-Displays show only the last confirmed physical success.
+Wall frame show only the last confirmed physical success.
 
 An empty or removed selected view pauses rotation. The panel keeps its last
 image; Inky does not fall back to other birds or claim a new physical success.
@@ -194,10 +198,17 @@ health. No identity, private timestamp, collection label, host, queue detail,
 history or source credential is included. A status credential cannot read images
 or use owner routes.
 
+`panel_health` is `recent`, `stale` or `unknown`. It looks only at the wall
+frame's last successful update: `recent` means within two rotation intervals
+plus the display's startup delay, and `unknown` means no readable update has
+been recorded. It does not know about pauses, so it can read `stale` while an empty
+wall view has paused the wall frame, even though notifications report it as
+paused.
+
 **Approved** counts every approved plate in the catalog. **In rotation** counts
-approved plates in this status credential's permitted view. For **Current and
-saved**, that means saved birds plus birds matched by the selected observation
-window. Other approved plates remain in the library; a smaller in-rotation
+approved plates in this status credential's permitted view. For **On my
+frame**, that means the birds you added plus the birds noted in the selected
+observation window. Other approved plates remain in the library; a smaller in-rotation
 count does not mean those plates failed or are unfinished.
 
 The status view can differ from the physical wall's view. This count does not

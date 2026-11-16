@@ -6,13 +6,12 @@ remain available.
 
 ## Your eBird checklists
 
-Open **Manage → Sources → eBird Archive → Import or review history**. You can
+Open **Manage → Sources → eBird Archive → Import history**. You can
 also start from **Collections → Make a trip from your eBird checklists**.
 
 1. Choose the complete official Download My Data ZIP or CSV. Do not cut the
    archive down to one trip: this import replaces retained eBird history.
-   If history is already current, choose **Use retained history without an
-   upload**. That path has no original location labels.
+   If history is already current, choose **Use the history already here**. That path has no original location labels.
 2. Check the file. Inky validates all rows and shows additions, corrections,
    removals and affected collections. Checking does not update history.
    The export needs only the `Submission ID`, `Common Name`, `Scientific Name`,
@@ -36,13 +35,14 @@ also start from **Collections → Make a trip from your eBird checklists**.
    has looked them all up, so check again after editing the selection. A trip
    too large for the journal is refused at this step, before anything is saved.
 5. Save the trip. It has fixed membership. Saving makes no new lookups and does
-   not add Saved birds, queue plates, enable generation or change the wall.
+   not put birds on your frame, queue plates, enable generation or change the wall.
 
-Inky labels personal evidence only when a retained checklist still supports the
-species inside the trip's original dates. A later removal, reclassification or
-date correction can show **Source record changed**. Your curated membership
-stays intact. Birds added through ordinary collection editing are manual
-selections, not invented personal sightings.
+A bird in a trip shows **On your checklists during this trip** only while a
+retained checklist still supports it inside the trip's original dates. After a
+later removal, reclassification or date correction it shows **Its checklist
+link needs a look**. The trip keeps the bird either way. Birds you add by
+editing the collection show **Added by you**; they are not presented as birds
+you noted.
 
 Imported history can affect an already enabled source at its next refresh.
 The preview shows names entering or leaving that source's date window, before
@@ -52,7 +52,7 @@ source and automatic generation are enabled; an import enables neither.
 
 ## Analyzer detections
 
-Open **Manage → Sources → BirdNET Analyzer → Import or review history**. Choose
+Open **Manage → Sources → BirdNET Analyzer → Import history**. Choose
 an Analyzer CSV file. If you know the recording date, provide it for that batch.
 Otherwise leave it blank. Unknown dates stay unknown and cannot enter finite
 date windows. Review new, changed, duplicate, dated and undated records before

@@ -1,6 +1,6 @@
 # Privacy and data flow
 
-Inky keeps your journal on your controller. You can browse approved artwork
+Inky keeps your journal on your controller. You can browse the plates
 without connecting an observation source or signing in to Codex. A phone or
 tablet uses the controller through its browser; it does not need its own copy
 of your journal.
@@ -11,7 +11,7 @@ Your observations, imported history, collections, work records, and owner
 access state are private controller data. Your configuration and some state
 files can also contain credentials. The browser can retain session and view
 state. Keep [controller backups](backup.md) and exports private. Removing an
-import does not necessarily remove saved birds, generated work, or old backups;
+import does not necessarily remove birds on your frame, generated work, or old backups;
 follow the [private-data removal guide](backup.md#private-data-lifecycle-and-removal).
 
 Uploaded import files are kept only for the preview period you set. An upload

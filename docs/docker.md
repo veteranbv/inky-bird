@@ -25,7 +25,7 @@ You need:
   only if you want to generate missing art; and
 - a reachable controller address if you use a physical display or another device.
 
-The browser-journal release can start with approved artwork, no sources and
+The browser-journal release can start with the approved plates, no sources and
 generation off. It needs neither Codex sign-in nor an e-paper frame. Do not run
 the new art-first commands with an older published image; follow that release's
 existing configuration path and the [migration guide](migration-v1.md).
@@ -328,7 +328,7 @@ with exit code zero; it safely checks the catalog again whenever Compose
 recreates the project.
 
 New artwork is off with both `config.example.toml` and the `config init` seed:
-the controller shows approved artwork only. To make new plates, set
+the controller shows the approved plates only. To make new plates, set
 `generation_enabled = true` under `[controller]`, run `config-sync` and recreate
 the controller and scheduler (for an app-managed configuration, turn it on in
 Settings). Generation uses your own Codex sign-in or API key, and that
@@ -342,9 +342,9 @@ Open `http://CONTROLLER_ADDRESS:8793/app` from an address listed in
 the account from `access setup`). The examples above list only
 `http://localhost:8793`, which works from the Docker host itself. To sign in
 from a phone, add its address as described above, or for an app-managed
-configuration follow the [app-managed edit under Update](#update). The approved
-artwork is under **Birds → Available artwork**; Home stays empty until a bird
-is observed or saved.
+configuration follow the [app-managed edit under Update](#update). The plates
+are under **Birds → More plates**. With nothing on your frame yet, Home shows a
+plate from the catalog and **Choose birds**.
 
 To add a display, continue with
 [Prepare the display Pi](installation.md#2-prepare-the-display-pi).

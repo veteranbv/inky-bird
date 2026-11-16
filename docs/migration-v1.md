@@ -13,7 +13,8 @@ or e-paper frame to migrate.
   file without a `generation_enabled` line keeps generation on, as before,
   unless it is app-managed; only new files from `config.example.toml` or
   `config init` start with it off.
-- Saved birds keeps its current membership and CLI meaning.
+- The birds you added to your frame keep their membership and CLI meaning. The
+  journal shows them as **On my frame · added by you**.
 - Approved plates remain immutable unless an explicit reviewed catalog migration
   already accompanies the release.
 - `/v1/catalog`, active assets and the physical display's controller URL keep
@@ -23,7 +24,7 @@ or e-paper frame to migrate.
 
 The journal adds private named collections, Favorites, typed trip links, owner
 access, saved operation outcomes and optional presentation grants. Downloading
-public artwork does not claim a sighting or join your Saved birds.
+public plates does not record a bird as noted or put it on your frame.
 
 ## Before updating
 
@@ -105,15 +106,17 @@ pretend to perform those host changes.
 Use real saved state, not just a green HTTP response:
 
 1. Compare configured providers and generation policy with the pre-upgrade record.
-2. Compare Saved birds and approved catalog counts. Open several actual plates.
+2. Compare **On my frame · added by you** and approved catalog counts. Open
+   several actual plates.
 3. Check retained history coverage. A library may now show birds outside the
    live window; that does not make them new generation work.
 4. Open a personal trip and inspect its evidence labels. Imported collections
-   without local checklist links must not claim verified personal sightings.
+   without local checklist links must not claim birds you noted yourself.
 5. Create a small named selection, reload it, then restart the controller and
-   confirm it remains. It must not silently join Saved birds or change the wall.
-6. Inspect Sources, Plate work and Notifications separately. Old failed artifacts
-   are not automatically runnable backlog.
+   confirm it remains. It must not silently join your frame or change the wall.
+6. Inspect **Sources**, **In the works** and **Notifications** separately. Failed
+   attempts left from before the upgrade are not put back in the works on their
+   own.
 7. Verify a scheduled discovery cycle, service restart recovery and a real panel
    success through the existing doctor and telemetry paths.
 8. If using advanced access, test local recovery, exact SSO identity rejection,
