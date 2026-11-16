@@ -542,7 +542,8 @@ def test_base_images_are_literal_digest_pins_an_updater_can_read() -> None:
             external[match.group(1)] = match.group(2)
         stages.add(stage)
     assert set(external) == {"python", "ghcr.io/astral-sh/uv"}
-    assert external["python"].startswith("3.11.") and external["python"].endswith("-slim-bookworm")
+    # The image's Python series is chosen on purpose; Dependabot only updates its patch.
+    assert external["python"].startswith("3.14.") and external["python"].endswith("-slim-bookworm")
     assert "ARG PYTHON_IMAGE" not in (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert {"build", "tool-downloads", "runtime"} <= stages
 
