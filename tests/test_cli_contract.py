@@ -16,8 +16,10 @@ import pytest
 from PIL import UnidentifiedImageError
 
 from inky_bird_frame.access import AccessDeniedError, AccessError
-from inky_bird_frame.catalog import CandidateApprovalError
+from inky_bird_frame.catalog import CandidateApprovalError, CatalogBusyError
 from inky_bird_frame.cli import main
+from inky_bird_frame.controller import ControllerCycleBusyError, ObservationRefreshBusyError
+from inky_bird_frame.display_node import DisplayCycleBusyError
 from inky_bird_frame.errors import (
     BusyError,
     CatalogError,
@@ -37,6 +39,7 @@ from inky_bird_frame.errors import (
 from inky_bird_frame.journal import JournalError
 from inky_bird_frame.oidc import OIDCError
 from inky_bird_frame.owner_operations import OwnerOperationBusyError, OwnerOperationError
+from inky_bird_frame.publisher import CatalogPublishBusyError
 from inky_bird_frame.settings import SettingsError
 
 ERROR_CODES = {
@@ -74,7 +77,7 @@ def _raising(exc: BaseException) -> Callable[[Namespace], int]:
     return command
 
 
-def _busy(exc: Exception) -> Exception:
+def _would_block(exc: Exception) -> Exception:
     exc.__cause__ = BlockingIOError(35, "Resource temporarily unavailable")
     return exc
 
@@ -100,10 +103,13 @@ def test_success_envelope_is_exact() -> None:
         (UsageError("--example requires --other"), "usage", 2),
         (ValueError("Unsupported display size example"), "internal", 1),
         (BusyError("Another scheduler is already running"), "busy", 3),
-        (_busy(GenerationError("Another controller cycle is already running")), "busy", 3),
-        (_busy(DataSourceError("Another observation refresh is already running")), "busy", 3),
-        (_busy(CatalogPublishError("Another catalog publication is running")), "busy", 3),
-        (_busy(CatalogError("Another display cycle is already running")), "busy", 3),
+        (ControllerCycleBusyError("Another controller cycle is already running"), "busy", 3),
+        (ObservationRefreshBusyError("Another observation refresh is already running"), "busy", 3),
+        (CatalogPublishBusyError("Another catalog publication is running"), "busy", 3),
+        (DisplayCycleBusyError("Another display cycle is already running"), "busy", 3),
+        (CatalogBusyError("The catalog is busy; try again in a moment"), "busy", 3),
+        (_would_block(GenerationError("Generation example failed")), "generation", 1),
+        (_would_block(DataSourceError("Source example failed")), "data_source", 1),
         (OwnerOperationBusyError("Another owner operation is running"), "busy", 3),
         (BlockingIOError(35, "Resource temporarily unavailable"), "busy", 3),
         (DataSourceError("Source example failed"), "data_source", 1),
