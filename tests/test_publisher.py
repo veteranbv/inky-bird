@@ -288,6 +288,15 @@ def _settled() -> AbstractContextManager[object]:
     return patch("inky_bird_frame.publisher.time_ns", return_value=time_ns() + 10**10)
 
 
+def _just_written() -> AbstractContextManager[object]:
+    """Treat files written by the test as inside the publisher's settling window.
+
+    The publisher's clock is held before every file time, so the result does not
+    depend on how long a loaded machine takes to reach the next publish.
+    """
+    return patch("inky_bird_frame.publisher.time_ns", return_value=0)
+
+
 def _commit_to_remote(root: Path, remote: Path, change: Callable[[Path], None]) -> None:
     """Change the remote main branch from a separate clone, as another publisher would."""
     other = root / "other-clone"
@@ -2197,10 +2206,11 @@ class PublicationRunTests(unittest.TestCase):
             snapshots, counting = self._counting_snapshots()
 
             with _github(fake), cast(AbstractContextManager[object], counting):
-                published = run_catalog_publish(config)
                 # Files written moments ago are never trusted by their metadata alone.
-                for _ in range(2):
-                    self.assertFalse(run_catalog_publish(config)["verification_reused"])
+                with _just_written():
+                    published = run_catalog_publish(config)
+                    for _ in range(2):
+                        self.assertFalse(run_catalog_publish(config)["verification_reused"])
                 with _settled():
                     verified = run_catalog_publish(config)
                     reused = run_catalog_publish(config)
