@@ -14,6 +14,7 @@ a change to any of them makes the pair be judged again.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import random
 import shutil
@@ -318,11 +319,22 @@ def verdict_stamp(config: EvalConfig, judge: str, rubric: str) -> dict[str, obje
     }
 
 
-def _current_verdict(path: Path, stamp: dict[str, object]) -> dict[str, object] | None:
+def expected_sha256(spec: PairSpec) -> str:
+    """Fingerprint of the lettering a pair's plates are judged against."""
+    return sha256_text(json.dumps(spec.expected_text, sort_keys=True))
+
+
+def _current_verdict(
+    path: Path, stamp: dict[str, object], spec: PairSpec
+) -> dict[str, object] | None:
     if not path.exists():
         return None
     record = read_object(path)
-    return record if record.get("stamp") == stamp else None
+    if record.get("stamp") != stamp:
+        return None
+    # Verdicts stored before the expected lettering was fingerprinted carry no digest.
+    expected = expected_sha256(spec)
+    return record if record.get("expected_text_sha256", expected) == expected else None
 
 
 def _judge_once(
@@ -353,7 +365,12 @@ def _judge_once(
         usage = None if verdict.usage is None else dict(verdict.usage)
         write_json(
             _verdict_path(run, pair_id, judge.name),
-            {"stamp": stamp, **verdict.as_dict(), "usage": usage},
+            {
+                "stamp": stamp,
+                "expected_text_sha256": expected_sha256(spec),
+                **verdict.as_dict(),
+                "usage": usage,
+            },
         )
         error_path.unlink(missing_ok=True)
         ledger.record("judgment-finished", pair=pair_id, judge=judge.name, usage=usage)
@@ -383,7 +400,8 @@ def judge_pairs(
         (spec, pair_id, sides, judge)
         for spec, pair_id, sides in prepared
         for judge in judges
-        if _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name]) is None
+        if _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name], spec)
+        is None
     ]
     # Only a judgment still to be made needs its folder; a stored verdict's
     # folder was removed after judging and is not rebuilt.
@@ -423,7 +441,7 @@ def load_judged(
     votes: list[Vote] = []
     errors: list[tuple[str, str]] = []
     for judge in judges:
-        record = _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name])
+        record = _current_verdict(_verdict_path(run, pair_id, judge.name), stamps[judge.name], spec)
         if record is not None:
             votes.append(unblind(judge.name, parse_verdict(record), first_sides[judge.name]))
             continue
@@ -444,6 +462,7 @@ def pending_judgments(
         if _current_verdict(
             _verdict_path(run, run.opaque_id(spec.identity), judge.name),
             verdict_stamp(config, judge.name, rubric),
+            spec,
         )
         is None
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -238,6 +239,30 @@ def test_a_cached_verdict_leaves_no_blind_folder_behind(tmp_path: Path) -> None:
     # A stored verdict needs no folder, so none is rebuilt and left on disk.
     assert not any(blind_folder(run, spec.identity, "fake-1").exists() for spec in specs)
     assert list(run.path("blind").iterdir()) == []
+
+
+def test_a_verdict_judged_against_other_lettering_is_asked_again(tmp_path: Path) -> None:
+    run, panel, _ = make_run(tmp_path)
+    specs = _specs(tmp_path, run, panel, 2)
+    judge = PixelJudge("fake-1")
+    judge_pairs(run, specs, [judge], config())
+    corrected = [
+        dataclasses.replace(specs[0], expected_text={**specs[0].expected_text, "habitat": "Bog"}),
+        specs[1],
+    ]
+
+    pairs = judge_pairs(run, corrected, [judge], config())
+
+    # Only the pair whose expected lettering changed is judged again.
+    assert len(judge.requests) == 3
+    assert all(len(pair.votes) == 1 for pair in pairs)
+    # A verdict stored before lettering was fingerprinted is still current.
+    for path in run.path("verdicts").glob("*/fake-1.json"):
+        record = json.loads(path.read_text())
+        del record["expected_text_sha256"]
+        path.write_text(json.dumps(record))
+    judge_pairs(run, corrected, [judge], config())
+    assert len(judge.requests) == 3
 
 
 def test_a_failing_judge_is_retried_then_recorded_and_left_out(tmp_path: Path) -> None:
