@@ -17,7 +17,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 # Every installer step starts a fresh interpreter; importing what only some
@@ -32,9 +34,56 @@ def _rules() -> set[str]:
     return set(path.read_text().split()) if path.exists() else set()
 
 
+# The stops an installer can be sent, by the matrix or by its own cleanup.
+STOPS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+
+@contextlib.contextmanager
+def deferred_stops() -> Iterator[None]:
+    """Run a critical section whole: a stop that arrives meanwhile is
+    delivered once it ends, so shared state and logs are never left torn or
+    missing. Every fake runs under it, except while it waits on something
+    that must stay stoppable (``stops_allowed``)."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@contextlib.contextmanager
+def stops_allowed() -> Iterator[None]:
+    previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def stoppable_child() -> None:
+    """``preexec_fn`` for a child: it gets stops as the real command would."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+
+
+def _append(path: Path, text: str) -> None:
+    """Append in one write, so a line is never half there."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, text.encode())
+    finally:
+        os.close(descriptor)
+
+
+def _replace(path: Path, text: str) -> None:
+    """Replace a file whole: a fake stopped part way must not leave it empty
+    or torn for every later call to fail on."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
 def _log(*entry: object) -> None:
-    with (FAKE / "log").open("a") as handle:
-        handle.write(json.dumps([str(item) for item in entry]) + "\n")
+    _append(FAKE / "log", json.dumps([str(item) for item in entry]) + "\n")
 
 
 def _state(name: str) -> dict[str, object]:
@@ -44,12 +93,7 @@ def _state(name: str) -> dict[str, object]:
 
 
 def _save(name: str, value: dict[str, object]) -> None:
-    """Replace a state file whole: a fake stopped part way must not leave it
-    empty or torn for every later call to fail on."""
-    path = FAKE / f"{name}.json"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    temporary.write_text(json.dumps(value, sort_keys=True))
-    os.replace(temporary, path)
+    _replace(FAKE / f"{name}.json", json.dumps(value, sort_keys=True))
 
 
 STEP_LOCK_TIMEOUT_SECONDS = 30.0
@@ -67,7 +111,7 @@ def _step_lock() -> Path:
         try:
             lock.mkdir()
             # Who holds it, so a lock left behind names its holder.
-            (FAKE / "steps.lock.owner").write_text(f"{os.getpid()} {' '.join(sys.argv[1:3])}\n")
+            _replace(FAKE / "steps.lock.owner", f"{os.getpid()} {' '.join(sys.argv[1:3])}\n")
             return lock
         except FileExistsError:
             if time.monotonic() >= deadline:
@@ -78,41 +122,36 @@ def _step_lock() -> Path:
 
 
 def step(tool: str, arguments: list[str], *, action: bool) -> str:
-    """Number this call and return what the matrix injects at it, if anything."""
-    import signal
-
+    """Number this call and return what the matrix injects at it, if anything;
+    an injected fault is logged, so a case can tell it was made."""
     steps = FAKE / "steps"
     if not FAKE.is_dir():
         return ""
-    # A stop signal while the lock is held would leave it and hang every
-    # later step; it is delivered once the lock is released.
-    stops = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
-    signal.pthread_sigmask(signal.SIG_BLOCK, stops)
-    try:
+    # A stop while the lock is held would leave it and hang every later step.
+    with deferred_stops():
         lock = _step_lock()
         try:
             index = len(steps.read_text().splitlines()) if steps.exists() else 0
-            with steps.open("a") as handle:
-                kind = "action" if action else "query"
-                line = "\t".join([str(index), kind, tool, *arguments]).replace("\n", " ")
-                handle.write(line + "\n")
+            kind = "action" if action else "query"
+            line = "\t".join([str(index), kind, tool, *arguments]).replace("\n", " ")
+            _append(steps, line + "\n")
         finally:
             (FAKE / "steps.lock.owner").unlink(missing_ok=True)
             lock.rmdir()
-    finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
-    inject = FAKE / "inject"
-    if not action or not inject.exists():
-        return ""
-    # One line per injected fault; a second one lands in the first one's cleanup.
-    for line in inject.read_text().splitlines():
-        at_text, mode = line.split()
-        at = int(at_text)
-        if mode == "expire" and tool == "sudo" and index >= at:
-            (FAKE / "sudo-expired").touch()
-            return "fail"
-        if index == at:
-            return "fail" if mode == "expire" else mode
+        inject = FAKE / "inject"
+        if not action or not inject.exists():
+            return ""
+        # One line per injected fault; a second one lands in the first one's cleanup.
+        for entry in inject.read_text().splitlines():
+            at_text, mode = entry.split()
+            at = int(at_text)
+            if mode == "expire" and tool == "sudo" and index >= at:
+                (FAKE / "sudo-expired").touch()
+                _log("fault-injected", index, mode)
+                return "fail"
+            if index == at:
+                _log("fault-injected", index, mode)
+                return "fail" if mode == "expire" else mode
     return ""
 
 
@@ -157,9 +196,8 @@ STOP_SIGNALS = {"kill": "SIGTERM", "hangup": "SIGHUP", "interrupt": "SIGINT"}
 
 def kill_installer(mode: str = "kill") -> None:
     """Stop the installer: TERM or HUP to the script itself, or INT to its whole
-    process group as Ctrl-C does. This call ignores the interrupt it sends."""
-    import signal
-
+    process group as Ctrl-C does. This call ignores the interrupt it sends.
+    It runs whole, sending and logging, under ``deferred_stops``."""
     pid = _installer_pid(outermost=mode == "interrupt")
     if pid is None:
         return
@@ -182,7 +220,12 @@ def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> in
     if KILL:
         import subprocess
 
-        return subprocess.run(arguments, env=environment, check=False).returncode
+        return subprocess.run(
+            arguments, env=environment, check=False, preexec_fn=stoppable_child
+        ).returncode
+    # The command gets stops as it would run alone; one already waiting ends
+    # this process here, before it runs.
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
     os.execvpe(arguments[0], arguments, environment)
     return 1
 
@@ -192,38 +235,35 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
     stop the installer once the helper holds the locks, and end with it.
 
     The installer goes on meanwhile and may end this helper before the stop
-    is sent; its own stop waits until the stop has gone out, so the case
+    is sent; that stop is deferred until this one has gone out, so the case
     always stops the installer."""
-    import signal
     import subprocess
     import time
 
     global KILL
     KILL = False
-    helper = subprocess.Popen(command, env=environment)
+    helper = subprocess.Popen(command, env=environment, preexec_fn=stoppable_child)
 
     def finish(signum: int, frame: object) -> None:
         # Only unwind here; waiting inside a handler can deadlock on Popen's lock.
         raise SystemExit(128 + signum)
 
-    stops = {signal.SIGTERM, signal.SIGHUP}
-    signal.pthread_sigmask(signal.SIG_BLOCK, stops)
     try:
-        try:
-            deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
-            while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+        deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
+        while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if "stop-sent-late" in _rules():
+            # Let the installer get as far as ending this helper first.
+            late = time.monotonic() + 30
+            while not signal.sigpending() & {signal.SIGTERM, signal.SIGHUP}:
+                if time.monotonic() >= late:
+                    break
                 time.sleep(0.01)
-            if "stop-sent-late" in _rules():
-                # Let the installer get as far as ending this helper first.
-                late = time.monotonic() + 30
-                while not signal.sigpending() & stops and time.monotonic() < late:
-                    time.sleep(0.01)
-            kill_installer(STOP)
-        finally:
-            signal.signal(signal.SIGTERM, finish)
-            signal.signal(signal.SIGHUP, finish)
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
-        return helper.wait()
+        kill_installer(STOP)
+        signal.signal(signal.SIGTERM, finish)
+        signal.signal(signal.SIGHUP, finish)
+        with stops_allowed():
+            return helper.wait()
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -689,7 +729,7 @@ def sudo(arguments: list[str]) -> int:
         # ``sudo-v-expires-after:N`` lets the first N validations succeed.
         counter = FAKE / "sudo-validations"
         count = int(counter.read_text()) if counter.exists() else 0
-        counter.write_text(str(count + 1))
+        _replace(counter, str(count + 1))
         limits = [
             int(rule.rpartition(":")[2])
             for rule in rules
@@ -775,7 +815,6 @@ def ssh(arguments: list[str]) -> int:
     connection: the installer running on the other end is told with a hangup,
     finishes its own cleanup, and this end then fails as ssh does; any other
     command there runs to its end."""
-    import signal
     import subprocess
 
     command = arguments[-1]
@@ -802,14 +841,15 @@ def ssh(arguments: list[str]) -> int:
         stderr=subprocess.PIPE,
         text=True,
         process_group=0,
+        preexec_fn=stoppable_child,
     )
     group.append(remote.pid)
     # The test run kills this group too if anything in it outlives the run.
-    with (FAKE / "groups").open("a") as handle:
-        handle.write(f"{remote.pid}\n")
+    _append(FAKE / "groups", f"{remote.pid}\n")
     if dropped:
         hang_up()
-    stdout, stderr = remote.communicate()
+    with stops_allowed():
+        stdout, stderr = remote.communicate()
     sys.stderr.write(stderr)
     if dropped:
         return 255
@@ -881,7 +921,7 @@ def _remove_distribution(venv: Path, removed: str, kept: str, backup: Path | Non
             "distribution": [removed, gone],
             "files": [[str(path), str(backup / str(number))] for number, path in enumerate(paths)],
         }
-        (backup / "plan.json").write_text(json.dumps(plan))
+        _replace(backup / "plan.json", json.dumps(plan))
     _save("pip", dists)
     for number, path in enumerate(paths):
         if backup is not None:
@@ -1070,6 +1110,7 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                 env=environment,
                 text=True,
                 check=False,
+                preexec_fn=stoppable_child,
             ).returncode
         return 0
     return 0
@@ -1116,7 +1157,8 @@ def _check_serve(helper: Path) -> int:
 
     rules = _rules()
     if "health-hang" in rules:
-        time.sleep(3600)
+        with stops_allowed():
+            time.sleep(3600)
     prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird")
     serving = set()
     for name in (f"com.{prefix}.serve", f"{prefix}-controller.service"):
@@ -1142,7 +1184,6 @@ def stopped_hook(arguments: list[str]) -> int:
     """An owner's --stopped-hook: record what it finds, then succeed, or as
     the rules say fail (``hook-fail``), die (``hook-killed``) or never end
     (``hook-hang``)."""
-    import signal
     import time
 
     rules = _rules()
@@ -1177,7 +1218,8 @@ def stopped_hook(arguments: list[str]) -> int:
     if "hook-killed" in rules:
         os.kill(os.getpid(), signal.SIGKILL)
     if "hook-hang" in rules:
-        time.sleep(3600)
+        with stops_allowed():
+            time.sleep(3600)
     if "hook-fail" in rules:
         print("synthetic hook failure", file=sys.stderr)
         return 7
@@ -1232,7 +1274,7 @@ def _injected_failure(tool: str, arguments: list[str]) -> int:
     return {"rsync": 23, "ssh": 255, "launchctl": 5}.get(tool, 1)
 
 
-def main() -> int:
+def run() -> int:
     global KILL, STOP
     tool, arguments = sys.argv[1], sys.argv[2:]
     if tool == "build-venv":
@@ -1265,22 +1307,23 @@ def main() -> int:
             "ssh": ssh,
             "stopped-hook": stopped_hook,
         }
-        if tool in ("launchctl", "systemctl"):
-            # A service manager applies each command whole, whatever stops
-            # the client; a stop signal reaches the fake once it has.
-            import signal
-
-            stops = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
-            signal.pthread_sigmask(signal.SIG_BLOCK, stops)
-            try:
-                status = handlers[tool](arguments)
-            finally:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
-        else:
-            status = handlers[tool](arguments)
+        status = handlers[tool](arguments)
     if KILL:
         kill_installer(STOP)
     return status
+
+
+def main() -> int:
+    """Each call runs whole: what it changes and logs, and a stop it injects,
+    complete before a stop that reached it meanwhile ends it, as the real
+    command's effect would; then it dies of that stop."""
+    try:
+        with deferred_stops():
+            return run()
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        return 130
 
 
 if __name__ == "__main__":

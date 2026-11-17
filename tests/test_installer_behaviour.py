@@ -196,7 +196,9 @@ trap 'stopped=TERM' TERM
 # in a subshell that ignores it, which they inherit, so none of them dies
 # between taking the lock and releasing it (a mkdir that died after making the
 # lock would leave this loop waiting for itself).
-index=$(
+# The fault injected here, if any, is logged in the same section, so a case
+# can tell it was made.
+numbered=$(
   trap '' HUP INT TERM
   while ! {mkdir} "$lock" 2>/dev/null; do :; done
   printf '%s {name}\n' "$$" > "$lock.owner"
@@ -211,20 +213,24 @@ index=$(
   }} >> "$FAKE/steps"
   {rm} -f "$lock.owner"
   {rmdir} "$lock"
-  printf '%s' "$index"
+  mode=""
+  if [ -f "$FAKE/inject" ]; then
+    while read -r at injected; do
+      if [ "$at" = "$index" ]; then
+        mode=$injected
+      fi
+    done < "$FAKE/inject"
+  fi
+  if [ -n "$mode" ]; then
+    printf '["fault-injected", "%s", "%s"]\n' "$index" "$mode" >> "$FAKE/log"
+  fi
+  printf '%s %s' "$index" "$mode"
 )
 trap - HUP INT TERM
 if [ -n "$stopped" ]; then
   kill -s "$stopped" $$
 fi
-mode=""
-if [ -f "$FAKE/inject" ]; then
-  while read -r at injected; do
-    if [ "$at" = "$index" ]; then
-      mode=$injected
-    fi
-  done < "$FAKE/inject"
-fi
+mode=${{numbered#* }}
 case "$mode" in
   fail | expire)
     echo "{name}: synthetic failure" >&2

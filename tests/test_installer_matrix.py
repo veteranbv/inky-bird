@@ -17,7 +17,10 @@ step of the cleanup that follows, or stops it there. Rollback commands appear on
 With one fault every rollback command works, so every unit must be exactly as
 it was. A unit may differ only when its own rollback failed (sudo expired, or
 the second fault was one of that unit's calls), and only in the way the output
-says it does. Every definition records the version that rendered it, so one
+says it does. Every fake runs each call whole, deferring a stop that reaches it until it
+has changed and logged what it does (and sent the stop it injects), and a case
+passes only if the fake logged making its fault. Every definition records the
+version that rendered it, so one
 left from the new version differs from the one it replaced. Claims that the
 previous or the new version runs must hold for the active link, every service
 and every enabled or running unit; an installer's own success line is such a
@@ -1359,8 +1362,6 @@ def check_install(
         covered.add("I4")
     # I8: an injected failure never reports success, and a kill is never silent.
     stopped = case.mode in STOP_MODES
-    if stopped and not any(call[0] == "stop-sent" for call in machine.calls()):
-        report.append("the stop this case injects was never sent to the installer")
     if outcome.returncode == 0 and case.mode != "none":
         # The new version runs; only owner setup, or a leftover the output names, remains.
         tolerated = (case.tool == "inky-bird" and "owner setup is incomplete" in output) or (
@@ -2163,6 +2164,7 @@ class Group:
                 f"the run diverged from the recording before step {case.step}"
             )
             return outcome
+        check_fault_made(machine, case, outcome)
         if self.kind == "install":
             check_install(machine, self.scenario, case, before, outcome)
         else:
@@ -2192,6 +2194,19 @@ class Group:
         if after.tree != before.tree or after.stray != before.stray:
             outcome.violations.append("I8: a busy run changed the machine")
         return outcome
+
+
+def check_fault_made(machine: Machine, case: Case, outcome: Outcome) -> None:
+    """A case passes only if its fault happened: the call it fails or stops
+    at saw the fault (and, for a stop, sent it), as the fakes log within the
+    same uninterruptible section. Otherwise a run that never met its fault
+    would be checked as if it had."""
+    calls = machine.calls()
+    made = {(call[1], call[2]) for call in calls if call[0] == "fault-injected"}
+    if (str(case.step), case.mode) not in made:
+        outcome.violations.append(f"the fault this case injects at call {case.step} was never made")
+    if case.mode in STOP_MODES and not any(call[0] == "stop-sent" for call in calls):
+        outcome.violations.append("the stop this case injects was never sent to the installer")
 
 
 # Which cases run --------------------------------------------------------------
