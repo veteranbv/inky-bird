@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import signal
@@ -83,10 +84,13 @@ SYSTEM_PATHS = {
 RUN_TIMEOUT_SECONDS = 120
 
 
-def group_members(group: int) -> list[str]:
-    """Live processes in one process group, as ``pid command`` lines."""
+def group_members(group: int, marker: str | None = None) -> list[str]:
+    """Live processes in one process group, as ``pid command`` lines. With
+    ``marker`` (``FAKE=<this machine>``), only those whose environment holds
+    it: once a run's leader has exited, its group's number can be taken by a
+    new group of another run, which must not be counted, or killed, as its."""
     listing = subprocess.run(
-        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
         capture_output=True,
         text=True,
         check=True,
@@ -94,19 +98,27 @@ def group_members(group: int) -> list[str]:
     members = []
     for line in listing.splitlines():
         pid, pgid, stat, *command = line.split(None, 3)
-        if int(pgid) == group and not stat.startswith("Z"):
-            members.append(f"{pid} {' '.join(command)}")
+        text = " ".join(command)
+        if int(pgid) != group or stat.startswith("Z"):
+            continue
+        if marker is not None and not re.search(re.escape(marker) + r"(\s|$)", text):
+            continue
+        members.append(f"{pid} {text[:300]}")
     return members
 
 
-def end_group(group: int) -> list[str]:
+def end_group(group: int, marker: str | None = None) -> list[str]:
     """Kill whatever is left of a run's process group; return what had survived it."""
-    survivors = group_members(group)
+    survivors = group_members(group, marker)
     if survivors:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(group, signal.SIGKILL)
+        if marker is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group, signal.SIGKILL)
+        for member in survivors:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(member.split()[0]), signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while group_members(group) and time.monotonic() < deadline:
+        while group_members(group, marker) and time.monotonic() < deadline:
             time.sleep(0.05)
     return survivors
 
@@ -137,8 +149,11 @@ def run_contained(
     # Commands the fake ssh ran on the "display", each in a group of its own.
     remote_groups = Path(environment.get("FAKE", "/nonexistent")) / "groups"
 
+    # Every process of a matrix run carries its machine's FAKE directory.
+    marker = f"FAKE={environment['FAKE']}" if "FAKE" in environment else None
+
     def end_all() -> list[str]:
-        survivors = end_group(process.pid)
+        survivors = end_group(process.pid, marker)
         if remote_groups.exists():
             for group in remote_groups.read_text().split():
                 # A group that has ended may have its number reused by another
