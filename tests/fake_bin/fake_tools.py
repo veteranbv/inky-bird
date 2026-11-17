@@ -173,6 +173,7 @@ def kill_installer(mode: str = "kill") -> None:
         os.killpg(os.getpgid(pid), signal.SIGINT)
     else:
         os.kill(pid, getattr(signal, STOP_SIGNALS[mode]))
+    _log("stop-sent", mode)
 
 
 def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> int:
@@ -187,8 +188,12 @@ def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> in
 
 
 def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path) -> int:
-    """The cycle lock helper runs in the background until the installer ends it;
-    stop the installer once the helper holds the lock, and end with it."""
+    """The lock helper runs in the background until the installer ends it;
+    stop the installer once the helper holds the locks, and end with it.
+
+    The installer goes on meanwhile and may end this helper before the stop
+    is sent; its own stop waits until the stop has gone out, so the case
+    always stops the installer."""
     import signal
     import subprocess
     import time
@@ -201,15 +206,27 @@ def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path
         # Only unwind here; waiting inside a handler can deadlock on Popen's lock.
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGTERM, finish)
+    stops = {signal.SIGTERM, signal.SIGHUP}
+    signal.pthread_sigmask(signal.SIG_BLOCK, stops)
     try:
-        deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
-        while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        kill_installer(STOP)
+        try:
+            deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
+            while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if "stop-sent-late" in _rules():
+                # Let the installer get as far as ending this helper first.
+                late = time.monotonic() + 30
+                while not signal.sigpending() & stops and time.monotonic() < late:
+                    time.sleep(0.01)
+            kill_installer(STOP)
+        finally:
+            signal.signal(signal.SIGTERM, finish)
+            signal.signal(signal.SIGHUP, finish)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
         return helper.wait()
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         if helper.poll() is None:
             helper.terminate()
         helper.wait()

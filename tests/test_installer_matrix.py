@@ -1359,6 +1359,8 @@ def check_install(
         covered.add("I4")
     # I8: an injected failure never reports success, and a kill is never silent.
     stopped = case.mode in STOP_MODES
+    if stopped and not any(call[0] == "stop-sent" for call in machine.calls()):
+        report.append("the stop this case injects was never sent to the installer")
     if outcome.returncode == 0 and case.mode != "none":
         # The new version runs; only owner setup, or a leftover the output names, remains.
         tolerated = (case.tool == "inky-bird" and "owner setup is incomplete" in output) or (

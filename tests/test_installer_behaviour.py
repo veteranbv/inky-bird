@@ -1366,6 +1366,42 @@ def test_macos_agent_whose_shutdown_needs_a_lock_is_killed_only_after_launchds_t
     assert host.installed_version() == "new"
 
 
+@pytest.mark.parametrize("hook", [False, True])
+@pytest.mark.parametrize("mode", ["interrupt", "kill", "hangup"])
+def test_a_stop_injected_at_the_lock_holder_reaches_the_installer(
+    tmp_path: Path, mode: str, hook: bool
+) -> None:
+    """The holder runs beside the installer, which may release it before the
+    matrix's stop is sent; the stop must still arrive, and the run must not
+    claim success."""
+    host = linux_host(tmp_path)
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert result.returncode == 0, result.stderr
+    holds = [
+        int(line.split("\t")[0])
+        for line in (host.fake / "steps").read_text().splitlines()
+        if "hold-writer-locks" in line
+    ]
+    # Put the machine back: the old version installed and running.
+    other = Host(tmp_path / "again", "Linux")
+    other.install_old_version()
+    other.install_units(
+        controller_service="active",
+        refresh_service="inactive",
+        refresh_timer="active",
+        generate_service="inactive",
+        generate_timer="active",
+    )
+    other.fail("stop-sent-late")
+    (other.fake / "inject").write_text(f"{holds[-1]} {mode}\n")
+    options = ("--stopped-hook", str(other.stopped_hook())) if hook else ()
+    result = other.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert any(call[0] == "stop-sent" for call in other.calls()), result.stderr
+    assert result.returncode != 0
+    assert "Controller installed" not in result.stdout
+
+
 def hook_calls(host: Host) -> list[list[str]]:
     return [call for call in host.calls() if call[0] == "stopped-hook"]
 
