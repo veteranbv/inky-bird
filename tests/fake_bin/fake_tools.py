@@ -21,6 +21,7 @@ import signal
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 # Every installer step starts a fresh interpreter; importing what only some
 # tools need where they use it takes about a quarter off each call.
@@ -1456,17 +1457,17 @@ def run_with_accounts(arguments: list[str]) -> None:
         assert isinstance(listed, list)
         return [gid, *(groups[str(group)] for group in listed)]
 
-    def lstat(path: str | os.PathLike[str]) -> os.stat_result:
-        return _seen(real_lstat(path), path, owners)
+    def lstat(path: str | os.PathLike[str], **options: Any) -> os.stat_result:
+        return _seen(real_lstat(path, **options), path, owners)
 
-    def stat(path: str | os.PathLike[str]) -> os.stat_result:
-        return _seen(real_stat(path), path, owners)
+    def stat(path: str | os.PathLike[str], **options: Any) -> os.stat_result:
+        return _seen(real_stat(path, **options), path, owners)
 
     # The synthetic account database, and owners recorded by the fake chown.
     pwd.getpwnam = getpwnam
     grp.getgrgid = getgrgid
     os.getgrouplist = getgrouplist
-    os.lstat = lstat  # type: ignore[assignment]  # stat_result keyword options are not used
+    os.lstat = lstat  # type: ignore[assignment]  # passes dir_fd and follow_symlinks through
     os.stat = stat  # type: ignore[assignment]
     sys.argv = arguments
     runpy.run_path(arguments[0], run_name="__main__")
