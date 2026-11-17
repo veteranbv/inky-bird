@@ -1208,6 +1208,7 @@ CLAIMS = {
     "The stopped-boundary hook failed with exit status ${status}; the upgrade did not switch to "
     "the new version.": "neutral",
     "The new version started, but its web service failed its health check.": "neutral",
+    "${unit} did not begin to stop.": "neutral",
 }
 CLAIM_CLASSES = ("installed", "new", "previous", "unchanged", "uninstalled", "neutral")
 # A shell expansion in a printed line: ${name}, ${name[*]-default}, $name or $1.
@@ -1491,10 +1492,12 @@ def check_install(
 def check_quiet_writers(
     machine: Machine, scenario: Scenario, before: Snapshot, outcome: Outcome
 ) -> None:
-    """I11: before the switch, a service running the previous version is
-    stopped only while every writer lock is held, so nothing it writes is cut
-    off. (After the switch a rollback stops what the run started, or tried to
-    restart, without them.) The owner's
+    """I11: no writer is cut off mid-write, and none runs during the hook.
+    Before the switch, a service running the previous version is told to stop
+    only while every writer lock is held, so it is between writes; the run
+    never waits for it to exit while still holding a lock its shutdown may
+    need, so no service manager has to kill it. (After the switch a rollback
+    stops what the run started, or tried to restart, without them.) The owner's
     stopped-boundary hook runs at most once, and on success exactly once: with
     every service of the role stopped, every writer lock held (there are none
     to hold without an installed version) and the previous version still
@@ -1510,6 +1513,13 @@ def check_quiet_writers(
             outcome.covered.add("I11")
             if held != "lock-held":
                 report.append(f"I11: {unit} running {runtime} was stopped without the writer locks")
+    # A service whose shutdown waits for a writer lock is asked to stop while
+    # the locks are held, and waited for once they are released; one waited
+    # for with the locks held is killed by its manager's stop timeout.
+    for call in calls:
+        if call[0] == "stop-timeout":
+            outcome.covered.add("I11")
+            report.append(f"I11: {call[1]} was killed waiting for a writer lock the run held")
     hooks = [call for call in calls if call[0] == "stopped-hook"]
     if not scenario.arguments:
         if hooks:

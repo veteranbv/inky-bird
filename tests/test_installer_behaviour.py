@@ -1304,6 +1304,60 @@ def test_a_lock_holder_that_ignores_a_stop_is_forced_and_the_run_still_ends(
     assert str(tmp_path) not in helpers
 
 
+def stop_timeouts(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] in ("stop-timeout", "exit-timeout")]
+
+
+@pytest.mark.parametrize("hook", [False, True])
+def test_linux_services_whose_shutdown_needs_a_lock_stop_without_a_timeout(
+    tmp_path: Path, hook: bool
+) -> None:
+    """The fake scheduler and web service do not exit while the installer
+    holds the writer locks, as a scheduler recording the end of a job does
+    not: they are asked to stop under the locks and waited for without them."""
+    host = linux_host(tmp_path, mode="app")
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=APP_UNITS)
+    assert result.returncode == 0, result.stderr
+    assert not stop_timeouts(host)
+    stopped = {call[1]: call[2] for call in stops(host)}
+    expected = {f"{host.family}-scheduler.service": "lock-held"}
+    if hook:
+        expected[f"{host.family}-controller.service"] = "lock-held"
+        ((_, held, _, running, *_),) = hook_calls(host)
+        assert held == "lock-held" and not json.loads(running)
+    assert stopped == expected
+    assert host.unit_state("scheduler.service") == {"active": True, "enabled": True}
+
+
+def test_linux_upgrade_waits_for_a_timer_job_blocked_on_a_lock_without_holding_it(
+    tmp_path: Path,
+) -> None:
+    host = linux_host(tmp_path)
+    # A refresh a timer started, waiting for a writer lock.
+    host.set_busy("refresh.service", 2)
+    result = run_linux(host, quiesce_timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "Timed out" not in result.stderr
+
+
+def test_macos_agent_whose_shutdown_needs_a_lock_is_killed_only_after_launchds_timeout(
+    tmp_path: Path,
+) -> None:
+    """launchd stops an agent in bootout and has no stop whose signal can be
+    seen before it returns, so the installer boots agents out holding the
+    locks. One that waits for a lock is killed after launchd's exit timeout:
+    bounded, and while it holds no lock, so no write is cut short."""
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("agents-wait-for-locks")
+    started = time.monotonic()
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert time.monotonic() - started < 60
+    assert stop_timeouts(host) == [["exit-timeout", f"com.{host.family}.serve"]]
+    assert host.installed_version() == "new"
+
+
 def hook_calls(host: Host) -> list[list[str]]:
     return [call for call in host.calls() if call[0] == "stopped-hook"]
 

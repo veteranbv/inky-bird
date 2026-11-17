@@ -707,14 +707,21 @@ refuses only if the check itself fails to run, for example when it cannot open
 a lock in `state_dir`: "Could not check whether a plate is being made. No
 changes made."
 
-On a Linux controller, setup then stops the scheduler and job timers, lets go
-of the locks, and waits up to 30 more minutes for a refresh, generate,
-catalog-publish or notifications job a timer had already started to finish
-before it copies anything. If a job is still running then, setup stops with
-"Timed out waiting for `UNIT` to finish." (naming the job). Run setup again once
-the job has finished. On macOS, checking the catalog publisher of the new
-version lets go of the locks briefly and takes them again; work that started in
-between and does not finish within the wait stops the upgrade before the switch.
+On a Linux controller, setup then asks the scheduler to stop and stops the job
+timers, lets go of the locks, and waits up to 30 more minutes for the scheduler
+to exit and for a refresh, generate, catalog-publish or notifications job a
+timer had already started to finish before it copies anything. The scheduler
+may need one of the locks to finish stopping, so setup does not wait for it
+while holding them. If a job is still running then, setup stops with "Timed
+out waiting for `UNIT` to finish." (naming the job). Run setup again once the
+job has finished. On macOS, checking the catalog publisher of the new version
+lets go of the locks briefly and takes them again; work that started in
+between and does not finish within the wait stops the upgrade before the
+switch. macOS stops each agent as it unloads it, with the locks held; an agent
+that is itself waiting for one of them, such as a scheduler recording the end
+of a job, is ended by launchd after its exit timeout (system-defined, usually 20
+seconds; the installed agents set none). It holds no lock then, so nothing it
+was writing is cut short.
 
 Once the new version's services are started, setup asks the web service for
 `/health` on this machine, at the configured `bind_host` and `port` (a wildcard

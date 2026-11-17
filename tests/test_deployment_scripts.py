@@ -887,7 +887,7 @@ def test_controller_installers_hold_writer_locks_run_the_hook_and_check_health_i
         ),
         (
             "install-controller-systemd.sh",
-            'sudo systemctl stop "${service_prefix}-scheduler.service"',
+            'request_stop "${service_prefix}-scheduler.service"',
         ),
     ):
         script = (root / name).read_text()

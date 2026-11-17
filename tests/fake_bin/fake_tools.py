@@ -402,6 +402,14 @@ def launchctl(arguments: list[str]) -> int:
             return 3
         held = "lock-held" if _cycle_lock_held() else "lock-free"
         _log("launchctl", "bootout", label, held)
+        if (
+            "agents-wait-for-locks" in _rules()
+            and held == "lock-held"
+            and _waits_for_locks_to_stop(label)
+            and not _until_locks_free(STOP_TIMEOUT_SECONDS)
+        ):
+            # launchd waits its exit timeout, then kills the agent.
+            _log("exit-timeout", label)
         _log("stopped", label, held, _process_runtime(label))
         if f"bootout:{label}" in _rules():
             return 5
@@ -523,6 +531,27 @@ def _record_run(unit: str) -> None:
     _save("runs", runs)
 
 
+# How long a service manager waits for a stopping service before it kills it.
+STOP_TIMEOUT_SECONDS = 2.0
+
+
+def _waits_for_locks_to_stop(unit: str) -> bool:
+    """Services whose own shutdown can need a writer lock: the scheduler
+    records the end of the job it stops, the web service finishes requests."""
+    return unit.endswith(("-scheduler.service", "-controller.service", ".scheduler", ".serve"))
+
+
+def _until_locks_free(seconds: float) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while _cycle_lock_held():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def systemctl(arguments: list[str]) -> int:
     units = _state("systemd")
     verb = arguments[0]
@@ -533,9 +562,23 @@ def systemctl(arguments: list[str]) -> int:
     rules = _rules()
     if verb == "show":
         busy = _state("busy")
+        stopping = _state("stopping")
+        if "--property=ActiveState" in arguments and unit in stopping:
+            # Signalled to stop, it finishes only once it can take the lock it waits for.
+            if _cycle_lock_held():
+                print("deactivating")
+                return 0
+            stopping.pop(unit)
+            _save("stopping", stopping)
+            _record_process(unit, running=False)
+            print("inactive")
+            return 0
         if "--property=ActiveState" in arguments:
             remaining = int(str(busy.get(unit, 0)))
-            if remaining > 0:
+            if remaining > 0 and _cycle_lock_held():
+                # A job waiting for a writer lock the installer holds.
+                print("activating")
+            elif remaining > 0:
                 busy[unit] = remaining - 1
                 _save("busy", busy)
                 _log("busy-poll", unit, remaining - 1)
@@ -562,6 +605,10 @@ def systemctl(arguments: list[str]) -> int:
         return 5
     if verb == "disable" and not exists:
         return 1
+    if verb in ("start", "restart", "disable"):
+        stopping = _state("stopping")
+        if stopping.pop(unit, None) is not None:
+            _save("stopping", stopping)
     if verb in ("start", "restart") and _oneshot(unit):
         _record_run(unit)
         record["active"] = False
@@ -578,6 +625,19 @@ def systemctl(arguments: list[str]) -> int:
             _log("lock-at-stop", unit, held)
         if unit.endswith(".service") and (record["active"] or unit in _state("busy")):
             _log("stopped", unit, held, _process_runtime(unit))
+        if record["active"] and held == "lock-held" and _waits_for_locks_to_stop(unit):
+            # Its shutdown waits for a lock the caller holds (the scheduler
+            # records each job's end); systemd waits for it to exit.
+            if "--no-block" in arguments:
+                record["active"] = False
+                stopping = _state("stopping")
+                stopping[unit] = True
+                _save("stopping", stopping)
+                _save("systemd", units)
+                return 0
+            if not _until_locks_free(STOP_TIMEOUT_SECONDS):
+                # systemd's stop timeout: it kills the service.
+                _log("stop-timeout", unit)
         record["active"] = False
         _record_process(unit, running=False)
         if _oneshot(unit):

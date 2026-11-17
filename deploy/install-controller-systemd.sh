@@ -410,6 +410,46 @@ check_new_serve() {
 }
 
 
+# Ask a long-running service to stop while every writer lock is held, so it is
+# between writes when it is signalled. Its own shutdown can need one of those
+# locks (the scheduler records the end of the job it stops), so do not wait
+# for it to exit here: wait_until_stopped does, once they are released.
+request_stop() {
+  local unit=$1
+  local deadline=$((SECONDS + 30))
+  stopped_units+=("${unit}")
+  sudo systemctl stop --no-block "${unit}"
+  while [ "$(systemctl show --property=ActiveState --value "${unit}" 2>/dev/null || true)" = active ]; do
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "${unit} did not begin to stop." >&2
+      exit 1
+    fi
+    sleep "${poll_seconds}"
+  done
+}
+
+# Wait until none of the named services runs, up to ${deadline}.
+wait_until_stopped() {
+  local name
+  local service
+  local state
+  for name in "$@"; do
+    service="${service_prefix}-${name}.service"
+    while true; do
+      state=$(systemctl show --property=ActiveState --value "${service}" 2>/dev/null || true)
+      case "${state}" in
+        active | activating | deactivating | reloading) ;;
+        *) break ;;
+      esac
+      if ((SECONDS >= deadline)); then
+        echo "Timed out waiting for ${service} to finish." >&2
+        exit 1
+      fi
+      sleep 2
+    done
+  done
+}
+
 # Remember every managed unit's file and state before anything changes.
 record_units() {
   local unit
@@ -749,8 +789,7 @@ record_units
 # App-owned installations use the same dynamic scheduler as Docker. Stop it
 # before replacing its runtime; a managed installation removes it below.
 if systemctl is-active --quiet "${service_prefix}-scheduler.service"; then
-  stopped_units+=("${service_prefix}-scheduler.service")
-  sudo systemctl stop "${service_prefix}-scheduler.service"
+  request_stop "${service_prefix}-scheduler.service"
 fi
 for name in refresh generate catalog-publish notifications; do
   timer="${service_prefix}-${name}.timer"
@@ -759,37 +798,26 @@ for name in refresh generate catalog-publish notifications; do
     sudo systemctl stop "${timer}"
   fi
 done
-# A job a timer started may be waiting for one of the writer locks; let it
-# finish rather than wait for each other.
+# The scheduler, and a job a timer started, may be waiting for one of the
+# writer locks to finish; let go of them rather than wait for each other.
 release_writer_locks
 deadline=$((SECONDS + quiesce_timeout_seconds))
-for name in refresh generate catalog-publish notifications; do
-  service="${service_prefix}-${name}.service"
-  while true; do
-    state=$(systemctl show --property=ActiveState --value "${service}" 2>/dev/null || true)
-    case "${state}" in
-      active | activating | deactivating | reloading) ;;
-      *) break ;;
-    esac
-    if ((SECONDS >= deadline)); then
-      echo "Timed out waiting for ${service} to finish." >&2
-      exit 1
-    fi
-    sleep 2
-  done
-done
+wait_until_stopped scheduler refresh generate catalog-publish notifications
 if [ -n "${stopped_hook}" ]; then
   if ! sudo -v; then
     echo "Administrator access is required to install system services." >&2
     exit 1
   fi
-  hold_writer_locks true
   # The hook runs with every service stopped; the web service starts again
   # with the others below.
   if systemctl is-active --quiet "${service_prefix}-controller.service"; then
-    stopped_units+=("${service_prefix}-controller.service")
-    sudo systemctl stop "${service_prefix}-controller.service"
+    hold_writer_locks true
+    request_stop "${service_prefix}-controller.service"
+    release_writer_locks
+    deadline=$((SECONDS + quiesce_timeout_seconds))
+    wait_until_stopped controller
   fi
+  hold_writer_locks true
   run_stopped_hook
   release_writer_locks
 fi
