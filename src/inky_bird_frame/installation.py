@@ -12,7 +12,7 @@ import ssl
 import stat
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -20,12 +20,13 @@ from urllib.parse import urlsplit, urlunsplit
 from xml.parsers.expat import ExpatError
 
 from .birdbuddy import birdbuddy_status
-from .config import AppConfig, DiscoveryProvider, load_config
+from .config import AppConfig, DiscoveryProvider, load_config, parse_config_bytes
 from .errors import ConfigurationError, InkyBirdFrameError, InstallationError
 from .http import get_json, write_bytes_atomic
 from .images import SUPPORTED_HARDWARE_SIZES
 from .native_names import LEGACY_NAME, resolve_native_layout, service_family
 from .notifications import notification_state_path, notification_status
+from .system_service import valid_account_name
 
 SUDO_AUTHORIZATION_TIMEOUT_SECONDS = 300
 # CodexRunner's default per-call limit; a test keeps the two equal.
@@ -64,6 +65,25 @@ SYSTEMD_SERVICE_HARDENING = (
     "ProtectControlGroups=true\n"
     "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n"
 )
+# The first line of every unit a system-service installation renders, so the
+# user installer can tell those units from its own.
+SYSTEM_SERVICE_MARKER = "# Inky Bird system service"
+SYSTEMD_UNIT_DIRECTORY = Path("/etc/systemd/system")
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class SystemService:
+    """A root-installed controller that runs as its own account.
+
+    Its units carry no secret: they name the private environment file, which
+    the application loads itself. The web service, which starts no other
+    program, may write only below ``writable_paths``.
+    """
+
+    group: str
+    environment_file: Path
+    writable_paths: tuple[Path, ...]
 
 
 class InstallationRole(StrEnum):
@@ -380,6 +400,27 @@ def load_private_environment() -> list[str]:
     return added
 
 
+def read_account_config(path: Path, owner: int) -> AppConfig:
+    """Load the configuration an account owns, as root may: the file itself,
+    never a link, owned by that account; settings only, no secrets."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
+                raise ConfigurationError(
+                    f"The configuration {path} must be a regular file the service account owns"
+                )
+            content = handle.read(MAX_CONFIG_BYTES + 1)
+    except OSError:
+        raise ConfigurationError(
+            f"The configuration {path} must be a regular file, not a link"
+        ) from None
+    if len(content) > MAX_CONFIG_BYTES:
+        raise ConfigurationError(f"The configuration {path} is larger than 1 MiB")
+    return parse_config_bytes(content, path=path, load_secrets=False)
+
+
 def generation_species_timeout_seconds(config: AppConfig) -> int:
     """The longest one bird can take: its agent calls at their timeout."""
     # A profile, one profile refresh, and per attempt one generation and one review.
@@ -403,19 +444,28 @@ def controller_systemd_units(
     home: Path,
     user: str,
     service_prefix: str = LEGACY_NAME,
+    system: SystemService | None = None,
 ) -> dict[str, str]:
     """Render the complete systemd controller unit set for one installation."""
-    service_prefix = service_family(service_prefix)
+    if system is None:
+        service_prefix = service_family(service_prefix)
+    elif not valid_account_name(service_prefix) or service_prefix != user:
+        raise InstallationError("A system service is named after the account it runs as")
     service_path = controller_executable_path(
         config.controller.codex_path, generation_enabled=config.controller.generation_enabled
     )
-    tls_environment = "".join(
-        f"Environment={_systemd_quote(f'{name}={value}')}\n"
-        for name, value in native_tls_environment(config_path).items()
+    tls_environment = (
+        "".join(
+            f"Environment={_systemd_quote(f'{name}={value}')}\n"
+            for name, value in native_tls_environment(config_path).items()
+        )
+        if system is None
+        else ""
     )
     common = (
         f"User={user}\n"
-        f"WorkingDirectory={_systemd_literal(str(app_dir))}\n"
+        + ("" if system is None else f"Group={_systemd_literal(system.group)}\n")
+        + f"WorkingDirectory={_systemd_literal(str(app_dir))}\n"
         f"Environment={_systemd_quote(f'HOME={home}')}\n"
         f"Environment={_systemd_quote(f'PATH={service_path}')}\n"
         "Environment=PYTHONUNBUFFERED=1\n" + tls_environment
@@ -423,16 +473,39 @@ def controller_systemd_units(
     access_path = config_path.resolve().parent / "native-access.env"
     owner_environment = (
         f"EnvironmentFile={_systemd_quote(str(access_path))}\n"
-        if config.controller.oidc is not None
+        if config.controller.oidc is not None and system is None
         else ""
     )
+    serving_hardening = SYSTEMD_SERVICE_HARDENING
+    if system is not None:
+        environment_file = f"{PRIVATE_ENVIRONMENT_FILE_ENV}={system.environment_file}"
+        common += f"Environment={_systemd_quote(environment_file)}\n"
+        # A missing path (prefix "-") must not stop the service from starting.
+        writable = " ".join(
+            _systemd_quote(f"-{path}") for path in dict.fromkeys(system.writable_paths)
+        )
+        serving_hardening += f"ProtectSystem=strict\nReadWritePaths={writable}\n"
 
     def command(*arguments: str) -> str:
         return " ".join(
             (_systemd_quote(str(executable)), *(_systemd_argument(item) for item in arguments))
         )
 
-    serving = common + owner_environment + SYSTEMD_SERVICE_HARDENING
+    serving = common + owner_environment + serving_hardening
+    units = _controller_units(config, service_prefix, common, serving, command, config_path)
+    if system is not None:
+        units = {name: f"{SYSTEM_SERVICE_MARKER}\n{text}" for name, text in units.items()}
+    return units
+
+
+def _controller_units(
+    config: AppConfig,
+    service_prefix: str,
+    common: str,
+    serving: str,
+    command: Callable[..., str],
+    config_path: Path,
+) -> dict[str, str]:
     units = {
         f"{service_prefix}-controller.service": f"""[Unit]
 Description=Serve the Inky Bird approved catalog
@@ -992,8 +1065,28 @@ def _systemd_last_run_check(
     )
 
 
+def _system_service_prefix() -> str | None:
+    """The account running doctor, when system services were installed for it.
+
+    A system service is named after its account and its units start with
+    SYSTEM_SERVICE_MARKER; run as that account, doctor checks those units.
+    """
+    import pwd
+
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+        unit = SYSTEMD_UNIT_DIRECTORY / f"{name}-controller.service"
+        with unit.open(encoding="utf-8", errors="replace") as handle:
+            first = handle.readline().rstrip("\n")
+    except (KeyError, OSError):
+        return None
+    return name if first == SYSTEM_SERVICE_MARKER and valid_account_name(name) else None
+
+
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
-    prefix = _native_family(config)
+    prefix: str | DiagnosticCheck | None = _system_service_prefix()
+    if prefix is None:
+        prefix = _native_family(config)
     if isinstance(prefix, DiagnosticCheck):
         yield prefix
         return
@@ -1171,8 +1264,24 @@ def _authorize_linux_setup() -> None:
         raise InstallationError("Administrator authorization failed; run sudo -v and try again")
 
 
-def validate_native_controller_setup(config: AppConfig, config_path: Path) -> None:
-    """Refuse, before any change, what the native controller installers would refuse."""
+def validate_native_controller_setup(
+    config: AppConfig, config_path: Path, *, system_service: bool = False
+) -> None:
+    """Refuse, before any change, what the native controller installers would refuse.
+
+    A system service names its private environment file in every unit and the
+    application loads it, so settings read from environment variables work
+    there; the two serving-only native files are replaced by that one file.
+    """
+    if system_service:
+        for name in ("native-access.env", "native-tls.env"):
+            path = config_path.parent / name
+            if path.exists() or path.is_symlink():
+                raise InstallationError(
+                    f"A system service does not read {path}; move its setting into the "
+                    f"private environment file, then remove {name}"
+                )
+        return
     environment_credentials: list[str] = []
     if config.discovery.geoapify_api_key_env is not None:
         environment_credentials.append("geoapify_api_key_env")
@@ -1218,11 +1327,14 @@ def setup(
     uv_bin: Path | None = None,
     python_version: str | None = None,
     venv: Path | None = None,
+    service_account: str | None = None,
 ) -> dict[str, object]:
     config_path = config_path.expanduser().resolve()
     config = load_config(config_path)
     if role is InstallationRole.CONTROLLER:
-        validate_native_controller_setup(config, config_path)
+        validate_native_controller_setup(
+            config, config_path, system_service=service_account is not None
+        )
     script = _setup_script(role, source_dir)
     if not script.is_file():
         raise InstallationError(f"Installer is missing: {script}")
@@ -1232,7 +1344,11 @@ def setup(
         "install and enable native service-manager definitions",
         "verify the installed services with the native service manager",
     ]
-    if role is InstallationRole.CONTROLLER and config.controller.oidc is not None:
+    if (
+        role is InstallationRole.CONTROLLER
+        and config.controller.oidc is not None
+        and service_account is None
+    ):
         changes.append("retain the named OIDC secret in a private serving-only native cache")
     result: dict[str, object] = {
         "role": role.value,
@@ -1248,6 +1364,13 @@ def setup(
                 "New artwork is off. To turn it on, set generation_enabled = true "
                 "under [controller] in the configuration, then run setup again."
             )
+    if service_account is not None:
+        result["service_account"] = service_account
+        command = f"sudo {script} --service-account {service_account}"
+        if apply:
+            raise InstallationError(f"Install a system service as root: {command}")
+        result["confirmation"] = f"Install it as root: {command}"
+        return result
     if not apply:
         result["confirmation"] = "Repeat the same command with --yes to apply these changes."
         return result
