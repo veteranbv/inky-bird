@@ -342,7 +342,9 @@ def test_helpers_run_as_the_account_lead_their_own_group_and_are_stopped_by_it(
         for call in host.calls()
         if call[0] == "as-account" and ("hold-writer-locks" in call or "check-serve" in call)
     ]
-    assert len(background) == 3 and all(call[-1] == "leader" for call in background)
+    # Three holds (before the first stop, around the web service's stop, for
+    # the hook) and the health check.
+    assert len(background) == 4 and all(call[-1] == "leader" for call in background)
     host.fail("holder-ignores-term", "new:refresh")
     started = time.monotonic()
     result = run_system(host, "--stopped-hook", str(host.stopped_hook()))

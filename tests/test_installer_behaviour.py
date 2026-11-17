@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import signal
@@ -86,10 +87,13 @@ SYSTEM_ACCOUNT = "inky-bird"
 RUN_TIMEOUT_SECONDS = 120
 
 
-def group_members(group: int) -> list[str]:
-    """Live processes in one process group, as ``pid command`` lines."""
+def group_members(group: int, marker: str | None = None) -> list[str]:
+    """Live processes in one process group, as ``pid command`` lines. With
+    ``marker`` (``FAKE=<this machine>``), only those whose environment holds
+    it: once a run's leader has exited, its group's number can be taken by a
+    new group of another run, which must not be counted, or killed, as its."""
     listing = subprocess.run(
-        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
         capture_output=True,
         text=True,
         check=True,
@@ -97,21 +101,57 @@ def group_members(group: int) -> list[str]:
     members = []
     for line in listing.splitlines():
         pid, pgid, stat, *command = line.split(None, 3)
-        if int(pgid) == group and not stat.startswith("Z"):
-            members.append(f"{pid} {' '.join(command)}")
+        text = " ".join(command)
+        if int(pgid) != group or stat.startswith("Z"):
+            continue
+        if marker is not None and not re.search(re.escape(marker) + r"(\s|$)", text):
+            continue
+        members.append(f"{pid} {text[:300]}")
     return members
 
 
-def end_group(group: int) -> list[str]:
+def end_group(group: int, marker: str | None = None) -> list[str]:
     """Kill whatever is left of a run's process group; return what had survived it."""
-    survivors = group_members(group)
+    survivors = group_members(group, marker)
     if survivors:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(group, signal.SIGKILL)
+        if marker is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group, signal.SIGKILL)
+        for member in survivors:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(member.split()[0]), signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while group_members(group) and time.monotonic() < deadline:
+        while group_members(group, marker) and time.monotonic() < deadline:
             time.sleep(0.05)
     return survivors
+
+
+def hang_report(
+    process: subprocess.Popen[str], environment: dict[str, str], marker: str | None
+) -> str:
+    """What a run that did not finish was doing: whether its leader still
+    runs, every process of the run in any group (one holding the output pipes
+    keeps the run open after its leader exits) and the last calls it made."""
+    lines = [f"leader {'running' if process.poll() is None else f'exited {process.returncode}'}"]
+    listing = subprocess.run(
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="]
+        + ["-o", "etime=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    for line in listing.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and (
+            marker is None
+            or re.search(re.escape(marker) + r"(\s|$)", fields[5])
+            or int(fields[2]) == process.pid
+        ):
+            lines.append(" ".join(fields[:5]) + " " + fields[5][:160])
+    steps = Path(environment.get("FAKE", "/nonexistent")) / "steps"
+    if steps.exists():
+        lines += ["last calls:", *steps.read_text().splitlines()[-4:]]
+    return "\n".join(lines)
 
 
 def run_contained(
@@ -140,8 +180,11 @@ def run_contained(
     # Commands the fake ssh ran on the "display", each in a group of its own.
     remote_groups = Path(environment.get("FAKE", "/nonexistent")) / "groups"
 
+    # Every process of a matrix run carries its machine's FAKE directory.
+    marker = f"FAKE={environment['FAKE']}" if "FAKE" in environment else None
+
     def end_all() -> list[str]:
-        survivors = end_group(process.pid)
+        survivors = end_group(process.pid, marker)
         if remote_groups.exists():
             for group in remote_groups.read_text().split():
                 # A group that has ended may have its number reused by another
@@ -158,9 +201,12 @@ def run_contained(
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            report = hang_report(process, environment, marker)
             end_all()
             process.communicate()
-            raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
+            raise AssertionError(
+                f"{command[-1]} did not finish within {timeout}s\n{report}"
+            ) from None
         finally:
             if process.poll() is None:
                 process.kill()
@@ -199,7 +245,9 @@ trap 'stopped=TERM' TERM
 # in a subshell that ignores it, which they inherit, so none of them dies
 # between taking the lock and releasing it (a mkdir that died after making the
 # lock would leave this loop waiting for itself).
-index=$(
+# The fault injected here, if any, is logged in the same section, so a case
+# can tell it was made.
+numbered=$(
   trap '' HUP INT TERM
   while ! {mkdir} "$lock" 2>/dev/null; do :; done
   printf '%s {name}\n' "$$" > "$lock.owner"
@@ -214,20 +262,24 @@ index=$(
   }} >> "$FAKE/steps"
   {rm} -f "$lock.owner"
   {rmdir} "$lock"
-  printf '%s' "$index"
+  mode=""
+  if [ -f "$FAKE/inject" ]; then
+    while read -r at injected; do
+      if [ "$at" = "$index" ]; then
+        mode=$injected
+      fi
+    done < "$FAKE/inject"
+  fi
+  if [ -n "$mode" ]; then
+    printf '["fault-injected", "%s", "%s"]\n' "$index" "$mode" >> "$FAKE/log"
+  fi
+  printf '%s %s' "$index" "$mode"
 )
 trap - HUP INT TERM
 if [ -n "$stopped" ]; then
   kill -s "$stopped" $$
 fi
-mode=""
-if [ -f "$FAKE/inject" ]; then
-  while read -r at injected; do
-    if [ "$at" = "$index" ]; then
-      mode=$injected
-    fi
-  done < "$FAKE/inject"
-fi
+mode=${{numbered#* }}
 case "$mode" in
   fail | expire)
     echo "{name}: synthetic failure" >&2
@@ -1312,6 +1364,29 @@ def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_pa
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
+def test_the_health_check_accepts_a_regular_install(tmp_path: Path, system: str) -> None:
+    """With UV_NO_EDITABLE the service imports its own copy of the package
+    from the venv; the check must name the runtime by that same copy."""
+    host = controller_host(tmp_path, system)
+    if system == "Darwin":
+        result = host.run_with(
+            "install-controller.sh",
+            (),
+            shell=MACOS_BASH,
+            FAKE_AGENTS="serve refresh",
+            UV_NO_EDITABLE="1",
+        )
+    else:
+        result = host.run_with(
+            "install-controller-systemd.sh", (), FAKE_UNITS=TIMER_UNITS, UV_NO_EDITABLE="1"
+        )
+    assert result.returncode == 0, result.stderr
+    new = Path(os.path.realpath(host.app / ".venv"))
+    assert (new / "lib/python3/site-packages/inky_bird_frame").is_dir()
+    assert host.installed_version() == "new"
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
 def test_a_failed_health_check_switches_back(tmp_path: Path, system: str) -> None:
     host = controller_host(tmp_path, system)
     host.fail("health-fail")
@@ -1351,6 +1426,96 @@ def test_a_lock_holder_that_ignores_a_stop_is_forced_and_the_run_still_ends(
         ["/bin/ps", "-ww", "-ax", "-o", "command="], capture_output=True, text=True, check=True
     ).stdout
     assert str(tmp_path) not in helpers
+
+
+def stop_timeouts(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] in ("stop-timeout", "exit-timeout")]
+
+
+@pytest.mark.parametrize("hook", [False, True])
+def test_linux_services_whose_shutdown_needs_a_lock_stop_without_a_timeout(
+    tmp_path: Path, hook: bool
+) -> None:
+    """The fake scheduler and web service do not exit while the installer
+    holds the writer locks, as a scheduler recording the end of a job does
+    not: they are asked to stop under the locks and waited for without them."""
+    host = linux_host(tmp_path, mode="app")
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=APP_UNITS)
+    assert result.returncode == 0, result.stderr
+    assert not stop_timeouts(host)
+    stopped = {call[1]: call[2] for call in stops(host)}
+    expected = {f"{host.family}-scheduler.service": "lock-held"}
+    if hook:
+        expected[f"{host.family}-controller.service"] = "lock-held"
+        ((_, held, _, running, *_),) = hook_calls(host)
+        assert held == "lock-held" and not json.loads(running)
+    assert stopped == expected
+    assert host.unit_state("scheduler.service") == {"active": True, "enabled": True}
+
+
+def test_linux_upgrade_waits_for_a_timer_job_blocked_on_a_lock_without_holding_it(
+    tmp_path: Path,
+) -> None:
+    host = linux_host(tmp_path)
+    # A refresh a timer started, waiting for a writer lock.
+    host.set_busy("refresh.service", 2)
+    result = run_linux(host, quiesce_timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "Timed out" not in result.stderr
+
+
+def test_macos_agent_whose_shutdown_needs_a_lock_is_killed_only_after_launchds_timeout(
+    tmp_path: Path,
+) -> None:
+    """launchd stops an agent in bootout and has no stop whose signal can be
+    seen before it returns, so the installer boots agents out holding the
+    locks. One that waits for a lock is killed after launchd's exit timeout:
+    bounded, and while it holds no lock, so no write is cut short."""
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("agents-wait-for-locks")
+    started = time.monotonic()
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert time.monotonic() - started < 60
+    assert stop_timeouts(host) == [["exit-timeout", f"com.{host.family}.serve"]]
+    assert host.installed_version() == "new"
+
+
+@pytest.mark.parametrize("hook", [False, True])
+@pytest.mark.parametrize("mode", ["interrupt", "kill", "hangup"])
+def test_a_stop_injected_at_the_lock_holder_reaches_the_installer(
+    tmp_path: Path, mode: str, hook: bool
+) -> None:
+    """The holder runs beside the installer, which may release it before the
+    matrix's stop is sent; the stop must still arrive, and the run must not
+    claim success."""
+    host = linux_host(tmp_path)
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert result.returncode == 0, result.stderr
+    holds = [
+        int(line.split("\t")[0])
+        for line in (host.fake / "steps").read_text().splitlines()
+        if "hold-writer-locks" in line
+    ]
+    # Put the machine back: the old version installed and running.
+    other = Host(tmp_path / "again", "Linux")
+    other.install_old_version()
+    other.install_units(
+        controller_service="active",
+        refresh_service="inactive",
+        refresh_timer="active",
+        generate_service="inactive",
+        generate_timer="active",
+    )
+    other.fail("stop-sent-late")
+    (other.fake / "inject").write_text(f"{holds[-1]} {mode}\n")
+    options = ("--stopped-hook", str(other.stopped_hook())) if hook else ()
+    result = other.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert any(call[0] == "stop-sent" for call in other.calls()), result.stderr
+    assert result.returncode != 0
+    assert "Controller installed" not in result.stdout
 
 
 def hook_calls(host: Host) -> list[list[str]]:
@@ -1474,8 +1639,16 @@ def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
     in_shared = shared / "hook"
     in_shared.write_text(good.read_text())
     in_shared.chmod(0o755)
-    link = tmp_path / "linked-hook"
-    link.symlink_to(good)
+    # A directory above the hook's own that another account could replace.
+    above = tmp_path / "writable-above"
+    (above / "own").mkdir(parents=True)
+    above.chmod(0o777)
+    deep = above / "own/hook"
+    deep.write_text(good.read_text())
+    deep.chmod(0o755)
+    # A safe-looking link whose target is not safe.
+    link = tmp_path / "linked-to-shared"
+    link.symlink_to(in_shared)
     plain = tmp_path / "plain-hook"
     plain.write_text(good.read_text())
     return {
@@ -1483,10 +1656,33 @@ def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
         "missing": str(tmp_path / "missing"),
         "group-writable": str(writable),
         "in a shared directory": str(in_shared),
-        "a link": str(link),
+        "below a writable directory": str(deep),
+        "a link to an unsafe hook": str(link),
         "not executable": str(plain),
         "a directory": str(tmp_path),
     }
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_hook_reached_through_a_link_or_a_sticky_directory_runs_from_its_real_path(
+    tmp_path: Path, system: str
+) -> None:
+    """The real path is checked and run: a link to a safe hook is fine, and a
+    shared sticky directory such as /tmp is, since no one else can replace
+    what is in it."""
+    host = controller_host(tmp_path / "machine", system)
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    hook = sticky / "hook"
+    hook.write_text(host.stopped_hook().read_text())
+    hook.chmod(0o755)
+    link = tmp_path / "linked-hook"
+    link.symlink_to(hook)
+    result = run_controller(host, options=("--stopped-hook", str(link)))
+    assert result.returncode == 0, result.stderr
+    assert f"Running the stopped-boundary hook: {os.path.realpath(hook)}" in result.stderr
+    assert len(hook_calls(host)) == 1
 
 
 @pytest.mark.parametrize("system", SYSTEMS)

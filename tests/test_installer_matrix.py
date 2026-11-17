@@ -17,7 +17,10 @@ step of the cleanup that follows, or stops it there. Rollback commands appear on
 With one fault every rollback command works, so every unit must be exactly as
 it was. A unit may differ only when its own rollback failed (sudo expired, or
 the second fault was one of that unit's calls), and only in the way the output
-says it does. Every definition records the version that rendered it, so one
+says it does. Every fake runs each call whole, deferring a stop that reaches it until it
+has changed and logged what it does (and sent the stop it injects), and a case
+passes only if the fake logged making its fault. Every definition records the
+version that rendered it, so one
 left from the new version differs from the one it replaced. Claims that the
 previous or the new version runs must hold for the active link, every service
 and every enabled or running unit; an installer's own success line is such a
@@ -52,7 +55,7 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 291 cases, beside 88 recording
+both controllers and on a shared Pi's display: 292 cases, beside 88 recording
 runs, 26 busy runs (each holding one writer lock, chosen from the group's
 name) and 20 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
@@ -1224,7 +1227,7 @@ CLAIMS = {
     "--stopped-hook-timeout must be a whole number of seconds. No changes made.": "unchanged",
     "--stopped-hook-timeout needs --stopped-hook. No changes made.": "unchanged",
     "--stopped-hook must name, by absolute path, an executable file that only you or root can "
-    "change. No changes made.": "unchanged",
+    "change, in directories only you or root can change. No changes made.": "unchanged",
     "Could not read the state directory for the stopped-boundary hook. No changes made.": (
         "unchanged"
     ),
@@ -1365,6 +1368,7 @@ CLAIMS = {
     "The stopped-boundary hook failed with exit status ${status}; the upgrade did not switch to "
     "the new version.": "neutral",
     "The new version started, but its web service failed its health check.": "neutral",
+    "${unit} did not begin to stop.": "neutral",
     "Processes of ${service_account} still run after its services stopped; the upgrade did "
     "not switch to the new version.": "neutral",
     "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new "
@@ -1652,10 +1656,12 @@ def check_install(
 def check_quiet_writers(
     machine: Machine, scenario: Scenario, before: Snapshot, outcome: Outcome
 ) -> None:
-    """I11: before the switch, a service running the previous version is
-    stopped only while every writer lock is held, so nothing it writes is cut
-    off. (After the switch a rollback stops what the run started, or tried to
-    restart, without them.) The owner's
+    """I11: no writer is cut off mid-write, and none runs during the hook.
+    Before the switch, a service running the previous version is told to stop
+    only while every writer lock is held, so it is between writes; the run
+    never waits for it to exit while still holding a lock its shutdown may
+    need, so no service manager has to kill it. (After the switch a rollback
+    stops what the run started, or tried to restart, without them.) The owner's
     stopped-boundary hook runs at most once, and on success exactly once: with
     every service of the role stopped, every writer lock held (there are none
     to hold without an installed version) and the previous version still
@@ -1671,6 +1677,13 @@ def check_quiet_writers(
             outcome.covered.add("I11")
             if held != "lock-held":
                 report.append(f"I11: {unit} running {runtime} was stopped without the writer locks")
+    # A service whose shutdown waits for a writer lock is asked to stop while
+    # the locks are held, and waited for once they are released; one waited
+    # for with the locks held is killed by its manager's stop timeout.
+    for call in calls:
+        if call[0] == "stop-timeout":
+            outcome.covered.add("I11")
+            report.append(f"I11: {call[1]} was killed waiting for a writer lock the run held")
     hooks = [call for call in calls if call[0] == "stopped-hook"]
     if "--stopped-hook" not in scenario.arguments:
         if hooks:
@@ -2312,6 +2325,7 @@ class Group:
                 f"the run diverged from the recording before step {case.step}"
             )
             return outcome
+        check_fault_made(machine, case, outcome)
         if self.kind == "install":
             check_install(machine, self.scenario, case, before, outcome)
         else:
@@ -2341,6 +2355,19 @@ class Group:
         if after.tree != before.tree or after.stray != before.stray:
             outcome.violations.append("I8: a busy run changed the machine")
         return outcome
+
+
+def check_fault_made(machine: Machine, case: Case, outcome: Outcome) -> None:
+    """A case passes only if its fault happened: the call it fails or stops
+    at saw the fault (and, for a stop, sent it), as the fakes log within the
+    same uninterruptible section. Otherwise a run that never met its fault
+    would be checked as if it had."""
+    calls = machine.calls()
+    made = {(call[1], call[2]) for call in calls if call[0] == "fault-injected"}
+    if (str(case.step), case.mode) not in made:
+        outcome.violations.append(f"the fault this case injects at call {case.step} was never made")
+    if case.mode in STOP_MODES and not any(call[0] == "stop-sent" for call in calls):
+        outcome.violations.append("the stop this case injects was never sent to the installer")
 
 
 # Which cases run --------------------------------------------------------------

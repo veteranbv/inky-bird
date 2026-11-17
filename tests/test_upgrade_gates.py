@@ -412,3 +412,38 @@ def test_tls_is_checked_on_loopback_for_the_certificate_name(tmp_path: Path, tru
                 owner_allowed_origins=(f"https://inky.example.test:{port}",),
             )
     assert status == (0 if trusted else 1)
+
+
+def test_the_runtime_id_names_the_imported_package_not_the_helper_file(tmp_path: Path) -> None:
+    """A regular install imports its own copy of the package from the venv,
+    while the runtime's source tree keeps another: two processes importing the
+    same copy agree, and a helper run by path from the source does not."""
+    for root in ("site", "src"):
+        package = tmp_path / root / "inky_bird_frame"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "upgrade_gates.py").write_text((SOURCE / "upgrade_gates.py").read_text())
+    imported = "from inky_bird_frame.upgrade_gates import runtime_id; print(runtime_id())"
+
+    def run(*arguments: str) -> str:
+        return subprocess.run(
+            [sys.executable, "-S", "-P", *arguments],
+            env={"PYTHONPATH": str(tmp_path / "site"), "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    serving = run("-c", imported)
+    by_module = run(
+        "-c",
+        "import runpy; runpy.run_module('inky_bird_frame.upgrade_gates', run_name='x')\n"
+        + imported,
+    )
+    by_path = run(
+        "-c",
+        "import runpy, sys; m = runpy.run_path(sys.argv[1]); print(m['runtime_id']())",
+        str(tmp_path / "src/inky_bird_frame/upgrade_gates.py"),
+    )
+    assert serving == by_module
+    assert by_path != serving

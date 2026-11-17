@@ -804,14 +804,21 @@ refuses only if the check itself fails to run, for example when it cannot open
 a lock in `state_dir`: "Could not check whether a plate is being made. No
 changes made."
 
-On a Linux controller, setup then stops the scheduler and job timers, lets go
-of the locks, and waits up to 30 more minutes for a refresh, generate,
-catalog-publish or notifications job a timer had already started to finish
-before it copies anything. If a job is still running then, setup stops with
-"Timed out waiting for `UNIT` to finish." (naming the job). Run setup again once
-the job has finished. On macOS, checking the catalog publisher of the new
-version lets go of the locks briefly and takes them again; work that started in
-between and does not finish within the wait stops the upgrade before the switch.
+On a Linux controller, setup then asks the scheduler to stop and stops the job
+timers, lets go of the locks, and waits up to 30 more minutes for the scheduler
+to exit and for a refresh, generate, catalog-publish or notifications job a
+timer had already started to finish before it copies anything. The scheduler
+may need one of the locks to finish stopping, so setup does not wait for it
+while holding them. If a job is still running then, setup stops with "Timed
+out waiting for `UNIT` to finish." (naming the job). Run setup again once the
+job has finished. On macOS, checking the catalog publisher of the new version
+lets go of the locks briefly and takes them again; work that started in
+between and does not finish within the wait stops the upgrade before the
+switch. macOS stops each agent as it unloads it, with the locks held; an agent
+that is itself waiting for one of them, such as a scheduler recording the end
+of a job, is ended by launchd after its exit timeout (system-defined, usually 20
+seconds; the installed agents set none). It holds no lock then, so nothing it
+was writing is cut short.
 
 Once the new version's services are started, setup asks the web service for
 `/health` on this machine, at the configured `bind_host` and `port` (a wildcard
@@ -844,10 +851,13 @@ The hook runs once per upgrade, after every service is stopped and while the
 writer locks are held, and before the switch to the new version; on Linux the
 web service is stopped for it too and starts again with the new version. It
 does not run when the upgrade stops earlier, for example while a plate is still
-being made. It must be an absolute path to an executable regular file, not a
-link, that only you or root can change, in a directory only you or root can
-change; setup checks this before it changes anything and again just before
-running it. Its output passes through. It runs without your environment, with
+being made. It must be an absolute path to an executable regular file that only
+you or root can change. Setup follows any links to the file's real path and
+requires every directory from `/` down to it to belong to you or root and be
+writable by no one else; a shared directory such as `/tmp` is accepted only
+with its sticky bit set, so no one else can replace what is in it. It checks
+this before it changes anything, runs the real path, and checks again just
+before running it. Its output passes through. It runs without your environment, with
 only `PATH`, `HOME` and these names:
 
 | Variable | Value |

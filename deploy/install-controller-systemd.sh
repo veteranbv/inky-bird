@@ -31,25 +31,39 @@ if [ "${system_requested}" = true ] && [ "${current_uid}" != 0 ]; then
   exit 1
 fi
 
-# Whether $1 is safe to run: an absolute path to an executable regular file,
-# not a link, in a directory, each owned by this account or root and writable
-# by no one else.
-stopped_hook_is_safe() {
+# Print the real path of $1 if it is safe to run: an absolute path whose real
+# path is an executable regular file, with every directory from / down to it
+# owned by this account or root and writable by no one else (or, for a shared
+# directory such as /tmp, sticky, so no one else can replace what is in it).
+# The installer runs that real path, so no link can be swapped in afterwards.
+stopped_hook_real_path() {
   python3 -I -c '
 import os, stat, sys
 path = sys.argv[1]
-def owned(info, kind):
-    return kind(info.st_mode) and info.st_uid in (os.getuid(), 0) and not info.st_mode & 0o022
+def owned(info):
+    return info.st_uid in (os.getuid(), 0)
+def safe_directory(info):
+    shared = info.st_mode & stat.S_ISVTX
+    return stat.S_ISDIR(info.st_mode) and owned(info) and (shared or not info.st_mode & 0o022)
 try:
-    safe = (
-        os.path.isabs(path)
-        and owned(os.lstat(path), stat.S_ISREG)
-        and os.access(path, os.X_OK)
-        and owned(os.lstat(os.path.dirname(path)), stat.S_ISDIR)
-    )
+    if not os.path.isabs(path):
+        sys.exit(1)
+    real = os.path.realpath(path)
+    hook = os.lstat(real)
+    if not (stat.S_ISREG(hook.st_mode) and owned(hook) and not hook.st_mode & 0o022):
+        sys.exit(1)
+    if not os.access(real, os.X_OK):
+        sys.exit(1)
+    directory = os.path.dirname(real)
+    while True:
+        if not safe_directory(os.lstat(directory)):
+            sys.exit(1)
+        if directory == "/":
+            break
+        directory = os.path.dirname(directory)
 except OSError:
-    safe = False
-sys.exit(0 if safe else 1)
+    sys.exit(1)
+print(real)
 ' "$1"
 }
 
@@ -85,9 +99,11 @@ case "${stopped_hook_timeout}" in
     ;;
 esac
 stopped_hook_timeout=$((10#${stopped_hook_timeout}))
-if [ -n "${stopped_hook}" ] && ! stopped_hook_is_safe "${stopped_hook}"; then
-  echo "--stopped-hook must name, by absolute path, an executable file that only you or root can change. No changes made." >&2
-  exit 1
+if [ -n "${stopped_hook}" ]; then
+  if ! stopped_hook=$(stopped_hook_real_path "${stopped_hook}"); then
+    echo "--stopped-hook must name, by absolute path, an executable file that only you or root can change, in directories only you or root can change. No changes made." >&2
+    exit 1
+  fi
 fi
 if [ -z "${stopped_hook}" ] && [ "${stopped_hook_timeout}" -gt 0 ]; then
   echo "--stopped-hook-timeout needs --stopped-hook. No changes made." >&2
@@ -533,7 +549,7 @@ run_stopped_hook() {
     return 0
   fi
   stopped_hook_ran=true
-  if ! stopped_hook_is_safe "${stopped_hook}"; then
+  if [ "$(stopped_hook_real_path "${stopped_hook}" || true)" != "${stopped_hook}" ]; then
     echo "The stopped-boundary hook is no longer safe to run; the upgrade did not switch to the new version." >&2
     exit 1
   fi
@@ -560,7 +576,8 @@ run_stopped_hook() {
 }
 
 # Loaded is not working: the new web service must answer its health check
-# from the new runtime, on this machine.
+# from the new runtime, on this machine. The check imports the package as the
+# service does, editable or not, so both name the same runtime.
 check_new_serve() {
   local environment=()
   if [ -n "${service_account}" ]; then
@@ -568,13 +585,53 @@ check_new_serve() {
   fi
   if ! run_bounded "$((health_timeout_seconds + 15))" \
       ${account_prefix[@]+"${account_prefix[@]}"} "${new_runtime}/.venv/bin/python" -I \
-      "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" check-serve "${config_path}" \
+      -m inky_bird_frame.upgrade_gates check-serve "${config_path}" \
       "${health_timeout_seconds}" ${environment[@]+"${environment[@]}"}; then
     echo "The new version started, but its web service failed its health check." >&2
     exit 1
   fi
 }
 
+
+# Ask a long-running service to stop while every writer lock is held, so it is
+# between writes when it is signalled. Its own shutdown can need one of those
+# locks (the scheduler records the end of the job it stops), so do not wait
+# for it to exit here: wait_until_stopped does, once they are released.
+request_stop() {
+  local unit=$1
+  local deadline=$((SECONDS + 30))
+  stopped_units+=("${unit}")
+  admin systemctl stop --no-block "${unit}"
+  while [ "$(systemctl show --property=ActiveState --value "${unit}" 2>/dev/null || true)" = active ]; do
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "${unit} did not begin to stop." >&2
+      exit 1
+    fi
+    sleep "${poll_seconds}"
+  done
+}
+
+# Wait until none of the named services runs, up to ${deadline}.
+wait_until_stopped() {
+  local name
+  local service
+  local state
+  for name in "$@"; do
+    service="${service_prefix}-${name}.service"
+    while true; do
+      state=$(systemctl show --property=ActiveState --value "${service}" 2>/dev/null || true)
+      case "${state}" in
+        active | activating | deactivating | reloading) ;;
+        *) break ;;
+      esac
+      if ((SECONDS >= deadline)); then
+        echo "Timed out waiting for ${service} to finish." >&2
+        exit 1
+      fi
+      sleep 2
+    done
+  done
+}
 
 # Remember every managed unit's file and state before anything changes.
 record_units() {
@@ -939,7 +996,7 @@ except (ValueError, KeyError, TypeError):
 fi
 if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$(as_account \
     "${new_runtime}/.venv/bin/python" -I \
-    "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" state-dir "${config_path}"); then
+    -m inky_bird_frame.upgrade_gates state-dir "${config_path}"); then
   echo "Could not read the state directory for the stopped-boundary hook. No changes made." >&2
   exit 1
 fi
@@ -954,8 +1011,7 @@ record_units
 # App-owned installations use the same dynamic scheduler as Docker. Stop it
 # before replacing its runtime; a managed installation removes it below.
 if systemctl is-active --quiet "${service_prefix}-scheduler.service"; then
-  stopped_units+=("${service_prefix}-scheduler.service")
-  admin systemctl stop "${service_prefix}-scheduler.service"
+  request_stop "${service_prefix}-scheduler.service"
 fi
 for name in refresh generate catalog-publish notifications; do
   timer="${service_prefix}-${name}.timer"
@@ -964,41 +1020,30 @@ for name in refresh generate catalog-publish notifications; do
     admin systemctl stop "${timer}"
   fi
 done
-# A job a timer started may be waiting for one of the writer locks; let it
-# finish rather than wait for each other.
+# The scheduler, and a job a timer started, may be waiting for one of the
+# writer locks to finish; let go of them rather than wait for each other.
 release_writer_locks
 deadline=$((SECONDS + quiesce_timeout_seconds))
-for name in refresh generate catalog-publish notifications; do
-  service="${service_prefix}-${name}.service"
-  while true; do
-    state=$(systemctl show --property=ActiveState --value "${service}" 2>/dev/null || true)
-    case "${state}" in
-      active | activating | deactivating | reloading) ;;
-      *) break ;;
-    esac
-    if ((SECONDS >= deadline)); then
-      echo "Timed out waiting for ${service} to finish." >&2
-      exit 1
-    fi
-    sleep 2
-  done
-done
+wait_until_stopped scheduler refresh generate catalog-publish notifications
 if [ -n "${stopped_hook}" ]; then
   if ! admin_ready; then
     echo "Administrator access is required to install system services." >&2
     exit 1
   fi
-  hold_writer_locks true
   # The hook runs with every service stopped; the web service starts again
   # with the others below.
   if systemctl is-active --quiet "${service_prefix}-controller.service"; then
-    stopped_units+=("${service_prefix}-controller.service")
-    admin systemctl stop "${service_prefix}-controller.service"
+    hold_writer_locks true
+    request_stop "${service_prefix}-controller.service"
+    release_writer_locks
+    deadline=$((SECONDS + quiesce_timeout_seconds))
+    wait_until_stopped controller
   fi
   if [ -n "${service_account}" ] && ! account_processes_gone; then
     echo "Processes of ${service_account} still run after its services stopped; the upgrade did not switch to the new version." >&2
     exit 1
   fi
+  hold_writer_locks true
   run_stopped_hook
   release_writer_locks
 fi
