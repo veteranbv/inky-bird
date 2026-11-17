@@ -123,6 +123,34 @@ def end_group(group: int, marker: str | None = None) -> list[str]:
     return survivors
 
 
+def hang_report(
+    process: subprocess.Popen[str], environment: dict[str, str], marker: str | None
+) -> str:
+    """What a run that did not finish was doing: whether its leader still
+    runs, every process of the run in any group (one holding the output pipes
+    keeps the run open after its leader exits) and the last calls it made."""
+    lines = [f"leader {'running' if process.poll() is None else f'exited {process.returncode}'}"]
+    listing = subprocess.run(
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="]
+        + ["-o", "etime=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    for line in listing.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and (
+            marker is None
+            or re.search(re.escape(marker) + r"(\s|$)", fields[5])
+            or int(fields[2]) == process.pid
+        ):
+            lines.append(" ".join(fields[:5]) + " " + fields[5][:160])
+    steps = Path(environment.get("FAKE", "/nonexistent")) / "steps"
+    if steps.exists():
+        lines += ["last calls:", *steps.read_text().splitlines()[-4:]]
+    return "\n".join(lines)
+
+
 def run_contained(
     command: list[str],
     environment: dict[str, str],
@@ -170,9 +198,12 @@ def run_contained(
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            report = hang_report(process, environment, marker)
             end_all()
             process.communicate()
-            raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
+            raise AssertionError(
+                f"{command[-1]} did not finish within {timeout}s\n{report}"
+            ) from None
         finally:
             if process.poll() is None:
                 process.kill()
