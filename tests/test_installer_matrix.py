@@ -52,7 +52,7 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 291 cases, beside 88 recording
+both controllers and on a shared Pi's display: 292 cases, beside 88 recording
 runs, 26 busy runs (each holding one writer lock, chosen from the group's
 name) and 20 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
