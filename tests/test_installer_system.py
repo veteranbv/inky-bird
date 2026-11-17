@@ -434,3 +434,19 @@ def test_a_program_the_account_cannot_reach_is_refused_by_setpriv(tmp_path: Path
     hidden.chmod(0o755)
     allowed = subprocess.run(command, env=environment, capture_output=True, text=True)
     assert allowed.returncode == 0, allowed.stderr
+
+
+def test_a_checkout_only_root_can_read_still_gives_the_account_a_readable_runtime(
+    tmp_path: Path,
+) -> None:
+    """A root shell's umask of 077 leaves the checkout's files 0600; the copies
+    the account reads are made 0644 (folders 0755), and root's."""
+    host = system_host(tmp_path)
+    private = host.source / "src/inky_bird_frame/config.py"
+    private.chmod(0o600)
+    (host.source / "catalog").chmod(0o700)
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    runtime = Path(os.path.realpath(host.app / ".venv")).parent
+    assert (runtime / "src/inky_bird_frame/config.py").stat().st_mode & 0o777 == 0o644
+    assert (host.app / "catalog").stat().st_mode & 0o777 == 0o755

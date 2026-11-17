@@ -420,6 +420,9 @@ def build_venv(project: Path) -> None:
         path.chmod(0o755)
     tag = project / "src/runtime-tag"
     (project / ".venv/tag").write_text(tag.read_text() if tag.exists() else "missing\n")
+    # uv leaves its lock file writable by everyone, whatever the umask.
+    (project / ".venv/.lock").touch()
+    (project / ".venv/.lock").chmod(0o666)
     site = site_packages(project / ".venv")
     site.mkdir(parents=True, exist_ok=True)
     if os.environ.get("UV_NO_EDITABLE", "").lower() in ("1", "true"):
@@ -801,6 +804,18 @@ def rsync(arguments: list[str]) -> int:
         if "--delete" in arguments and target.exists():
             shutil.rmtree(target)
         shutil.copytree(source, target, dirs_exist_ok=True)
+        # --chmod=D<mode> and F<mode> give folders and files fixed modes; without
+        # them -a keeps the source's, as rsync does.
+        modes = {
+            argument[8]: int(argument[9:], 8)
+            for argument in arguments
+            if argument.startswith("--chmod=") and argument[8:9] in ("D", "F")
+        }
+        for path in [target, *target.rglob("*")] if modes else ():
+            if not path.is_symlink():
+                kind = "D" if path.is_dir() else "F"
+                if kind in modes:
+                    path.chmod(modes[kind])
     else:
         destination = (
             target / source.name if target_text.endswith("/") or target.is_dir() else target

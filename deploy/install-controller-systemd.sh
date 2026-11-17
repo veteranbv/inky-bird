@@ -229,8 +229,12 @@ done
 # units itself, and runs the application as the account, with only the
 # environment given here.
 account_prefix=()
+copy_options=()
 presence_timeout_seconds=30
 if [ -n "${service_account}" ]; then
+  # A copy is root's, readable by everyone, whatever owner and modes the
+  # checkout's files have (a root umask of 077 makes them 0600).
+  copy_options=(--no-owner --no-group --chmod=D0755 --chmod=F0644)
   account_prefix=(setpriv "--reuid=${account_uid}" "--regid=${account_gid}" --init-groups --
     env -i "PATH=/usr/local/bin:/usr/bin:/bin" "HOME=${account_home}" "LANG=C.UTF-8"
     "INKY_BIRD_ENV_FILE=${environment_file}")
@@ -378,7 +382,7 @@ make_temp_dir() {
 # Copy what building, and later reinstalling, a runtime needs from ${root}.
 stage_runtime_source() {
   local target=$1
-  rsync -a --delete "${root}/src/" "${target}/src/"
+  rsync -a --delete ${copy_options[@]+"${copy_options[@]}"} "${root}/src/" "${target}/src/"
   mkdir -p "${target}/deploy" "${target}/docs"
   install -m 0755 "${root}/deploy/install-controller-systemd.sh" "${target}/deploy/"
   for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
@@ -1003,6 +1007,13 @@ fi
 env -u UV_PROJECT_ENVIRONMENT ${uv_environment[@]+"${uv_environment[@]}"} "${uv_bin}" sync \
   --project "${new_runtime}" --python "${python_version}" --extra controller --locked \
   ${uv_options[@]+"${uv_options[@]}"}
+# uv leaves some files writable by everyone (its .venv/.lock): the account
+# must not be able to change any of the code it runs. The tree is this run's
+# own, under the install root, and chmod -R follows no links.
+if [ -n "${service_account}" ]; then
+  contained "${runtimes_dir}" "${new_runtime}"
+  chmod -R go-w "${new_runtime}"
+fi
 # The account runs this build: it must be able to read all of it, whatever
 # modes uv's cache gave the files.
 if ! hidden=$(account_can_read "${new_runtime}"); then
@@ -1203,7 +1214,7 @@ else
   # its own catalog from there.
   if [ "${catalog_root}" != "${app_dir}" ]; then
     contained "${app_dir}" "${app_dir}/catalog"
-    rsync -a --delete "${catalog_root}/catalog/" "${app_dir}/catalog/"
+    rsync -a --delete "${copy_options[@]}" "${catalog_root}/catalog/" "${app_dir}/catalog/"
   fi
   controller_program as_account "${new_runtime}/.venv/bin/python" - \
     "${unit_dir}" "${app_dir}" "${app_dir}" "${config_path}" "${account_home}" "${user}" sync
