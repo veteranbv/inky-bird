@@ -398,10 +398,11 @@ run_stopped_hook() {
 }
 
 # Loaded is not working: the new web service must answer its health check
-# from the new runtime, on this machine.
+# from the new runtime, on this machine. The check imports the package as the
+# service does, editable or not, so both name the same runtime.
 check_new_serve() {
   if ! run_bounded "$((health_timeout_seconds + 15))" "${new_runtime}/.venv/bin/python" -I \
-      "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" check-serve "${config_path}" \
+      -m inky_bird_frame.upgrade_gates check-serve "${config_path}" \
       "${health_timeout_seconds}"; then
     echo "The new version started, but its web service failed its health check." >&2
     exit 1
@@ -733,7 +734,7 @@ except (ValueError, KeyError, TypeError):
   exit 1
 fi
 if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$("${new_runtime}/.venv/bin/python" -I \
-    "${new_runtime}/src/inky_bird_frame/upgrade_gates.py" state-dir "${config_path}"); then
+    -m inky_bird_frame.upgrade_gates state-dir "${config_path}"); then
   echo "Could not read the state directory for the stopped-boundary hook. No changes made." >&2
   exit 1
 fi

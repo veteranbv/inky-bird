@@ -1240,6 +1240,29 @@ def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_pa
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
+def test_the_health_check_accepts_a_regular_install(tmp_path: Path, system: str) -> None:
+    """With UV_NO_EDITABLE the service imports its own copy of the package
+    from the venv; the check must name the runtime by that same copy."""
+    host = controller_host(tmp_path, system)
+    if system == "Darwin":
+        result = host.run_with(
+            "install-controller.sh",
+            (),
+            shell=MACOS_BASH,
+            FAKE_AGENTS="serve refresh",
+            UV_NO_EDITABLE="1",
+        )
+    else:
+        result = host.run_with(
+            "install-controller-systemd.sh", (), FAKE_UNITS=TIMER_UNITS, UV_NO_EDITABLE="1"
+        )
+    assert result.returncode == 0, result.stderr
+    new = Path(os.path.realpath(host.app / ".venv"))
+    assert (new / "lib/python3/site-packages/inky_bird_frame").is_dir()
+    assert host.installed_version() == "new"
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
 def test_a_failed_health_check_switches_back(tmp_path: Path, system: str) -> None:
     host = controller_host(tmp_path, system)
     host.fail("health-fail")

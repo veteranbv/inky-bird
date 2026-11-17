@@ -345,10 +345,16 @@ def build_venv(project: Path) -> None:
         path.chmod(0o755)
     tag = project / "src/runtime-tag"
     (project / ".venv/tag").write_text(tag.read_text() if tag.exists() else "missing\n")
-    # uv installs the project editable: the venv imports this source tree by
-    # absolute path, wherever the venv itself is later moved.
     site = site_packages(project / ".venv")
     site.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("UV_NO_EDITABLE", "").lower() in ("1", "true"):
+        # A regular install: the venv imports its own copy of the package.
+        import shutil
+
+        shutil.copytree(project / "src/inky_bird_frame", site / "inky_bird_frame")
+        return
+    # uv installs the project editable: the venv imports this source tree by
+    # absolute path, wherever the venv itself is later moved.
     (site / "_inky_bird.pth").write_text(f"{os.path.abspath(project)}/src\n")
 
 
@@ -889,7 +895,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     if arguments[:1] == ["-I"]:
         arguments = arguments[1:]
     if arguments[:1] and arguments[0].endswith(".py"):
-        return _upgrade_gate(tag, arguments[0], arguments[1:], environment)
+        return _upgrade_gate(tag, venv, arguments[0], arguments[1:], environment)
+    if arguments[:2] == ["-m", "inky_bird_frame.upgrade_gates"]:
+        return _upgrade_gate(tag, venv, None, arguments[2:], environment)
     if arguments[:1] == ["-c"]:
         program = arguments[1]
         if "distribution(" in program:
@@ -985,16 +993,22 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     return 0
 
 
-def _upgrade_gate(tag: str, script: str, arguments: list[str], environment: dict[str, str]) -> int:
-    """The application's upgrade helper: it runs for real against the
-    synthetic configuration, except the web service health check, which asks
-    which runtime the recorded serving process runs."""
+def _upgrade_gate(
+    tag: str, venv: Path, script: str | None, arguments: list[str], environment: dict[str, str]
+) -> int:
+    """The application's upgrade helper, run by path or (``script`` None) as
+    the module the venv imports: it runs for real against the synthetic
+    configuration, except the web service health check, which compares the
+    package the helper is from with the one the serving process imports, as
+    the real one compares their runtime IDs."""
     command = arguments[0]
     _log("upgrade-gate", command, tag)
     if command == "check-serve":
-        return _check_serve(tag)
+        helper = Path(script).resolve().parent if script else imported_package(venv)
+        return _check_serve(helper)
     # -P keeps the helper's own directory, which shadows standard modules, off the path.
-    real = [sys.executable, "-S", "-P", script, *arguments]
+    module = [script] if script else ["-m", "inky_bird_frame.upgrade_gates"]
+    real = [sys.executable, "-S", "-P", *module, *arguments]
     if KILL and command == "hold-writer-locks":
         return _hold_then_stop(real, environment, Path(arguments[2]))
     if command == "hold-writer-locks" and "holder-ignores-term" in _rules():
@@ -1005,7 +1019,16 @@ def _upgrade_gate(tag: str, script: str, arguments: list[str], environment: dict
     return _exec(real, environment)
 
 
-def _check_serve(tag: str) -> int:
+def imported_package(venv: Path) -> Path:
+    """The package directory a venv's Python imports ``inky_bird_frame`` from."""
+    site = site_packages(venv)
+    if (site / "inky_bird_frame").is_dir():
+        return (site / "inky_bird_frame").resolve()
+    source = editable_source(site)
+    return (source / "inky_bird_frame").resolve() if source else Path("/nonexistent")
+
+
+def _check_serve(helper: Path) -> int:
     """``health-fail`` fails the check and ``health-hang`` never answers."""
     import time
 
@@ -1013,11 +1036,12 @@ def _check_serve(tag: str) -> int:
     if "health-hang" in rules:
         time.sleep(3600)
     prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird")
-    serving = {
-        _process_runtime(f"com.{prefix}.serve"),
-        _process_runtime(f"{prefix}-controller.service"),
-    }
-    if "health-fail" in rules or tag not in serving:
+    serving = set()
+    for name in (f"com.{prefix}.serve", f"{prefix}-controller.service"):
+        process = _state("processes").get(name)
+        if isinstance(process, dict):
+            serving.add(imported_package(Path(str(process["directory"]))))
+    if "health-fail" in rules or helper not in serving:
         print("The web service health check failed: synthetic failure.", file=sys.stderr)
         return 1
     return 0
