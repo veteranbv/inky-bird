@@ -1279,7 +1279,10 @@ def setpriv(arguments: list[str]) -> int:
         given[name] = value
     environment = {name: value for name, value in os.environ.items() if name.startswith("FAKE")}
     environment.update(given, FAKE_IDENTITY="account", FAKE_UID=str(found[1]["uid"]))
-    _log("as-account", found[0], json.dumps(sorted(given)), rest[0])
+    # A helper started in the background leads its own process group, so the
+    # installer can stop it by group alone.
+    leader = "leader" if os.getpgid(0) == os.getpid() else "member"
+    _log("as-account", found[0], json.dumps(sorted(given)), rest[0], *rest[1:5], leader)
     executable = shutil.which(rest[0], path=given.get("PATH", "")) or rest[0]
     return _exec([executable, *rest[1:]], environment)
 

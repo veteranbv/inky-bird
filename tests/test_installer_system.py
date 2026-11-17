@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -323,3 +324,32 @@ def test_two_installations_under_different_accounts_do_not_touch_each_other(
     assert sorted(str(path) for path in (first_root / "app").rglob("*")) == first_app
     assert host.state_of("systemd")["inky-bird-controller.service"]["active"] is True
     assert_outside_intact(host)
+
+
+def test_helpers_run_as_the_account_lead_their_own_group_and_are_stopped_by_it(
+    tmp_path: Path,
+) -> None:
+    """The lock holder and the health check, run through setpriv, keep the
+    process ID the installer started, which leads its group; one that ignores
+    a polite stop is still stopped, by its group, within the bound."""
+    host = system_host(tmp_path)
+    assert run_system(host).returncode == 0
+    (host.fake / "log").write_text("")
+    result = run_system(host, "--stopped-hook", str(host.stopped_hook()))
+    assert result.returncode == 0, result.stdout + result.stderr
+    background = [
+        call
+        for call in host.calls()
+        if call[0] == "as-account" and ("hold-writer-locks" in call or "check-serve" in call)
+    ]
+    assert len(background) == 3 and all(call[-1] == "leader" for call in background)
+    host.fail("holder-ignores-term", "new:refresh")
+    started = time.monotonic()
+    result = run_system(host, "--stopped-hook", str(host.stopped_hook()))
+    assert time.monotonic() - started < 90
+    assert result.returncode == 1
+    assert host.state_of("systemd")["inky-bird-controller.service"]["active"] is True
+    listing = subprocess.run(
+        ["/bin/ps", "-ww", "-ax", "-o", "command="], capture_output=True, text=True, check=True
+    ).stdout
+    assert str(tmp_path) not in listing
