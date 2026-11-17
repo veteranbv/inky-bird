@@ -195,19 +195,27 @@ stopped=""
 trap 'stopped=HUP' HUP
 trap 'stopped=INT' INT
 trap 'stopped=TERM' TERM
-while ! {mkdir} "$lock" 2>/dev/null; do :; done
-printf '%s {name}\n' "$$" > "$lock.owner"
-index=0
-if [ -f "$FAKE/steps" ]; then
-  index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
-fi
-{{
-  printf '%s\taction\t{name}' "$index"
-  printf '\t%s' "$@" | {tr} '\n' ' '
-  printf '\n'
-}} >> "$FAKE/steps"
-{rm} -f "$lock.owner"
-{rmdir} "$lock"
+# A Ctrl-C reaches the whole process group, the commands below too: they run
+# in a subshell that ignores it, which they inherit, so none of them dies
+# between taking the lock and releasing it (a mkdir that died after making the
+# lock would leave this loop waiting for itself).
+index=$(
+  trap '' HUP INT TERM
+  while ! {mkdir} "$lock" 2>/dev/null; do :; done
+  printf '%s {name}\n' "$$" > "$lock.owner"
+  index=0
+  if [ -f "$FAKE/steps" ]; then
+    index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
+  fi
+  {{
+    printf '%s\taction\t{name}' "$index"
+    printf '\t%s' "$@" | {tr} '\n' ' '
+    printf '\n'
+  }} >> "$FAKE/steps"
+  {rm} -f "$lock.owner"
+  {rmdir} "$lock"
+  printf '%s' "$index"
+)
 trap - HUP INT TERM
 if [ -n "$stopped" ]; then
   kill -s "$stopped" $$
