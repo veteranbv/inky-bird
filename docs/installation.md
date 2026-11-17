@@ -754,10 +754,13 @@ The hook runs once per upgrade, after every service is stopped and while the
 writer locks are held, and before the switch to the new version; on Linux the
 web service is stopped for it too and starts again with the new version. It
 does not run when the upgrade stops earlier, for example while a plate is still
-being made. It must be an absolute path to an executable regular file, not a
-link, that only you or root can change, in a directory only you or root can
-change; setup checks this before it changes anything and again just before
-running it. Its output passes through. It runs without your environment, with
+being made. It must be an absolute path to an executable regular file that only
+you or root can change. Setup follows any links to the file's real path and
+requires every directory from `/` down to it to belong to you or root and be
+writable by no one else; a shared directory such as `/tmp` is accepted only
+with its sticky bit set, so no one else can replace what is in it. It checks
+this before it changes anything, runs the real path, and checks again just
+before running it. Its output passes through. It runs without your environment, with
 only `PATH`, `HOME` and these names:
 
 | Variable | Value |

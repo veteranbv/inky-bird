@@ -1544,8 +1544,16 @@ def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
     in_shared = shared / "hook"
     in_shared.write_text(good.read_text())
     in_shared.chmod(0o755)
-    link = tmp_path / "linked-hook"
-    link.symlink_to(good)
+    # A directory above the hook's own that another account could replace.
+    above = tmp_path / "writable-above"
+    (above / "own").mkdir(parents=True)
+    above.chmod(0o777)
+    deep = above / "own/hook"
+    deep.write_text(good.read_text())
+    deep.chmod(0o755)
+    # A safe-looking link whose target is not safe.
+    link = tmp_path / "linked-to-shared"
+    link.symlink_to(in_shared)
     plain = tmp_path / "plain-hook"
     plain.write_text(good.read_text())
     return {
@@ -1553,10 +1561,33 @@ def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
         "missing": str(tmp_path / "missing"),
         "group-writable": str(writable),
         "in a shared directory": str(in_shared),
-        "a link": str(link),
+        "below a writable directory": str(deep),
+        "a link to an unsafe hook": str(link),
         "not executable": str(plain),
         "a directory": str(tmp_path),
     }
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_hook_reached_through_a_link_or_a_sticky_directory_runs_from_its_real_path(
+    tmp_path: Path, system: str
+) -> None:
+    """The real path is checked and run: a link to a safe hook is fine, and a
+    shared sticky directory such as /tmp is, since no one else can replace
+    what is in it."""
+    host = controller_host(tmp_path / "machine", system)
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    hook = sticky / "hook"
+    hook.write_text(host.stopped_hook().read_text())
+    hook.chmod(0o755)
+    link = tmp_path / "linked-hook"
+    link.symlink_to(hook)
+    result = run_controller(host, options=("--stopped-hook", str(link)))
+    assert result.returncode == 0, result.stderr
+    assert f"Running the stopped-boundary hook: {os.path.realpath(hook)}" in result.stderr
+    assert len(hook_calls(host)) == 1
 
 
 @pytest.mark.parametrize("system", SYSTEMS)

@@ -1104,7 +1104,7 @@ CLAIMS = {
     "--stopped-hook-timeout must be a whole number of seconds. No changes made.": "unchanged",
     "--stopped-hook-timeout needs --stopped-hook. No changes made.": "unchanged",
     "--stopped-hook must name, by absolute path, an executable file that only you or root can "
-    "change. No changes made.": "unchanged",
+    "change, in directories only you or root can change. No changes made.": "unchanged",
     "Could not read the state directory for the stopped-boundary hook. No changes made.": (
         "unchanged"
     ),

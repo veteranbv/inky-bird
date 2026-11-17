@@ -10,25 +10,39 @@ if [ "$(id -u)" = 0 ]; then
   exit 1
 fi
 
-# Whether $1 is safe to run: an absolute path to an executable regular file,
-# not a link, in a directory, each owned by this account or root and writable
-# by no one else.
-stopped_hook_is_safe() {
+# Print the real path of $1 if it is safe to run: an absolute path whose real
+# path is an executable regular file, with every directory from / down to it
+# owned by this account or root and writable by no one else (or, for a shared
+# directory such as /tmp, sticky, so no one else can replace what is in it).
+# The installer runs that real path, so no link can be swapped in afterwards.
+stopped_hook_real_path() {
   python3 -I -c '
 import os, stat, sys
 path = sys.argv[1]
-def owned(info, kind):
-    return kind(info.st_mode) and info.st_uid in (os.getuid(), 0) and not info.st_mode & 0o022
+def owned(info):
+    return info.st_uid in (os.getuid(), 0)
+def safe_directory(info):
+    shared = info.st_mode & stat.S_ISVTX
+    return stat.S_ISDIR(info.st_mode) and owned(info) and (shared or not info.st_mode & 0o022)
 try:
-    safe = (
-        os.path.isabs(path)
-        and owned(os.lstat(path), stat.S_ISREG)
-        and os.access(path, os.X_OK)
-        and owned(os.lstat(os.path.dirname(path)), stat.S_ISDIR)
-    )
+    if not os.path.isabs(path):
+        sys.exit(1)
+    real = os.path.realpath(path)
+    hook = os.lstat(real)
+    if not (stat.S_ISREG(hook.st_mode) and owned(hook) and not hook.st_mode & 0o022):
+        sys.exit(1)
+    if not os.access(real, os.X_OK):
+        sys.exit(1)
+    directory = os.path.dirname(real)
+    while True:
+        if not safe_directory(os.lstat(directory)):
+            sys.exit(1)
+        if directory == "/":
+            break
+        directory = os.path.dirname(directory)
 except OSError:
-    safe = False
-sys.exit(0 if safe else 1)
+    sys.exit(1)
+print(real)
 ' "$1"
 }
 
@@ -61,9 +75,11 @@ case "${stopped_hook_timeout}" in
     ;;
 esac
 stopped_hook_timeout=$((10#${stopped_hook_timeout}))
-if [ -n "${stopped_hook}" ] && ! stopped_hook_is_safe "${stopped_hook}"; then
-  echo "--stopped-hook must name, by absolute path, an executable file that only you or root can change. No changes made." >&2
-  exit 1
+if [ -n "${stopped_hook}" ]; then
+  if ! stopped_hook=$(stopped_hook_real_path "${stopped_hook}"); then
+    echo "--stopped-hook must name, by absolute path, an executable file that only you or root can change, in directories only you or root can change. No changes made." >&2
+    exit 1
+  fi
 fi
 if [ -z "${stopped_hook}" ] && [ "${stopped_hook_timeout}" -gt 0 ]; then
   echo "--stopped-hook-timeout needs --stopped-hook. No changes made." >&2
@@ -371,7 +387,7 @@ run_stopped_hook() {
     return 0
   fi
   stopped_hook_ran=true
-  if ! stopped_hook_is_safe "${stopped_hook}"; then
+  if [ "$(stopped_hook_real_path "${stopped_hook}" || true)" != "${stopped_hook}" ]; then
     echo "The stopped-boundary hook is no longer safe to run; the upgrade did not switch to the new version." >&2
     exit 1
   fi
