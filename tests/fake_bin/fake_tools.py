@@ -44,7 +44,12 @@ def _state(name: str) -> dict[str, object]:
 
 
 def _save(name: str, value: dict[str, object]) -> None:
-    (FAKE / f"{name}.json").write_text(json.dumps(value, sort_keys=True))
+    """Replace a state file whole: a fake stopped part way must not leave it
+    empty or torn for every later call to fail on."""
+    path = FAKE / f"{name}.json"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    temporary.write_text(json.dumps(value, sort_keys=True))
+    os.replace(temporary, path)
 
 
 STEP_LOCK_TIMEOUT_SECONDS = 30.0
@@ -1243,7 +1248,19 @@ def main() -> int:
             "ssh": ssh,
             "stopped-hook": stopped_hook,
         }
-        status = handlers[tool](arguments)
+        if tool in ("launchctl", "systemctl"):
+            # A service manager applies each command whole, whatever stops
+            # the client; a stop signal reaches the fake once it has.
+            import signal
+
+            stops = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+            signal.pthread_sigmask(signal.SIG_BLOCK, stops)
+            try:
+                status = handlers[tool](arguments)
+            finally:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+        else:
+            status = handlers[tool](arguments)
     if KILL:
         kill_installer(STOP)
     return status
