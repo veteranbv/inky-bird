@@ -17,7 +17,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 # Every installer step starts a fresh interpreter; importing what only some
@@ -32,9 +34,56 @@ def _rules() -> set[str]:
     return set(path.read_text().split()) if path.exists() else set()
 
 
+# The stops an installer can be sent, by the matrix or by its own cleanup.
+STOPS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+
+@contextlib.contextmanager
+def deferred_stops() -> Iterator[None]:
+    """Run a critical section whole: a stop that arrives meanwhile is
+    delivered once it ends, so shared state and logs are never left torn or
+    missing. Every fake runs under it, except while it waits on something
+    that must stay stoppable (``stops_allowed``)."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@contextlib.contextmanager
+def stops_allowed() -> Iterator[None]:
+    previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def stoppable_child() -> None:
+    """``preexec_fn`` for a child: it gets stops as the real command would."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
+
+
+def _append(path: Path, text: str) -> None:
+    """Append in one write, so a line is never half there."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, text.encode())
+    finally:
+        os.close(descriptor)
+
+
+def _replace(path: Path, text: str) -> None:
+    """Replace a file whole: a fake stopped part way must not leave it empty
+    or torn for every later call to fail on."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
 def _log(*entry: object) -> None:
-    with (FAKE / "log").open("a") as handle:
-        handle.write(json.dumps([str(item) for item in entry]) + "\n")
+    _append(FAKE / "log", json.dumps([str(item) for item in entry]) + "\n")
 
 
 def _state(name: str) -> dict[str, object]:
@@ -44,7 +93,7 @@ def _state(name: str) -> dict[str, object]:
 
 
 def _save(name: str, value: dict[str, object]) -> None:
-    (FAKE / f"{name}.json").write_text(json.dumps(value, sort_keys=True))
+    _replace(FAKE / f"{name}.json", json.dumps(value, sort_keys=True))
 
 
 STEP_LOCK_TIMEOUT_SECONDS = 30.0
@@ -61,38 +110,48 @@ def _step_lock() -> Path:
     while True:
         try:
             lock.mkdir()
+            # Who holds it, so a lock left behind names its holder.
+            _replace(FAKE / "steps.lock.owner", f"{os.getpid()} {' '.join(sys.argv[1:3])}\n")
             return lock
         except FileExistsError:
             if time.monotonic() >= deadline:
-                raise
+                owner = FAKE / "steps.lock.owner"
+                held = owner.read_text().strip() if owner.exists() else "unknown"
+                raise RuntimeError(f"the step lock is still held by {held}") from None
             time.sleep(0.001)
 
 
 def step(tool: str, arguments: list[str], *, action: bool) -> str:
-    """Number this call and return what the matrix injects at it, if anything."""
+    """Number this call and return what the matrix injects at it, if anything;
+    an injected fault is logged, so a case can tell it was made."""
     steps = FAKE / "steps"
     if not FAKE.is_dir():
         return ""
-    lock = _step_lock()
-    try:
-        index = len(steps.read_text().splitlines()) if steps.exists() else 0
-        with steps.open("a") as handle:
+    # A stop while the lock is held would leave it and hang every later step.
+    with deferred_stops():
+        lock = _step_lock()
+        try:
+            index = len(steps.read_text().splitlines()) if steps.exists() else 0
             kind = "action" if action else "query"
-            handle.write("\t".join([str(index), kind, tool, *arguments]).replace("\n", " ") + "\n")
-    finally:
-        lock.rmdir()
-    inject = FAKE / "inject"
-    if not action or not inject.exists():
-        return ""
-    # One line per injected fault; a second one lands in the first one's cleanup.
-    for line in inject.read_text().splitlines():
-        at_text, mode = line.split()
-        at = int(at_text)
-        if mode == "expire" and tool == "sudo" and index >= at:
-            (FAKE / "sudo-expired").touch()
-            return "fail"
-        if index == at:
-            return "fail" if mode == "expire" else mode
+            line = "\t".join([str(index), kind, tool, *arguments]).replace("\n", " ")
+            _append(steps, line + "\n")
+        finally:
+            (FAKE / "steps.lock.owner").unlink(missing_ok=True)
+            lock.rmdir()
+        inject = FAKE / "inject"
+        if not action or not inject.exists():
+            return ""
+        # One line per injected fault; a second one lands in the first one's cleanup.
+        for entry in inject.read_text().splitlines():
+            at_text, mode = entry.split()
+            at = int(at_text)
+            if mode == "expire" and tool == "sudo" and index >= at:
+                (FAKE / "sudo-expired").touch()
+                _log("fault-injected", index, mode)
+                return "fail"
+            if index == at:
+                _log("fault-injected", index, mode)
+                return "fail" if mode == "expire" else mode
     return ""
 
 
@@ -137,9 +196,8 @@ STOP_SIGNALS = {"kill": "SIGTERM", "hangup": "SIGHUP", "interrupt": "SIGINT"}
 
 def kill_installer(mode: str = "kill") -> None:
     """Stop the installer: TERM or HUP to the script itself, or INT to its whole
-    process group as Ctrl-C does. This call ignores the interrupt it sends."""
-    import signal
-
+    process group as Ctrl-C does. This call ignores the interrupt it sends.
+    It runs whole, sending and logging, under ``deferred_stops``."""
     pid = _installer_pid(outermost=mode == "interrupt")
     if pid is None:
         return
@@ -153,6 +211,7 @@ def kill_installer(mode: str = "kill") -> None:
         os.killpg(os.getpgid(pid), signal.SIGINT)
     else:
         os.kill(pid, getattr(signal, STOP_SIGNALS[mode]))
+    _log("stop-sent", mode)
 
 
 def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> int:
@@ -161,44 +220,77 @@ def _exec(arguments: list[str], environment: dict[str, str] | None = None) -> in
     if KILL:
         import subprocess
 
-        return subprocess.run(arguments, env=environment, check=False).returncode
+        return subprocess.run(
+            arguments, env=environment, check=False, preexec_fn=stoppable_child
+        ).returncode
+    # The command gets stops as it would run alone; one already waiting ends
+    # this process here, before it runs.
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
     os.execvpe(arguments[0], arguments, environment)
     return 1
 
 
 def _hold_then_stop(command: list[str], environment: dict[str, str], ready: Path) -> int:
-    """The cycle lock helper runs in the background until the installer ends it;
-    stop the installer once the helper holds the lock, and end with it."""
-    import signal
+    """The lock helper runs in the background until the installer ends it;
+    stop the installer once the helper holds the locks, and end with it.
+
+    The installer goes on meanwhile and may end this helper before the stop
+    is sent; that stop is deferred until this one has gone out, so the case
+    always stops the installer."""
     import subprocess
     import time
 
     global KILL
     KILL = False
-    helper = subprocess.Popen(command, env=environment)
+    helper = subprocess.Popen(command, env=environment, preexec_fn=stoppable_child)
 
     def finish(signum: int, frame: object) -> None:
         # Only unwind here; waiting inside a handler can deadlock on Popen's lock.
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGTERM, finish)
     try:
         deadline = time.monotonic() + STEP_LOCK_TIMEOUT_SECONDS
         while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
             time.sleep(0.01)
+        if "stop-sent-late" in _rules():
+            # Let the installer get as far as ending this helper first.
+            late = time.monotonic() + 30
+            while not signal.sigpending() & {signal.SIGTERM, signal.SIGHUP}:
+                if time.monotonic() >= late:
+                    break
+                time.sleep(0.01)
         kill_installer(STOP)
-        return helper.wait()
+        signal.signal(signal.SIGTERM, finish)
+        signal.signal(signal.SIGHUP, finish)
+        with stops_allowed():
+            return helper.wait()
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         if helper.poll() is None:
             helper.terminate()
         helper.wait()
 
 
-def _cycle_lock_held() -> bool:
+# The application's own list of writer locks, which installers must hold.
+UPGRADE_GATES = TOOLS.parents[2] / "src/inky_bird_frame/upgrade_gates.py"
+
+
+def writer_locks() -> tuple[str, ...]:
+    import ast
+
+    tree = ast.parse(UPGRADE_GATES.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "WRITER_LOCKS":
+            value = ast.literal_eval(node.value)
+            assert isinstance(value, dict)
+            return tuple(value)
+    raise AssertionError("upgrade_gates.py names no WRITER_LOCKS")
+
+
+def _lock_held(lock: Path) -> bool:
     import fcntl
 
-    lock = Path(os.environ["FAKE_STATE_DIR"]) / "controller.lock"
     if not lock.exists():
         return False
     with lock.open("a+") as handle:
@@ -208,6 +300,19 @@ def _cycle_lock_held() -> bool:
             return True
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     return False
+
+
+def _cycle_lock_held() -> bool:
+    """Whether something holds every writer lock, as an installer must
+    before it stops anything that writes."""
+    state = Path(os.environ["FAKE_STATE_DIR"])
+    return all(_lock_held(state / name) for name in writer_locks())
+
+
+def _process_runtime(name: str) -> str:
+    """The runtime a recorded service process runs, or ``none``."""
+    process = _state("processes").get(name)
+    return str(process["runtime"]) if isinstance(process, dict) else "none"
 
 
 def runtime_tag(executable: str) -> str:
@@ -302,10 +407,16 @@ def build_venv(project: Path) -> None:
         path.chmod(0o755)
     tag = project / "src/runtime-tag"
     (project / ".venv/tag").write_text(tag.read_text() if tag.exists() else "missing\n")
-    # uv installs the project editable: the venv imports this source tree by
-    # absolute path, wherever the venv itself is later moved.
     site = site_packages(project / ".venv")
     site.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("UV_NO_EDITABLE", "").lower() in ("1", "true"):
+        # A regular install: the venv imports its own copy of the package.
+        import shutil
+
+        shutil.copytree(project / "src/inky_bird_frame", site / "inky_bird_frame")
+        return
+    # uv installs the project editable: the venv imports this source tree by
+    # absolute path, wherever the venv itself is later moved.
     (site / "_inky_bird.pth").write_text(f"{os.path.abspath(project)}/src\n")
 
 
@@ -333,6 +444,9 @@ def system_python(arguments: list[str]) -> int:
         for name in ("service_prefix", "app_dir", "support_dir", "config_path"):
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
+    if any(argument.endswith(".venv.next") for argument in arguments):
+        # Points the active link at a runtime: the switch, or a switch back.
+        _log("switch")
     return _exec([sys.executable, *arguments])
 
 
@@ -348,7 +462,17 @@ def launchctl(arguments: list[str]) -> int:
         label = arguments[1].split("/")[-1]
         if label not in loaded:
             return 3
-        _log("launchctl", "bootout", label, "lock-held" if _cycle_lock_held() else "lock-free")
+        held = "lock-held" if _cycle_lock_held() else "lock-free"
+        _log("launchctl", "bootout", label, held)
+        if (
+            "agents-wait-for-locks" in _rules()
+            and held == "lock-held"
+            and _waits_for_locks_to_stop(label)
+            and not _until_locks_free(STOP_TIMEOUT_SECONDS)
+        ):
+            # launchd waits its exit timeout, then kills the agent.
+            _log("exit-timeout", label)
+        _log("stopped", label, held, _process_runtime(label))
         if f"bootout:{label}" in _rules():
             return 5
         del loaded[label]
@@ -469,6 +593,27 @@ def _record_run(unit: str) -> None:
     _save("runs", runs)
 
 
+# How long a service manager waits for a stopping service before it kills it.
+STOP_TIMEOUT_SECONDS = 2.0
+
+
+def _waits_for_locks_to_stop(unit: str) -> bool:
+    """Services whose own shutdown can need a writer lock: the scheduler
+    records the end of the job it stops, the web service finishes requests."""
+    return unit.endswith(("-scheduler.service", "-controller.service", ".scheduler", ".serve"))
+
+
+def _until_locks_free(seconds: float) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while _cycle_lock_held():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def systemctl(arguments: list[str]) -> int:
     units = _state("systemd")
     verb = arguments[0]
@@ -479,9 +624,23 @@ def systemctl(arguments: list[str]) -> int:
     rules = _rules()
     if verb == "show":
         busy = _state("busy")
+        stopping = _state("stopping")
+        if "--property=ActiveState" in arguments and unit in stopping:
+            # Signalled to stop, it finishes only once it can take the lock it waits for.
+            if _cycle_lock_held():
+                print("deactivating")
+                return 0
+            stopping.pop(unit)
+            _save("stopping", stopping)
+            _record_process(unit, running=False)
+            print("inactive")
+            return 0
         if "--property=ActiveState" in arguments:
             remaining = int(str(busy.get(unit, 0)))
-            if remaining > 0:
+            if remaining > 0 and _cycle_lock_held():
+                # A job waiting for a writer lock the installer holds.
+                print("activating")
+            elif remaining > 0:
                 busy[unit] = remaining - 1
                 _save("busy", busy)
                 _log("busy-poll", unit, remaining - 1)
@@ -508,6 +667,10 @@ def systemctl(arguments: list[str]) -> int:
         return 5
     if verb == "disable" and not exists:
         return 1
+    if verb in ("start", "restart", "disable"):
+        stopping = _state("stopping")
+        if stopping.pop(unit, None) is not None:
+            _save("stopping", stopping)
     if verb in ("start", "restart") and _oneshot(unit):
         _record_run(unit)
         record["active"] = False
@@ -519,8 +682,24 @@ def systemctl(arguments: list[str]) -> int:
                 _start_cycle(unit)
         record["active"] = True
     elif verb == "stop":
+        held = "lock-held" if _cycle_lock_held() else "lock-free"
         if unit.endswith("scheduler.service") or unit.endswith("generate.service"):
-            _log("lock-at-stop", unit, "lock-held" if _cycle_lock_held() else "lock-free")
+            _log("lock-at-stop", unit, held)
+        if unit.endswith(".service") and (record["active"] or unit in _state("busy")):
+            _log("stopped", unit, held, _process_runtime(unit))
+        if record["active"] and held == "lock-held" and _waits_for_locks_to_stop(unit):
+            # Its shutdown waits for a lock the caller holds (the scheduler
+            # records each job's end); systemd waits for it to exit.
+            if "--no-block" in arguments:
+                record["active"] = False
+                stopping = _state("stopping")
+                stopping[unit] = True
+                _save("stopping", stopping)
+                _save("systemd", units)
+                return 0
+            if not _until_locks_free(STOP_TIMEOUT_SECONDS):
+                # systemd's stop timeout: it kills the service.
+                _log("stop-timeout", unit)
         record["active"] = False
         _record_process(unit, running=False)
         if _oneshot(unit):
@@ -550,7 +729,7 @@ def sudo(arguments: list[str]) -> int:
         # ``sudo-v-expires-after:N`` lets the first N validations succeed.
         counter = FAKE / "sudo-validations"
         count = int(counter.read_text()) if counter.exists() else 0
-        counter.write_text(str(count + 1))
+        _replace(counter, str(count + 1))
         limits = [
             int(rule.rpartition(":")[2])
             for rule in rules
@@ -636,7 +815,6 @@ def ssh(arguments: list[str]) -> int:
     connection: the installer running on the other end is told with a hangup,
     finishes its own cleanup, and this end then fails as ssh does; any other
     command there runs to its end."""
-    import signal
     import subprocess
 
     command = arguments[-1]
@@ -663,14 +841,15 @@ def ssh(arguments: list[str]) -> int:
         stderr=subprocess.PIPE,
         text=True,
         process_group=0,
+        preexec_fn=stoppable_child,
     )
     group.append(remote.pid)
     # The test run kills this group too if anything in it outlives the run.
-    with (FAKE / "groups").open("a") as handle:
-        handle.write(f"{remote.pid}\n")
+    _append(FAKE / "groups", f"{remote.pid}\n")
     if dropped:
         hang_up()
-    stdout, stderr = remote.communicate()
+    with stops_allowed():
+        stdout, stderr = remote.communicate()
     sys.stderr.write(stderr)
     if dropped:
         return 255
@@ -742,7 +921,7 @@ def _remove_distribution(venv: Path, removed: str, kept: str, backup: Path | Non
             "distribution": [removed, gone],
             "files": [[str(path), str(backup / str(number))] for number, path in enumerate(paths)],
         }
-        (backup / "plan.json").write_text(json.dumps(plan))
+        _replace(backup / "plan.json", json.dumps(plan))
     _save("pip", dists)
     for number, path in enumerate(paths):
         if backup is not None:
@@ -832,8 +1011,15 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         # PYTHON* variables cannot shadow the installed package.
         print("inline program run without -I", file=sys.stderr)
         return 64
+    if arguments[:1] and arguments[0].endswith(".py"):
+        print("helper script run without -I", file=sys.stderr)
+        return 64
     if arguments[:1] == ["-I"]:
         arguments = arguments[1:]
+    if arguments[:1] and arguments[0].endswith(".py"):
+        return _upgrade_gate(tag, venv, arguments[0], arguments[1:], environment)
+    if arguments[:2] == ["-m", "inky_bird_frame.upgrade_gates"]:
+        return _upgrade_gate(tag, venv, None, arguments[2:], environment)
     if arguments[:1] == ["-c"]:
         program = arguments[1]
         if "distribution(" in program:
@@ -852,6 +1038,10 @@ def venv_python(executable: str, arguments: list[str]) -> int:
     if arguments[:1] == ["-"]:
         source = sys.stdin.read()
         _log("heredoc", tag)
+        # The real program takes the catalog lock unless told the installer holds it.
+        if "catalog_state_lock" in source and _cycle_lock_held() and arguments[-1] != "true":
+            print("waiting forever for the catalog lock the installer holds", file=sys.stderr)
+            return 75
         if f"{tag}:heredoc" in rules:
             print("synthetic configuration rejection", file=sys.stderr)
             return 1
@@ -920,14 +1110,131 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                 env=environment,
                 text=True,
                 check=False,
+                preexec_fn=stoppable_child,
             ).returncode
         return 0
+    return 0
+
+
+def _upgrade_gate(
+    tag: str, venv: Path, script: str | None, arguments: list[str], environment: dict[str, str]
+) -> int:
+    """The application's upgrade helper, run by path or (``script`` None) as
+    the module the venv imports: it runs for real against the synthetic
+    configuration, except the web service health check, which compares the
+    package the helper is from with the one the serving process imports, as
+    the real one compares their runtime IDs."""
+    command = arguments[0]
+    _log("upgrade-gate", command, tag)
+    if command == "check-serve":
+        helper = Path(script).resolve().parent if script else imported_package(venv)
+        return _check_serve(helper)
+    # -P keeps the helper's own directory, which shadows standard modules, off the path.
+    module = [script] if script else ["-m", "inky_bird_frame.upgrade_gates"]
+    real = [sys.executable, "-S", "-P", *module, *arguments]
+    if KILL and command == "hold-writer-locks":
+        return _hold_then_stop(real, environment, Path(arguments[2]))
+    if command == "hold-writer-locks" and "holder-ignores-term" in _rules():
+        import signal
+
+        # Ignored across exec: the helper outlives an installer's polite stop.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    return _exec(real, environment)
+
+
+def imported_package(venv: Path) -> Path:
+    """The package directory a venv's Python imports ``inky_bird_frame`` from."""
+    site = site_packages(venv)
+    if (site / "inky_bird_frame").is_dir():
+        return (site / "inky_bird_frame").resolve()
+    source = editable_source(site)
+    return (source / "inky_bird_frame").resolve() if source else Path("/nonexistent")
+
+
+def _check_serve(helper: Path) -> int:
+    """``health-fail`` fails the check and ``health-hang`` never answers."""
+    import time
+
+    rules = _rules()
+    if "health-hang" in rules:
+        with stops_allowed():
+            time.sleep(3600)
+    prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX", "inky-bird")
+    serving = set()
+    for name in (f"com.{prefix}.serve", f"{prefix}-controller.service"):
+        process = _state("processes").get(name)
+        if isinstance(process, dict):
+            serving.add(imported_package(Path(str(process["directory"]))))
+    if "health-fail" in rules or helper not in serving:
+        print("The web service health check failed: synthetic failure.", file=sys.stderr)
+        return 1
+    return 0
+
+
+# What an installer tells its --stopped-hook.
+HOOK_VARIABLES = (
+    "INKY_BIRD_HOOK_PREVIOUS_RUNTIME",
+    "INKY_BIRD_HOOK_NEW_RUNTIME",
+    "INKY_BIRD_HOOK_CONFIG",
+    "INKY_BIRD_HOOK_STATE_DIR",
+)
+
+
+def stopped_hook(arguments: list[str]) -> int:
+    """An owner's --stopped-hook: record what it finds, then succeed, or as
+    the rules say fail (``hook-fail``), die (``hook-killed``) or never end
+    (``hook-hang``)."""
+    import time
+
+    rules = _rules()
+    held = "lock-held" if _cycle_lock_held() else "lock-free"
+    venv = Path(os.environ["FAKE_LAYOUT_APP_DIR"]) / ".venv"
+    tag = Path(os.path.realpath(venv)) / "tag"
+    active = tag.read_text().strip() if tag.exists() else "none"
+    systemd = _state("systemd")
+    running = {
+        name
+        for name, record in systemd.items()
+        if isinstance(record, dict) and record.get("active")
+    }
+    running |= set(_state("launchd")) | set(_state("busy"))
+    given = {name: os.environ.get(name, "") for name in HOOK_VARIABLES}
+    # The shell that runs this fake sets PWD, SHLVL and _, its wrapper exports
+    # FAKE*, Python sets LC_CTYPE for a C locale, and macOS adds its own.
+    shell = {"PATH", "HOME", "PWD", "OLDPWD", "SHLVL", "_", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    extra = sorted(
+        name
+        for name in set(os.environ) - set(HOOK_VARIABLES) - shell
+        if not name.startswith("FAKE")
+    )
+    _log(
+        "stopped-hook",
+        held,
+        active,
+        json.dumps(sorted(running)),
+        json.dumps(given),
+        json.dumps(extra),
+    )
+    if "hook-killed" in rules:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if "hook-hang" in rules:
+        with stops_allowed():
+            time.sleep(3600)
+    if "hook-fail" in rules:
+        print("synthetic hook failure", file=sys.stderr)
+        return 7
+    print("synthetic hook output")
     return 0
 
 
 def inky_bird(executable: str, arguments: list[str]) -> int:
     tag = runtime_tag(executable)
     _log("inky-bird", tag, *arguments)
+    # These take writer locks themselves: run while an installer holds them,
+    # they would wait for it forever.
+    if arguments[:1] in (["refresh"], ["catalog-publish"]) and _cycle_lock_held():
+        print("waiting forever for a writer lock the installer holds", file=sys.stderr)
+        return 75
     rules = _rules()
     # ``tag:command`` fails as a configuration error; ``tag:command:type`` names the type.
     kinds = [rule.rpartition(":")[2] for rule in rules if rule.startswith(f"{tag}:{arguments[0]}:")]
@@ -967,7 +1274,7 @@ def _injected_failure(tool: str, arguments: list[str]) -> int:
     return {"rsync": 23, "ssh": 255, "launchctl": 5}.get(tool, 1)
 
 
-def main() -> int:
+def run() -> int:
     global KILL, STOP
     tool, arguments = sys.argv[1], sys.argv[2:]
     if tool == "build-venv":
@@ -998,11 +1305,25 @@ def main() -> int:
             "sudo": sudo,
             "rsync": rsync,
             "ssh": ssh,
+            "stopped-hook": stopped_hook,
         }
         status = handlers[tool](arguments)
     if KILL:
         kill_installer(STOP)
     return status
+
+
+def main() -> int:
+    """Each call runs whole: what it changes and logs, and a stop it injects,
+    complete before a stop that reached it meanwhile ends it, as the real
+    command's effect would; then it dies of that stop."""
+    try:
+        with deferred_stops():
+            return run()
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        return 130
 
 
 if __name__ == "__main__":

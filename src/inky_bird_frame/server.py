@@ -22,6 +22,7 @@ from .http import write_json_atomic
 from .images import slugify
 from .notifications import _read_state
 from .timeutil import parse_utc_timestamp
+from .upgrade_gates import runtime_id
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -307,6 +308,8 @@ class CatalogService:
             "active_species": _species_count(self.active_catalog_path),
             "notification_dead_letters": dead_letter_count(self.config.state_dir),
             "version": __version__,
+            # Lets an upgrade tell this process from one still running older code.
+            "runtime": runtime_id(),
             "schema_version": 1,
         }
 

@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import signal
@@ -27,6 +28,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tests/fake_bin/fake_tools.py"
+UPGRADE_GATES = ROOT / "src/inky_bird_frame/upgrade_gates.py"
 _spec = importlib.util.spec_from_file_location("fake_tools", TOOLS)
 assert _spec is not None and _spec.loader is not None
 fake_tools = importlib.util.module_from_spec(_spec)
@@ -82,10 +84,13 @@ SYSTEM_PATHS = {
 RUN_TIMEOUT_SECONDS = 120
 
 
-def group_members(group: int) -> list[str]:
-    """Live processes in one process group, as ``pid command`` lines."""
+def group_members(group: int, marker: str | None = None) -> list[str]:
+    """Live processes in one process group, as ``pid command`` lines. With
+    ``marker`` (``FAKE=<this machine>``), only those whose environment holds
+    it: once a run's leader has exited, its group's number can be taken by a
+    new group of another run, which must not be counted, or killed, as its."""
     listing = subprocess.run(
-        ["/bin/ps", "-ww", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command="],
         capture_output=True,
         text=True,
         check=True,
@@ -93,21 +98,57 @@ def group_members(group: int) -> list[str]:
     members = []
     for line in listing.splitlines():
         pid, pgid, stat, *command = line.split(None, 3)
-        if int(pgid) == group and not stat.startswith("Z"):
-            members.append(f"{pid} {' '.join(command)}")
+        text = " ".join(command)
+        if int(pgid) != group or stat.startswith("Z"):
+            continue
+        if marker is not None and not re.search(re.escape(marker) + r"(\s|$)", text):
+            continue
+        members.append(f"{pid} {text[:300]}")
     return members
 
 
-def end_group(group: int) -> list[str]:
+def end_group(group: int, marker: str | None = None) -> list[str]:
     """Kill whatever is left of a run's process group; return what had survived it."""
-    survivors = group_members(group)
+    survivors = group_members(group, marker)
     if survivors:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(group, signal.SIGKILL)
+        if marker is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(group, signal.SIGKILL)
+        for member in survivors:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(member.split()[0]), signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while group_members(group) and time.monotonic() < deadline:
+        while group_members(group, marker) and time.monotonic() < deadline:
             time.sleep(0.05)
     return survivors
+
+
+def hang_report(
+    process: subprocess.Popen[str], environment: dict[str, str], marker: str | None
+) -> str:
+    """What a run that did not finish was doing: whether its leader still
+    runs, every process of the run in any group (one holding the output pipes
+    keeps the run open after its leader exits) and the last calls it made."""
+    lines = [f"leader {'running' if process.poll() is None else f'exited {process.returncode}'}"]
+    listing = subprocess.run(
+        ["/bin/ps", "axeww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="]
+        + ["-o", "etime=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    for line in listing.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and (
+            marker is None
+            or re.search(re.escape(marker) + r"(\s|$)", fields[5])
+            or int(fields[2]) == process.pid
+        ):
+            lines.append(" ".join(fields[:5]) + " " + fields[5][:160])
+    steps = Path(environment.get("FAKE", "/nonexistent")) / "steps"
+    if steps.exists():
+        lines += ["last calls:", *steps.read_text().splitlines()[-4:]]
+    return "\n".join(lines)
 
 
 def run_contained(
@@ -136,8 +177,11 @@ def run_contained(
     # Commands the fake ssh ran on the "display", each in a group of its own.
     remote_groups = Path(environment.get("FAKE", "/nonexistent")) / "groups"
 
+    # Every process of a matrix run carries its machine's FAKE directory.
+    marker = f"FAKE={environment['FAKE']}" if "FAKE" in environment else None
+
     def end_all() -> list[str]:
-        survivors = end_group(process.pid)
+        survivors = end_group(process.pid, marker)
         if remote_groups.exists():
             for group in remote_groups.read_text().split():
                 # A group that has ended may have its number reused by another
@@ -154,9 +198,12 @@ def run_contained(
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            report = hang_report(process, environment, marker)
             end_all()
             process.communicate()
-            raise AssertionError(f"{command[-1]} did not finish within {timeout}s") from None
+            raise AssertionError(
+                f"{command[-1]} did not finish within {timeout}s\n{report}"
+            ) from None
         finally:
             if process.poll() is None:
                 process.kill()
@@ -180,30 +227,56 @@ def tool_wrapper(tool: str, *, own_path: bool = False) -> str:
 
 def coreutil_wrapper(name: str, real: str) -> str:
     """A shell stand-in that numbers a file command as a step before running it."""
-    mkdir, rmdir, wc, tr = (
-        shlex.quote(system_tool(tool)) for tool in ("mkdir", "rmdir", "wc", "tr")
+    mkdir, rmdir, wc, tr, rm = (
+        shlex.quote(system_tool(tool)) for tool in ("mkdir", "rmdir", "wc", "tr", "rm")
     )
     return f"""#!/bin/sh
 {fake_tools.DEPTH_GUARD}lock="$FAKE/steps.lock"
-while ! {mkdir} "$lock" 2>/dev/null; do :; done
-index=0
-if [ -f "$FAKE/steps" ]; then
-  index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
+# A stop signal in here would leave the lock and hang every later step: hold
+# it until the lock is released, then die of it as the real command would.
+stopped=""
+trap 'stopped=HUP' HUP
+trap 'stopped=INT' INT
+trap 'stopped=TERM' TERM
+# A Ctrl-C reaches the whole process group, the commands below too: they run
+# in a subshell that ignores it, which they inherit, so none of them dies
+# between taking the lock and releasing it (a mkdir that died after making the
+# lock would leave this loop waiting for itself).
+# The fault injected here, if any, is logged in the same section, so a case
+# can tell it was made.
+numbered=$(
+  trap '' HUP INT TERM
+  while ! {mkdir} "$lock" 2>/dev/null; do :; done
+  printf '%s {name}\n' "$$" > "$lock.owner"
+  index=0
+  if [ -f "$FAKE/steps" ]; then
+    index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
+  fi
+  {{
+    printf '%s\taction\t{name}' "$index"
+    printf '\t%s' "$@" | {tr} '\n' ' '
+    printf '\n'
+  }} >> "$FAKE/steps"
+  {rm} -f "$lock.owner"
+  {rmdir} "$lock"
+  mode=""
+  if [ -f "$FAKE/inject" ]; then
+    while read -r at injected; do
+      if [ "$at" = "$index" ]; then
+        mode=$injected
+      fi
+    done < "$FAKE/inject"
+  fi
+  if [ -n "$mode" ]; then
+    printf '["fault-injected", "%s", "%s"]\n' "$index" "$mode" >> "$FAKE/log"
+  fi
+  printf '%s %s' "$index" "$mode"
+)
+trap - HUP INT TERM
+if [ -n "$stopped" ]; then
+  kill -s "$stopped" $$
 fi
-{{
-  printf '%s\taction\t{name}' "$index"
-  printf '\t%s' "$@" | {tr} '\n' ' '
-  printf '\n'
-}} >> "$FAKE/steps"
-{rmdir} "$lock"
-mode=""
-if [ -f "$FAKE/inject" ]; then
-  while read -r at injected; do
-    if [ "$at" = "$index" ]; then
-      mode=$injected
-    fi
-  done < "$FAKE/inject"
-fi
+mode=${{numbered#* }}
 case "$mode" in
   fail | expire)
     echo "{name}: synthetic failure" >&2
@@ -309,6 +382,8 @@ class Host:
         (package / "native_names.py").write_text("# replaced by the synthetic python3\n")
         (package / "config.py").write_text(FAKE_CONFIG_MODULE)
         (package / "installation.py").write_text(FAKE_INSTALLATION_MODULE)
+        # The installers' upgrade helper runs for real against the synthetic config.
+        (package / "upgrade_gates.py").write_text(UPGRADE_GATES.read_text())
         (directory / "src/runtime-tag").write_text(f"{tag}\n")
         (directory / "catalog").mkdir(exist_ok=True)
         (directory / "deploy").mkdir(exist_ok=True)
@@ -321,6 +396,7 @@ class Host:
         name: str,
         quiesce_timeout: int = 3,
         *,
+        health_timeout: int = 5,
         source: Path | None = None,
         text: str | None = None,
         system_paths: tuple[str, ...] | None = None,
@@ -339,6 +415,7 @@ class Host:
         text = text.replace(
             "quiesce_timeout_seconds=1800", f"quiesce_timeout_seconds={quiesce_timeout}"
         )
+        text = text.replace("health_timeout_seconds=90", f"health_timeout_seconds={health_timeout}")
         # Polling for the cycle lock helper is only a wait; a short one keeps runs quick.
         text = text.replace("poll_seconds=1\n", "poll_seconds=0.05\n")
         # So is the helper's own watch for its installer to end, and its wait for a
@@ -349,6 +426,23 @@ class Host:
         target.write_text(text)
         target.chmod(0o755)
         return target
+
+    def stopped_hook(self) -> Path:
+        """An owner's --stopped-hook, which reaches the fake tools without the
+        installer's environment: it runs with only the variables it is given."""
+        path = self.support / "stopped-hook"
+        exports = "".join(
+            f"{name}={shlex.quote(value)}; export {name}\n"
+            for name, value in (
+                ("FAKE", str(self.fake)),
+                ("FAKE_STATE_DIR", str(self.state)),
+                ("FAKE_LAYOUT_APP_DIR", str(self.app)),
+            )
+        )
+        shebang, body = tool_wrapper("stopped-hook").split("\n", 1)
+        path.write_text(f"{shebang}\n{exports}{body}")
+        path.chmod(0o755)
+        return path
 
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
@@ -378,6 +472,19 @@ class Host:
             [shell, str(self.script(name, quiesce_timeout))], self.environment(**extra)
         )
 
+    def run_with(
+        self,
+        name: str,
+        options: tuple[str, ...],
+        *,
+        shell: str = "bash",
+        health_timeout: int = 5,
+        **extra: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a script with command-line options and its health check's time limit."""
+        script = self.script(name, health_timeout=health_timeout)
+        return run_contained([shell, str(script), *options], self.environment(**extra))
+
     def start(
         self,
         name: str,
@@ -385,12 +492,13 @@ class Host:
         *,
         shell: str = "bash",
         quiesce_timeout: int = 3,
+        options: tuple[str, ...] = (),
         **extra: str,
     ) -> subprocess.Popen[str]:
         """Start a script in the background with stdout and stderr in ``output``."""
         with output.open("w") as handle:
             return subprocess.Popen(
-                [shell, str(self.script(name, quiesce_timeout))],
+                [shell, str(self.script(name, quiesce_timeout)), *options],
                 env=self.environment(**extra),
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -480,8 +588,9 @@ def bootstraps(host: Host) -> list[list[str]]:
 
 
 @contextmanager
-def running_generation(host: Host) -> Iterator[Callable[[], None]]:
-    """Hold the controller cycle lock the way a running generation does.
+def running_generation(host: Host, lock: str = "controller.lock") -> Iterator[Callable[[], None]]:
+    """Hold a writer lock the way a running writer does: by default the
+    controller cycle lock, as a plate being made holds it.
 
     The lock is held until the yielded ``release`` is called or the block ends.
     """
@@ -494,7 +603,7 @@ def running_generation(host: Host) -> Iterator[Callable[[], None]]:
             "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
             "print('locked', flush=True)\n"
             "sys.stdin.read()\n",
-            str(host.state / "controller.lock"),
+            str(host.state / lock),
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -522,6 +631,31 @@ def wait_until(condition: Callable[[], bool], what: str, timeout: float = 60.0) 
         if time.monotonic() >= deadline:
             pytest.fail(f"timed out after {timeout:.0f}s waiting for {what}")
         time.sleep(0.05)
+
+
+@pytest.mark.parametrize(
+    "stop", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP], ids=["INT", "TERM", "HUP"]
+)
+def test_a_stopped_step_never_leaves_the_step_lock(tmp_path: Path, stop: signal.Signals) -> None:
+    """A stop signal that reaches a numbered file command while it holds the
+    step lock is delivered once the lock is released; a lock left behind would
+    hang every later step of the run and of its rerun."""
+    host = Host(tmp_path, "Linux", number_file_commands=True)
+    lock = host.fake / "steps.lock"
+    lock.mkdir()
+    step = subprocess.Popen(
+        [str(host.bin / "mkdir"), str(tmp_path / "made")],
+        env=host.environment(),
+        start_new_session=True,
+    )
+    time.sleep(0.5)
+    os.kill(step.pid, stop)
+    time.sleep(0.2)
+    assert step.poll() is None, "the step died while it waited for the lock"
+    lock.rmdir()
+    assert step.wait(timeout=30) == -stop
+    assert not lock.exists()
+    assert not (tmp_path / "made").exists()
 
 
 # Uninstallers ----------------------------------------------------------------
@@ -1057,6 +1191,458 @@ def test_macos_failure_after_install_says_the_new_version_is_running(tmp_path: P
     assert host.loaded_agents()["serve"]["generation"] == "new"
     assert "new version is installed and running" in result.stderr
     assert "started again" not in result.stderr
+
+
+# Writer locks, the health check and the stopped-boundary hook ---------------
+
+
+def controller_host(tmp_path: Path, system: str) -> Host:
+    if system == "Darwin":
+        return macos_host(tmp_path, "serve", "refresh")
+    return linux_host(tmp_path)
+
+
+def run_controller(
+    host: Host, *, options: tuple[str, ...] = (), health_timeout: int = 5
+) -> subprocess.CompletedProcess[str]:
+    if host.system == "Darwin":
+        return host.run_with(
+            "install-controller.sh",
+            options,
+            shell=MACOS_BASH,
+            health_timeout=health_timeout,
+            FAKE_AGENTS="serve refresh",
+        )
+    return host.run_with(
+        "install-controller-systemd.sh",
+        options,
+        health_timeout=health_timeout,
+        FAKE_UNITS=TIMER_UNITS,
+    )
+
+
+def assert_previous_running(host: Host) -> None:
+    assert host.installed_version() == "old"
+    if host.system == "Darwin":
+        assert {label: value["generation"] for label, value in host.loaded_agents().items()} == {
+            "serve": "old",
+            "refresh": "old",
+        }
+    else:
+        assert "# old" in host.unit_text("controller.service")
+        for unit in ("controller.service", "refresh.timer", "generate.timer"):
+            assert host.unit_state(unit)["active"] is True
+
+
+def stops(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] == "stopped"]
+
+
+SYSTEMS = ["Darwin", "Linux"]
+
+
+@pytest.mark.parametrize("lock", ["refresh.lock", "notifications.lock", "catalog-state.lock"])
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_an_upgrade_waits_for_every_writer_and_changes_nothing_if_one_runs_on(
+    tmp_path: Path, system: str, lock: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    with running_generation(host, lock):
+        result = run_controller(host)
+    assert result.returncode == 3, result.stderr
+    assert "Waiting for" in result.stderr
+    assert "Other work is still running" in result.stderr and "No changes made" in result.stderr
+    assert not stops(host)
+    assert_previous_running(host)
+
+
+def test_linux_upgrade_stops_the_scheduler_only_once_a_writer_finishes(tmp_path: Path) -> None:
+    host = linux_host(tmp_path, mode="app")
+    output = tmp_path / "installer.out"
+    with running_generation(host, "notifications-dispatch.lock") as release:
+        installer = host.start(
+            "install-controller-systemd.sh", output, quiesce_timeout=120, FAKE_UNITS=APP_UNITS
+        )
+        try:
+            wait_until(
+                lambda: (
+                    "Waiting for notification delivery to finish" in output.read_text()
+                    or installer.poll() is not None
+                ),
+                "the installer to wait for notification delivery",
+            )
+            assert installer.poll() is None, output.read_text()
+            assert not stops(host)
+            release()
+            returncode = installer.wait(timeout=120)
+        finally:
+            if installer.poll() is None:
+                installer.kill()
+                installer.wait()
+            assert not end_group(installer.pid)
+    assert returncode == 0, output.read_text()
+    assert [call[2] for call in stops(host)] == ["lock-held"]
+    assert host.installed_version() == "new"
+
+
+def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_path: Path) -> None:
+    """The check takes the publisher's own locks; every agent stops while the
+    installer holds them all."""
+    host = macos_host(tmp_path, "serve", "refresh", "catalog-publish")
+    result = run_macos(host, "serve refresh catalog-publish")
+    assert result.returncode == 0, result.stderr
+    held = [call for call in host.calls() if call[0] == "upgrade-gate"]
+    assert [call[1] for call in held] == ["hold-writer-locks", "hold-writer-locks", "check-serve"]
+    assert {label for _, label, *_ in stops(host)} == {
+        f"com.{host.family}.{label}" for label in ("serve", "refresh", "catalog-publish")
+    }
+    assert {call[2] for call in stops(host)} == {"lock-held"}
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_the_health_check_accepts_a_regular_install(tmp_path: Path, system: str) -> None:
+    """With UV_NO_EDITABLE the service imports its own copy of the package
+    from the venv; the check must name the runtime by that same copy."""
+    host = controller_host(tmp_path, system)
+    if system == "Darwin":
+        result = host.run_with(
+            "install-controller.sh",
+            (),
+            shell=MACOS_BASH,
+            FAKE_AGENTS="serve refresh",
+            UV_NO_EDITABLE="1",
+        )
+    else:
+        result = host.run_with(
+            "install-controller-systemd.sh", (), FAKE_UNITS=TIMER_UNITS, UV_NO_EDITABLE="1"
+        )
+    assert result.returncode == 0, result.stderr
+    new = Path(os.path.realpath(host.app / ".venv"))
+    assert (new / "lib/python3/site-packages/inky_bird_frame").is_dir()
+    assert host.installed_version() == "new"
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_failed_health_check_switches_back(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("health-fail")
+    result = run_controller(host)
+    assert result.returncode == 1
+    assert "web service failed its health check" in result.stderr
+    assert "started again on the previous version" in result.stderr
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_health_check_that_never_answers_is_stopped(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("health-hang")
+    started = time.monotonic()
+    # run_contained also fails if the check outlives the run.
+    result = run_controller(host, health_timeout=1)
+    assert time.monotonic() - started < 60
+    assert result.returncode == 1
+    assert "web service failed its health check" in result.stderr
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_lock_holder_that_ignores_a_stop_is_forced_and_the_run_still_ends(
+    tmp_path: Path, system: str
+) -> None:
+    """Cleanup never waits without a bound for a helper it started."""
+    host = controller_host(tmp_path, system)
+    host.fail("holder-ignores-term", "new:heredoc" if system == "Darwin" else "new:refresh")
+    started = time.monotonic()
+    result = run_controller(host)
+    assert time.monotonic() - started < 90
+    assert result.returncode == 1
+    assert_previous_running(host)
+    helpers = subprocess.run(
+        ["/bin/ps", "-ww", "-ax", "-o", "command="], capture_output=True, text=True, check=True
+    ).stdout
+    assert str(tmp_path) not in helpers
+
+
+def stop_timeouts(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] in ("stop-timeout", "exit-timeout")]
+
+
+@pytest.mark.parametrize("hook", [False, True])
+def test_linux_services_whose_shutdown_needs_a_lock_stop_without_a_timeout(
+    tmp_path: Path, hook: bool
+) -> None:
+    """The fake scheduler and web service do not exit while the installer
+    holds the writer locks, as a scheduler recording the end of a job does
+    not: they are asked to stop under the locks and waited for without them."""
+    host = linux_host(tmp_path, mode="app")
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=APP_UNITS)
+    assert result.returncode == 0, result.stderr
+    assert not stop_timeouts(host)
+    stopped = {call[1]: call[2] for call in stops(host)}
+    expected = {f"{host.family}-scheduler.service": "lock-held"}
+    if hook:
+        expected[f"{host.family}-controller.service"] = "lock-held"
+        ((_, held, _, running, *_),) = hook_calls(host)
+        assert held == "lock-held" and not json.loads(running)
+    assert stopped == expected
+    assert host.unit_state("scheduler.service") == {"active": True, "enabled": True}
+
+
+def test_linux_upgrade_waits_for_a_timer_job_blocked_on_a_lock_without_holding_it(
+    tmp_path: Path,
+) -> None:
+    host = linux_host(tmp_path)
+    # A refresh a timer started, waiting for a writer lock.
+    host.set_busy("refresh.service", 2)
+    result = run_linux(host, quiesce_timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "Timed out" not in result.stderr
+
+
+def test_macos_agent_whose_shutdown_needs_a_lock_is_killed_only_after_launchds_timeout(
+    tmp_path: Path,
+) -> None:
+    """launchd stops an agent in bootout and has no stop whose signal can be
+    seen before it returns, so the installer boots agents out holding the
+    locks. One that waits for a lock is killed after launchd's exit timeout:
+    bounded, and while it holds no lock, so no write is cut short."""
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("agents-wait-for-locks")
+    started = time.monotonic()
+    result = run_macos(host)
+    assert result.returncode == 0, result.stderr
+    assert time.monotonic() - started < 60
+    assert stop_timeouts(host) == [["exit-timeout", f"com.{host.family}.serve"]]
+    assert host.installed_version() == "new"
+
+
+@pytest.mark.parametrize("hook", [False, True])
+@pytest.mark.parametrize("mode", ["interrupt", "kill", "hangup"])
+def test_a_stop_injected_at_the_lock_holder_reaches_the_installer(
+    tmp_path: Path, mode: str, hook: bool
+) -> None:
+    """The holder runs beside the installer, which may release it before the
+    matrix's stop is sent; the stop must still arrive, and the run must not
+    claim success."""
+    host = linux_host(tmp_path)
+    options = ("--stopped-hook", str(host.stopped_hook())) if hook else ()
+    result = host.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert result.returncode == 0, result.stderr
+    holds = [
+        int(line.split("\t")[0])
+        for line in (host.fake / "steps").read_text().splitlines()
+        if "hold-writer-locks" in line
+    ]
+    # Put the machine back: the old version installed and running.
+    other = Host(tmp_path / "again", "Linux")
+    other.install_old_version()
+    other.install_units(
+        controller_service="active",
+        refresh_service="inactive",
+        refresh_timer="active",
+        generate_service="inactive",
+        generate_timer="active",
+    )
+    other.fail("stop-sent-late")
+    (other.fake / "inject").write_text(f"{holds[-1]} {mode}\n")
+    options = ("--stopped-hook", str(other.stopped_hook())) if hook else ()
+    result = other.run_with("install-controller-systemd.sh", options, FAKE_UNITS=TIMER_UNITS)
+    assert any(call[0] == "stop-sent" for call in other.calls()), result.stderr
+    assert result.returncode != 0
+    assert "Controller installed" not in result.stdout
+
+
+def hook_calls(host: Host) -> list[list[str]]:
+    return [call for call in host.calls() if call[0] == "stopped-hook"]
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_the_stopped_hook_runs_once_with_everything_stopped_and_locked(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    result = run_controller(host, options=("--stopped-hook", str(hook)))
+    assert result.returncode == 0, result.stderr
+    assert "synthetic hook output" in result.stdout
+    ((_, held, active, running, given, extra),) = hook_calls(host)
+    assert (held, active, extra) == ("lock-held", "old", "[]")
+    family = {f"com.{host.family}.serve", f"com.{host.family}.refresh"}
+    family |= {f"{host.family}-{name}" for name in TIMER_UNITS.split()}
+    assert not set(json.loads(running)) & family
+    variables = json.loads(given)
+    assert variables["INKY_BIRD_HOOK_CONFIG"] == str(host.config)
+    assert variables["INKY_BIRD_HOOK_STATE_DIR"] == str(host.state)
+    assert Path(variables["INKY_BIRD_HOOK_PREVIOUS_RUNTIME"]).resolve() == host.app.resolve()
+    assert (
+        Path(variables["INKY_BIRD_HOOK_NEW_RUNTIME"]).parent.resolve()
+        == (host.app / ".runtimes").resolve()
+    )
+    assert host.installed_version() == "new"
+    if system == "Linux":
+        # The web service stopped for the hook runs again, on the new version.
+        assert host.unit_state("controller.service") == {"active": True, "enabled": True}
+        assert "lock-held" in [call[2] for call in stops(host)]
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        ("hook-fail", "failed with exit status 7"),
+        ("hook-killed", "failed with exit status 137"),
+        ("health-fail", "web service failed its health check"),
+    ],
+)
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_failed_hook_or_a_later_failure_switches_back(
+    tmp_path: Path, system: str, rule: str, message: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail(rule)
+    result = run_controller(host, options=("--stopped-hook", str(hook)))
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "started again on the previous version" in result.stderr
+    assert len(hook_calls(host)) == 1
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_hook_past_its_time_limit_is_stopped(tmp_path: Path, system: str) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail("hook-hang")
+    started = time.monotonic()
+    result = run_controller(
+        host, options=("--stopped-hook", str(hook), "--stopped-hook-timeout", "1")
+    )
+    assert time.monotonic() - started < 60
+    assert result.returncode == 1
+    assert "did not finish within 1 seconds and was stopped" in result.stderr
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_stopped_installer_stops_its_hook_before_starting_services_again(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    hook = host.stopped_hook()
+    host.fail("hook-hang")
+    output = tmp_path / "installer.out"
+    if system == "Darwin":
+        installer = host.start(
+            "install-controller.sh",
+            output,
+            shell=MACOS_BASH,
+            options=("--stopped-hook", str(hook)),
+            FAKE_AGENTS="serve refresh",
+        )
+    else:
+        installer = host.start(
+            "install-controller-systemd.sh",
+            output,
+            options=("--stopped-hook", str(hook)),
+            FAKE_UNITS=TIMER_UNITS,
+        )
+    try:
+        wait_until(lambda: bool(hook_calls(host)), "the hook to start")
+        installer.send_signal(signal.SIGTERM)
+        returncode = installer.wait(timeout=60)
+    finally:
+        if installer.poll() is None:
+            installer.kill()
+            installer.wait()
+        survivors = end_group(installer.pid)
+    assert not survivors, survivors
+    assert returncode == 143, output.read_text()
+    assert "started again on the previous version" in output.read_text()
+    assert_previous_running(host)
+
+
+def unsafe_hooks(host: Host, tmp_path: Path) -> dict[str, str]:
+    """Hooks the installers refuse before they change anything."""
+    good = host.stopped_hook()
+    writable = tmp_path / "writable-hook"
+    writable.write_text(good.read_text())
+    writable.chmod(0o775)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    in_shared = shared / "hook"
+    in_shared.write_text(good.read_text())
+    in_shared.chmod(0o755)
+    # A directory above the hook's own that another account could replace.
+    above = tmp_path / "writable-above"
+    (above / "own").mkdir(parents=True)
+    above.chmod(0o777)
+    deep = above / "own/hook"
+    deep.write_text(good.read_text())
+    deep.chmod(0o755)
+    # A safe-looking link whose target is not safe.
+    link = tmp_path / "linked-to-shared"
+    link.symlink_to(in_shared)
+    plain = tmp_path / "plain-hook"
+    plain.write_text(good.read_text())
+    return {
+        "relative": "stopped-hook",
+        "missing": str(tmp_path / "missing"),
+        "group-writable": str(writable),
+        "in a shared directory": str(in_shared),
+        "below a writable directory": str(deep),
+        "a link to an unsafe hook": str(link),
+        "not executable": str(plain),
+        "a directory": str(tmp_path),
+    }
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_hook_reached_through_a_link_or_a_sticky_directory_runs_from_its_real_path(
+    tmp_path: Path, system: str
+) -> None:
+    """The real path is checked and run: a link to a safe hook is fine, and a
+    shared sticky directory such as /tmp is, since no one else can replace
+    what is in it."""
+    host = controller_host(tmp_path / "machine", system)
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    hook = sticky / "hook"
+    hook.write_text(host.stopped_hook().read_text())
+    hook.chmod(0o755)
+    link = tmp_path / "linked-hook"
+    link.symlink_to(hook)
+    result = run_controller(host, options=("--stopped-hook", str(link)))
+    assert result.returncode == 0, result.stderr
+    assert f"Running the stopped-boundary hook: {os.path.realpath(hook)}" in result.stderr
+    assert len(hook_calls(host)) == 1
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_unsafe_hooks_and_bad_options_are_refused_before_any_change(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path / "machine", system)
+    refusals: list[tuple[tuple[str, ...], str]] = [
+        (("--stopped-hook", hook), "--stopped-hook must name")
+        for hook in unsafe_hooks(host, tmp_path).values()
+    ]
+    refusals += [
+        (("--stopped-hook",), "--stopped-hook needs a value"),
+        (("--stopped-hook-timeout", "soon"), "must be a whole number of seconds"),
+        (("--stopped-hook-timeout", "5"), "--stopped-hook-timeout needs --stopped-hook"),
+        (("--later",), "Unknown option: --later."),
+    ]
+    for options, message in refusals:
+        (host.fake / "log").write_text("")
+        result = run_controller(host, options=options)
+        assert result.returncode == 1, options
+        assert message in result.stderr and "No changes made" in result.stderr, options
+        assert not uv_calls(host) and not hook_calls(host), options
+        assert_previous_running(host)
 
 
 # Display node installer -----------------------------------------------------

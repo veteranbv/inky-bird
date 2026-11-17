@@ -351,8 +351,9 @@ or retained in the private collection. It may initially be zero in a region
 whose birds have not been generated yet. The approved count comes from the last
 built catalog index; the active count comes from current active-catalog state.
 The endpoint does not rebuild or scan the catalog, so it stays fast as the
-catalog grows. Run `"$IBF" --version` to identify the command-line installation
-directly.
+catalog grows. `runtime` is an opaque name for the installed code the service
+runs; it changes with every native upgrade and names no path. Run
+`"$IBF" --version` to identify the command-line installation directly.
 
 An existing controller can explicitly retain every currently approved plate
 after upgrading by previewing and applying `collection import-approved`; see
@@ -688,25 +689,95 @@ uv run inky-bird setup controller --config "$CONFIG" --yes
 uv run inky-bird doctor controller --config "$CONFIG"
 ```
 
-Before it changes anything, controller setup waits up to 30 minutes for a plate
-that is being made. If one is still being made, setup stops with "A plate is
-still being made. Run the upgrade again after it finishes. No changes made."
-(`setup` then reports "Installer exited with status 3"). If the installed version
-cannot be loaded, or cannot read your configuration (for example after you
-edited it for the new release), setup says it cannot check for a plate and
-continues without waiting; with no installed version, it continues without a
-message. Setup refuses only if the check itself fails to run, for example when
-it cannot open the lock in `state_dir`: "Could not check whether a plate is
-being made. No changes made."
+Before it changes anything, controller setup waits up to 30 minutes for every
+writer to finish what it is writing: a plate being made, an observation
+refresh, a catalog publication, notification delivery and any other work that
+holds one of the application's locks in `state_dir`. It says what it waits for,
+for example "Waiting for the observation refresh to finish." It then holds all
+of those locks while it stops services, so no service is stopped in the middle
+of a write. If a plate is still being made at the end of the wait, setup stops
+with "A plate is still being made. Run the upgrade again after it finishes. No
+changes made."; if other work is, with "Other work is still running. Run the
+upgrade again after it finishes. No changes made." (`setup` then reports
+"Installer exited with status 3"). If the installed version cannot be loaded,
+or cannot read your configuration (for example after you edited it for the new
+release), setup says it cannot check for a plate and continues without
+waiting; with no installed version, it continues without a message. Setup
+refuses only if the check itself fails to run, for example when it cannot open
+a lock in `state_dir`: "Could not check whether a plate is being made. No
+changes made."
 
-On a Linux controller, setup then stops the scheduler and job timers and waits
-up to 30 more minutes for a running refresh, generate, catalog-publish or
-notifications job to finish before it copies anything. If a job is still
-running then, setup stops with "Timed out waiting for `UNIT` to finish." (naming
-the job). Run setup again once the job has finished. If an upgrade fails after
-it stopped services, it starts again only the services it stopped and says so,
-or lists any it could not start with the command to start them. It does not
-undo state or catalog changes the new version already made.
+On a Linux controller, setup then asks the scheduler to stop and stops the job
+timers, lets go of the locks, and waits up to 30 more minutes for the scheduler
+to exit and for a refresh, generate, catalog-publish or notifications job a
+timer had already started to finish before it copies anything. The scheduler
+may need one of the locks to finish stopping, so setup does not wait for it
+while holding them. If a job is still running then, setup stops with "Timed
+out waiting for `UNIT` to finish." (naming the job). Run setup again once the
+job has finished. On macOS, checking the catalog publisher of the new version
+lets go of the locks briefly and takes them again; work that started in
+between and does not finish within the wait stops the upgrade before the
+switch. macOS stops each agent as it unloads it, with the locks held; an agent
+that is itself waiting for one of them, such as a scheduler recording the end
+of a job, is ended by launchd after its exit timeout (system-defined, usually 20
+seconds; the installed agents set none). It holds no lock then, so nothing it
+was writing is cut short.
+
+Once the new version's services are started, setup asks the web service for
+`/health` on this machine, at the configured `bind_host` and `port` (a wildcard
+address is asked on loopback), for up to 90 seconds. With `tls_certificate`
+set, it connects over HTTPS to this machine and verifies the certificate for
+the name of `healthcheck_origin`, or of an `owner_allowed_origins` entry served
+on that port, against the trust in `native-tls.env` or the system's. The answer
+must be `"ok": true` from the code just installed (its `runtime`). Otherwise
+setup says "The new version started, but its web service failed its health
+check." and switches back.
+
+If an upgrade fails after it stopped services, it starts again only the
+services it stopped and says so, or lists any it could not start with the
+command to start them. It does not undo state or catalog changes the new
+version already made.
+
+### Run a command while the services are stopped
+
+The native controller installers (`deploy/install-controller.sh` on macOS,
+`deploy/install-controller-systemd.sh` on Linux) accept an advanced option for
+work that needs the controller stopped, such as a backup of `state_dir` taken
+before the new version first writes to it:
+
+```bash
+./deploy/install-controller.sh --stopped-hook "$HOME/bin/inky-backup"
+./deploy/install-controller.sh --stopped-hook "$HOME/bin/inky-backup" --stopped-hook-timeout 600
+```
+
+The hook runs once per upgrade, after every service is stopped and while the
+writer locks are held, and before the switch to the new version; on Linux the
+web service is stopped for it too and starts again with the new version. It
+does not run when the upgrade stops earlier, for example while a plate is still
+being made. It must be an absolute path to an executable regular file that only
+you or root can change. Setup follows any links to the file's real path and
+requires every directory from `/` down to it to belong to you or root and be
+writable by no one else; a shared directory such as `/tmp` is accepted only
+with its sticky bit set, so no one else can replace what is in it. It checks
+this before it changes anything, runs the real path, and checks again just
+before running it. Its output passes through. It runs without your environment, with
+only `PATH`, `HOME` and these names:
+
+| Variable | Value |
+| --- | --- |
+| `INKY_BIRD_HOOK_PREVIOUS_RUNTIME` | The directory of the version running now; empty on a first install. |
+| `INKY_BIRD_HOOK_NEW_RUNTIME` | The directory of the version about to be switched to. |
+| `INKY_BIRD_HOOK_CONFIG` | The configuration file. |
+| `INKY_BIRD_HOOK_STATE_DIR` | The configured `state_dir`. |
+
+A hook that exits with any status but 0, or is killed, stops the upgrade: setup
+says "The stopped-boundary hook failed with exit status `N`" and starts the
+services again on the previous version. There is no time limit unless you give
+`--stopped-hook-timeout` in seconds; a hook still running then is stopped and
+counts as failed. A hook still running when setup itself is stopped is stopped
+before the services start again. Copy files directly; do not run `inky-bird`
+commands that write state from the hook, since they wait for the locks setup
+holds. A hook should not leave processes of its own running.
 
 On the display, stop the timer and wait for a running panel update to finish
 before setup. An install that began under the old name uses

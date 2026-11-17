@@ -873,3 +873,37 @@ def test_display_restore_fails_loudly_for_a_damaged_saved_copy(tmp_path: Path) -
     assert result.returncode != 0
     assert "could not be put back" in result.stderr
     assert not (venv.site / "inky_bird_frame/cli.py").exists()
+
+
+def test_controller_installers_hold_writer_locks_run_the_hook_and_check_health_in_order() -> None:
+    """Locks before the first stop, the hook before the switch, the health
+    check before the run counts as installed. Behaviour is exercised in
+    tests/test_installer_behaviour.py and the installer matrix."""
+    root = Path(__file__).resolve().parents[1] / "deploy"
+    for name, first_stop in (
+        (
+            "install-controller.sh",
+            'launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"',
+        ),
+        (
+            "install-controller-systemd.sh",
+            'request_stop "${service_prefix}-scheduler.service"',
+        ),
+    ):
+        script = (root / name).read_text()
+        hold = script.index("\nhold_writer_locks false\n")
+        hook = script.index("  run_stopped_hook\n" if "systemd" in name else "\nrun_stopped_hook\n")
+        activation = script.index("\nactivate_runtime\n")
+        health = script.index("  check_new_serve\n")
+        complete = script.rindex("installation_complete=true")
+        assert hold < script.index(first_stop) < hook < activation < health < complete
+        # Cleanup stops a hook or check still running before it puts services back.
+        cleanup = script[script.index("cleanup() {") :]
+        assert cleanup.index("stop_bounded") < cleanup.index("release_writer_locks")
+        assert cleanup.index("release_writer_locks") < cleanup.index("installation_complete")
+        # The new runtime's helpers run as the package it imports, editable or not.
+        assert "-m inky_bird_frame.upgrade_gates check-serve" in script
+        assert "-m inky_bird_frame.upgrade_gates state-dir" in script
+    macos = (root / "install-controller.sh").read_text()
+    # The catalog sync takes its own lock only when the installer does not hold it.
+    assert "with nullcontext() if writer_locks_held else catalog_state_lock(" in macos
