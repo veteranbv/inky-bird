@@ -272,3 +272,47 @@ def test_the_health_check_loads_the_private_file_it_is_given(
     assert upgrade_gates.main(["check-serve", str(config), "1"]) == 0
     assert upgrade_gates.main(["check-serve", str(config), "1", str(environment)]) == 0
     assert seen == [None, "synthetic"]
+
+
+def test_doctor_checks_the_units_of_the_system_service_it_runs_as(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run as a system service's account, doctor checks that account's units,
+    not the user layout's; anyone else falls back to the user layout."""
+    import pwd
+
+    from inky_bird_frame import installation
+
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = load_config(write_config(tmp_path, codex))
+    units = tmp_path / "units"
+    units.mkdir()
+    monkeypatch.setattr(installation, "SYSTEMD_UNIT_DIRECTORY", units)
+    monkeypatch.setattr(installation, "_native_family", lambda config: "inky-bird")
+    checked: list[str] = []
+
+    def unit_check(unit: str) -> installation.DiagnosticCheck:
+        checked.append(unit)
+        return installation.DiagnosticCheck(unit, installation.CheckStatus.PASS, unit)
+
+    monkeypatch.setattr(installation, "_systemd_unit_check", unit_check)
+    monkeypatch.setattr(installation, "_systemd_last_run_check", lambda unit, **_: unit_check(unit))
+    entry = pwd.getpwuid(os.getuid())
+    fields = (
+        "inky-bird-qa",
+        *entry[1:],
+    )
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: pwd.struct_passwd(fields))
+    list(installation._systemd_controller_checks(config))
+    assert checked[0] == "inky-bird-controller.service"
+    checked.clear()
+    (units / "inky-bird-qa-controller.service").write_text(f"{SYSTEM_SERVICE_MARKER}\n[Unit]\n")
+    list(installation._systemd_controller_checks(config))
+    assert checked[0] == "inky-bird-qa-controller.service"
+    assert all(name.startswith("inky-bird-qa-") for name in checked)
+    # A unit the user installer wrote, under that name, is not a system service.
+    checked.clear()
+    (units / "inky-bird-qa-controller.service").write_text("[Unit]\n")
+    list(installation._systemd_controller_checks(config))
+    assert checked[0] == "inky-bird-controller.service"

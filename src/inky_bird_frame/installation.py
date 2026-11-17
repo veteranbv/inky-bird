@@ -68,6 +68,7 @@ SYSTEMD_SERVICE_HARDENING = (
 # The first line of every unit a system-service installation renders, so the
 # user installer can tell those units from its own.
 SYSTEM_SERVICE_MARKER = "# Inky Bird system service"
+SYSTEMD_UNIT_DIRECTORY = Path("/etc/systemd/system")
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
@@ -1064,8 +1065,28 @@ def _systemd_last_run_check(
     )
 
 
+def _system_service_prefix() -> str | None:
+    """The account running doctor, when system services were installed for it.
+
+    A system service is named after its account and its units start with
+    SYSTEM_SERVICE_MARKER; run as that account, doctor checks those units.
+    """
+    import pwd
+
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+        unit = SYSTEMD_UNIT_DIRECTORY / f"{name}-controller.service"
+        with unit.open(encoding="utf-8", errors="replace") as handle:
+            first = handle.readline().rstrip("\n")
+    except (KeyError, OSError):
+        return None
+    return name if first == SYSTEM_SERVICE_MARKER and valid_account_name(name) else None
+
+
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
-    prefix = _native_family(config)
+    prefix: str | DiagnosticCheck | None = _system_service_prefix()
+    if prefix is None:
+        prefix = _native_family(config)
     if isinstance(prefix, DiagnosticCheck):
         yield prefix
         return

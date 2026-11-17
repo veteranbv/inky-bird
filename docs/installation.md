@@ -400,6 +400,16 @@ that start Codex keep their own sandbox. Before it switches to a new version,
 the installer checks that the account cannot change any part of the code
 under `app`, and stops if it can.
 
+Run `doctor` as the account, with its private file, so it checks that
+account's services and folders:
+
+```bash
+sudo -u inky-bird env INKY_BIRD_ENV_FILE=/srv/inky-bird/config/private.env \
+  /srv/inky-bird/app/.venv/bin/inky-bird doctor controller --config /srv/inky-bird/config/config.toml
+```
+
+Run as anyone else, `doctor` checks the user installer's services instead.
+
 To upgrade, check out the new tag and run the same command. Everything under
 [Update](#update) applies. `--stopped-hook` runs as root, with the environment
 described there; treat `INKY_BIRD_HOOK_STATE_DIR` as a path the account
