@@ -61,10 +61,14 @@ def _step_lock() -> Path:
     while True:
         try:
             lock.mkdir()
+            # Who holds it, so a lock left behind names its holder.
+            (FAKE / "steps.lock.owner").write_text(f"{os.getpid()} {' '.join(sys.argv[1:3])}\n")
             return lock
         except FileExistsError:
             if time.monotonic() >= deadline:
-                raise
+                owner = FAKE / "steps.lock.owner"
+                held = owner.read_text().strip() if owner.exists() else "unknown"
+                raise RuntimeError(f"the step lock is still held by {held}") from None
             time.sleep(0.001)
 
 
@@ -88,6 +92,7 @@ def step(tool: str, arguments: list[str], *, action: bool) -> str:
                 line = "\t".join([str(index), kind, tool, *arguments]).replace("\n", " ")
                 handle.write(line + "\n")
         finally:
+            (FAKE / "steps.lock.owner").unlink(missing_ok=True)
             lock.rmdir()
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)

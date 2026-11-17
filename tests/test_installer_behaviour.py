@@ -181,8 +181,8 @@ def tool_wrapper(tool: str, *, own_path: bool = False) -> str:
 
 def coreutil_wrapper(name: str, real: str) -> str:
     """A shell stand-in that numbers a file command as a step before running it."""
-    mkdir, rmdir, wc, tr = (
-        shlex.quote(system_tool(tool)) for tool in ("mkdir", "rmdir", "wc", "tr")
+    mkdir, rmdir, wc, tr, rm = (
+        shlex.quote(system_tool(tool)) for tool in ("mkdir", "rmdir", "wc", "tr", "rm")
     )
     return f"""#!/bin/sh
 {fake_tools.DEPTH_GUARD}lock="$FAKE/steps.lock"
@@ -193,6 +193,7 @@ trap 'stopped=HUP' HUP
 trap 'stopped=INT' INT
 trap 'stopped=TERM' TERM
 while ! {mkdir} "$lock" 2>/dev/null; do :; done
+printf '%s {name}\n' "$$" > "$lock.owner"
 index=0
 if [ -f "$FAKE/steps" ]; then
   index=$({wc} -l < "$FAKE/steps" | {tr} -d ' ')
@@ -202,6 +203,7 @@ fi
   printf '\t%s' "$@" | {tr} '\n' ' '
   printf '\n'
 }} >> "$FAKE/steps"
+{rm} -f "$lock.owner"
 {rmdir} "$lock"
 trap - HUP INT TERM
 if [ -n "$stopped" ]; then

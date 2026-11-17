@@ -339,15 +339,17 @@ run_bounded() {
 }
 
 # Stop a process start_background started, with its whole process group,
-# and wait until it has gone: ask, then after at most 10 seconds force.
+# and wait until it has gone: ask, then after at most 10 seconds force. It
+# leads its group, so only the group is signalled: the ID alone may already
+# belong to another process once the first has exited.
 stop_group() {
   local deadline=$((SECONDS + 10))
-  kill -TERM -- "-$1" 2>/dev/null || kill -TERM "$1" 2>/dev/null || true
+  kill -TERM -- "-$1" 2>/dev/null || true
   while kill -0 "$1" 2>/dev/null && [ "${SECONDS}" -lt "${deadline}" ]; do
     sleep "${poll_seconds}"
   done
   # Whatever of the group is left, the command itself or what it started.
-  kill -KILL -- "-$1" 2>/dev/null || kill -KILL "$1" 2>/dev/null || true
+  kill -KILL -- "-$1" 2>/dev/null || true
   wait "$1" 2>/dev/null || true
 }
 
