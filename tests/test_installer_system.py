@@ -355,3 +355,82 @@ def test_helpers_run_as_the_account_lead_their_own_group_and_are_stopped_by_it(
         ["/bin/ps", "-ww", "-ax", "-o", "command="], capture_output=True, text=True, check=True
     ).stdout
     assert str(tmp_path) not in listing
+
+
+def assert_units_start_real_commands(host: Host, account: str) -> None:
+    """Every program a unit starts exists and runs: the account-named units
+    start the installed command, not one named after the account."""
+    started = 0
+    for unit in host.units.glob(f"{account}-*.service"):
+        for line in unit.read_text().splitlines():
+            if line.startswith("ExecStart="):
+                program = Path(line.partition("=")[2].split()[0].strip('"'))
+                assert program.is_file() and os.access(program, os.X_OK), (unit.name, program)
+                started += 1
+    assert started
+
+
+@pytest.mark.parametrize("account", ["inky-bird", "inky-bird-qa"])
+def test_every_unit_starts_a_command_the_installed_runtime_has(
+    tmp_path: Path, account: str
+) -> None:
+    host = system_host(tmp_path, account)
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert_units_start_real_commands(host, account)
+
+
+def test_the_staged_runtime_is_readable_by_the_account_and_root_s_alone_to_change(
+    tmp_path: Path,
+) -> None:
+    """mktemp makes a folder 0700: the installer opens the new runtime to the
+    account (0755) before the account checks the configuration with it."""
+    host = system_host(tmp_path)
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    runtime = Path(os.path.realpath(host.app / ".venv")).parent
+    assert runtime.stat().st_mode & 0o777 == 0o755
+
+
+def test_code_folders_the_account_cannot_read_are_refused_before_any_change(
+    tmp_path: Path,
+) -> None:
+    host = system_host(tmp_path)
+    (host.app / ".runtimes").mkdir(parents=True)
+    (host.app / ".runtimes").chmod(0o700)
+    before = machine_state(host)
+    result = run_system(host)
+    assert result.returncode == 1
+    assert result.stderr.endswith(
+        f"inky-bird cannot read or search {host.app}/.runtimes; give its folders mode 0755 "
+        "(chmod go+rX). No changes made.\n"
+    )
+    assert machine_state(host) == before
+
+
+def test_a_program_the_account_cannot_reach_is_refused_by_setpriv(tmp_path: Path) -> None:
+    """The fake setpriv runs only what the account could reach by real modes."""
+    host = system_host(tmp_path)
+    hidden = tmp_path / "hidden"
+    (hidden / "bin").mkdir(parents=True)
+    program = hidden / "bin/tool"
+    program.write_text("#!/bin/sh\nexit 0\n")
+    program.chmod(0o755)
+    hidden.chmod(0o700)
+    environment = host.environment(FAKE_UID="0")
+    command = [
+        str(host.bin / "setpriv"),
+        "--reuid=2001",
+        "--regid=2001",
+        "--init-groups",
+        "--",
+        "env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        str(program),
+    ]
+    denied = subprocess.run(command, env=environment, capture_output=True, text=True)
+    assert denied.returncode == 126 and "Permission denied" in denied.stderr
+    hidden.chmod(0o755)
+    allowed = subprocess.run(command, env=environment, capture_output=True, text=True)
+    assert allowed.returncode == 0, allowed.stderr

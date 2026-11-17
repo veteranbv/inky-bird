@@ -1006,13 +1006,18 @@ def _pip(venv: Path, arguments: list[str]) -> int:
     return 0
 
 
-def _executable(source: str, prefix: str) -> str:
-    """The command a controller program's services start, as it names it."""
+def _executable(source: str, prefix: str, mode: str = "") -> str:
+    """The command a controller program's services start, as it names it:
+    a fixed name, the service prefix, or for a system service's units
+    (``render``) the command its program picks."""
     import re
 
     named = re.search(r'executable = app_dir / "\.venv/bin/([\w-]+)"', source)
     if named is not None:
         return named.group(1)
+    picked = 'command_name = "inky-bird" if mode == "render" else service_prefix'
+    if picked in source and 'executable = app_dir / ".venv/bin" / command_name' in source:
+        return "inky-bird" if mode == "render" else prefix
     assert 'executable = app_dir / ".venv/bin" / service_prefix' in source, "unknown executable"
     return prefix
 
@@ -1083,7 +1088,7 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         if mode == "sync":
             return 0
         if "plistlib" in source or "controller_systemd_units" in source:
-            executable = _executable(source, prefix)
+            executable = _executable(source, prefix, mode)
         if "plistlib" in source:
             import plistlib
 
@@ -1344,6 +1349,65 @@ def _group_ids() -> dict[str, int]:
     return groups
 
 
+def _seen(
+    result: os.stat_result,
+    path: str | bytes | os.PathLike[str],
+    owners: dict[str, object],
+) -> os.stat_result:
+    """A file's status as the synthetic host has it: the owner ``chown``
+    recorded; real modes inside the machine's folder, and outside it (the
+    test's private temp folders, the checkout pytest runs in) the modes of a
+    host's system folders, which everyone can read and search."""
+    given = os.path.abspath(os.fsdecode(path))
+    fields = list(result[:10])
+    recorded = owners.get(given)
+    if isinstance(recorded, dict):
+        fields[4], fields[5] = recorded["uid"], recorded["gid"]
+    if not any(given.startswith(machine + "/") for machine in _machine_roots()):
+        fields[0] = int(fields[0]) | 0o755
+    return os.stat_result(fields)
+
+
+MACHINE_ROOTS: tuple[str, ...] = ()
+
+
+def _machine_roots() -> tuple[str, ...]:
+    """The machine's own folder, as given and resolved; found once, before
+    the helper's stat functions are replaced (resolving uses them)."""
+    global MACHINE_ROOTS
+    if not MACHINE_ROOTS:
+        MACHINE_ROOTS = (str(FAKE.parent), os.path.realpath(FAKE.parent))
+    return MACHINE_ROOTS
+
+
+def _account_may(path: str, entry: dict[str, object], wanted: int) -> bool:
+    """Whether the account has ``wanted`` (r=4, w=2, x=1) on ``path``, by its
+    real mode bits, as the kernel chooses owner, group or other."""
+    info = _seen(os.stat(path), path, _state("owners"))
+    listed = entry.get("groups", [])
+    assert isinstance(listed, list)
+    groups = {int(str(entry["gid"])), *(_group_ids()[str(group)] for group in listed)}
+    if info.st_uid == entry["uid"]:
+        bits = info.st_mode >> 6
+    elif info.st_gid in groups:
+        bits = info.st_mode >> 3
+    else:
+        bits = info.st_mode
+    return bits & wanted == wanted
+
+
+def _denied(path: str, entry: dict[str, object], *, run: bool) -> str | None:
+    """The first folder on the way to ``path`` the account cannot search, or
+    with ``run`` the file itself if it cannot execute it; None when allowed."""
+    real = os.path.realpath(path)
+    for folder in reversed([os.path.dirname(real), *Path(real).parents]):
+        if not _account_may(str(folder), entry, 1):
+            return str(folder)
+    if run and not _account_may(real, entry, 1):
+        return real
+    return None
+
+
 def run_with_accounts(arguments: list[str]) -> None:
     """Run a helper script as the host would, with the synthetic accounts in
     the account database and the owners ``chown`` recorded on the files."""
@@ -1353,9 +1417,10 @@ def run_with_accounts(arguments: list[str]) -> None:
 
     real_getpwnam, real_getgrgid = pwd.getpwnam, grp.getgrgid
     real_lstat, real_stat = os.lstat, os.stat
+    _machine_roots()
+    owners = _state("owners")
     accounts = _accounts()
     groups = _group_ids()
-    owners = _state("owners")
 
     def getpwnam(name: str) -> pwd.struct_passwd:
         entry = accounts.get(name)
@@ -1376,19 +1441,11 @@ def run_with_accounts(arguments: list[str]) -> None:
         assert isinstance(listed, list)
         return [gid, *(groups[str(group)] for group in listed)]
 
-    def owned(result: os.stat_result, path: str | bytes | os.PathLike[str]) -> os.stat_result:
-        recorded = owners.get(os.path.abspath(os.fsdecode(path)))
-        if not isinstance(recorded, dict):
-            return result
-        fields = list(result[:10])
-        fields[4], fields[5] = recorded["uid"], recorded["gid"]
-        return os.stat_result(fields)
-
     def lstat(path: str | os.PathLike[str]) -> os.stat_result:
-        return owned(real_lstat(path), path)
+        return _seen(real_lstat(path), path, owners)
 
     def stat(path: str | os.PathLike[str]) -> os.stat_result:
-        return owned(real_stat(path), path)
+        return _seen(real_stat(path), path, owners)
 
     # The synthetic account database, and owners recorded by the fake chown.
     pwd.getpwnam = getpwnam
@@ -1403,7 +1460,8 @@ def run_with_accounts(arguments: list[str]) -> None:
 def setpriv(arguments: list[str]) -> int:
     """Run a command as a synthetic account: only with its supplementary
     groups and a scrubbed environment (``env -i``), which it then sees alone,
-    beside the fakes' own settings."""
+    beside the fakes' own settings, and only a program the account can reach
+    and run (exit 126, as a shell reports Permission denied)."""
     import shutil
 
     separator = arguments.index("--")
@@ -1430,6 +1488,13 @@ def setpriv(arguments: list[str]) -> int:
     leader = "leader" if os.getpgid(0) == os.getpid() else "member"
     _log("as-account", found[0], json.dumps(sorted(given)), rest[0], *rest[1:5], leader)
     executable = shutil.which(rest[0], path=given.get("PATH", "")) or rest[0]
+    # The account must be able to reach and run the program, and to reach the
+    # folder it starts in, by the real modes of the files: as the kernel would.
+    for path, run in ((executable, True), (os.getcwd(), False)):
+        denied = _denied(path, found[1], run=run)
+        if denied is not None:
+            print(f"setpriv: {rest[0]}: Permission denied ({denied})", file=sys.stderr)
+            return 126
     return _exec([executable, *rest[1:]], environment)
 
 

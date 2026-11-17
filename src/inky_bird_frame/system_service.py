@@ -10,6 +10,7 @@ with fixed keys and shell-quoted values; it never changes anything.
 ``preflight`` checks the account, the install root and the source checkout.
 ``contained`` checks a path root is about to delete, move or replace.
 ``verify-code`` checks that the account cannot change the code it runs.
+``readable`` checks that the account can reach and read a path and all it holds.
 """
 
 from __future__ import annotations
@@ -225,11 +226,75 @@ def preflight(name: str, install_root: Path, source: Path) -> dict[str, str]:
         found["problem"] = "source-writable"
     else:
         unsafe = layout_problem(install_root, account)
+        # Folders root makes here get 0755; existing ones must let the
+        # account reach its data and read its code.
+        hidden = next(
+            (
+                found_path
+                for found_path in (
+                    unreadable(install_root, account, tree=False),
+                    *(
+                        unreadable(install_root / CODE_DIRECTORY / name, account, tree=False)
+                        for name in ("", ".runtimes", "catalog", "deploy")
+                    ),
+                )
+                if found_path is not None
+            ),
+            None,
+        )
         if unsafe is not None:
             found.update(problem="layout-unsafe", unsafe_path=unsafe)
+        elif hidden is not None:
+            found.update(problem="layout-unreadable", unsafe_path=str(hidden))
         else:
             found["give_directories"] = " ".join(to_give(install_root, account))
     return found
+
+
+def permits(info: os.stat_result, account: Account, read: int, search: int) -> bool:
+    """Whether the account has these permission bits, as the kernel picks them."""
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid == account.uid:
+        shift = 6
+    elif info.st_gid in account.groups:
+        shift = 3
+    else:
+        shift = 0
+    wanted = (read | search) << shift
+    return mode & wanted == wanted
+
+
+def unreadable(path: Path, account: Account, *, tree: bool = True) -> Path | None:
+    """The first folder on the way to ``path`` the account cannot search, or
+    entry at or below it (only ``path`` itself without ``tree``) that it
+    cannot read; folders must also be searchable."""
+    for current in reversed((path, *path.parents)):
+        if current == path:
+            break
+        try:
+            info = os.stat(current)
+        except FileNotFoundError:
+            return None
+        if not permits(info, account, 0, 1):
+            return current
+    if not path.exists():
+        return None
+    entries = [path]
+    if tree and path.is_dir() and not path.is_symlink():
+        for directory, subdirectories, files in os.walk(path, followlinks=False):
+            subdirectories.sort()
+            entries.extend(Path(directory) / name for name in sorted(subdirectories + files))
+    for entry in entries:
+        try:
+            info = os.lstat(entry)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        search = 1 if stat.S_ISDIR(info.st_mode) else 0
+        if not permits(info, account, 4, search):
+            return entry
+    return None
 
 
 def contained(install_root: Path, base: Path, target: Path, account: Account) -> bool:
@@ -267,12 +332,19 @@ def main(arguments: list[str]) -> int:
         name, install_root, source = rest
         print(_assignments(preflight(name, Path(install_root), Path(source))), end="")
         return 0
-    if command in ("contained", "verify-code"):
+    if command in ("contained", "verify-code", "readable"):
         name, install_root, *paths = rest
         account = lookup_account(name)
         if account is None:
             return 1
         root = Path(install_root)
+        if command == "readable":
+            (path,) = paths
+            hidden = unreadable(Path(path), account)
+            if hidden is not None:
+                print(_assignments({"unsafe_path": str(hidden)}), end="")
+                return 1
+            return 0
         if command == "contained":
             base, target = (Path(path) for path in paths)
             return 0 if contained(root, base, target, account) else 1

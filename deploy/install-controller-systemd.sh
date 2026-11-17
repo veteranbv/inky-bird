@@ -182,6 +182,10 @@ else
       echo "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
       exit 1
       ;;
+    layout-unreadable)
+      echo "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 (chmod go+rX). No changes made." >&2
+      exit 1
+      ;;
     *)
       echo "Could not check the service account. No changes made." >&2
       exit 1
@@ -243,6 +247,16 @@ admin_ready() {
 }
 as_account() {
   ${account_prefix[@]+"${account_prefix[@]}"} "$@"
+}
+# A folder mktemp made (mode 0700) that the account must read: the code stays
+# root's alone to change, as everything else under app is (0755).
+share_with_account() {
+  [ -z "${service_account}" ] || chmod 0755 "$1"
+}
+# Whether the account can reach $1 and read everything in it.
+account_can_read() {
+  [ -z "${service_account}" ] ||
+    python3 -I "${system_helper}" readable "${service_account}" "${install_root}" "$1"
 }
 # Whether root may delete, move or replace $2 inside $1. For a system service
 # the path must lie under the install root through folders the account cannot
@@ -668,6 +682,7 @@ activate_runtime() {
   elif [ -e "${app_dir}/.venv" ]; then
     venv_before=directory
     make_temp_dir legacy_runtime "${runtimes_dir}/runtime.XXXXXX"
+    share_with_account "${legacy_runtime}"
     previous_runtime=${legacy_runtime}
     contained "${runtimes_dir}" "${legacy_runtime}/.venv"
     mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
@@ -948,6 +963,12 @@ else
   mkdir "${ready_dir}"
   chown "${service_account}:${account_group}" "${ready_dir}"
   chmod 711 "${work_dir}"
+  if ! hidden=$(account_can_read "${ready_dir}"); then
+    unsafe_path=${ready_dir}
+    eval "${hidden}"
+    echo "${service_account} cannot reach ${unsafe_path}; set TMPDIR to a folder it can search, such as /tmp." >&2
+    exit 1
+  fi
   mkdir -p "${app_dir}/catalog" "${app_dir}/deploy" "${runtimes_dir}"
   # The account's folders it does not own yet: missing, or empty ones a run
   # stopped before it gave them away. Their folder is root's, so none of them
@@ -968,6 +989,7 @@ runtimes_dir=$(cd -P "${runtimes_dir}" && pwd)
 # Build and check the new runtime beside the live one; nothing running changes.
 make_temp_dir new_runtime "${runtimes_dir}/runtime.XXXXXX"
 contained "${runtimes_dir}" "${new_runtime}"
+share_with_account "${new_runtime}"
 stage_runtime_source "${new_runtime}"
 # A system service keeps the interpreter uv may download with its code, where
 # the account can run but not change it, and compiles bytecode it cannot write.
@@ -981,6 +1003,14 @@ fi
 env -u UV_PROJECT_ENVIRONMENT ${uv_environment[@]+"${uv_environment[@]}"} "${uv_bin}" sync \
   --project "${new_runtime}" --python "${python_version}" --extra controller --locked \
   ${uv_options[@]+"${uv_options[@]}"}
+# The account runs this build: it must be able to read all of it, whatever
+# modes uv's cache gave the files.
+if ! hidden=$(account_can_read "${new_runtime}"); then
+  unsafe_path=${new_runtime}
+  eval "${hidden}"
+  echo "${service_account} cannot read ${unsafe_path} in the new version. No changes made." >&2
+  exit 1
+fi
 # The CLI reports a rejection as a JSON envelope on stdout; show its message.
 if ! validation=$(as_account "${new_runtime}/.venv/bin/inky-bird" config validate \
     --config "${config_path}"); then
@@ -1147,7 +1177,9 @@ if mode == "sync":
 service_prefix = os.environ["INKY_BIRD_SERVICE_PREFIX"]
 # The command named like the services: 0.9 installs had only inky-bird-frame,
 # so a service whose definition a failed upgrade could not put back still starts.
-executable = app_dir / ".venv/bin" / service_prefix
+# A system service is named after its account; it runs the canonical command.
+command_name = "inky-bird" if mode == "render" else service_prefix
+executable = app_dir / ".venv/bin" / command_name
 units = controller_systemd_units(
     config,
     executable=executable,

@@ -1261,6 +1261,11 @@ CLAIMS = {
     "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by "
     "${service_account}. No changes made.": "unchanged",
     "Could not check the service account. No changes made.": "unchanged",
+    "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 "
+    "(chmod go+rX). No changes made.": "unchanged",
+    "${service_account} cannot read ${unsafe_path} in the new version. No changes made.": (
+        "unchanged"
+    ),
     "${service_prefix}-${name}.service was installed by the user installer for ${owner}; this "
     "installer does not move it. Remove it with deploy/uninstall-controller-systemd.sh run as "
     "${owner}, then run this again. No changes made.": "unchanged",
@@ -1369,6 +1374,8 @@ CLAIMS = {
     "the new version.": "neutral",
     "The new version started, but its web service failed its health check.": "neutral",
     "${unit} did not begin to stop.": "neutral",
+    "${service_account} cannot reach ${unsafe_path}; set TMPDIR to a folder it can search, "
+    "such as /tmp.": "neutral",
     "Processes of ${service_account} still run after its services stopped; the upgrade did "
     "not switch to the new version.": "neutral",
     "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new "
