@@ -382,14 +382,15 @@ jobs:
           retention-days: 7
 
   installer-matrix:
-    name: Installer matrix ${{ matrix.shard }}/8
+    name: Installer matrix ${{ matrix.shard }}/12
     runs-on: ubuntu-latest
-    # No run history yet: about 3x the expected 12 minutes per shard.
+    # Eight shards ran 26 to 40 minutes once the system-service groups were added;
+    # twelve keep each well inside the limit.
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       # The matrix runs synthetic installs, not catalog data: skip the images.
       - name: Checkout
@@ -449,22 +450,22 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         env:
           INKY_INSTALLER_MATRIX: full
-          INKY_MATRIX_SHARD: ${{ matrix.shard }}/8
+          INKY_MATRIX_SHARD: ${{ matrix.shard }}/12
           INKY_MATRIX_WORKERS: "4"
         run: uv run pytest tests/test_installer_matrix.py -p no:cacheprovider
 
   # The macOS installers again under the Bash 3.2 that macOS ships, which the
   # Linux shards do not have.
   installer-matrix-macos:
-    name: Installer matrix macOS ${{ matrix.shard }}/2
+    name: Installer matrix macOS ${{ matrix.shard }}/4
     runs-on: macos-latest
-    # No run history yet: both shards together take about 6 minutes on four
-    # local workers.
+    # Two shards ran 23 to 40 minutes once the system-service groups were added;
+    # four keep each well inside the limit.
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     steps:
       # The matrix runs synthetic installs, not catalog data: skip the images.
       - name: Checkout
@@ -529,7 +530,7 @@ jobs:
         env:
           INKY_INSTALLER_MATRIX: full
           INKY_INSTALLER_MATRIX_ONLY: "install:macos:*,install:macos-hook:*,install:macos-system:*,install:macos-system-hook:*,uninstall:macos:*"
-          INKY_MATRIX_SHARD: ${{ matrix.shard }}/2
+          INKY_MATRIX_SHARD: ${{ matrix.shard }}/4
           INKY_MATRIX_WORKERS: "4"
         run: uv run pytest tests/test_installer_matrix.py -p no:cacheprovider
 
