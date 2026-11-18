@@ -908,3 +908,40 @@ def test_controller_installers_hold_writer_locks_run_the_hook_and_check_health_i
     macos = (root / "install-controller.sh").read_text()
     # The catalog sync takes its own lock only when the installer does not hold it.
     assert "with nullcontext() if writer_locks_held else catalog_state_lock(" in macos
+
+
+def test_browser_tool_downloads_are_retried_three_times_and_the_checks_are_not(
+    tmp_path: Path,
+) -> None:
+    """The workflow's own retry, run in Bash: a download that fails twice
+    succeeds on the third attempt, one that always fails stops after three."""
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+    step = workflow.split("- name: Install pinned browser test tools", 1)[1].split("- name:", 1)[0]
+    function = re.search(r"^ *retry\(\) \{\n.*?^ *\}\n", step, re.MULTILINE | re.DOTALL)
+    assert function is not None
+    assert "retry npm install" in step
+    assert 'retry "$qa_tools/node_modules/.bin/playwright" install' in step
+    assert "retry npm ls" not in step and "retry test" not in step
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    (fakes / "sleep").write_text('#!/bin/sh\necho slept >> "$LOG"\n')
+    (fakes / "sleep").chmod(0o755)
+    log = tmp_path / "log"
+    for failures, status, attempts in ((2, 0, 3), (5, 1, 3)):
+        log.write_text("")
+        script = (
+            "set -euo pipefail\n"
+            + function.group(0)
+            + f'download() {{ echo try >> "$LOG"; [ "$(grep -c try "$LOG")" -gt {failures} ]; }}\n'
+            + "retry download\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == status, result.stderr
+        assert log.read_text().count("try") == attempts
+        assert log.read_text().count("slept") == 2

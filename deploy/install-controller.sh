@@ -198,7 +198,8 @@ else
       exit 1
       ;;
     account-home)
-      echo "The home directory of ${service_account} must be ${install_root}/home. No changes made." >&2
+      quoted_install_root=$(printf '%q' "${install_root}")
+      echo "The home directory of ${service_account} must be ${quoted_install_root}/home. No changes made." >&2
       exit 1
       ;;
     root-path)
@@ -206,19 +207,23 @@ else
       exit 1
       ;;
     root-unsafe)
-      echo "${install_root}, or a folder above it, can be changed by someone other than root. No changes made." >&2
+      quoted_install_root=$(printf '%q' "${install_root}")
+      echo "${quoted_install_root}, or a folder above it, can be changed by someone other than root. No changes made." >&2
       exit 1
       ;;
     source-writable)
-      echo "${service_account} can change the source checkout ${root}; use a checkout only root can change. No changes made." >&2
+      quoted_root=$(printf '%q' "${root}")
+      echo "${service_account} can change the source checkout ${quoted_root}; use a checkout only root can change. No changes made." >&2
       exit 1
       ;;
     layout-unsafe)
-      echo "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
+      quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+      echo "${quoted_unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
       exit 1
       ;;
     layout-unreadable)
-      echo "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 (chmod go+rX). No changes made." >&2
+      quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+      echo "${service_account} cannot read or search ${quoted_unsafe_path}; give its folders mode 0755 (chmod go+rX). No changes made." >&2
       exit 1
       ;;
     *)
@@ -402,7 +407,8 @@ account_processes_gone() {
 }
 
 if [ ! -f "${config_path}" ]; then
-  echo "Controller configuration is missing: ${config_path}" >&2
+  quoted_config_path=$(printf '%q' "${config_path}")
+  echo "Controller configuration is missing: ${quoted_config_path}" >&2
   exit 1
 fi
 if [ -n "${service_account}" ]; then
@@ -460,6 +466,20 @@ still_running=()
 leftovers=()
 new_runtime_linked=false
 
+# Remove the work folders a power loss left where this installer keeps them,
+# from before the current boot: no installer or job can still use them. Only
+# with the writer locks held, or with no installed version to write; the
+# helper removes only this user's own folders and follows no link.
+remove_stale_work() {
+  local parent=${support_dir}
+  if [ -n "${service_account}" ]; then
+    parent=${install_root}
+  fi
+  if [ "${writer_locks_unavailable}" = false ]; then
+    "${new_runtime}/.venv/bin/python" -I -m inky_bird_frame.upgrade_gates remove-stale-work \
+      "${parent}"
+  fi
+}
 # Hold every lock a writer takes, so nothing is mid-write while services
 # stop: the installed version's Python runs the new version's helper, so the
 # installed code finds the state directory. It waits up to
@@ -618,7 +638,8 @@ run_stopped_hook() {
   elif [ -e "${app_dir}/.venv" ]; then
     previous=${app_dir}
   fi
-  echo "Running the stopped-boundary hook: ${stopped_hook}" >&2
+  quoted_stopped_hook=$(printf '%q' "${stopped_hook}")
+  echo "Running the stopped-boundary hook: ${quoted_stopped_hook}" >&2
   run_bounded "${stopped_hook_timeout}" env -i "PATH=${PATH}" "HOME=${HOME}" \
     "INKY_BIRD_HOOK_PREVIOUS_RUNTIME=${previous}" \
     "INKY_BIRD_HOOK_NEW_RUNTIME=${new_runtime}" \
@@ -817,9 +838,11 @@ cleanup() {
       runtime_restored=false
     elif [ "${runtime_activated}" = true ] && ! restore_venv; then
       runtime_restored=false
-      echo "Could not switch back to the previous version; the new one is kept in ${new_runtime}." >&2
+      quoted_new_runtime=$(printf '%q' "${new_runtime}")
+      echo "Could not switch back to the previous version; the new one is kept in ${quoted_new_runtime}." >&2
       if [ "${venv_before}" = directory ] && [ -d "${legacy_runtime}/.venv" ]; then
-        echo "The previous version is kept in ${legacy_runtime}." >&2
+        quoted_legacy_runtime=$(printf '%q' "${legacy_runtime}")
+        echo "The previous version is kept in ${quoted_legacy_runtime}." >&2
       fi
     fi
     if [ "${agents_recorded}" = true ]; then
@@ -834,7 +857,8 @@ cleanup() {
       leftovers+=("${new_runtime}")
     fi
     if [ "${#leftovers[@]}" -gt 0 ]; then
-      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${leftovers[*]}" >&2
+      quoted_leftovers=$(printf '%q ' "${leftovers[@]}")
+      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${quoted_leftovers% }" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
       { contained "${app_dir}" "${runtimes_dir}" && rmdir "${runtimes_dir}" 2>/dev/null; } || true
@@ -842,13 +866,15 @@ cleanup() {
     if [ "${#still_running[@]}" -gt 0 ]; then
       echo "The upgrade failed and these agents could not be stopped: ${still_running[*]}." >&2
       if [ "${runtime_activated}" = true ]; then
-        echo "They may still run the new version, kept in ${new_runtime}." >&2
+        quoted_new_runtime=$(printf '%q' "${new_runtime}")
+        echo "They may still run the new version, kept in ${quoted_new_runtime}." >&2
       fi
       echo "Stop each with: launchctl bootout ${domain}/<agent>" >&2
     fi
     if [ "${#unrestored[@]}" -gt 0 ]; then
       echo "The upgrade failed and these agents are not running: ${unrestored[*]}." >&2
-      echo "Start each with: launchctl bootstrap ${domain} ${agents_dir}/<agent>.plist" >&2
+      quoted_agents_dir=$(printf '%q' "${agents_dir}")
+      echo "Start each with: launchctl bootstrap ${domain} ${quoted_agents_dir}/<agent>.plist" >&2
     elif [ "${runtime_restored}" = true ] && [ "${#still_running[@]}" -eq 0 ]; then
       if [ "${#stopped_labels[@]}" -gt 0 ]; then
         echo "The upgrade failed; the agents it stopped were started again on the previous version." >&2
@@ -862,11 +888,13 @@ cleanup() {
   elif [ "${status}" -ne 0 ]; then
     echo "The new version is installed and running, but a final step failed; see the error above." >&2
     if [ -n "${previous_runtime}" ]; then
-      echo "Previous version kept for rollback: ${previous_runtime}" >&2
+      quoted_previous_runtime=$(printf '%q' "${previous_runtime}")
+      echo "Previous version kept for rollback: ${quoted_previous_runtime}" >&2
     fi
   fi
   if [ -n "${work_dir}" ] && ! rm -rf "${work_dir}"; then
-    echo "Could not remove temporary files; remove them by hand: ${work_dir}" >&2
+    quoted_work_dir=$(printf '%q' "${work_dir}")
+    echo "Could not remove temporary files; remove them by hand: ${quoted_work_dir}" >&2
   fi
   if [ -n "${cleanup_stop}" ] && [ "${status}" -eq 0 ]; then
     echo "Stopped while finishing; the new version is installed and running." >&2
@@ -884,9 +912,10 @@ if [ -z "${service_account}" ]; then
   make_temp_dir work_dir "${support_dir}/install.XXXXXX"
   ready_dir=${work_dir}
 else
-  # Root's own temporary folder. The writer lock holder, which runs as the
-  # account, says in its folder there that it holds the locks.
-  make_temp_dir work_dir
+  # Root's own folder in the install root, which only root can change. The
+  # writer lock holder, which runs as the account, says in its folder there
+  # that it holds the locks.
+  make_temp_dir work_dir "${install_root}/install.XXXXXX"
   recovery_parent=${work_dir}
   ready_dir="${work_dir}/account"
   mkdir "${ready_dir}"
@@ -895,7 +924,8 @@ else
   if ! hidden=$(account_can_read "${ready_dir}"); then
     unsafe_path=${ready_dir}
     eval "${hidden}"
-    echo "${service_account} cannot reach ${unsafe_path}; set TMPDIR to a folder it can search, such as /tmp." >&2
+    quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+    echo "${service_account} cannot reach ${quoted_unsafe_path}. No changes made." >&2
     exit 1
   fi
 fi
@@ -950,7 +980,8 @@ fi
 if ! hidden=$(account_can_read "${new_runtime}"); then
   unsafe_path=${new_runtime}
   eval "${hidden}"
-  echo "${service_account} cannot read ${unsafe_path} in the new version. No changes made." >&2
+  quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+  echo "${service_account} cannot read ${quoted_unsafe_path} in the new version. No changes made." >&2
   exit 1
 fi
 # The interpreter uv downloads is code too, and uv leaves a lock file beside
@@ -962,7 +993,8 @@ if [ -n "${service_account}" ] && [ -e "${python_dir}" ]; then
   if ! hidden=$(account_can_read "${python_dir}"); then
     unsafe_path=${python_dir}
     eval "${hidden}"
-    echo "${service_account} cannot read ${unsafe_path} in the new version. No changes made." >&2
+    quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+    echo "${service_account} cannot read ${quoted_unsafe_path} in the new version. No changes made." >&2
     exit 1
   fi
 fi
@@ -987,12 +1019,7 @@ if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$(as_account \
 fi
 
 hold_writer_locks false
-# Work folders a power loss left beside the configuration; after a reboot no
-# installer or job uses them. A system service keeps its own in TMPDIR.
-if [ -z "${service_account}" ]; then
-  "${new_runtime}/.venv/bin/python" -I -m inky_bird_frame.upgrade_gates remove-stale-work \
-    "${support_dir}"
-fi
+remove_stale_work
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "${domain}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
@@ -1330,7 +1357,8 @@ if [ -n "${service_account}" ] && ! code_check=$(python3 -I "${system_helper}" v
     "${service_account}" "${install_root}"); then
   unsafe_path=${app_dir}
   eval "${code_check}"
-  echo "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new version." >&2
+  quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+  echo "${service_account} could change ${quoted_unsafe_path}; the upgrade did not switch to the new version." >&2
   exit 1
 fi
 activate_runtime
@@ -1394,9 +1422,11 @@ for runtime in "${runtimes_dir}"/*; do
   fi
   # This script and the files it reads are in the runtime it was run from.
   if [ "${runtime}" -ef "${root}" ]; then
-    echo "The runtime this installer ran from is kept in ${runtime}." >&2
+    quoted_runtime=$(printf '%q' "${runtime}")
+    echo "The runtime this installer ran from is kept in ${quoted_runtime}." >&2
   elif ! { contained "${runtimes_dir}" "${runtime}" && rm -rf "${runtime}"; }; then
-    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+    quoted_runtime=$(printf '%q' "${runtime}")
+    echo "Could not remove an older runtime; remove it by hand: ${quoted_runtime}" >&2
   fi
 done
 # Remove the legacy single-agent layout only after the new agents verified,
@@ -1405,11 +1435,16 @@ if launchctl print "${domain}/com.${service_prefix}.controller-cycle" >/dev/null
   launchctl bootout "${domain}/com.${service_prefix}.controller-cycle"
 fi
 rm -f "${legacy_cycle_plist}"
-echo "Controller installed from ${root} into ${app_dir}."
-echo "Configuration: ${config_path}"
-echo "Logs: ${log_dir}"
+quoted_root=$(printf '%q' "${root}")
+quoted_app_dir=$(printf '%q' "${app_dir}")
+echo "Controller installed from ${quoted_root} into ${quoted_app_dir}."
+quoted_config_path=$(printf '%q' "${config_path}")
+echo "Configuration: ${quoted_config_path}"
+quoted_log_dir=$(printf '%q' "${log_dir}")
+echo "Logs: ${quoted_log_dir}"
 if [ -n "${previous_runtime}" ]; then
-  echo "Previous version kept for rollback: ${previous_runtime}"
+  quoted_previous_runtime=$(printf '%q' "${previous_runtime}")
+  echo "Previous version kept for rollback: ${quoted_previous_runtime}"
 fi
 if ! as_account "${app_dir}/.venv/bin/inky-bird" access setup --if-needed --config "${config_path}"; then
   echo "Controller installation completed; owner setup is incomplete. Run access setup in a private terminal. Display and scheduled work continue." >&2

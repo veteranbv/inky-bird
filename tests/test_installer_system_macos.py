@@ -53,6 +53,7 @@ def test_a_fresh_install_writes_launch_daemons_that_run_as_the_account(tmp_path:
     result = run_system(host)
     assert result.returncode == 0, result.stdout + result.stderr
     ran = identities(host)
+    assert ran["upgrade-gate remove-stale-work"] == {"root"}
     for what in ("inky-bird", "upgrade-gate", "heredoc sync"):
         assert ran[what] == {"account"}, what
     for what in ("uv", "launchctl", "rsync", "chown", "heredoc render"):
@@ -415,3 +416,18 @@ def test_the_interpreter_uv_downloads_is_code_the_account_cannot_change(tmp_path
     # An upgrade, with the interpreter already there, also succeeds.
     result = run_system(host)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_root_s_work_folders_from_before_the_boot_are_removed_from_the_install_root(
+    tmp_path: Path,
+) -> None:
+    host = system_host(tmp_path)
+    assert host.install_root is not None
+    assert run_system(host).returncode == 0
+    stale = host.install_root / "install.stale"
+    stale.mkdir()
+    os.utime(stale, (0, 0))
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stale.exists()
+    assert not list(host.install_root.glob("install.*"))

@@ -322,12 +322,17 @@ def boot_time() -> float:
 
 def remove_stale_work(folder: Path, booted: float) -> list[Path]:
     """Remove the work folders directly in ``folder`` last changed before
-    ``booted``, never following a link, and name each one removed."""
+    ``booted`` and owned by this user, never following a link, and name each
+    one removed."""
     removed = []
     for pattern in WORK_DIR_PATTERNS:
         for path in sorted(folder.glob(pattern)):
             info = path.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_mtime >= booted:
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mtime >= booted
+            ):
                 continue
             try:
                 shutil.rmtree(path)

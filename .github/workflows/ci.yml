@@ -344,8 +344,22 @@ jobs:
           AXE_PLAYWRIGHT_VERSION: "4.14.0"
         run: |
           set -euo pipefail
+          # The downloads alone are retried, three attempts in all; the checks are not.
+          retry() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Download attempt ${attempt} failed; retrying in $((attempt * 15)) seconds." >&2
+                sleep $((attempt * 15))
+              fi
+            done
+            return 1
+          }
           qa_tools="${RUNNER_TEMP}/qa-tools"
-          npm install --prefix "$qa_tools" --ignore-scripts --no-audit --no-fund --save-exact \
+          retry npm install --prefix "$qa_tools" --ignore-scripts --no-audit --no-fund --save-exact \
             "playwright@${PLAYWRIGHT_VERSION}" "playwright-core@${PLAYWRIGHT_VERSION}" \
             "axe-core@${AXE_CORE_VERSION}" "@axe-core/playwright@${AXE_PLAYWRIGHT_VERSION}"
           for package in playwright playwright-core axe-core @axe-core/playwright; do
@@ -353,7 +367,7 @@ jobs:
           done
           test "$(node -p "require('${qa_tools}/node_modules/playwright-core/package.json').version")" \
             = "$PLAYWRIGHT_VERSION"
-          "$qa_tools/node_modules/.bin/playwright" install --with-deps chromium
+          retry "$qa_tools/node_modules/.bin/playwright" install --with-deps chromium
 
       # The log names the failing phase and, for a layout check, the window
       # and every measured box.

@@ -478,5 +478,19 @@ def test_remove_stale_work_removes_only_folders_from_before_the_boot(tmp_path: P
     assert (outside / "kept").exists()
 
 
+def test_remove_stale_work_keeps_folders_another_user_owns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a folder others can write to, only this user's own leftovers go."""
+    booted = time.time() - 60
+    old = booted - 3600
+    (tmp_path / "install.theirs").mkdir()
+    os.utime(tmp_path / "install.theirs", (old, old))
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    assert upgrade_gates.remove_stale_work(tmp_path, booted) == []
+    assert (tmp_path / "install.theirs").is_dir()
+
+
 def test_boot_time_is_in_the_past() -> None:
     assert 0 < upgrade_gates.boot_time() < time.time()
