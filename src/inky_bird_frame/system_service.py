@@ -11,6 +11,8 @@ with fixed keys and shell-quoted values; it never changes anything.
 ``contained`` checks a path root is about to delete, move or replace.
 ``verify-code`` checks that the account cannot change the code it runs.
 ``readable`` checks that the account can reach and read a path and all it holds.
+``remove-code`` deletes the code under the install root, for an uninstall.
+``own-group`` says whether the account's primary group is its own alone.
 ``run-as`` replaces itself with a command run as the account, as ``setpriv``
 does on Linux: macOS has no setpriv, and ``sudo -u`` keeps its own process
 between the installer and the command (and may give it a terminal of its own),
@@ -331,6 +333,37 @@ def _assignments(values: dict[str, str]) -> str:
     return "".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items())
 
 
+def own_group(account: Account) -> bool:
+    """Whether the account's primary group is its own: named after it, with no
+    other member and no other account whose primary group it is."""
+    try:
+        members = set(grp.getgrgid(account.gid).gr_mem)
+    except KeyError:
+        return False
+    others = {entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == account.gid}
+    return account.group == account.name and members | others <= {account.name}
+
+
+def remove_code(install_root: Path, account: Account) -> bool:
+    """Delete ``<install root>/app``, if it is still the real folder root's
+    code is in: checked and removed here in one step, without following links."""
+    import shutil
+
+    code = install_root / CODE_DIRECTORY
+    try:
+        info = os.lstat(code)
+    except FileNotFoundError:
+        return True
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or not trusted(info)
+        or not contained(install_root, install_root, code, account)
+    ):
+        return False
+    shutil.rmtree(code)
+    return True
+
+
 def run_as(name: str, command: list[str]) -> int:
     """Become the account, for good, and run ``command`` in this process."""
     account = lookup_account(name)
@@ -359,12 +392,16 @@ def main(arguments: list[str]) -> int:
         name, install_root, source = rest
         print(_assignments(preflight(name, Path(install_root), Path(source))), end="")
         return 0
-    if command in ("contained", "verify-code", "readable"):
+    if command in ("contained", "verify-code", "readable", "remove-code", "own-group"):
         name, install_root, *paths = rest
         account = lookup_account(name)
         if account is None:
             return 1
         root = Path(install_root)
+        if command == "own-group":
+            return 0 if own_group(account) else 1
+        if command == "remove-code":
+            return 0 if remove_code(root, account) else 1
         if command == "readable":
             (path,) = paths
             hidden = unreadable(Path(path), account)
