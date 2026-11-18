@@ -37,6 +37,22 @@ web service health check after the switch answers from the runtime the fake
 serving process runs. The full matrix stops the installer at each of these
 steps in all three ways, and fails each.
 
+A crash case is a power loss once a call completes: the fake freezes, then
+SIGKILLs, every process of the run, so no trap or cleanup runs. Unlike a stop,
+which the installer handles, the machine then reboots: no process or held
+lock survives, /tmp is empty, and each service manager starts what is
+enabled (launchd: every job in its folder; systemd: every enabled
+long-running unit). The booted machine must select one complete version, the
+previous one unchanged or the new one whole, with every unit that starts at
+boot on it; the owner's configuration, private env file and state must be
+unchanged; and a plain rerun must succeed and converge to an upgrade's end
+state (I13), with no work folder of the crashed run left beside the
+configuration (the rerun removes those from before the boot). Crash cases
+cover upgrades from ``fresh``, ``single`` and ``staged`` on both controllers'
+user scenarios and system services, with and without the hook: every other
+step in the full matrix, every eighth
+in ``sample``, the middle step by default.
+
 Upgrades start from what each layout's own installers left: the frozen
 installers of the last release (``release-0.9.8``, under the inky-bird-frame
 names), of the single-directory layout, or today's; in ``checkout`` the
@@ -55,9 +71,10 @@ The default run fails the first and the middle call of every scenario and
 start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
-both controllers and on a shared Pi's display: 292 cases, beside 88 recording
-runs, 26 busy runs (each holding one writer lock, chosen from the group's
-name) and 20 tests of the matrix itself. Run every case,
+both controllers and on a shared Pi's display, and crashes each crash group
+at its middle step: 365 cases (21 of them crashes), beside 103 recording
+runs, 30 busy runs (each holding one writer lock, chosen from the group's
+name) and 22 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
@@ -122,6 +139,8 @@ from test_installer_behaviour import (
     running_generation,
 )
 
+from inky_bird_frame.upgrade_gates import WORK_DIR_PATTERNS
+
 # The single-directory installers as of 5ded22f, the last commit before the
 # staged layout; they build the starting state every upgrade is tested from.
 SINGLE_DIRECTORY = ROOT / "tests/fake_bin/single_directory"
@@ -181,6 +200,24 @@ AGENTS = "serve refresh catalog-publish"
 CONFIG_CANARY = "synthetic-matrix-canary"
 KILL_STRIDE = 3
 STOP_MODES = ("kill", "interrupt", "hangup")
+# A power loss: the whole run killed at once, no trap or cleanup (``crash``).
+CRASH = "crash"
+# The controller upgrades a crash at each step is checked for, from these states.
+CRASH_SCENARIOS = frozenset(
+    {
+        "macos",
+        "macos-hook",
+        "linux-timers",
+        "linux-timers-hook",
+        "linux-app",
+        "linux-app-hook",
+        "linux-system",
+        "linux-system-hook",
+        "macos-system",
+        "macos-system-hook",
+    }
+)
+CRASH_STATES = frozenset({"fresh", "single", "staged"})
 
 
 @dataclass(frozen=True)
@@ -2411,6 +2448,7 @@ class Group:
     def evaluate(self, case: Case, recorded: list[list[str]], slot: Path) -> Outcome:
         machine = self.machine(slot)
         before = snapshot(machine, self.scenario)
+        protected = private_data(machine)
         injection = f"{case.step} {case.mode}"
         if case.first is not None:
             injection = f"{case.first} fail\n{injection}"
@@ -2424,6 +2462,9 @@ class Group:
             )
             return outcome
         check_fault_made(machine, case, outcome)
+        if case.mode == CRASH:
+            self.after_crash(machine, before, protected, outcome)
+            return outcome
         if self.kind == "install":
             check_install(machine, self.scenario, case, before, outcome)
         else:
@@ -2433,6 +2474,54 @@ class Group:
         if survivors:
             outcome.violations.append(f"processes outlived the rerun: {survivors}")
         return outcome
+
+    def after_crash(
+        self, machine: Machine, before: Snapshot, protected: dict[str, str], outcome: Outcome
+    ) -> None:
+        """I13: a power loss at any call leaves one complete version that the
+        machine boots, private data as it was, and nothing a plain rerun of
+        the same installer refuses on: it converges on the normal end state."""
+        report = outcome.violations
+        outcome.covered.add("I13")
+        reboot(machine)
+        check_booted(machine, self.scenario, before, report)
+        now = private_data(machine)
+        if now != protected:
+            changed = sorted(
+                name for name in set(now) | set(protected) if now.get(name) != protected.get(name)
+            )
+            report.append(f"I13: the crash changed the owner's private data: {changed}")
+        machine.reset_run()
+        try:
+            result = machine.execute(self.script(machine), self.scenario)
+        except AssertionError as error:
+            report.append(f"I13: the rerun after the crash was not contained: {error}")
+            return
+        if result.returncode != 0:
+            report.append(
+                f"I13: the rerun after the crash failed ({result.returncode}): "
+                + (result.stdout + result.stderr)[-1500:]
+            )
+            return
+        after = view(machine, self.scenario.role)
+        if after.tag != "new":
+            report.append(f"I13: after the rerun the active version is {after.tag}")
+        for unit, process in after.processes.items():
+            if process["runtime"] != "new":
+                report.append(f"I13: after the rerun {unit} runs {process['runtime']}")
+        check_final_units(machine, self.scenario, after, report)
+        if not installed_script(machine, self.scenario).is_file():
+            report.append("I13: after the rerun the installed version has no installer")
+        if len(after.runtimes) > 2:
+            report.append(f"I13: after the rerun {len(after.runtimes)} runtimes remain")
+        left = sorted(
+            path.name for pattern in WORK_DIR_PATTERNS for path in machine.support.glob(pattern)
+        )
+        if left:
+            report.append(f"I13: after the rerun the crashed run's work folders remain: {left}")
+        survivors = machine.survivors()
+        if survivors:
+            report.append(f"processes outlived the rerun: {survivors}")
 
     def busy(self, slot: Path) -> Outcome:
         """I8: a writer that is still running, a plate being made or other
@@ -2453,6 +2542,115 @@ class Group:
         if after.tree != before.tree or after.stray != before.stray:
             outcome.violations.append("I8: a busy run changed the machine")
         return outcome
+
+
+def private_data(machine: Machine) -> dict[str, str]:
+    """The owner's data an upgrade must never change: the configuration, the
+    private env file beside it and the state directory, apart from the lock
+    files writers create on first use."""
+    found = {name: digest(machine.support / name) for name in ("config.toml", "private.env")}
+    # The system installer creates an empty private env file when there is none.
+    env_file = machine.support / "private.env"
+    if env_file.is_file() and not env_file.is_symlink() and not env_file.stat().st_size:
+        found["private.env"] = "absent"
+    if machine.state.is_dir():
+        for path in sorted(machine.state.rglob("*")):
+            if path.is_file() and not path.name.endswith(".lock"):
+                found[str(path.relative_to(machine.state))] = digest(path)
+    return found
+
+
+def reboot(machine: Machine) -> None:
+    """The machine as it comes back after a power loss: no process of the run,
+    no held lock, an empty /tmp, and every service and agent the service
+    manager starts at boot started from what is on disk now. Agents load from
+    every plist present; units start when enabled."""
+    for name in (
+        "steps.lock.owner",
+        "sudo-expired",
+        "sudo-validations",
+        "busy.json",
+        "stopping.json",
+    ):
+        (machine.fake / name).unlink(missing_ok=True)
+    shutil.rmtree(machine.fake / "steps.lock", ignore_errors=True)
+    # Everything on disk predates the boot, whatever this machine's clock says.
+    for pattern in WORK_DIR_PATTERNS:
+        for path in machine.support.glob(pattern):
+            os.utime(path, (0, 0), follow_symlinks=False)
+    for path in machine.tmp.iterdir() if machine.tmp.is_dir() else ():
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    processes: dict[str, dict[str, object]] = {}
+    if machine.system == "Darwin":
+        loaded: dict[str, dict[str, object]] = {}
+        for plist in sorted(machine.agents.glob(f"com.{machine.family}.*.plist")):
+            payload = plistlib.loads(plist.read_bytes())
+            executable = str(payload["ProgramArguments"][0])
+            process = fake_tools.resolve_runtime(executable)
+            job: dict[str, object] = {
+                "generation": payload.get("Comment", "unknown"),
+                "runtime": process["runtime"],
+                "run_at_load": payload.get("RunAtLoad"),
+            }
+            # A system service's jobs are LaunchDaemons, in the system domain.
+            if machine.account:
+                job["domain"] = "system"
+            loaded[str(payload["Label"])] = job
+            if payload.get("RunAtLoad") or payload.get("KeepAlive"):
+                processes[str(payload["Label"])] = process
+        machine.save_state("launchd", loaded)
+    else:
+        units = machine.state_of("systemd")
+        for unit, record in units.items():
+            defined = (machine.units / unit).exists()
+            record["active"] = bool(record.get("enabled")) and defined and long_running(unit)
+            program = executable_of(machine, unit) if record["active"] else None
+            if program is not None and unit.endswith(".service"):
+                processes[unit] = fake_tools.resolve_runtime(str(program))
+        machine.save_state("systemd", units)
+    machine.save_state("processes", processes)
+
+
+def check_booted(machine: Machine, scenario: Scenario, before: Snapshot, report: list[str]) -> None:
+    """I13 after the reboot: one version is selected, the previous one intact
+    or the new one complete, and everything that starts at boot runs it."""
+    after = view(machine, scenario.role)
+    if after.tag not in (before.role.tag, "new"):
+        report.append(f"I13: after a crash the machine boots version {after.tag}")
+    if (
+        before.role.tag is not None
+        and after.tag == before.role.tag
+        and after.code != before.role.code
+    ):
+        report.append("I13: after a crash the previous version is changed")
+    if after.tag == "new":
+        code = controller_runtime(machine)
+        source = imported_source(code.venv) if code.venv else None
+        complete = (
+            code.venv is not None
+            and (code.venv / "bin/python").exists()
+            and source is not None
+            and (source / "inky_bird_frame").is_dir()
+            and (source.parent / "deploy" / scenario.script).is_file()
+        )
+        if not complete:
+            report.append("I13: after a crash the selected new version is incomplete")
+    for unit, process in after.processes.items():
+        if process["runtime"] != after.tag:
+            report.append(
+                f"I13: after a crash {unit} starts at boot on {process['runtime']}, "
+                f"while {after.tag} is selected"
+            )
+    for unit, (enabled, active) in after.units.items():
+        if not (enabled or active):
+            continue
+        executable = executable_of(machine, unit)
+        found = runtime_of(executable) if executable is not None else None
+        if found is None or found[0] == "missing" or not found[1].exists():
+            report.append(f"I13: after a crash {unit} starts at boot from a missing runtime")
 
 
 def check_fault_made(machine: Machine, case: Case, outcome: Outcome) -> None:
@@ -2493,6 +2691,8 @@ STATE_DIRECTORY = Path(
 # single-directory layout on both controllers and on a shared Pi's display.
 # "sample" fails every eighth call of every group instead.
 SAMPLE_STRIDE = 8
+# The full matrix crashes the installer at every second call of a crash group.
+CRASH_STRIDE = 2
 DEFAULT_SECOND_PASS = {
     ("install", "linux-system", "staged"),
     ("install", "macos-system", "staged"),
@@ -2914,7 +3114,14 @@ class Matrix:
                 if kind_of_call == "action"
             ]
             middle = len(actions) // 2
+            crash = kind == "install" and scenario in CRASH_SCENARIOS and state in CRASH_STATES
             for position, (index, tool, called) in enumerate(actions):
+                if crash and (
+                    (FULL and position % CRASH_STRIDE == 0)
+                    or (SAMPLE and position % SAMPLE_STRIDE == 0)
+                    or (not (FULL or SAMPLE) and position == middle)
+                ):
+                    found.append(Case(kind, scenario, state, index, CRASH, tool))
                 # Alternate a stop of the installer, an interrupt of its whole
                 # process group (Ctrl-C) and a hangup.
                 if FULL or SAMPLE:

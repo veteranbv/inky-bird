@@ -250,6 +250,8 @@ if [ -n "${service_account}" ]; then
   agents_dir=${daemons_dir}
   domain=system
 fi
+# Where launchd reads the jobs, which a first install writes elsewhere first.
+export INKY_BIRD_JOBS_DIR="${agents_dir}"
 serve_plist="${agents_dir}/com.${service_prefix}.serve.plist"
 refresh_plist="${agents_dir}/com.${service_prefix}.refresh.plist"
 generation_plist="${agents_dir}/com.${service_prefix}.generate.plist"
@@ -257,6 +259,16 @@ catalog_publish_plist="${agents_dir}/com.${service_prefix}.catalog-publish.plist
 notifications_plist="${agents_dir}/com.${service_prefix}.notifications.plist"
 scheduler_plist="${agents_dir}/com.${service_prefix}.scheduler.plist"
 legacy_cycle_plist="${agents_dir}/com.${service_prefix}.controller-cycle.plist"
+agent_plists=(serve_plist refresh_plist generation_plist catalog_publish_plist \
+  notifications_plist scheduler_plist)
+# Point every agent definition variable at the same file names in folder $1.
+place_agents() {
+  local name file
+  for name in "${agent_plists[@]}"; do
+    file=${!name}
+    printf -v "${name}" '%s/%s' "$1" "${file##*/}"
+  done
+}
 # Each runtime holds one source copy and the venv built from it;
 # ${app_dir}/.venv links to the active one.
 runtimes_dir="${app_dir}/.runtimes"
@@ -640,6 +652,16 @@ check_new_serve() {
   fi
 }
 
+# Moves the directory $1 to $2, then renames the link $3 to $1; if that rename
+# fails, $1 moves back.
+swap_in_link='import os, sys
+os.rename(sys.argv[1], sys.argv[2])
+try:
+    os.replace(sys.argv[3], sys.argv[1])
+except OSError:
+    os.rename(sys.argv[2], sys.argv[1])
+    raise'
+
 replace_venv_link() {
   contained "${app_dir}" "${app_dir}/.venv.next" && contained "${app_dir}" "${app_dir}/.venv" && \
     rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
@@ -661,7 +683,12 @@ activate_runtime() {
     share_with_account "${legacy_runtime}"
     previous_runtime=${legacy_runtime}
     contained "${runtimes_dir}" "${legacy_runtime}/.venv"
-    mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
+    # Move the venv aside and link the new runtime in one step, so a power loss
+    # cannot leave the jobs with no venv at all.
+    contained "${app_dir}" "${app_dir}/.venv.next" && contained "${app_dir}" "${app_dir}/.venv" && \
+      rm -f "${app_dir}/.venv.next" && ln -s "${new_runtime}/.venv" "${app_dir}/.venv.next" && \
+      python3 -c "${swap_in_link}" "${app_dir}/.venv" "${legacy_runtime}/.venv" "${app_dir}/.venv.next"
+    return
   else
     venv_before=absent
   fi
@@ -910,11 +937,13 @@ env -u UV_PROJECT_ENVIRONMENT ${uv_environment[@]+"${uv_environment[@]}"} "${uv_
   --project "${new_runtime}" --python "${python_version}" --extra controller --locked \
   ${uv_options[@]+"${uv_options[@]}"}
 # uv leaves some files writable by everyone (its .venv/.lock): the account
-# must not be able to change any of the code it runs. The tree is this run's
-# own, under the install root, and chmod -R follows no links.
+# must not be able to change any of the code it runs. That includes a runtime
+# an interrupted run (a power loss) left before this step, which this run
+# removes once it succeeds. The tree is under the install root, and chmod -R
+# follows no links.
 if [ -n "${service_account}" ]; then
-  contained "${runtimes_dir}" "${new_runtime}"
-  chmod -R go-w "${new_runtime}"
+  contained "${app_dir}" "${runtimes_dir}"
+  chmod -R go-w "${runtimes_dir}"
 fi
 # The account runs this build: it must be able to read all of it, whatever
 # modes uv's cache gave the files.
@@ -958,6 +987,12 @@ if [ -n "${stopped_hook}" ] && ! stopped_hook_state_dir=$(as_account \
 fi
 
 hold_writer_locks false
+# Work folders a power loss left beside the configuration; after a reboot no
+# installer or job uses them. A system service keeps its own in TMPDIR.
+if [ -z "${service_account}" ]; then
+  "${new_runtime}/.venv/bin/python" -I -m inky_bird_frame.upgrade_gates remove-stale-work \
+    "${support_dir}"
+fi
 
 for label in serve refresh generate catalog-publish notifications scheduler; do
   if launchctl print "${domain}/com.${service_prefix}.${label}" >/dev/null 2>&1; then
@@ -969,6 +1004,16 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
   fi
 done
 agents_recorded=true
+
+# A first install's jobs have no runtime until the switch: write them aside
+# and move them in after it, so a power loss in between leaves launchd no job
+# to start at boot or login from a missing runtime.
+first_install=false
+if [ ! -e "${app_dir}/.venv" ] && [ ! -L "${app_dir}/.venv" ]; then
+  first_install=true
+  mkdir "${work_dir}/agents"
+  place_agents "${work_dir}/agents"
+fi
 
 # Check the configuration, sync the catalog and write the agents, with the
 # interpreter and arguments given. A system service runs it twice: as its
@@ -1014,7 +1059,7 @@ if mode == "render":
     config = read_account_config(config_path, int(sys.argv[17]))
     # Other installations' web services on this machine, by their own jobs.
     others = []
-    for path in sorted(serve_path.parent.glob("com.*.serve.plist")):
+    for path in sorted(Path(os.environ["INKY_BIRD_JOBS_DIR"]).glob("com.*.serve.plist")):
         try:
             with path.open("rb") as handle:
                 job = plistlib.load(handle)
@@ -1289,6 +1334,15 @@ if [ -n "${service_account}" ] && ! code_check=$(python3 -I "${system_helper}" v
   exit 1
 fi
 activate_runtime
+if [ "${first_install}" = true ]; then
+  for name in "${agent_plists[@]}"; do
+    staged=${!name}
+    if [ -f "${staged}" ]; then
+      mv "${staged}" "${agents_dir}/${staged##*/}"
+    fi
+  done
+  place_agents "${agents_dir}"
+fi
 launchctl bootstrap "${domain}" "${serve_plist}"
 if [ -f "${refresh_plist}" ]; then
   launchctl bootstrap "${domain}" "${refresh_plist}"

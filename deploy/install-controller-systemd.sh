@@ -670,6 +670,16 @@ record_units() {
   units_recorded=true
 }
 
+# Moves the directory $1 to $2, then renames the link $3 to $1; if that rename
+# fails, $1 moves back.
+swap_in_link='import os, sys
+os.rename(sys.argv[1], sys.argv[2])
+try:
+    os.replace(sys.argv[3], sys.argv[1])
+except OSError:
+    os.rename(sys.argv[2], sys.argv[1])
+    raise'
+
 replace_venv_link() {
   contained "${app_dir}" "${app_dir}/.venv.next" && contained "${app_dir}" "${app_dir}/.venv" && \
     rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
@@ -691,7 +701,12 @@ activate_runtime() {
     share_with_account "${legacy_runtime}"
     previous_runtime=${legacy_runtime}
     contained "${runtimes_dir}" "${legacy_runtime}/.venv"
-    mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
+    # Move the venv aside and link the new runtime in one step, so a power loss
+    # cannot leave the units with no venv at all.
+    contained "${app_dir}" "${app_dir}/.venv.next" && contained "${app_dir}" "${app_dir}/.venv" && \
+      rm -f "${app_dir}/.venv.next" && ln -s "${new_runtime}/.venv" "${app_dir}/.venv.next" && \
+      python3 -c "${swap_in_link}" "${app_dir}/.venv" "${legacy_runtime}/.venv" "${app_dir}/.venv.next"
+    return
   else
     venv_before=absent
   fi
@@ -1010,11 +1025,13 @@ env -u UV_PROJECT_ENVIRONMENT ${uv_environment[@]+"${uv_environment[@]}"} "${uv_
   --project "${new_runtime}" --python "${python_version}" --extra controller --locked \
   ${uv_options[@]+"${uv_options[@]}"}
 # uv leaves some files writable by everyone (its .venv/.lock): the account
-# must not be able to change any of the code it runs. The tree is this run's
-# own, under the install root, and chmod -R follows no links.
+# must not be able to change any of the code it runs. That includes a runtime
+# an interrupted run (a power loss) left before this step, which this run
+# removes once it succeeds. The tree is under the install root, and chmod -R
+# follows no links.
 if [ -n "${service_account}" ]; then
-  contained "${runtimes_dir}" "${new_runtime}"
-  chmod -R go-w "${new_runtime}"
+  contained "${app_dir}" "${runtimes_dir}"
+  chmod -R go-w "${runtimes_dir}"
 fi
 # The account runs this build: it must be able to read all of it, whatever
 # modes uv's cache gave the files.

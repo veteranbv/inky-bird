@@ -354,7 +354,12 @@ def test_the_real_program_renders_launch_daemons_that_lint_and_run_the_command(
         )
     ]
     app = install_root / "app"
-    environment = {**os.environ, "INKY_BIRD_SERVICE_PREFIX": account}
+    # The installer names launchd's folder, where other installations' jobs are.
+    environment = {
+        **os.environ,
+        "INKY_BIRD_SERVICE_PREFIX": account,
+        "INKY_BIRD_JOBS_DIR": str(jobs),
+    }
     arguments = [*map(str, paths), str(app), str(app), str(config), str(install_root / "logs")]
     arguments += ["true", "render", account, account, str(install_root / "config/private.env")]
     arguments += [str(install_root / "home"), str(os.getuid())]

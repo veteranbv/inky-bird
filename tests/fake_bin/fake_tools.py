@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import sys
 from collections.abc import Iterator
@@ -208,10 +209,53 @@ def _installer_pid(*, outermost: bool = False) -> int | None:
 STOP_SIGNALS = {"kill": "SIGTERM", "hangup": "SIGHUP", "interrupt": "SIGINT"}
 
 
+def crash_run() -> None:
+    """A power loss: every process of this run, the installer and each helper
+    in any process group, is frozen, then killed, this one last. No trap or
+    cleanup runs; only what is on disk remains."""
+    import subprocess
+
+    marker = re.compile(re.escape(f"FAKE={FAKE}") + r"(\s|$)")
+    frozen: set[int] = set()
+    _log("stop-sent", "crash")
+    # Freeze first, so nothing starts another process while the run is killed.
+    while True:
+        listing = subprocess.run(
+            ["/bin/ps", "axeww", "-o", "pid=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            # Not one of the run's processes, so it does not list itself.
+            env={"PATH": "/usr/bin:/bin"},
+        ).stdout
+        found = (
+            {
+                int(line.split(None, 1)[0])
+                for line in listing.splitlines()
+                if len(line.split(None, 1)) == 2 and marker.search(line.split(None, 1)[1])
+            }
+            - {os.getpid()}
+            - frozen
+        )
+        if not found:
+            break
+        for pid in found:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGSTOP)
+        frozen |= found
+    for pid in frozen:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
 def kill_installer(mode: str = "kill") -> None:
     """Stop the installer: TERM or HUP to the script itself, or INT to its whole
-    process group as Ctrl-C does. This call ignores the interrupt it sends.
-    It runs whole, sending and logging, under ``deferred_stops``."""
+    process group as Ctrl-C does, or (``crash``) kill the whole run at once.
+    This call ignores the interrupt it sends. It runs whole, sending and
+    logging, under ``deferred_stops``."""
+    if mode == "crash":
+        crash_run()
     pid = _installer_pid(outermost=mode == "interrupt")
     if pid is None:
         return
@@ -1639,7 +1683,7 @@ def run() -> int:
     injected = step(tool, recorded, action=not _is_query(tool, arguments))
     if injected == "fail":
         return _injected_failure(tool, arguments)
-    KILL = injected in STOP_SIGNALS
+    KILL = injected in STOP_SIGNALS or injected == "crash"
     STOP = injected if KILL else "kill"
     if tool == "venv-python":
         status = venv_python(arguments[0], arguments[1:])

@@ -285,7 +285,7 @@ case "$mode" in
     echo "{name}: synthetic failure" >&2
     exit 1
     ;;
-  kill | interrupt | hangup)
+  kill | interrupt | hangup | crash)
     status=0
     {shlex.quote(real)} "$@" || status=$?
     # The interrupt goes to the whole process group; this call has completed.
@@ -1359,7 +1359,12 @@ def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_pa
     result = run_macos(host, "serve refresh catalog-publish")
     assert result.returncode == 0, result.stderr
     held = [call for call in host.calls() if call[0] == "upgrade-gate"]
-    assert [call[1] for call in held] == ["hold-writer-locks", "hold-writer-locks", "check-serve"]
+    assert [call[1] for call in held] == [
+        "hold-writer-locks",
+        "remove-stale-work",
+        "hold-writer-locks",
+        "check-serve",
+    ]
     assert {label for _, label, *_ in stops(host)} == {
         f"com.{host.family}.{label}" for label in ("serve", "refresh", "catalog-publish")
     }
