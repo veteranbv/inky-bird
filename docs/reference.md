@@ -60,6 +60,7 @@ path or address; the private service log keeps the cause.
 | `data_source_unavailable` | 503 | A bird data source, such as retained eBird history, cannot be read right now. |
 | `dependency_missing` | 503 | A component Inky needs is not installed. |
 | `journal_unavailable` | 503 | Local state is damaged or unreadable. Check storage and the approved catalog; do not delete private history. |
+| `service_stopping` | 503 | Inky is stopping, so a request still waiting for its turn ended. Try again in a moment. |
 
 ### Catalog and display routes
 

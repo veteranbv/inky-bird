@@ -14,6 +14,7 @@ from time import monotonic, sleep
 from typing import Final, cast
 from urllib.parse import quote, urlencode
 
+from . import lock_wait
 from .errors import DataSourceError, TaxonomyMatchError
 from .http import get_json, write_json_atomic
 from .timeutil import parse_utc_timestamp
@@ -963,7 +964,7 @@ def resolve_ebird_archive_names(
 @contextmanager
 def _taxonomy_crosswalk_lock(cache_path: Path) -> Iterator[None]:
     with cache_path.with_suffix(f"{cache_path.suffix}.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

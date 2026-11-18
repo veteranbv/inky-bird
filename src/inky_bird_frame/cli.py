@@ -18,7 +18,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from . import __version__
+from . import __version__, lock_wait
 from .birdbuddy import (
     AUTHORIZED_ACCESS_ATTESTATION,
     birdbuddy_status,
@@ -1208,6 +1208,9 @@ def _hold_scheduler_lock(stack: ExitStack, path: Path) -> None:
         try:
             stack.enter_context(state_lock(path, nonblocking=True))
         except BlockingIOError as exc:
+            stopped = lock_wait.stop_signal()
+            if stopped is not None:
+                raise lock_wait.StopRequestedError(stopped) from exc
             if time.monotonic() >= deadline:
                 raise BusyError(
                     "Another scheduler is already running for this installation"
@@ -1230,6 +1233,8 @@ def scheduler_command(args: argparse.Namespace) -> int:
 
     def request_stop(signum: int, _frame: object) -> None:
         stop.set()
+        # A lock wait in progress ends too, rather than waiting out the holder.
+        lock_wait.request_stop(signum)
         command_runner.terminate(signum)
 
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
@@ -1289,6 +1294,9 @@ def scheduler_command(args: argparse.Namespace) -> int:
                 on_jobs_error=config_failed,
                 on_jobs_recovered=config_recovered,
             )
+    except lock_wait.StopRequestedError:
+        # The stop ended a lock wait; the scheduler stops as it would have.
+        pass
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)

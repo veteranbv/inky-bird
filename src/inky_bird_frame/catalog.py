@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from time import monotonic, sleep, time_ns
+from time import monotonic, time_ns
 from typing import BinaryIO, cast
 
+from . import lock_wait
 from .birds import BirdSpecies
 from .errors import BusyError, CatalogError, MissingDependencyError
 from .http import write_bytes_atomic, write_json_atomic
@@ -77,18 +78,8 @@ class CatalogBusyError(CatalogError, BusyError):
 
 
 def _flock_within(descriptor: int, operation: int, timeout: float) -> None:
-    deadline = monotonic() + timeout
-    delay = 0.01
-    while True:
-        try:
-            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
-            return
-        except BlockingIOError as exc:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise CatalogBusyError("The catalog is busy; try again in a moment") from exc
-            sleep(min(delay, remaining))
-            delay = min(delay * 2, 0.25)
+    if not lock_wait.flock(descriptor, operation, deadline=monotonic() + timeout):
+        raise CatalogBusyError("The catalog is busy; try again in a moment")
 
 
 @contextmanager
@@ -100,7 +91,7 @@ def catalog_state_lock(
     operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     with (state_dir / "catalog-state.lock").open("a+") as handle:
         if timeout is None:
-            fcntl.flock(handle.fileno(), operation)
+            lock_wait.flock(handle.fileno(), operation)
         else:
             _flock_within(handle.fileno(), operation, timeout)
         try:

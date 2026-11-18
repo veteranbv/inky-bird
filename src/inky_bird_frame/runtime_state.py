@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
+from . import lock_wait
 from .errors import CatalogError
 from .http import write_json_atomic
 
@@ -25,7 +26,10 @@ def state_lock(path: Path, *, nonblocking: bool = False) -> Iterator[None]:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise CatalogError("Runtime state lock is unsafe")
         os.fchmod(handle.fileno(), 0o600)
-        fcntl.flock(handle, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+        if nonblocking:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

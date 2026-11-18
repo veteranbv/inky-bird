@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from . import lock_wait
 from .birds import BirdNetAnalyzerSpecies, ObservationWindow, date_range_for_window
 from .errors import DataSourceError
 from .history_summary import (
@@ -134,7 +135,7 @@ def _state_errors() -> Iterator[None]:
 def _history_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "birdnet-analyzer.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

@@ -18,8 +18,13 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+from collections.abc import Iterator
 from ipaddress import ip_address
 from typing import Any
+
+import pytest
+
+from inky_bird_frame import lock_wait
 
 # Keep tests hermetic against the developer's git configuration; global
 # url.<base>.insteadOf rewrites otherwise change `git remote get-url` output
@@ -168,3 +173,12 @@ socket.gethostbyname = _guarded_gethostbyname
 socket.gethostbyname_ex = _guarded_gethostbyname_ex
 socket.gethostbyaddr = _guarded_gethostbyaddr
 shutil.disk_usage = _ample_disk_usage
+
+
+@pytest.fixture(autouse=True)
+def _no_stop_request_carries_over() -> Iterator[None]:
+    """A test that stops the scheduler or web server in this process records a
+    stop for the whole process, as a real stop would; the next test starts as a
+    process that was never asked to stop."""
+    yield
+    lock_wait._stop_signal = None

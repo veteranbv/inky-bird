@@ -8,13 +8,16 @@ import hashlib
 import json
 import logging
 import re
+import sys
+from contextlib import suppress
 from datetime import datetime
 from html import escape
 from pathlib import Path, PurePosixPath
+from types import FrameType
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from . import __version__
+from . import __version__, lock_wait
 from .catalog import read_json, rebuild_catalog_index, utc_now
 from .config import ControllerConfig
 from .errors import CatalogError
@@ -38,6 +41,8 @@ _READ_PATHS = frozenset({"/health", "/v1/catalog", "/v1/embed/featured-plate"})
 _TELEMETRY_PATHS = frozenset({"/v1/display-fetch", "/v1/display-success"})
 MAX_TELEMETRY_REQUEST_BYTES = 1024
 FEATURED_PLATE_REFRESH_SECONDS = 15 * 60
+# The exit status uvicorn.run gives when the server never started.
+UVICORN_STARTUP_FAILURE = 3
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CATALOG_STRING_FIELDS = (
     "common_name",
@@ -621,14 +626,29 @@ def serve_catalog(config: ControllerConfig, *, app_config: AppConfig | None = No
 
     config.catalog_dir.mkdir(parents=True, exist_ok=True)
     rebuild_index_logging_failures(config.catalog_dir)
-    uvicorn.run(
-        create_app(config, app_config=app_config),
-        host=config.bind_host,
-        port=config.port,
-        access_log=False,
-        server_header=False,
-        proxy_headers=False,
-        ssl_certfile=str(config.tls_certificate) if config.tls_certificate else None,
-        ssl_keyfile=str(config.tls_private_key) if config.tls_private_key else None,
-        ssl_keyfile_password="" if config.tls_private_key else None,
+
+    class _StoppableServer(uvicorn.Server):
+        def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+            # Requests waiting for a lock end too, so the shutdown, which waits
+            # for every request, does not wait for the lock's holder.
+            lock_wait.request_stop(sig)
+            super().handle_exit(sig, frame)
+
+    server = _StoppableServer(
+        uvicorn.Config(
+            create_app(config, app_config=app_config),
+            host=config.bind_host,
+            port=config.port,
+            access_log=False,
+            server_header=False,
+            proxy_headers=False,
+            ssl_certfile=str(config.tls_certificate) if config.tls_certificate else None,
+            ssl_keyfile=str(config.tls_private_key) if config.tls_private_key else None,
+            ssl_keyfile_password="" if config.tls_private_key else None,
+        )
     )
+    # As uvicorn.run does for one process without reload.
+    with suppress(KeyboardInterrupt):
+        server.run()
+    if not server.started:
+        sys.exit(UVICORN_STARTUP_FAILURE)
