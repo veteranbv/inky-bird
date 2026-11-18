@@ -1118,10 +1118,36 @@ system = None
 if mode == "render":
     from inky_bird_frame.installation import SystemService, read_account_config
 
+    import pwd
+    import shlex
+
+    from inky_bird_frame.installation import SYSTEM_SERVICE_MARKER, system_service_problem
+
     config = read_account_config(config_path, int(sys.argv[10]))
     controller = config.controller
     writable = (config_path.parent, home, controller.workspace_dir, controller.catalog_dir)
     system = SystemService(sys.argv[8], Path(sys.argv[9]), (*writable, controller.state_dir))
+    # Other system services' web services on this machine, by their own units.
+    others = []
+    for unit in sorted(Path(sys.argv[11]).glob("inky-bird*-controller.service")):
+        try:
+            lines = unit.read_text().splitlines()
+            other = next(line.partition("=")[2] for line in lines if line.startswith("User="))
+            if lines[:1] != [SYSTEM_SERVICE_MARKER] or other == user:
+                continue
+            if unit.name != f"{other}-controller.service":
+                continue
+            start = shlex.split(
+                next(line.partition("=")[2] for line in lines if line.startswith("ExecStart="))
+            )
+            other_config = Path(start[start.index("--config") + 1])
+            owner = pwd.getpwnam(other).pw_uid
+            others.append((other, read_account_config(other_config, owner)))
+        except (StopIteration, KeyError, ValueError, OSError, ConfigurationError):
+            continue
+    problem = system_service_problem(config, config_path.parent.parent, others)
+    if problem is not None:
+        raise ConfigurationError(problem)
 elif mode == "sync":
     from inky_bird_frame.installation import (
         load_private_environment,
@@ -1220,7 +1246,7 @@ else
     "${unit_dir}" "${app_dir}" "${app_dir}" "${config_path}" "${account_home}" "${user}" sync
   controller_program "${new_runtime}/.venv/bin/python" - \
     "${unit_dir}" "${app_dir}" "${app_dir}" "${config_path}" "${account_home}" "${user}" \
-    render "${account_group}" "${environment_file}" "${account_uid}"
+    render "${account_group}" "${environment_file}" "${account_uid}" "${unit_root}"
 fi
 
 # Only an unreachable bird source may wait for the scheduled refresh; any other

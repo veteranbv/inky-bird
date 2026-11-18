@@ -126,7 +126,8 @@ examples with the exact release you intend to install.
 ### macOS controller
 
 The standard installer creates jobs for your logged-in macOS user. It does not
-create a system account or install administrator-managed services. If an operator
+create a system account. To run Inky as its own account in LaunchDaemons, see
+[macOS controller as a system service](#macos-controller-as-a-system-service). If an operator
 already runs Inky through system LaunchDaemons (jobs that can start before login),
 use that deployment process for upgrades. The standard installer refuses to
 compete with those jobs before it changes files. Run `doctor controller` as the
@@ -400,6 +401,10 @@ that start Codex keep their own sandbox. Before it switches to a new version,
 the installer checks that the account cannot change any part of the code
 under `app`, and stops if it can.
 
+Its workspace, catalog and state must be inside its install root, and it must
+not serve on the port of another system service on the machine; the installer
+refuses either before it changes the services.
+
 Run `doctor` as the account, with its private file, so it checks that
 account's services and folders:
 
@@ -421,6 +426,96 @@ and starts the previous version again, without running the hook.
 To remove it, take out the units by hand as shown under [Uninstall](#uninstall),
 with the account's name in place of `inky-bird`, then delete the install root
 and the account (`sudo userdel inky-bird`) once you no longer need the data.
+
+### macOS controller as a system service
+
+The same mode exists on macOS, with the same checks and the same layout. The
+installer runs as root, writes LaunchDaemons in `/Library/LaunchDaemons` that
+run as the account (`UserName`, `GroupName`), and runs every step that reads the
+account's data or runs the application as that account. Without
+`--service-account`, it installs LaunchAgents for the logged-in user as
+described above.
+
+Create a hidden account with no shell and no administrator rights first; the
+installer checks it and never creates it. Pick a user and group ID below 500
+that `dscl . -list /Users UniqueID` and `dscl . -list /Groups PrimaryGroupID`
+do not show yet (400 here):
+
+```bash
+sudo dscl . -create /Groups/inky-bird PrimaryGroupID 400
+for setting in "UniqueID 400" "PrimaryGroupID 400" "UserShell /usr/bin/false" \
+    "NFSHomeDirectory /opt/inky-bird/home" "IsHidden 1" "Password *"; do
+  sudo dscl . -create /Users/inky-bird $setting
+done
+```
+
+The install root is `/opt/<account>` unless you give `--install-root`; it holds
+the same `app`, `config`, `home`, `state` and `logs` folders as on Linux, and
+the jobs write their logs to `logs`. Prepare the configuration and install:
+
+```bash
+sudo install -d -m 0755 /opt/inky-bird
+sudo install -d -o inky-bird -g inky-bird -m 0700 /opt/inky-bird/config
+sudo install -o inky-bird -g inky-bird -m 0600 config.example.toml /opt/inky-bird/config/config.toml
+sudo env UV_BIN="$(command -v uv)" ./deploy/install-controller.sh --service-account inky-bird
+```
+
+Run the installer from a checkout only root can change. It refuses, with one
+line ending in "No changes made.", what the Linux installer refuses. It also
+refuses an account whose shell is not `/usr/bin/false` or a `nologin`, and
+LaunchAgents of the same names loaded for the user who runs `sudo`: remove
+those with `deploy/uninstall-controller.sh` as that user first. It does not
+move an installation from one mode to the other.
+
+The jobs' definitions hold no secret, so they are readable by anyone. They name
+the private environment file `config/private.env` in `INKY_BIRD_ENV_FILE`,
+which the application loads, exactly as on Linux.
+
+To run a step as the account, the installer uses
+`system_service.py run-as`, which takes the account's groups and IDs and then
+replaces itself with the command. It does not use `sudo -u`, because sudo stays
+between the installer and the command and may give the command a terminal of
+its own, so the installer could not stop it by its process group.
+
+macOS has no equivalent of systemd's `ProtectSystem`. What contains a system
+service here is ordinary file ownership: the jobs run as the account, with a
+umask of `077`; the code under `app` is root's and the installer checks before
+the switch that the account cannot change any of it. Beyond its own folders,
+the account can write only where any unprivileged account can, such as `/tmp`,
+and read what anyone can read; the jobs have no sandbox.
+
+When the installer stops a job, launchd sends it `SIGTERM` and, if it is still
+running after its exit timeout (system-defined, usually 20 seconds; the jobs
+set none), `SIGKILL`. A job waiting for a writer lock the installer holds
+holds no lock itself, so nothing it was writing is cut short.
+
+A second installation on the same Mac, such as a rehearsal beside production,
+uses its own account (for example `inky-bird-rehearsal`), which gives it its own
+job labels (`com.inky-bird-rehearsal.serve`) and install root. Its workspace,
+catalog and state must be inside its own install root, so it has its own
+locks, and it must serve on a different port: the installer refuses to share
+either with another installation on the machine.
+
+Run `doctor` as the account, with its private file:
+
+```bash
+sudo -u inky-bird env INKY_BIRD_ENV_FILE=/opt/inky-bird/config/private.env \
+  /opt/inky-bird/app/.venv/bin/inky-bird doctor controller --config /opt/inky-bird/config/config.toml
+```
+
+To upgrade, check out the new tag and run the same command; the `--stopped-hook`
+and the check that no process of the account remains work as on Linux. To
+remove it, unload and delete each job, then the install root and the account
+once you no longer need the data:
+
+```bash
+for label in serve scheduler refresh generate catalog-publish notifications; do
+  sudo launchctl bootout "system/com.inky-bird.$label" 2>/dev/null || true
+  sudo rm -f "/Library/LaunchDaemons/com.inky-bird.$label.plist"
+done
+sudo dscl . -delete /Users/inky-bird
+sudo dscl . -delete /Groups/inky-bird
+```
 
 ### Docker controller
 

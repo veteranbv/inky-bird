@@ -884,7 +884,7 @@ def test_controller_installers_hold_writer_locks_run_the_hook_and_check_health_i
     for name, first_stop in (
         (
             "install-controller.sh",
-            'launchctl bootout "gui/${uid}/com.${service_prefix}.catalog-publish"',
+            'launchctl bootout "${domain}/com.${service_prefix}.catalog-publish"',
         ),
         (
             "install-controller-systemd.sh",

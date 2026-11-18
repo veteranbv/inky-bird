@@ -324,6 +324,28 @@ SCENARIOS = {
             arguments=(*SYSTEM_ARGUMENTS, *HOOK_ARGUMENTS),
             service_account=SYSTEM_ACCOUNT,
         ),
+        # Installed as root for a service account: LaunchDaemons that run as it.
+        Scenario(
+            "macos-system",
+            "install-controller.sh",
+            "controller",
+            "Darwin",
+            (("FAKE_AGENTS", AGENTS), ("FAKE_UID", "0")),
+            ("fresh", "staged", RETAINED),
+            arguments=SYSTEM_ARGUMENTS,
+            service_account=SYSTEM_ACCOUNT,
+        ),
+        Scenario(
+            "macos-system-hook",
+            "install-controller.sh",
+            "controller",
+            "Darwin",
+            (("FAKE_AGENTS", AGENTS), ("FAKE_UID", "0")),
+            ("staged",),
+            start="macos-system",
+            arguments=(*SYSTEM_ARGUMENTS, *HOOK_ARGUMENTS),
+            service_account=SYSTEM_ACCOUNT,
+        ),
         Scenario(
             "linux-timers-to-app",
             "install-controller-systemd.sh",
@@ -1103,6 +1125,7 @@ SYSTEM_IDENTITIES = {
     "uv": "root",
     "rsync": "root",
     "systemctl": "root",
+    "launchctl": "root",
     "chown": "root",
     "stopped-hook": "root",
 }
@@ -1133,7 +1156,7 @@ def check_system(machine: Machine, outcome: Outcome) -> None:
             report.append(f"I12: {what} {' '.join(detail)} ran as {identity}, not {expected}")
     allowed = tuple(
         os.path.realpath(path) + os.sep
-        for path in (machine.install_root, machine.tmp, machine.units)
+        for path in (machine.install_root, machine.tmp, machine.units, machine.agents)
     )
     for _, kind_of_call, tool, *arguments in machine.steps():
         if kind_of_call != "action" or tool not in DESTRUCTIVE_TOOLS:
@@ -1261,6 +1284,16 @@ CLAIMS = {
     "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by "
     "${service_account}. No changes made.": "unchanged",
     "Could not check the service account. No changes made.": "unchanged",
+    # unchanged: system-service mode on macOS
+    "${plist##*/} is a system service of ${owner}. Run the installer again with "
+    "--service-account ${owner}. No changes made.": "unchanged",
+    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo $0 "
+    "--service-account ${family}. No changes made.": "unchanged",
+    "The account ${service_account} can log in; give it the shell /usr/bin/false. "
+    "No changes made.": "unchanged",
+    "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; this installer does "
+    "not move it. Remove it with deploy/uninstall-controller.sh run as that user, then run "
+    "this again. No changes made.": "unchanged",
     "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 "
     "(chmod go+rX). No changes made.": "unchanged",
     "${service_account} cannot read ${unsafe_path} in the new version. No changes made.": (
@@ -1336,9 +1369,9 @@ CLAIMS = {
     "Removed /etc/systemd/system/${unit}.": "neutral",
     "Removed plist: ${plist}": "neutral",
     "Run the uninstaller again to finish.": "neutral",
-    "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist": "neutral",
+    "Start each with: launchctl bootstrap ${domain} ${agents_dir}/<agent>.plist": "neutral",
     "Start them with: sudo systemctl start ${stopped[*]}": "neutral",
-    "Stop each with: launchctl bootout gui/${uid}/<agent>": "neutral",
+    "Stop each with: launchctl bootout ${domain}/<agent>": "neutral",
     "Stop them with: sudo systemctl stop ${running[*]}": "neutral",
     "Stopped $1.": "neutral",
     "Stopped ${service_prefix}-display.service.": "neutral",
@@ -2404,6 +2437,7 @@ STATE_DIRECTORY = Path(
 SAMPLE_STRIDE = 8
 DEFAULT_SECOND_PASS = {
     ("install", "linux-system", "staged"),
+    ("install", "macos-system", "staged"),
     ("install", "macos", "single"),
     ("install", "linux-timers", "single"),
     ("install", "display", "shared-single"),
@@ -3131,6 +3165,7 @@ CLONE_CHECKS = (
     ("install", "linux-timers", "shared-single"),
     ("install", "linux-app", "staged"),
     ("install", "linux-system", "staged"),
+    ("install", "macos-system", "staged"),
     ("install", "display", "shared-both"),
     ("install", "remote-display", "single"),
     ("uninstall", "linux-timers", "shared"),
