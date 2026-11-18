@@ -149,6 +149,7 @@ HTTP_ERROR_CODES = (
     "password_confirmation_failed",
     "request_incomplete",
     "secure_access_required",
+    "service_stopping",
     "sign_in_rate_limited",
     "sign_in_required",
 )
