@@ -1323,8 +1323,9 @@ fi
 activate_runtime
 if [ "${first_install}" = true ]; then
   for name in "${agent_plists[@]}"; do
-    if [ -f "${!name}" ]; then
-      mv "${!name}" "${agents_dir}/"
+    staged=${!name}
+    if [ -f "${staged}" ]; then
+      mv "${staged}" "${agents_dir}/${staged##*/}"
     fi
   done
   place_agents "${agents_dir}"
