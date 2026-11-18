@@ -72,7 +72,7 @@ def display_systemd_units(config, *, executable, app_dir, config_path, user):
 FILE_COMMANDS = ("mv", "ln", "rm", "cp", "install", "mkdir", "mktemp", "rmdir")
 SYSTEM_PATHS = {
     "install-controller.sh": ("/Library/LaunchDaemons", "/usr/bin/plutil"),
-    "uninstall-controller.sh": (),
+    "uninstall-controller.sh": ("/Library/LaunchDaemons",),
     "install-controller-systemd.sh": ("/etc/systemd/system",),
     "uninstall-controller-systemd.sh": ("/etc/systemd/system",),
     "install-display-local.sh": ("/etc/systemd/system",),

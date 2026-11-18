@@ -424,3 +424,26 @@ def test_run_as_becomes_the_account_for_good_before_it_runs_anything(
         ("exec", ["env", "-i", "true"]),
     ]
     assert system_service.main(["run-as", "inky-bird", "env"]) == 64
+
+
+def test_remove_code_deletes_only_the_install_root_s_own_code_folder(tmp_path: Path) -> None:
+    from inky_bird_frame.system_service import remove_code
+
+    root = tmp_path / "srv"
+    outside = tmp_path / "outside"
+    (outside / "keep").mkdir(parents=True)
+    (root / "app/.runtimes/runtime.a").mkdir(parents=True)
+    (root / "config").mkdir()
+    owner = account(root)
+    assert remove_code(root, owner) and not (root / "app").exists()
+    assert (root / "config").is_dir()
+    # Already gone: nothing to do.
+    assert remove_code(root, owner)
+    # A link where the code was is never followed.
+    (root / "app").symlink_to(outside)
+    assert not remove_code(root, owner)
+    assert (outside / "keep").is_dir()
+    (root / "app").unlink()
+    # Code the account owns is not root's code.
+    (root / "app").mkdir()
+    assert not remove_code(root, account(root, uid=os.getuid()))
