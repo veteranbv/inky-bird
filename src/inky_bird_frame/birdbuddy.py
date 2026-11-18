@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Final
 from urllib.error import HTTPError
 
+from . import lock_wait
 from .birds import BirdBuddySpecies, ObservationWindow
 from .errors import BusyError, DataSourceError
 from .history_summary import SpeciesSummary, load_summary, parse_species_rows, write_summary
@@ -431,7 +432,7 @@ def _state_errors() -> Iterator[None]:
 def _auth_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "birdbuddy-auth.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
@@ -442,7 +443,7 @@ def _auth_lock(state_dir: Path) -> Iterator[None]:
 def _history_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "birdbuddy-detections.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

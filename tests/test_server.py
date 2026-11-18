@@ -12,7 +12,7 @@ import time
 import unittest
 from argparse import Namespace
 from collections.abc import Awaitable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection, HTTPSConnection
@@ -20,7 +20,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import uvicorn
@@ -99,11 +99,12 @@ def test_real_direct_tls_keeps_certificate_validation_and_encrypts_owner_access(
         tls_certificate=cert_path,
         tls_private_key=key_path,
     )
-    with patch("uvicorn.run") as run:
+    with _patched_run() as run:
         serve_catalog(config)
-    assert run.call_args.kwargs["ssl_certfile"] == str(cert_path)
-    assert run.call_args.kwargs["ssl_keyfile"] == str(key_path)
-    assert run.call_args.kwargs["ssl_keyfile_password"] == ""
+    options = _run_config(run)
+    assert options.ssl_certfile == str(cert_path)
+    assert options.ssl_keyfile == str(key_path)
+    assert options.ssl_keyfile_password == ""
     with _serving(
         config.catalog_dir,
         config.state_dir / "active-catalog.json",
@@ -167,19 +168,19 @@ def test_tls_startup_refuses_an_insecure_key_before_starting_any_listener(tmp_pa
         tls_certificate=tmp_path / "cert.pem",
         tls_private_key=key,
     )
-    with patch("uvicorn.run") as run, pytest.raises(ConfigurationError, match="0600"):
+    with _patched_run() as run, pytest.raises(ConfigurationError, match="0600"):
         serve_catalog(config)
     run.assert_not_called()
     key.chmod(0o600)
     link = tmp_path / "key-link.pem"
     link.symlink_to(key)
-    with patch("uvicorn.run") as run, pytest.raises(ConfigurationError, match="regular file"):
+    with _patched_run() as run, pytest.raises(ConfigurationError, match="regular file"):
         serve_catalog(replace(config, tls_private_key=link))
     run.assert_not_called()
-    with patch("uvicorn.run") as run, pytest.raises(ConfigurationError, match="Cannot load"):
+    with _patched_run() as run, pytest.raises(ConfigurationError, match="Cannot load"):
         serve_catalog(config)
     run.assert_not_called()
-    with patch("uvicorn.run") as run, pytest.raises(ConfigurationError, match="Supply both"):
+    with _patched_run() as run, pytest.raises(ConfigurationError, match="Supply both"):
         serve_catalog(replace(config, tls_certificate=None))
     run.assert_not_called()
 
@@ -218,6 +219,21 @@ def _active_catalog(*species: dict[str, object]) -> dict[str, object]:
         "generated_at": GENERATED_AT,
         "species": list(species),
     }
+
+
+def _patched_run() -> AbstractContextManager[MagicMock | AsyncMock]:
+    """Stand in for the server's run: record its configuration, as if it started."""
+
+    def started(server: uvicorn.Server, sockets: object = None) -> None:
+        server.started = True
+
+    return patch("uvicorn.Server.run", autospec=True, side_effect=started)
+
+
+def _run_config(run: MagicMock | AsyncMock) -> uvicorn.Config:
+    server = run.call_args.args[0]
+    assert isinstance(server, uvicorn.Server)
+    return server.config
 
 
 @contextmanager
@@ -1663,14 +1679,14 @@ def test_asset_path_checks_hold_even_when_the_allowlist_names_an_escape(tmp_path
 
 def test_production_server_keeps_logs_headers_and_proxies_off(tmp_path: Path) -> None:
     config = _plain_config(tmp_path)
-    with patch("uvicorn.run") as run:
+    with _patched_run() as run:
         serve_catalog(config)
-    options = run.call_args.kwargs
-    assert options["access_log"] is False
-    assert options["server_header"] is False
-    assert options["proxy_headers"] is False
-    assert (options["host"], options["port"]) == ("127.0.0.1", 8793)
-    assert options["ssl_certfile"] is None and options["ssl_keyfile"] is None
+    options = _run_config(run)
+    assert options.access_log is False
+    assert options.server_header is False
+    assert options.proxy_headers is False
+    assert (options.host, options.port) == ("127.0.0.1", 8793)
+    assert options.ssl_certfile is None and options.ssl_keyfile is None
 
 
 if __name__ == "__main__":

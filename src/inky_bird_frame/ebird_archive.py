@@ -19,6 +19,7 @@ from io import BufferedReader, TextIOWrapper
 from pathlib import Path
 from typing import TextIO
 
+from . import lock_wait
 from .birds import DateRange, EbirdArchiveSpecies, ObservationWindow, date_range_for_window
 from .catalog import catalog_state_lock
 from .errors import DataSourceError
@@ -218,7 +219,7 @@ def preview_ebird_checklists(archive_path: Path) -> tuple[EbirdChecklist, ...]:
 def _history_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "ebird-archive.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
