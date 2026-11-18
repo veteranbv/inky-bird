@@ -1041,6 +1041,19 @@ if ! hidden=$(account_can_read "${new_runtime}"); then
   echo "${service_account} cannot read ${unsafe_path} in the new version. No changes made." >&2
   exit 1
 fi
+# The interpreter uv downloads is code too, and uv leaves a lock file beside
+# it that anyone can write. The folder is root's, under the install root.
+python_dir="${app_dir}/.python"
+if [ -n "${service_account}" ] && [ -e "${python_dir}" ]; then
+  contained "${app_dir}" "${python_dir}"
+  chmod -R go-w "${python_dir}"
+  if ! hidden=$(account_can_read "${python_dir}"); then
+    unsafe_path=${python_dir}
+    eval "${hidden}"
+    echo "${service_account} cannot read ${unsafe_path} in the new version. No changes made." >&2
+    exit 1
+  fi
+fi
 # The CLI reports a rejection as a JSON envelope on stdout; show its message.
 if ! validation=$(as_account "${new_runtime}/.venv/bin/inky-bird" config validate \
     --config "${config_path}"); then

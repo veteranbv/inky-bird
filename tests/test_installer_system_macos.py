@@ -399,3 +399,19 @@ def test_the_real_program_renders_launch_daemons_that_lint_and_run_the_command(
         text=True,
     )
     assert refused.returncode != 0 and "state_dir must be inside" in refused.stderr
+
+
+def test_the_interpreter_uv_downloads_is_code_the_account_cannot_change(tmp_path: Path) -> None:
+    """uv leaves a lock file anyone can write beside a Python it downloads into
+    the install root; the code check refused that, as a real host showed."""
+    host = system_host(tmp_path)
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.install_root is not None
+    python_dir = host.install_root / "app" / ".python"
+    assert (python_dir / ".lock").is_file()
+    for path in [python_dir, *python_dir.rglob("*")]:
+        assert not path.lstat().st_mode & 0o022, path
+    # An upgrade, with the interpreter already there, also succeeds.
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
