@@ -506,6 +506,14 @@ def system_python(arguments: list[str]) -> int:
             print(f"{name}={shlex.quote(os.environ['FAKE_LAYOUT_' + name.upper()])}")
         return 0
     helper = [index for index, item in enumerate(arguments) if item.endswith("system_service.py")]
+    if helper and arguments[helper[0] + 1 : helper[0] + 2] == ["run-as"]:
+        # macOS's switch to the account: the helper becomes the account and
+        # runs the command, as the fake setpriv does.
+        name, separator, *command = arguments[helper[0] + 2 :]
+        entry = _accounts().get(name)
+        if entry is None or separator != "--":
+            return 1
+        return _as_account(name, entry, command, "run-as")
     if helper:
         # The real helper, against the synthetic account database and file owners.
         program = f"import sys; sys.path.insert(0, {str(TOOLS.parent)!r}); import fake_tools; "
@@ -524,11 +532,15 @@ def launchctl(arguments: list[str]) -> int:
     verb = arguments[0]
     if verb == "print":
         target = arguments[1]
-        return 0 if not target.startswith("system/") and target.split("/")[-1] in loaded else 1
+        entry = loaded.get(target.split("/")[-1])
+        # A job is in the system domain or a user's; a LaunchDaemon says which.
+        system = isinstance(entry, dict) and entry.get("domain") == "system"
+        return 0 if entry is not None and system == target.startswith("system/") else 1
     if verb == "bootout":
         label = arguments[1].split("/")[-1]
         if label not in loaded:
             return 3
+        _as("launchctl", verb)
         held = "lock-held" if _cycle_lock_held() else "lock-free"
         _log("launchctl", "bootout", label, held)
         if (
@@ -557,13 +569,25 @@ def launchctl(arguments: list[str]) -> int:
         if f"bootstrap-{generation}:{label.split('.')[-1]}" in _rules():
             _log("launchctl", "bootstrap-failed", label, generation)
             return 5
+        _as("launchctl", verb)
         process = resolve_runtime(payload["ProgramArguments"][0])
         tag = str(process["runtime"])
-        loaded[label] = {
+        job: dict[str, object] = {
             "generation": generation,
             "runtime": tag,
             "run_at_load": payload.get("RunAtLoad"),
         }
+        loaded[label] = job
+        if arguments[1] == "system":
+            job["domain"] = "system"
+            # launchd starts a LaunchDaemon as its UserName; a program that
+            # account cannot reach or run never starts (it is loaded, not running).
+            account = _accounts().get(str(payload.get("UserName", "")))
+            program = str(payload["ProgramArguments"][0])
+            if account is None or _denied(program, account, run=True) is not None:
+                _log("launchctl", "denied", label, program)
+                _save("launchd", loaded)
+                return 0
         _save("launchd", loaded)
         processes = _state("processes")
         processes[label] = process
@@ -1127,9 +1151,16 @@ def venv_python(executable: str, arguments: list[str]) -> int:
         _log("heredoc", tag)
         # A system service checks and syncs as its account, then renders as root.
         mode = arguments[7] if len(arguments) > 7 else ""
+        held = arguments[-1]
+        if "plistlib" in source:
+            # The macOS program: one plist per agent, five paths, whether the
+            # installer holds the locks, then a system service's mode.
+            count = len([argument for argument in arguments if argument.endswith(".plist")])
+            held = arguments[count + 5] if len(arguments) > count + 5 else held
+            mode = arguments[count + 6] if len(arguments) > count + 6 else ""
         _as("heredoc", mode or "both")
         # The real program takes the catalog lock unless told the installer holds it.
-        if "catalog_state_lock" in source and _cycle_lock_held() and arguments[-1] != "true":
+        if "catalog_state_lock" in source and _cycle_lock_held() and held != "true":
             print("waiting forever for the catalog lock the installer holds", file=sys.stderr)
             return 75
         if f"{tag}:heredoc" in rules:
@@ -1180,6 +1211,9 @@ def venv_python(executable: str, arguments: list[str]) -> int:
                         # from the new version differs from the one it replaced.
                         "RenderedBy": tag,
                     }
+                    if mode == "render":
+                        payload["UserName"] = arguments[plists + 7]
+                        payload["GroupName"] = arguments[plists + 8]
                     Path(path).write_bytes(plistlib.dumps(payload))
                 else:
                     Path(path).unlink(missing_ok=True)
@@ -1262,7 +1296,7 @@ def _check_serve(helper: Path) -> int:
     prefix = os.environ.get("INKY_BIRD_SERVICE_PREFIX")
     # The account's scrubbed environment names no prefix: any web service.
     names = (
-        [name for name in _state("processes") if name.endswith("-controller.service")]
+        [name for name in _state("processes") if name.endswith(("-controller.service", ".serve"))]
         if prefix is None
         else [f"com.{prefix}.serve", f"{prefix}-controller.service"]
     )
@@ -1362,6 +1396,9 @@ def _is_query(tool: str, arguments: list[str]) -> bool:
     """Calls that only read state; failing one would just be a different answer."""
     # setpriv only runs its command as the account; that command is the step.
     if tool in ("uname", "id", "pgrep", "setpriv"):
+        return True
+    if tool == "python3" and "run-as" in arguments:
+        # macOS's account switch: like setpriv, its command is the step.
         return True
     if tool == "launchctl":
         return arguments[:1] == ["print"]
@@ -1522,7 +1559,6 @@ def setpriv(arguments: list[str]) -> int:
     groups and a scrubbed environment (``env -i``), which it then sees alone,
     beside the fakes' own settings, and only a program the account can reach
     and run (exit 126, as a shell reports Permission denied)."""
-    import shutil
 
     separator = arguments.index("--")
     options, command = arguments[:separator], arguments[separator + 1 :]
@@ -1536,6 +1572,20 @@ def setpriv(arguments: list[str]) -> int:
     ):
         print(f"setpriv: refused to run {command[:2]} as {values}", file=sys.stderr)
         return 64
+    return _as_account(found[0], found[1], command, "setpriv")
+
+
+def _as_account(name: str, entry: dict[str, object], command: list[str], tool: str) -> int:
+    """Run ``env -i NAME=value... program`` as a synthetic account, only if the
+    account can reach and run it by real file modes (exit 126 otherwise)."""
+    import shutil
+
+    if command[:2] != ["env", "-i"]:
+        print(
+            f"{tool}: refused to run {command[:2]} without a scrubbed environment", file=sys.stderr
+        )
+        return 64
+    found = (name, entry)
     given: dict[str, str] = {}
     rest = command[2:]
     while rest and "=" in rest[0] and not rest[0].startswith("/"):
@@ -1553,7 +1603,7 @@ def setpriv(arguments: list[str]) -> int:
     for path, run in ((executable, True), (os.getcwd(), False)):
         denied = _denied(path, found[1], run=run)
         if denied is not None:
-            print(f"setpriv: {rest[0]}: Permission denied ({denied})", file=sys.stderr)
+            print(f"{tool}: {rest[0]}: Permission denied ({denied})", file=sys.stderr)
             return 126
     return _exec([executable, *rest[1:]], environment)
 

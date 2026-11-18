@@ -41,14 +41,16 @@ A crash case is a power loss once a call completes: the fake freezes, then
 SIGKILLs, every process of the run, so no trap or cleanup runs. Unlike a stop,
 which the installer handles, the machine then reboots: no process or held
 lock survives, /tmp is empty, and each service manager starts what is
-enabled (launchd: every agent in LaunchAgents; systemd: every enabled
+enabled (launchd: every job in its folder; systemd: every enabled
 long-running unit). The booted machine must select one complete version, the
 previous one unchanged or the new one whole, with every unit that starts at
 boot on it; the owner's configuration, private env file and state must be
 unchanged; and a plain rerun must succeed and converge to an upgrade's end
-state (I13). Crash cases cover upgrades from ``fresh``, ``single`` and
-``staged`` on both controllers' user scenarios and the Linux system service,
-with and without the hook: every other step in the full matrix, every eighth
+state (I13), with no work folder of the crashed run left beside the
+configuration (the rerun removes those from before the boot). Crash cases
+cover upgrades from ``fresh``, ``single`` and ``staged`` on both controllers'
+user scenarios and system services, with and without the hook: every other
+step in the full matrix, every eighth
 in ``sample``, the middle step by default.
 
 Upgrades start from what each layout's own installers left: the frozen
@@ -70,9 +72,9 @@ start state, stops the installer at that middle call (with a signal chosen
 from the group's name), and fails every cleanup step that moves, links or
 removes a runtime after a failed upgrade from the single-directory layout on
 both controllers and on a shared Pi's display, and crashes each crash group
-at its middle step: 310 cases, beside 88 recording
-runs, 26 busy runs (each holding one writer lock, chosen from the group's
-name) and 20 tests of the matrix itself. Run every case,
+at its middle step: 365 cases (21 of them crashes), beside 103 recording
+runs, 30 busy runs (each holding one writer lock, chosen from the group's
+name) and 22 tests of the matrix itself. Run every case,
 and the second pass of every upgrade, with::
 
     INKY_INSTALLER_MATRIX=full uv run pytest tests/test_installer_matrix.py -q
@@ -136,6 +138,8 @@ from test_installer_behaviour import (
     run_contained,
     running_generation,
 )
+
+from inky_bird_frame.upgrade_gates import WORK_DIR_PATTERNS
 
 # The single-directory installers as of 5ded22f, the last commit before the
 # staged layout; they build the starting state every upgrade is tested from.
@@ -209,6 +213,8 @@ CRASH_SCENARIOS = frozenset(
         "linux-app-hook",
         "linux-system",
         "linux-system-hook",
+        "macos-system",
+        "macos-system-hook",
     }
 )
 CRASH_STATES = frozenset({"fresh", "single", "staged"})
@@ -352,6 +358,28 @@ SCENARIOS = {
             SYSTEM_ENVIRONMENT,
             ("staged",),
             start="linux-system",
+            arguments=(*SYSTEM_ARGUMENTS, *HOOK_ARGUMENTS),
+            service_account=SYSTEM_ACCOUNT,
+        ),
+        # Installed as root for a service account: LaunchDaemons that run as it.
+        Scenario(
+            "macos-system",
+            "install-controller.sh",
+            "controller",
+            "Darwin",
+            (("FAKE_AGENTS", AGENTS), ("FAKE_UID", "0")),
+            ("fresh", "staged", RETAINED),
+            arguments=SYSTEM_ARGUMENTS,
+            service_account=SYSTEM_ACCOUNT,
+        ),
+        Scenario(
+            "macos-system-hook",
+            "install-controller.sh",
+            "controller",
+            "Darwin",
+            (("FAKE_AGENTS", AGENTS), ("FAKE_UID", "0")),
+            ("staged",),
+            start="macos-system",
             arguments=(*SYSTEM_ARGUMENTS, *HOOK_ARGUMENTS),
             service_account=SYSTEM_ACCOUNT,
         ),
@@ -1134,6 +1162,7 @@ SYSTEM_IDENTITIES = {
     "uv": "root",
     "rsync": "root",
     "systemctl": "root",
+    "launchctl": "root",
     "chown": "root",
     "stopped-hook": "root",
 }
@@ -1164,7 +1193,7 @@ def check_system(machine: Machine, outcome: Outcome) -> None:
             report.append(f"I12: {what} {' '.join(detail)} ran as {identity}, not {expected}")
     allowed = tuple(
         os.path.realpath(path) + os.sep
-        for path in (machine.install_root, machine.tmp, machine.units)
+        for path in (machine.install_root, machine.tmp, machine.units, machine.agents)
     )
     for _, kind_of_call, tool, *arguments in machine.steps():
         if kind_of_call != "action" or tool not in DESTRUCTIVE_TOOLS:
@@ -1292,6 +1321,16 @@ CLAIMS = {
     "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by "
     "${service_account}. No changes made.": "unchanged",
     "Could not check the service account. No changes made.": "unchanged",
+    # unchanged: system-service mode on macOS
+    "${plist##*/} is a system service of ${owner}. Run the installer again with "
+    "--service-account ${owner}. No changes made.": "unchanged",
+    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo $0 "
+    "--service-account ${family}. No changes made.": "unchanged",
+    "The account ${service_account} can log in; give it the shell /usr/bin/false. "
+    "No changes made.": "unchanged",
+    "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; this installer does "
+    "not move it. Remove it with deploy/uninstall-controller.sh run as that user, then run "
+    "this again. No changes made.": "unchanged",
     "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 "
     "(chmod go+rX). No changes made.": "unchanged",
     "${service_account} cannot read ${unsafe_path} in the new version. No changes made.": (
@@ -1367,9 +1406,9 @@ CLAIMS = {
     "Removed /etc/systemd/system/${unit}.": "neutral",
     "Removed plist: ${plist}": "neutral",
     "Run the uninstaller again to finish.": "neutral",
-    "Start each with: launchctl bootstrap gui/${uid} ${agents_dir}/<agent>.plist": "neutral",
+    "Start each with: launchctl bootstrap ${domain} ${agents_dir}/<agent>.plist": "neutral",
     "Start them with: sudo systemctl start ${stopped[*]}": "neutral",
-    "Stop each with: launchctl bootout gui/${uid}/<agent>": "neutral",
+    "Stop each with: launchctl bootout ${domain}/<agent>": "neutral",
     "Stop them with: sudo systemctl stop ${running[*]}": "neutral",
     "Stopped $1.": "neutral",
     "Stopped ${service_prefix}-display.service.": "neutral",
@@ -2417,6 +2456,11 @@ class Group:
             report.append("I13: after the rerun the installed version has no installer")
         if len(after.runtimes) > 2:
             report.append(f"I13: after the rerun {len(after.runtimes)} runtimes remain")
+        left = sorted(
+            path.name for pattern in WORK_DIR_PATTERNS for path in machine.support.glob(pattern)
+        )
+        if left:
+            report.append(f"I13: after the rerun the crashed run's work folders remain: {left}")
         survivors = machine.survivors()
         if survivors:
             report.append(f"processes outlived the rerun: {survivors}")
@@ -2472,6 +2516,10 @@ def reboot(machine: Machine) -> None:
     ):
         (machine.fake / name).unlink(missing_ok=True)
     shutil.rmtree(machine.fake / "steps.lock", ignore_errors=True)
+    # Everything on disk predates the boot, whatever this machine's clock says.
+    for pattern in WORK_DIR_PATTERNS:
+        for path in machine.support.glob(pattern):
+            os.utime(path, (0, 0), follow_symlinks=False)
     for path in machine.tmp.iterdir() if machine.tmp.is_dir() else ():
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path, ignore_errors=True)
@@ -2484,11 +2532,15 @@ def reboot(machine: Machine) -> None:
             payload = plistlib.loads(plist.read_bytes())
             executable = str(payload["ProgramArguments"][0])
             process = fake_tools.resolve_runtime(executable)
-            loaded[str(payload["Label"])] = {
+            job: dict[str, object] = {
                 "generation": payload.get("Comment", "unknown"),
                 "runtime": process["runtime"],
                 "run_at_load": payload.get("RunAtLoad"),
             }
+            # A system service's jobs are LaunchDaemons, in the system domain.
+            if machine.account:
+                job["domain"] = "system"
+            loaded[str(payload["Label"])] = job
             if payload.get("RunAtLoad") or payload.get("KeepAlive"):
                 processes[str(payload["Label"])] = process
         machine.save_state("launchd", loaded)
@@ -2585,6 +2637,7 @@ SAMPLE_STRIDE = 8
 CRASH_STRIDE = 2
 DEFAULT_SECOND_PASS = {
     ("install", "linux-system", "staged"),
+    ("install", "macos-system", "staged"),
     ("install", "macos", "single"),
     ("install", "linux-timers", "single"),
     ("install", "display", "shared-single"),
@@ -3319,6 +3372,7 @@ CLONE_CHECKS = (
     ("install", "linux-timers", "shared-single"),
     ("install", "linux-app", "staged"),
     ("install", "linux-system", "staged"),
+    ("install", "macos-system", "staged"),
     ("install", "display", "shared-both"),
     ("install", "remote-display", "single"),
     ("uninstall", "linux-timers", "shared"),

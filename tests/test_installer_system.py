@@ -450,3 +450,51 @@ def test_a_checkout_only_root_can_read_still_gives_the_account_a_readable_runtim
     runtime = Path(os.path.realpath(host.app / ".venv")).parent
     assert (runtime / "src/inky_bird_frame/config.py").stat().st_mode & 0o777 == 0o644
     assert (host.app / "catalog").stat().st_mode & 0o777 == 0o755
+
+
+def test_the_real_program_renders_units_that_run_the_installed_command(tmp_path: Path) -> None:
+    """Rendering only, by the installer's own program, as root would run it."""
+    import sys
+
+    from test_installation import write_config
+
+    text = (Path(__file__).resolve().parents[1] / "deploy" / SCRIPT).read_text()
+    start = text.index("<<'PY'\n", text.index("controller_program() {")) + len("<<'PY'\n")
+    program = text[start : text.index("\nPY\n", start) + 1]
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    account = "inky-bird-qa"
+    root = tmp_path / account
+    (root / "config").mkdir(parents=True)
+    config = write_config(root / "config", codex)
+    units, rendered = tmp_path / "system", tmp_path / "rendered"
+    units.mkdir()
+    rendered.mkdir()
+    app = root / "app"
+    arguments = [str(rendered), str(app), str(app), str(config), str(root / "home"), account]
+    arguments += ["render", account, str(root / "config/private.env"), str(os.getuid())]
+    arguments += [str(units)]
+    environment = {**os.environ, "INKY_BIRD_SERVICE_PREFIX": account}
+
+    def render() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-", *arguments],
+            input=program,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    result = render()
+    assert result.returncode == 0, result.stderr
+    service = (rendered / f"{account}-controller.service").read_text()
+    assert f'ExecStart="{app}/.venv/bin/inky-bird" "serve"' in service
+    assert "User=inky-bird-qa\nGroup=inky-bird-qa\n" in service
+    # Its data stays under its own root, so a second installation has its own locks.
+    config.write_text(
+        config.read_text().replace(
+            'state_dir = "controller-state"', f'state_dir = "{tmp_path}/shared"'
+        )
+    )
+    result = render()
+    assert result.returncode != 0 and "state_dir must be inside" in result.stderr

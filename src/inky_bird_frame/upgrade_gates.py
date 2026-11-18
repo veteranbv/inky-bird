@@ -11,6 +11,10 @@ asks the local web service for ``/health``: it must answer ``ok`` from this
 same runtime. A system service passes its private environment file third.
 
 ``state-dir`` prints the configured state directory.
+
+``remove-stale-work`` removes the work folders an installer left in a folder
+before the current boot, when a power loss cut it short; nothing can use
+them after a reboot.
 """
 
 from __future__ import annotations
@@ -18,7 +22,10 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re
+import shutil
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -50,6 +57,8 @@ HEALTH_REQUEST_SECONDS = 5.0
 HEALTH_RETRY_SECONDS = 1.0
 MAX_HEALTH_BYTES = 64 * 1024
 PRIVATE_ENVIRONMENT_FILE = "INKY_BIRD_ENV_FILE"
+# The work folders an installer makes beside the configuration.
+WORK_DIR_PATTERNS = ("install.*", "catalog-publish-recovery.*")
 
 
 def lock_paths(state_dir: Path) -> list[Path]:
@@ -292,6 +301,44 @@ def print_state_dir(config_path: Path) -> int:
     return 0
 
 
+def boot_time() -> float:
+    """When this machine last booted, in seconds since the epoch."""
+    if sys.platform == "darwin":
+        reply = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        found = re.search(r"\bsec = (\d+)", reply)
+        if found is None:
+            raise ValueError(f"unreadable boot time: {reply!r}")
+        return float(found.group(1))
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return float(line.split()[1])
+    raise ValueError("no boot time in /proc/stat")
+
+
+def remove_stale_work(folder: Path, booted: float) -> list[Path]:
+    """Remove the work folders directly in ``folder`` last changed before
+    ``booted``, never following a link, and name each one removed."""
+    removed = []
+    for pattern in WORK_DIR_PATTERNS:
+        for path in sorted(folder.glob(pattern)):
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_mtime >= booted:
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                print(f"Could not remove {path}: {error.strerror}", file=sys.stderr)
+                continue
+            print(f"Removed work files an interrupted install left: {path}", file=sys.stderr)
+            removed.append(path)
+    return removed
+
+
 def main(arguments: list[str]) -> int:
     command, *rest = arguments
     if command == "hold-writer-locks":
@@ -305,6 +352,10 @@ def main(arguments: list[str]) -> int:
     if command == "state-dir":
         (config_path,) = rest
         return print_state_dir(Path(config_path))
+    if command == "remove-stale-work":
+        (folder,) = rest
+        remove_stale_work(Path(folder), boot_time())
+        return 0
     print(f"Unknown command: {command}", file=sys.stderr)
     return 64
 

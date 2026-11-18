@@ -447,3 +447,36 @@ def test_the_runtime_id_names_the_imported_package_not_the_helper_file(tmp_path:
     )
     assert serving == by_module
     assert by_path != serving
+
+
+def test_remove_stale_work_removes_only_folders_from_before_the_boot(tmp_path: Path) -> None:
+    booted = time.time() - 60
+    old = booted - 3600
+    for name in ("install.old", "catalog-publish-recovery.old", "other.old"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "file").write_text("left\n")
+        os.utime(tmp_path / name, (old, old))
+    (tmp_path / "install.current").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "kept").write_text("kept\n")
+    (tmp_path / "install.link").symlink_to(outside)
+    os.utime(tmp_path / "install.link", (old, old), follow_symlinks=False)
+    (tmp_path / "install.file").write_text("not a folder\n")
+    os.utime(tmp_path / "install.file", (old, old))
+
+    removed = upgrade_gates.remove_stale_work(tmp_path, booted)
+
+    assert removed == [tmp_path / "install.old", tmp_path / "catalog-publish-recovery.old"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "install.current",
+        "install.file",
+        "install.link",
+        "other.old",
+        "outside",
+    ]
+    assert (outside / "kept").exists()
+
+
+def test_boot_time_is_in_the_past() -> None:
+    assert 0 < upgrade_gates.boot_time() < time.time()

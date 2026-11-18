@@ -9,6 +9,7 @@ count as root's, as they would be on a host. The installer's use of it is in
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,7 @@ def test_doctor_checks_the_units_of_the_system_service_it_runs_as(
     units = tmp_path / "units"
     units.mkdir()
     monkeypatch.setattr(installation, "SYSTEMD_UNIT_DIRECTORY", units)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(installation, "_native_family", lambda config: "inky-bird")
     checked: list[str] = []
 
@@ -316,3 +318,109 @@ def test_doctor_checks_the_units_of_the_system_service_it_runs_as(
     (units / "inky-bird-qa-controller.service").write_text("[Unit]\n")
     list(installation._systemd_controller_checks(config))
     assert checked[0] == "inky-bird-controller.service"
+
+
+def test_doctor_checks_the_launch_daemons_of_the_system_service_it_runs_as(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On macOS the account's own LaunchDaemons, the ones that run as it."""
+    import plistlib
+    import pwd
+
+    from inky_bird_frame import installation
+
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    config = load_config(write_config(tmp_path, codex))
+    daemons = tmp_path / "LaunchDaemons"
+    daemons.mkdir()
+    monkeypatch.setattr(installation, "LAUNCH_DAEMON_DIRECTORY", daemons)
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(installation, "_native_family", lambda config: "inky-bird")
+    entry = pwd.getpwuid(os.getuid())
+    fields = ("inky-bird-rehearsal", *entry[1:])
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: pwd.struct_passwd(fields))
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: pwd.struct_passwd(fields))
+    printed: list[str] = []
+
+    def run(command: list[str], **options: object) -> installation.CommandResult:
+        printed.append(command[-1])
+        return installation.CommandResult(0, "", "")
+
+    monkeypatch.setattr(installation, "_run", run)
+    list(installation._launchd_checks(config))
+    assert printed[0] == f"gui/{os.getuid()}/com.inky-bird.serve"
+    printed.clear()
+    for label in ("serve", "refresh"):
+        path = daemons / f"com.inky-bird-rehearsal.{label}.plist"
+        job = {"Label": path.stem, "UserName": "inky-bird-rehearsal"}
+        path.write_bytes(plistlib.dumps(job))
+        path.chmod(0o644)
+    # Reading the real /Library/LaunchDaemons entry is covered by the test of
+    # _launchd_target; here the job is the account's.
+    monkeypatch.setattr(
+        installation, "_launchd_target", lambda label, uid: (f"system/{label}", "LaunchDaemon")
+    )
+    list(installation._launchd_checks(config))
+    assert printed[:2] == [
+        "system/com.inky-bird-rehearsal.serve",
+        "system/com.inky-bird-rehearsal.refresh",
+    ]
+
+
+def test_side_by_side_installations_keep_their_own_data_and_ports(tmp_path: Path) -> None:
+    from inky_bird_frame.installation import system_service_problem
+
+    codex = tmp_path / "codex"
+    codex.touch(mode=0o700)
+    root = tmp_path / "inky-bird-rehearsal"
+    (root / "config").mkdir(parents=True)
+    config = load_config(write_config(root / "config", codex))
+    assert system_service_problem(config, root, []) is None
+    assert "Port 8793 is already the port of the installation of inky-bird" in str(
+        system_service_problem(config, root, [("inky-bird", config)])
+    )
+    outside = tmp_path / "elsewhere"
+    (outside / "config").mkdir(parents=True)
+    shared = load_config(write_config(outside / "config", codex))
+    assert "workspace_dir must be inside" in str(system_service_problem(shared, root, []))
+
+
+def test_run_as_becomes_the_account_for_good_before_it_runs_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inky_bird_frame import system_service
+
+    calls: list[object] = []
+    identity = {"uid": 0}
+    account = system_service.Account(
+        "inky-bird",
+        2001,
+        2001,
+        "inky-bird",
+        Path("/opt/inky-bird/home"),
+        "/usr/bin/false",
+        frozenset({2001}),
+    )
+    monkeypatch.setattr(system_service, "lookup_account", lambda name: account)
+
+    def setuid(uid: int) -> None:
+        if identity["uid"] != 0:
+            raise PermissionError
+        identity["uid"] = uid
+        calls.append(("setuid", uid))
+
+    monkeypatch.setattr(os, "initgroups", lambda name, gid: calls.append(("initgroups", name, gid)))
+    monkeypatch.setattr(os, "setgid", lambda gid: calls.append(("setgid", gid)))
+    monkeypatch.setattr(os, "setuid", setuid)
+    monkeypatch.setattr(os, "getuid", lambda: identity["uid"])
+    monkeypatch.setattr(os, "geteuid", lambda: identity["uid"])
+    monkeypatch.setattr(os, "execvp", lambda program, arguments: calls.append(("exec", arguments)))
+    assert system_service.main(["run-as", "inky-bird", "--", "env", "-i", "true"]) == 1
+    assert calls == [
+        ("initgroups", "inky-bird", 2001),
+        ("setgid", 2001),
+        ("setuid", 2001),
+        ("exec", ["env", "-i", "true"]),
+    ]
+    assert system_service.main(["run-as", "inky-bird", "env"]) == 64

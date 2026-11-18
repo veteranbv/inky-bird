@@ -467,6 +467,9 @@ class Host:
         self.support = self.install_root / "config"
         self.config = self.support / "config.toml"
         self.state = self.install_root / "state"
+        if self.system == "Darwin":
+            # A system service's jobs are LaunchDaemons.
+            self.agents = self.fake / "LaunchDaemons"
 
     def make_system(self, account: str = SYSTEM_ACCOUNT, uid: int = 2001) -> None:
         """Add ``account`` and the configuration it owns, as the docs have the
@@ -1356,7 +1359,12 @@ def test_macos_publisher_check_runs_between_two_holds_of_the_writer_locks(tmp_pa
     result = run_macos(host, "serve refresh catalog-publish")
     assert result.returncode == 0, result.stderr
     held = [call for call in host.calls() if call[0] == "upgrade-gate"]
-    assert [call[1] for call in held] == ["hold-writer-locks", "hold-writer-locks", "check-serve"]
+    assert [call[1] for call in held] == [
+        "hold-writer-locks",
+        "remove-stale-work",
+        "hold-writer-locks",
+        "check-serve",
+    ]
     assert {label for _, label, *_ in stops(host)} == {
         f"com.{host.family}.{label}" for label in ("serve", "refresh", "catalog-publish")
     }

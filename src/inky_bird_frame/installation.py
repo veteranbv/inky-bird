@@ -69,6 +69,7 @@ SYSTEMD_SERVICE_HARDENING = (
 # user installer can tell those units from its own.
 SYSTEM_SERVICE_MARKER = "# Inky Bird system service"
 SYSTEMD_UNIT_DIRECTORY = Path("/etc/systemd/system")
+LAUNCH_DAEMON_DIRECTORY = Path("/Library/LaunchDaemons")
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
@@ -398,6 +399,33 @@ def load_private_environment() -> list[str]:
             os.environ[name] = value
             added.append(name)
     return added
+
+
+def system_service_problem(
+    config: AppConfig, install_root: Path, others: Sequence[tuple[str, AppConfig]]
+) -> str | None:
+    """Why this installation would share data or a port with another, if it would.
+
+    A system service's workspace, catalog and state stay under its own install
+    root, so a second installation on the machine (a rehearsal beside
+    production) has its own locks; and no two serve on one port.
+    """
+    root = install_root.resolve()
+    controller = config.controller
+    for name, path in (
+        ("workspace_dir", controller.workspace_dir),
+        ("catalog_dir", controller.catalog_dir),
+        ("state_dir", controller.state_dir),
+    ):
+        if not path.resolve().is_relative_to(root):
+            return f"{name} must be inside {root}, so no other installation shares it"
+    for account, other in others:
+        if other.controller.port == controller.port:
+            return (
+                f"Port {controller.port} is already the port of the installation of "
+                f"{account}; choose another port"
+            )
+    return None
 
 
 def read_account_config(path: Path, owner: int) -> AppConfig:
@@ -978,7 +1006,9 @@ def _native_family(config: AppConfig) -> str | DiagnosticCheck:
 
 
 def _launchd_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
-    prefix = _native_family(config)
+    prefix: str | DiagnosticCheck | None = _system_service_prefix()
+    if prefix is None:
+        prefix = _native_family(config)
     if isinstance(prefix, DiagnosticCheck):
         yield prefix
         return
@@ -1068,19 +1098,26 @@ def _systemd_last_run_check(
 def _system_service_prefix() -> str | None:
     """The account running doctor, when system services were installed for it.
 
-    A system service is named after its account and its units start with
-    SYSTEM_SERVICE_MARKER; run as that account, doctor checks those units.
+    A system service is named after its account: its systemd units start with
+    SYSTEM_SERVICE_MARKER, and its LaunchDaemons run as that account. Run as
+    that account, doctor checks those units or jobs.
     """
     import pwd
 
     try:
         name = pwd.getpwuid(os.getuid()).pw_name
-        unit = SYSTEMD_UNIT_DIRECTORY / f"{name}-controller.service"
-        with unit.open(encoding="utf-8", errors="replace") as handle:
-            first = handle.readline().rstrip("\n")
-    except (KeyError, OSError):
+        if platform.system() == "Darwin":
+            # A LaunchDaemon this installer made runs as the account it is named after.
+            with (LAUNCH_DAEMON_DIRECTORY / f"com.{name}.serve.plist").open("rb") as handle:
+                job = plistlib.load(handle)
+            ours = isinstance(job, dict) and job.get("UserName") == name
+        else:
+            unit = SYSTEMD_UNIT_DIRECTORY / f"{name}-controller.service"
+            with unit.open(encoding="utf-8", errors="replace") as handle:
+                ours = handle.readline().rstrip("\n") == SYSTEM_SERVICE_MARKER
+    except (KeyError, OSError, ValueError, plistlib.InvalidFileException, ExpatError):
         return None
-    return name if first == SYSTEM_SERVICE_MARKER and valid_account_name(name) else None
+    return name if ours and valid_account_name(name) else None
 
 
 def _systemd_controller_checks(config: AppConfig) -> Iterable[DiagnosticCheck]:
