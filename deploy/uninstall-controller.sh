@@ -111,7 +111,8 @@ if [ -n "${service_account}" ]; then
       exit 1
       ;;
     account-home)
-      echo "The home directory of ${service_account} must be ${install_root}/home. No changes made." >&2
+      quoted_install_root=$(printf '%q' "${install_root}")
+      echo "The home directory of ${service_account} must be ${quoted_install_root}/home. No changes made." >&2
       exit 1
       ;;
     root-path)
@@ -119,19 +120,23 @@ if [ -n "${service_account}" ]; then
       exit 1
       ;;
     root-unsafe)
-      echo "${install_root}, or a folder above it, can be changed by someone other than root. No changes made." >&2
+      quoted_install_root=$(printf '%q' "${install_root}")
+      echo "${quoted_install_root}, or a folder above it, can be changed by someone other than root. No changes made." >&2
       exit 1
       ;;
     source-writable)
-      echo "${service_account} can change the source checkout ${root}; use a checkout only root can change. No changes made." >&2
+      quoted_root=$(printf '%q' "${root}")
+      echo "${service_account} can change the source checkout ${quoted_root}; use a checkout only root can change. No changes made." >&2
       exit 1
       ;;
     layout-unsafe)
-      echo "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
+      quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+      echo "${quoted_unsafe_path} must be a folder, not a link: under app owned by root, otherwise by ${service_account}. No changes made." >&2
       exit 1
       ;;
     layout-unreadable)
-      echo "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 (chmod go+rX). No changes made." >&2
+      quoted_unsafe_path=$(printf '%q' "${unsafe_path}")
+      echo "${service_account} cannot read or search ${quoted_unsafe_path}; give its folders mode 0755 (chmod go+rX). No changes made." >&2
       exit 1
       ;;
     *)
@@ -319,7 +324,8 @@ except Exception:
   done
   if [ "${#failures[@]}" -eq 0 ] && { [ -e "${app_dir}" ] || [ -L "${app_dir}" ]; }; then
     if python3 -I "${system_helper}" remove-code "${service_account}" "${install_root}"; then
-      echo "Removed the application code: ${app_dir}"
+      quoted_app_dir=$(printf '%q' "${app_dir}")
+      echo "Removed the application code: ${quoted_app_dir}"
     else
       failures+=("${app_dir}")
     fi
@@ -369,9 +375,11 @@ fi
 echo "Controller ${jobs_kind} uninstalled."
 echo "Intentionally left in place:"
 if [ -n "${service_account}" ]; then
-  echo "  Configuration and private environment file: ${install_root}/config"
-  echo "  Home, state and logs: ${install_root}/home, ${install_root}/state, ${install_root}/logs"
-  echo "  Workspace, state, and catalog directories configured in ${config_path}"
+  quoted_install_root=$(printf '%q' "${install_root}")
+  echo "  Configuration and private environment file: ${quoted_install_root}/config"
+  echo "  Home, state and logs: ${quoted_install_root}/home, ${quoted_install_root}/state, ${quoted_install_root}/logs"
+  quoted_config_path=$(printf '%q' "${config_path}")
+  echo "  Workspace, state, and catalog directories configured in ${quoted_config_path}"
   echo "  The account ${service_account}"
   quoted_root=$(printf '%q' "${install_root}")
   # The group goes too only when it is the account's own: named after it, with
@@ -385,8 +393,10 @@ if [ -n "${service_account}" ]; then
   fi
   exit 0
 fi
-echo "  Application runtime and managed catalog: ${app_dir}"
-echo "  Configuration: ${config_path}"
+quoted_app_dir=$(printf '%q' "${app_dir}")
+echo "  Application runtime and managed catalog: ${quoted_app_dir}"
+quoted_config_path=$(printf '%q' "${config_path}")
+echo "  Configuration: ${quoted_config_path}"
 echo "  Logs and support data: ${support_dir}"
-echo "  Workspace, state, and catalog directories configured in ${config_path}"
+echo "  Workspace, state, and catalog directories configured in ${quoted_config_path}"
 echo "Remove those paths manually if you no longer need the controller data."

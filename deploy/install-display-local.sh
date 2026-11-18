@@ -214,11 +214,13 @@ service="${service_prefix}-display.service"
 timer="${service_prefix}-display.timer"
 
 if [ ! -f "${config_path}" ]; then
-  echo "Display-node configuration is missing: ${config_path}" >&2
+  quoted_config_path=$(printf '%q' "${config_path}")
+  echo "Display-node configuration is missing: ${quoted_config_path}" >&2
   exit 1
 fi
 if [ ! -x "${venv}/bin/python" ]; then
-  echo "Pimoroni Python environment is missing: ${venv}" >&2
+  quoted_venv=$(printf '%q' "${venv}")
+  echo "Pimoroni Python environment is missing: ${quoted_venv}" >&2
   exit 1
 fi
 # Distribution ownership changes only while the display role is quiescent.
@@ -475,15 +477,18 @@ cleanup() {
     report_units || units_restored=false
     if [ -n "${new_runtime}" ] && [ "${new_runtime_in_use}" != true ] && \
         ! rm -rf "${new_runtime}"; then
-      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${new_runtime}" >&2
+      quoted_new_runtime=$(printf '%q' "${new_runtime}")
+      echo "Could not remove what this upgrade added; nothing uses it, so remove it by hand: ${quoted_new_runtime}" >&2
     fi
     if [ "${created_runtimes_dir}" = true ]; then
       rmdir "${runtimes_dir}" 2>/dev/null || true
     fi
     if [ "${new_runtime_shadowed}" = true ]; then
-      echo "The upgrade failed; the display still runs the previous version, and the new version could not be taken out. Rerun the installer to finish; the new version is kept in ${new_runtime}." >&2
+      quoted_new_runtime=$(printf '%q' "${new_runtime}")
+      echo "The upgrade failed; the display still runs the previous version, and the new version could not be taken out. Rerun the installer to finish; the new version is kept in ${quoted_new_runtime}." >&2
     elif [ "${new_runtime_in_use}" = true ]; then
-      echo "The upgrade failed after the new version was installed; the display uses the new version, kept in ${new_runtime}." >&2
+      quoted_new_runtime=$(printf '%q' "${new_runtime}")
+      echo "The upgrade failed after the new version was installed; the display uses the new version, kept in ${quoted_new_runtime}." >&2
     elif [ -n "${installed}" ] && [ "${package_installed}" = true ] && [ "${units_restored}" = true ]; then
       echo "The upgrade failed; the previous version is unchanged." >&2
     fi
@@ -493,25 +498,31 @@ cleanup() {
   elif [ "${status}" -ne 0 ]; then
     echo "The new version is installed, but a final step failed; see the error above." >&2
     if [ -n "${previous_runtime}" ]; then
-      echo "Previous version kept for rollback: ${previous_runtime}" >&2
+      quoted_previous_runtime=$(printf '%q' "${previous_runtime}")
+      echo "Previous version kept for rollback: ${quoted_previous_runtime}" >&2
     fi
   fi
   if [ -n "${package_backup_dir}" ]; then
     if [ "${installation_complete}" != true ] && [ "${old_package_removed}" = true ] && \
         [ "${package_restored}" != true ]; then
-      echo "The previous version's package files could not be put back and are kept in ${package_backup_dir}." >&2
-      echo "Put them back with: ${venv}/bin/python -I ${package_backup_dir}/restore.py ${package_backup_dir}" >&2
+      quoted_package_backup_dir=$(printf '%q' "${package_backup_dir}")
+      echo "The previous version's package files could not be put back and are kept in ${quoted_package_backup_dir}." >&2
+      quoted_venv=$(printf '%q' "${venv}")
+      echo "Put them back with: ${quoted_venv}/bin/python -I ${quoted_package_backup_dir}/restore.py ${quoted_package_backup_dir}" >&2
     elif ! rm -rf "${package_backup_dir}"; then
-      echo "Could not remove the previous version's set-aside package files; remove them by hand: ${package_backup_dir}" >&2
+      quoted_package_backup_dir=$(printf '%q' "${package_backup_dir}")
+      echo "Could not remove the previous version's set-aside package files; remove them by hand: ${quoted_package_backup_dir}" >&2
     fi
   fi
   for kept in "${support_dir}"/previous-package.*; do
     if [ -d "${kept}" ] && [ "${kept}" != "${package_backup_dir}" ]; then
-      echo "Package files an earlier upgrade could not put back are still kept in ${kept}." >&2
+      quoted_kept=$(printf '%q' "${kept}")
+      echo "Package files an earlier upgrade could not put back are still kept in ${quoted_kept}." >&2
     fi
   done
   if [ -n "${work_dir}" ] && ! rm -rf "${work_dir}"; then
-    echo "Could not remove temporary files; remove them by hand: ${work_dir}" >&2
+    quoted_work_dir=$(printf '%q' "${work_dir}")
+    echo "Could not remove temporary files; remove them by hand: ${quoted_work_dir}" >&2
   fi
   if [ -n "${cleanup_stop}" ] && [ "${status}" -eq 0 ]; then
     echo "Stopped while finishing; the new version is installed and running." >&2
@@ -645,13 +656,19 @@ for runtime in "${runtimes_dir}"/*; do
   fi
   # This script and the files it reads are in the runtime it was run from.
   if [ "${runtime}" -ef "${root}" ]; then
-    echo "The runtime this installer ran from is kept in ${runtime}." >&2
+    quoted_runtime=$(printf '%q' "${runtime}")
+    echo "The runtime this installer ran from is kept in ${quoted_runtime}." >&2
   elif ! rm -rf "${runtime}"; then
-    echo "Could not remove an older runtime; remove it by hand: ${runtime}" >&2
+    quoted_runtime=$(printf '%q' "${runtime}")
+    echo "Could not remove an older runtime; remove it by hand: ${quoted_runtime}" >&2
   fi
 done
-echo "Display node installed from ${root} into ${app_dir}."
-echo "Configuration: ${config_path}"
+quoted_root=$(printf '%q' "${root}")
+quoted_app_dir=$(printf '%q' "${app_dir}")
+echo "Display node installed from ${quoted_root} into ${quoted_app_dir}."
+quoted_config_path=$(printf '%q' "${config_path}")
+echo "Configuration: ${quoted_config_path}"
 if [ -n "${previous_runtime}" ]; then
-  echo "Previous version kept for rollback: ${previous_runtime}"
+  quoted_previous_runtime=$(printf '%q' "${previous_runtime}")
+  echo "Previous version kept for rollback: ${quoted_previous_runtime}"
 fi

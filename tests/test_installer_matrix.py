@@ -47,7 +47,8 @@ previous one unchanged or the new one whole, with every unit that starts at
 boot on it; the owner's configuration, private env file and state must be
 unchanged; and a plain rerun must succeed and converge to an upgrade's end
 state (I13), with no work folder of the crashed run left beside the
-configuration (the rerun removes those from before the boot). Crash cases
+configuration, or in a system service's install root (the rerun removes those
+from before the boot). Crash cases
 cover upgrades from ``fresh``, ``single`` and ``staged`` on both controllers'
 user scenarios and system services, with and without the hook: every other
 step in the full matrix, every eighth
@@ -972,11 +973,17 @@ def executable_of(machine: Machine, unit: str) -> Path | None:
     return None
 
 
+def work_parent(machine: Machine) -> Path:
+    """Where an installer keeps its work folders: beside the configuration, or
+    in a system service's install root."""
+    return machine.install_root if machine.install_root is not None else machine.support
+
+
 def stray_paths(machine: Machine) -> set[str]:
     """Staging left where installers stage: temp dirs, link swaps, remote stages."""
     found = {str(path) for path in machine.tmp.iterdir()}
-    found |= {str(path) for path in machine.support.glob("install.*")}
-    found |= {str(path) for path in machine.support.glob("catalog-publish-recovery.*")}
+    found |= {str(path) for path in work_parent(machine).glob("install.*")}
+    found |= {str(path) for path in work_parent(machine).glob("catalog-publish-recovery.*")}
     found |= {str(path) for path in machine.support.glob("previous-package.*")}
     if machine.app.parent.is_dir():
         found |= {str(path) for path in machine.app.parent.glob(".inky-bird-stage.*")}
@@ -1193,6 +1200,9 @@ def check_system(machine: Machine, outcome: Outcome) -> None:
         identity, what, *detail = call[1:]
         if what == "heredoc":
             expected = HEREDOC_IDENTITIES.get(detail[0], "a system mode")
+        elif what == "upgrade-gate" and detail[:1] == ["remove-stale-work"]:
+            # Root's own work folders, in the install root only root can change.
+            expected = "root"
         else:
             expected = SYSTEM_IDENTITIES.get(what, identity)
         if identity != expected:
@@ -1229,8 +1239,8 @@ def check_system(machine: Machine, outcome: Outcome) -> None:
 #   are read by ``UNIT_STATEMENTS``; one they cannot read leaves its unit unnamed.
 CLAIMS = {
     # installed
-    "Controller installed from ${root} into ${app_dir}.": "installed",
-    "Display node installed from ${root} into ${app_dir}.": "installed",
+    "Controller installed from ${quoted_root} into ${quoted_app_dir}.": "installed",
+    "Display node installed from ${quoted_root} into ${quoted_app_dir}.": "installed",
     "Display node deployed to ${remote}.": "installed",
     "Controller installation completed; owner setup is incomplete. Run access setup in a "
     "private terminal. Display and scheduled work continue.": "installed",
@@ -1240,13 +1250,12 @@ CLAIMS = {
     "The new version is installed, but a final step failed; see the error above.": "installed",
     "Stopped while finishing; the new version is installed and running.": "installed",
     # new
-    "Could not switch back to the previous version; the new one is kept in ${new_runtime}.": (
-        "new"
-    ),
+    "Could not switch back to the previous version; the new one is kept in "
+    "${quoted_new_runtime}.": ("new"),
     "Could not switch back to the previous version; the new one stays active, kept in "
-    "${new_runtime}.": "new",
+    "${quoted_new_runtime}.": "new",
     "The upgrade failed after the new version was installed; the display uses the new "
-    "version, kept in ${new_runtime}.": "new",
+    "version, kept in ${quoted_new_runtime}.": "new",
     # previous
     "The upgrade failed; the agents it stopped were started again on the previous version.": (
         "previous"
@@ -1256,9 +1265,9 @@ CLAIMS = {
     ),
     "The upgrade failed; the previous version is running again.": "previous",
     "The upgrade failed; the previous version is unchanged.": "previous",
-    "The upgrade failed; the display still runs the previous version, and the new version "
-    "could not be taken out. Rerun the installer to finish; the new version is kept in "
-    "${new_runtime}.": "previous",
+    "The upgrade failed; the display still runs the previous version, and the new "
+    "version could not be taken out. Rerun the installer to finish; the new version is "
+    "kept in ${quoted_new_runtime}.": "previous",
     # unchanged
     "Not enough remote capacity for isolated source staging and the managed copy: need $3 "
     "KiB, have ${available} KiB. No live runtime changes made.": "unchanged",
@@ -1314,17 +1323,16 @@ CLAIMS = {
     "No changes made.": "unchanged",
     "The account ${service_account} can log in; give it the shell /usr/sbin/nologin. "
     "No changes made.": "unchanged",
-    "The home directory of ${service_account} must be ${install_root}/home. No changes made.": (
-        "unchanged"
-    ),
+    "The home directory of ${service_account} must be ${quoted_install_root}/home. No "
+    "changes made.": ("unchanged"),
     "--install-root must be an absolute path without . or .. parts, other than /. "
     "No changes made.": "unchanged",
-    "${install_root}, or a folder above it, can be changed by someone other than root. "
-    "No changes made.": "unchanged",
-    "${service_account} can change the source checkout ${root}; use a checkout only root can "
-    "change. No changes made.": "unchanged",
-    "${unsafe_path} must be a folder, not a link: under app owned by root, otherwise by "
-    "${service_account}. No changes made.": "unchanged",
+    "${quoted_install_root}, or a folder above it, can be changed by someone other than "
+    "root. No changes made.": "unchanged",
+    "${service_account} can change the source checkout ${quoted_root}; use a checkout "
+    "only root can change. No changes made.": "unchanged",
+    "${quoted_unsafe_path} must be a folder, not a link: under app owned by root, "
+    "otherwise by ${service_account}. No changes made.": "unchanged",
     "Could not check the service account. No changes made.": "unchanged",
     # unchanged: system-service mode on macOS
     "${plist##*/} is a system service of ${owner}. Run the installer again with "
@@ -1336,9 +1344,9 @@ CLAIMS = {
     "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; this installer does "
     "not move it. Remove it with deploy/uninstall-controller.sh run as that user, then run "
     "this again. No changes made.": "unchanged",
-    "${service_account} cannot read or search ${unsafe_path}; give its folders mode 0755 "
-    "(chmod go+rX). No changes made.": "unchanged",
-    "${service_account} cannot read ${unsafe_path} in the new version. No changes made.": (
+    "${service_account} cannot read or search ${quoted_unsafe_path}; give its folders "
+    "mode 0755 (chmod go+rX). No changes made.": "unchanged",
+    "${service_account} cannot read ${quoted_unsafe_path} in the new version. No changes made.": (
         "unchanged"
     ),
     "${service_prefix}-${name}.service was installed by the user installer for ${owner}; this "
@@ -1370,14 +1378,14 @@ CLAIMS = {
     "Controller services uninstalled.": "uninstalled",
     "Display node services uninstalled.": "uninstalled",
     # neutral
-    "  Application runtime and catalog copy: ${app_dir}": "neutral",
-    "  Application runtime and managed catalog: ${app_dir}": "neutral",
-    "  Configuration: ${config_path}": "neutral",
-    "  Display state directory configured in ${config_path}": "neutral",
+    "  Application runtime and catalog copy: ${quoted_app_dir}": "neutral",
+    "  Application runtime and managed catalog: ${quoted_app_dir}": "neutral",
+    "  Configuration: ${quoted_config_path}": "neutral",
+    "  Display state directory configured in ${quoted_config_path}": "neutral",
     "  Logs and support data: ${support_dir}": "neutral",
-    "  Pimoroni Python environment: ${venv}": "neutral",
+    "  Pimoroni Python environment: ${quoted_venv}": "neutral",
     "  Support data: ${support_dir}": "neutral",
-    "  Workspace, state, and catalog directories configured in ${config_path}": "neutral",
+    "  Workspace, state, and catalog directories configured in ${quoted_config_path}": "neutral",
     "Administrator access is required to install system services.": "neutral",
     "Administrator access is required to install the display service.": "neutral",
     "Booted out LaunchAgent: ${agent}": "neutral",
@@ -1385,43 +1393,44 @@ CLAIMS = {
     "Cannot determine remote staging capacity.": "neutral",
     "Check them with: systemctl status ${changed[*]}": "neutral",
     "Check them with: systemctl status ${differ[*]}": "neutral",
-    "Configuration: ${config_path}": "neutral",
-    "Controller configuration is missing: ${config_path}": "neutral",
+    "Configuration: ${quoted_config_path}": "neutral",
+    "Controller configuration is missing: ${quoted_config_path}": "neutral",
     "Controller installer currently supports macOS.": "neutral",
     "Controller installer requires Linux with systemd.": "neutral",
     "Controller uninstaller currently supports macOS.": "neutral",
     "Controller uninstaller requires Linux with systemd.": "neutral",
     "Could not fetch bird observations yet. The scheduled refresh will try again.": "neutral",
-    "Could not remove an older runtime; remove it by hand: ${runtime}": "neutral",
+    "Could not remove an older runtime; remove it by hand: ${quoted_runtime}": "neutral",
     "Could not remove isolated public-source staging; remove it after reconnecting: "
-    "${remote_stage}": "neutral",
-    "Could not remove temporary files; remove them by hand: ${reply_dir}": "neutral",
-    "Could not remove temporary files; remove them by hand: ${work_dir}": "neutral",
+    "${quoted_remote_stage}": "neutral",
+    "Could not remove temporary files; remove them by hand: ${quoted_reply_dir}": "neutral",
+    "Could not remove temporary files; remove them by hand: ${quoted_work_dir}": "neutral",
     "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
-    "${leftovers[*]}": "neutral",
+    "${quoted_leftovers% }": "neutral",
     "The previous version's package files could not be put back and are kept in "
-    "${package_backup_dir}.": "neutral",
-    "Put them back with: ${venv}/bin/python -I ${package_backup_dir}/restore.py "
-    "${package_backup_dir}": "neutral",
-    "Could not remove the previous version's set-aside package files; remove them by hand: "
-    "${package_backup_dir}": "neutral",
-    "Package files an earlier upgrade could not put back are still kept in ${kept}.": "neutral",
-    "The runtime this installer ran from is kept in ${runtime}.": "neutral",
+    "${quoted_package_backup_dir}.": "neutral",
+    "Put them back with: ${quoted_venv}/bin/python -I "
+    "${quoted_package_backup_dir}/restore.py ${quoted_package_backup_dir}": "neutral",
+    "Could not remove the previous version's set-aside package files; remove them by "
+    "hand: ${quoted_package_backup_dir}": "neutral",
+    "Package files an earlier upgrade could not put back are still kept in "
+    "${quoted_kept}.": "neutral",
+    "The runtime this installer ran from is kept in ${quoted_runtime}.": "neutral",
     "Could not remove what this upgrade added; nothing uses it, so remove it by hand: "
-    "${new_runtime}": "neutral",
-    "Display deployment key is missing: ${ssh_key}": "neutral",
+    "${quoted_new_runtime}": "neutral",
+    "Display deployment key is missing: ${quoted_ssh_key}": "neutral",
     "Display installer requires Linux with systemd.": "neutral",
     "Display uninstaller requires Linux with systemd.": "neutral",
-    "Display-node configuration is missing: ${config_path}": "neutral",
+    "Display-node configuration is missing: ${quoted_config_path}": "neutral",
     "Fix the cause shown above and run the uninstaller again.": "neutral",
     "INKY_BIRD_NONINTERACTIVE_SUDO must be true or false.": "neutral",
     "INKY_BIRD_RUN_INITIAL_DISPLAY must be true or false.": "neutral",
     "Intentionally left in place:": "neutral",
     "LaunchAgent is not loaded: ${agent}": "neutral",
-    "Logs: ${log_dir}": "neutral",
-    "Pimoroni Python environment is missing: ${venv}": "neutral",
+    "Logs: ${quoted_log_dir}": "neutral",
+    "Pimoroni Python environment is missing: ${quoted_venv}": "neutral",
     "Plist is not installed: ${plist}": "neutral",
-    "Previous version kept for rollback: ${previous_runtime}": "neutral",
+    "Previous version kept for rollback: ${quoted_previous_runtime}": "neutral",
     "Reloaded the systemd unit configuration.": "neutral",
     "Remote application, config and venv paths must be absolute, single-line paths.": "neutral",
     "Remote staging did not return a recognized private temporary directory.": "neutral",
@@ -1430,7 +1439,7 @@ CLAIMS = {
     "Removed /etc/systemd/system/${unit}.": "neutral",
     "Removed plist: ${plist}": "neutral",
     "Run the uninstaller again to finish.": "neutral",
-    "Start each with: launchctl bootstrap ${domain} ${agents_dir}/<agent>.plist": "neutral",
+    "Start each with: launchctl bootstrap ${domain} ${quoted_agents_dir}/<agent>.plist": "neutral",
     "Start them with: sudo systemctl start ${stopped[*]}": "neutral",
     "Stop each with: launchctl bootout ${domain}/<agent>": "neutral",
     "Stop them with: sudo systemctl stop ${running[*]}": "neutral",
@@ -1439,13 +1448,12 @@ CLAIMS = {
     "Stopped and disabled $1.": "neutral",
     "Stopped and disabled ${unit}.": "neutral",
     "Booted out LaunchDaemon: ${daemon}": "neutral",
-    "Removed the application code: ${app_dir}": "neutral",
+    "Removed the application code: ${quoted_app_dir}": "neutral",
     "Could not hold the writer locks again; the code was not removed. Run the uninstaller "
     "again to finish.": "neutral",
-    "  Configuration and private environment file: ${install_root}/config": "neutral",
-    "  Home, state and logs: ${install_root}/home, ${install_root}/state, ${install_root}/logs": (
-        "neutral"
-    ),
+    "  Configuration and private environment file: ${quoted_install_root}/config": "neutral",
+    "  Home, state and logs: ${quoted_install_root}/home, ${quoted_install_root}/state, "
+    "${quoted_install_root}/logs": "neutral",
     "  The account ${service_account}": "neutral",
     "Once you no longer need the controller data, remove them with: sudo rm -R "
     "${quoted_root} && sudo userdel ${service_account}": "neutral",
@@ -1457,7 +1465,7 @@ CLAIMS = {
     "The group ${quoted_group} is not the account's own, so it is left alone.": "neutral",
     "Stopped and disabled ${service_prefix}-display.timer.": "neutral",
     "The new version could not refresh bird observations; see the error above.": "neutral",
-    "The previous version is kept in ${legacy_runtime}.": "neutral",
+    "The previous version is kept in ${quoted_legacy_runtime}.": "neutral",
     "The upgrade failed and these agents are not running: ${unrestored[*]}.": "neutral",
     "The upgrade failed and these agents could not be stopped: ${still_running[*]}.": "neutral",
     "The upgrade failed and these services are stopped: ${stopped[*]}.": "neutral",
@@ -1465,9 +1473,9 @@ CLAIMS = {
     "These display services are not as they were before the upgrade: ${differ[*]}.": "neutral",
     "These services are not set up as they were before the upgrade: ${changed[*]}.": "neutral",
     "These services could not be stopped or disabled and may still run the new version, "
-    "kept in ${new_runtime}: ${stuck_units[*]}.": "neutral",
+    "kept in ${quoted_new_runtime}: ${stuck_units[*]}.": "neutral",
     "These services were restarted on the new version: ${restarted[*]}.": "neutral",
-    "They may still run the new version, kept in ${new_runtime}.": "neutral",
+    "They may still run the new version, kept in ${quoted_new_runtime}.": "neutral",
     "Timed out waiting for ${service} to finish.": "neutral",
     "Uninstall did not finish. Could not remove: ${failures[*]}.": "neutral",
     "Uninstall did not finish. Could not stop or remove: ${failures[*]}.": "neutral",
@@ -1477,7 +1485,7 @@ CLAIMS = {
     "switching to the new version.": "neutral",
     "Could not hold the writer locks again; the upgrade stopped before switching to the new "
     "version.": "neutral",
-    "Running the stopped-boundary hook: ${stopped_hook}": "neutral",
+    "Running the stopped-boundary hook: ${quoted_stopped_hook}": "neutral",
     "The stopped-boundary hook is no longer safe to run; the upgrade did not switch to the new "
     "version.": "neutral",
     "The stopped-boundary hook did not finish within ${stopped_hook_timeout} seconds and was "
@@ -1486,12 +1494,11 @@ CLAIMS = {
     "the new version.": "neutral",
     "The new version started, but its web service failed its health check.": "neutral",
     "${unit} did not begin to stop.": "neutral",
-    "${service_account} cannot reach ${unsafe_path}; set TMPDIR to a folder it can search, "
-    "such as /tmp.": "neutral",
+    "${service_account} cannot reach ${quoted_unsafe_path}. No changes made.": "unchanged",
     "Processes of ${service_account} still run after its services stopped; the upgrade did "
     "not switch to the new version.": "neutral",
-    "${service_account} could change ${unsafe_path}; the upgrade did not switch to the new "
-    "version.": "neutral",
+    "${service_account} could change ${quoted_unsafe_path}; the upgrade did not switch "
+    "to the new version.": "neutral",
 }
 CLAIM_CLASSES = ("installed", "new", "previous", "unchanged", "uninstalled", "neutral")
 # A shell expansion in a printed line: ${name}, ${name[*]-default}, $name or $1.
@@ -2515,7 +2522,9 @@ class Group:
         if len(after.runtimes) > 2:
             report.append(f"I13: after the rerun {len(after.runtimes)} runtimes remain")
         left = sorted(
-            path.name for pattern in WORK_DIR_PATTERNS for path in machine.support.glob(pattern)
+            path.name
+            for pattern in WORK_DIR_PATTERNS
+            for path in work_parent(machine).glob(pattern)
         )
         if left:
             report.append(f"I13: after the rerun the crashed run's work folders remain: {left}")
@@ -2576,7 +2585,7 @@ def reboot(machine: Machine) -> None:
     shutil.rmtree(machine.fake / "steps.lock", ignore_errors=True)
     # Everything on disk predates the boot, whatever this machine's clock says.
     for pattern in WORK_DIR_PATTERNS:
-        for path in machine.support.glob(pattern):
+        for path in work_parent(machine).glob(pattern):
             os.utime(path, (0, 0), follow_symlinks=False)
     for path in machine.tmp.iterdir() if machine.tmp.is_dir() else ():
         if path.is_dir() and not path.is_symlink():

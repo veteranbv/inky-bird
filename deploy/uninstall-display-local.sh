@@ -107,9 +107,12 @@ if [ "${#failures[@]}" -gt 0 ]; then
 fi
 echo "Display node services uninstalled."
 echo "Intentionally left in place:"
-echo "  Application runtime and catalog copy: ${app_dir}"
-echo "  Configuration: ${config_path}"
+quoted_app_dir=$(printf '%q' "${app_dir}")
+echo "  Application runtime and catalog copy: ${quoted_app_dir}"
+quoted_config_path=$(printf '%q' "${config_path}")
+echo "  Configuration: ${quoted_config_path}"
 echo "  Support data: ${support_dir}"
-echo "  Pimoroni Python environment: ${venv}"
-echo "  Display state directory configured in ${config_path}"
+quoted_venv=$(printf '%q' "${venv}")
+echo "  Pimoroni Python environment: ${quoted_venv}"
+echo "  Display state directory configured in ${quoted_config_path}"
 echo "Remove those paths manually if you no longer need the display data."

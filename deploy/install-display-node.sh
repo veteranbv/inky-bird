@@ -13,7 +13,8 @@ remote="${display_user}@${display_host}"
 ssh_options=(-i "${ssh_key}" -o BatchMode=yes -o IdentitiesOnly=yes)
 
 if [ ! -f "${ssh_key}" ]; then
-  echo "Display deployment key is missing: ${ssh_key}" >&2
+  quoted_ssh_key=$(printf '%q' "${ssh_key}")
+  echo "Display deployment key is missing: ${quoted_ssh_key}" >&2
   exit 1
 fi
 
@@ -86,12 +87,14 @@ cleanup() {
   trap 'cleanup_stop=130' INT
   trap 'cleanup_stop=143' TERM
   if [ -n "${reply_dir}" ] && ! rm -rf "${reply_dir}"; then
-    echo "Could not remove temporary files; remove them by hand: ${reply_dir}" >&2
+    quoted_reply_dir=$(printf '%q' "${reply_dir}")
+    echo "Could not remove temporary files; remove them by hand: ${quoted_reply_dir}" >&2
   fi
   # Only the exact path this invocation asked to create, never one that existed.
   if [ "${stage_requested}" = true ] && [ "${stage_foreign}" != true ] && \
       ! remote_command rm -rf -- "${remote_stage}"; then
-    echo "Could not remove isolated public-source staging; remove it after reconnecting: ${remote_stage}" >&2
+    quoted_remote_stage=$(printf '%q' "${remote_stage}")
+    echo "Could not remove isolated public-source staging; remove it after reconnecting: ${quoted_remote_stage}" >&2
   fi
   if [ -n "${cleanup_stop}" ] && [ "${status}" -eq 0 ]; then
     echo "Stopped while finishing; the new version is installed and running." >&2

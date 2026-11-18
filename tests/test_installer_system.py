@@ -53,7 +53,11 @@ def identities(host: Host) -> dict[str, set[str]]:
     found: dict[str, set[str]] = {}
     for call in host.calls():
         if call[0] == "as":
-            what = call[2] if call[2] != "heredoc" else f"heredoc {call[3]}"
+            what = call[2]
+            # The heredoc's modes, and root's own clean-up of its work folders,
+            # run as their own identities.
+            if what == "heredoc" or call[2:4] == ["upgrade-gate", "remove-stale-work"]:
+                what = f"{what} {call[3]}"
             found.setdefault(what, set()).add(call[1])
     return found
 
@@ -77,6 +81,7 @@ def test_a_fresh_install_keeps_the_code_root_s_and_runs_the_application_as_the_a
     result = run_system(host)
     assert result.returncode == 0, result.stdout + result.stderr
     ran = identities(host)
+    assert ran["upgrade-gate remove-stale-work"] == {"root"}
     for what in ("inky-bird", "upgrade-gate", "heredoc sync"):
         assert ran[what] == {"account"}, what
     for what in ("uv", "systemctl", "rsync", "chown", "heredoc render"):
@@ -514,3 +519,18 @@ def test_the_interpreter_uv_downloads_is_code_the_account_cannot_change(tmp_path
     # An upgrade, with the interpreter already there, also succeeds.
     result = run_system(host)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_root_s_work_folders_from_before_the_boot_are_removed_from_the_install_root(
+    tmp_path: Path,
+) -> None:
+    host = system_host(tmp_path)
+    assert host.install_root is not None
+    assert run_system(host).returncode == 0
+    stale = host.install_root / "install.stale"
+    stale.mkdir()
+    os.utime(stale, (0, 0))
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stale.exists()
+    assert not list(host.install_root.glob("install.*"))

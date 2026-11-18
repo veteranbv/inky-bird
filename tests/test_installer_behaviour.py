@@ -1770,3 +1770,56 @@ def test_display_failed_package_install_keeps_the_old_distribution(tmp_path: Pat
     removals = [call for call in host.calls() if call[0] == "remove-distribution"]
     assert removals in ([], [["remove-distribution", "inky-bird", "inky-bird-frame"]])
     assert "# old" in host.unit_text("display.timer")
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_printed_paths_are_quoted_so_a_command_with_them_can_be_pasted(
+    tmp_path: Path, system: str
+) -> None:
+    """A folder with a space in its name, as macOS's Application Support has,
+    prints shell-quoted: the path read back from the output is the real one."""
+    import shlex
+
+    host = controller_host(tmp_path, system)
+    spaced = host.support.parent / "Application Support" / "inky bird's"
+    spaced.parent.mkdir()
+    host.support.rename(spaced)
+    host.support, host.config = spaced, spaced / "config.toml"
+    result = run_controller(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    (line,) = [line for line in result.stdout.splitlines() if line.startswith("Configuration: ")]
+    assert shlex.split(line.removeprefix("Configuration: ")) == [str(host.config)]
+    # Its work folder, beside the configuration, is gone again.
+    assert not list(spaced.glob("install.*"))
+
+    host.config.unlink()
+    result = run_controller(host)
+    assert result.returncode == 1
+    (line,) = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("Controller configuration is missing: ")
+    ]
+    printed = line.removeprefix("Controller configuration is missing: ")
+    assert shlex.split(printed) == [str(host.config)]
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+@pytest.mark.parametrize("locks", ["held", "unavailable"])
+def test_work_folders_from_before_the_boot_are_removed_only_with_the_locks_held(
+    tmp_path: Path, system: str, locks: str
+) -> None:
+    """A power loss leaves the work folder beside the configuration; the next
+    run removes it, unless the installed version could not hold the locks."""
+    host = controller_host(tmp_path, system)
+    stale = host.support / "install.stale"
+    (stale / "units").mkdir(parents=True)
+    os.utime(stale, (0, 0))
+    current = host.support / "install.current"
+    current.mkdir()
+    if locks == "unavailable":
+        host.fail("old:load_config")
+    result = run_controller(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stale.exists() == (locks == "unavailable")
+    assert current.is_dir()
