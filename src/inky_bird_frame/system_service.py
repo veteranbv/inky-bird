@@ -11,6 +11,11 @@ with fixed keys and shell-quoted values; it never changes anything.
 ``contained`` checks a path root is about to delete, move or replace.
 ``verify-code`` checks that the account cannot change the code it runs.
 ``readable`` checks that the account can reach and read a path and all it holds.
+``run-as`` replaces itself with a command run as the account, as ``setpriv``
+does on Linux: macOS has no setpriv, and ``sudo -u`` keeps its own process
+between the installer and the command (and may give it a terminal of its own),
+so the installer could not stop the command by its process group or know its
+process ID.
 """
 
 from __future__ import annotations
@@ -326,8 +331,30 @@ def _assignments(values: dict[str, str]) -> str:
     return "".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items())
 
 
+def run_as(name: str, command: list[str]) -> int:
+    """Become the account, for good, and run ``command`` in this process."""
+    account = lookup_account(name)
+    if account is None or not command:
+        return 1
+    os.initgroups(name, account.gid)
+    os.setgid(account.gid)
+    os.setuid(account.uid)
+    if os.getuid() != account.uid or os.geteuid() != account.uid:
+        return 1
+    try:
+        os.setuid(0)
+    except PermissionError:
+        os.execvp(command[0], command)
+    return 1
+
+
 def main(arguments: list[str]) -> int:
     command, *rest = arguments
+    if command == "run-as":
+        name, separator, *program = rest
+        if separator != "--":
+            return 64
+        return run_as(name, program)
     if command == "preflight":
         name, install_root, source = rest
         print(_assignments(preflight(name, Path(install_root), Path(source))), end="")

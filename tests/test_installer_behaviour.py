@@ -467,6 +467,9 @@ class Host:
         self.support = self.install_root / "config"
         self.config = self.support / "config.toml"
         self.state = self.install_root / "state"
+        if self.system == "Darwin":
+            # A system service's jobs are LaunchDaemons.
+            self.agents = self.fake / "LaunchDaemons"
 
     def make_system(self, account: str = SYSTEM_ACCOUNT, uid: int = 2001) -> None:
         """Add ``account`` and the configuration it owns, as the docs have the

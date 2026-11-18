@@ -528,7 +528,7 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         env:
           INKY_INSTALLER_MATRIX: full
-          INKY_INSTALLER_MATRIX_ONLY: "install:macos:*,install:macos-hook:*,uninstall:macos:*"
+          INKY_INSTALLER_MATRIX_ONLY: "install:macos:*,install:macos-hook:*,install:macos-system:*,install:macos-system-hook:*,uninstall:macos:*"
           INKY_MATRIX_SHARD: ${{ matrix.shard }}/2
           INKY_MATRIX_WORKERS: "4"
         run: uv run pytest tests/test_installer_matrix.py -p no:cacheprovider
