@@ -5,6 +5,8 @@ if [ "$(uname -s)" != "Darwin" ]; then
   echo "Controller uninstaller currently supports macOS." >&2
   exit 1
 fi
+# Printed commands quote what they name, so one can be pasted as it is.
+script_command=$(printf '%q' "$0")
 
 # --- system-service mode -----------------------------------------------------
 # Options are only those of a system service: without them, the uninstaller
@@ -36,7 +38,7 @@ if [ -n "${install_root}" ] && [ -z "${service_account}" ]; then
   exit 1
 fi
 if [ -n "${service_account}" ] && [ "$(id -u)" != 0 ]; then
-  echo "Remove system services as root: sudo $0 --service-account NAME. No changes made." >&2
+  echo "Remove system services as root: sudo ${script_command} --service-account NAME. No changes made." >&2
   exit 1
 fi
 
@@ -186,12 +188,16 @@ if [ -n "${service_account}" ]; then
       if ! kill -0 "${lock_pid}" 2>/dev/null; then
         wait "${lock_pid}" || status=$?
         lock_pid=""
-        if [ "${status}" -ne 0 ] && [ "${1:-}" = again ]; then
+        # Without the ready file nothing is held, whatever the exit status.
+        if [ "${1:-}" = again ]; then
           echo "Could not hold the writer locks again; the code was not removed. Run the uninstaller again to finish." >&2
           exit 1
         fi
         case "${status}" in
-          0) return 0 ;;
+          0)
+            echo "The installed version cannot read its configuration, so the uninstaller cannot check for running work. Fix the configuration so the installed version can read it, then run the uninstaller again. No changes made." >&2
+            exit 1
+            ;;
           3)
             echo "A plate is still being made. Run the uninstaller again after it finishes. No changes made." >&2
             exit 3
@@ -367,7 +373,16 @@ if [ -n "${service_account}" ]; then
   echo "  Home, state and logs: ${install_root}/home, ${install_root}/state, ${install_root}/logs"
   echo "  Workspace, state, and catalog directories configured in ${config_path}"
   echo "  The account ${service_account}"
-  echo "Once you no longer need the controller data, remove them with: sudo rm -R ${install_root} && sudo dscl . -delete /Users/${service_account} && sudo dscl . -delete /Groups/${account_group}"
+  quoted_root=$(printf '%q' "${install_root}")
+  # The group goes too only when it is the account's own: named after it, with
+  # no other member and no other account in it.
+  if python3 -I "${system_helper}" own-group "${service_account}" "${install_root}"; then
+    echo "Once you no longer need the controller data, remove them with: sudo rm -R ${quoted_root} && sudo dscl . -delete /Users/${service_account} && sudo dscl . -delete /Groups/${service_account}"
+  else
+    quoted_group=$(printf '%q' "${account_group}")
+    echo "Once you no longer need the controller data, remove them with: sudo rm -R ${quoted_root} && sudo dscl . -delete /Users/${service_account}"
+    echo "The group ${quoted_group} is not the account's own, so it is left alone."
+  fi
   exit 0
 fi
 echo "  Application runtime and managed catalog: ${app_dir}"

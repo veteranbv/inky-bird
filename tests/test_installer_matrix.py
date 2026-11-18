@@ -1264,9 +1264,8 @@ CLAIMS = {
     # unchanged: system-service mode
     "${unit##*/} is a system service of ${owner}. Run the installer again with "
     "--service-account ${owner}. No changes made.": "unchanged",
-    "Install system services as root: sudo $0 --service-account NAME. No changes made.": (
-        "unchanged"
-    ),
+    "Install system services as root: sudo ${script_command} --service-account NAME. "
+    "No changes made.": "unchanged",
     "--install-root needs --service-account. No changes made.": "unchanged",
     "--service-account must be inky-bird, or inky-bird- followed by lowercase letters and "
     "digits. No changes made.": "unchanged",
@@ -1293,8 +1292,8 @@ CLAIMS = {
     # unchanged: system-service mode on macOS
     "${plist##*/} is a system service of ${owner}. Run the installer again with "
     "--service-account ${owner}. No changes made.": "unchanged",
-    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo $0 "
-    "--service-account ${family}. No changes made.": "unchanged",
+    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo "
+    "${script_command} --service-account ${family}. No changes made.": "unchanged",
     "The account ${service_account} can log in; give it the shell /usr/bin/false. "
     "No changes made.": "unchanged",
     "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; this installer does "
@@ -1309,10 +1308,13 @@ CLAIMS = {
     "installer does not move it. Remove it with deploy/uninstall-controller-systemd.sh run as "
     "${owner}, then run this again. No changes made.": "unchanged",
     "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: "
-    "sudo $0 --service-account ${owner}. No changes made.": "unchanged",
+    "sudo ${script_command} --service-account ${owner}. No changes made.": "unchanged",
     # unchanged: system-service uninstall
     "A plate is still being made. Run the uninstaller again after it finishes. "
     "No changes made.": "unchanged",
+    "The installed version cannot read its configuration, so the uninstaller cannot check for "
+    "running work. Fix the configuration so the installed version can read it, then run the "
+    "uninstaller again. No changes made.": "unchanged",
     "Other work is still running. Run the uninstaller again after it finishes. "
     "No changes made.": "unchanged",
     "${unit} was installed by the user installer; remove it with "
@@ -1320,9 +1322,8 @@ CLAIMS = {
     "${unit} runs as ${owner:-root}, not ${service_account}. No changes made.": "unchanged",
     "${service_prefix}-${name}.service is still running. Run the uninstaller again after it "
     "finishes. No changes made.": "unchanged",
-    "Remove system services as root: sudo $0 --service-account NAME. No changes made.": (
-        "unchanged"
-    ),
+    "Remove system services as root: sudo ${script_command} --service-account NAME. "
+    "No changes made.": "unchanged",
     "com.${service_prefix}.${label} does not run as ${service_account}; it is not this "
     "installation's. No changes made.": "unchanged",
     "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; remove it with "
@@ -1410,10 +1411,13 @@ CLAIMS = {
     ),
     "  The account ${service_account}": "neutral",
     "Once you no longer need the controller data, remove them with: sudo rm -R "
-    "${install_root} && sudo userdel ${service_account}": "neutral",
+    "${quoted_root} && sudo userdel ${service_account}": "neutral",
     "Once you no longer need the controller data, remove them with: sudo rm -R "
-    "${install_root} && sudo dscl . -delete /Users/${service_account} && sudo dscl . -delete "
-    "/Groups/${account_group}": "neutral",
+    "${quoted_root} && sudo dscl . -delete /Users/${service_account} && sudo dscl . -delete "
+    "/Groups/${service_account}": "neutral",
+    "Once you no longer need the controller data, remove them with: sudo rm -R "
+    "${quoted_root} && sudo dscl . -delete /Users/${service_account}": "neutral",
+    "The group ${quoted_group} is not the account's own, so it is left alone.": "neutral",
     "Stopped and disabled ${service_prefix}-display.timer.": "neutral",
     "The new version could not refresh bird observations; see the error above.": "neutral",
     "The previous version is kept in ${legacy_runtime}.": "neutral",

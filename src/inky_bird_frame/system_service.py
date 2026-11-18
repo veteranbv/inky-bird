@@ -12,6 +12,7 @@ with fixed keys and shell-quoted values; it never changes anything.
 ``verify-code`` checks that the account cannot change the code it runs.
 ``readable`` checks that the account can reach and read a path and all it holds.
 ``remove-code`` deletes the code under the install root, for an uninstall.
+``own-group`` says whether the account's primary group is its own alone.
 ``run-as`` replaces itself with a command run as the account, as ``setpriv``
 does on Linux: macOS has no setpriv, and ``sudo -u`` keeps its own process
 between the installer and the command (and may give it a terminal of its own),
@@ -332,6 +333,17 @@ def _assignments(values: dict[str, str]) -> str:
     return "".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items())
 
 
+def own_group(account: Account) -> bool:
+    """Whether the account's primary group is its own: named after it, with no
+    other member and no other account whose primary group it is."""
+    try:
+        members = set(grp.getgrgid(account.gid).gr_mem)
+    except KeyError:
+        return False
+    others = {entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == account.gid}
+    return account.group == account.name and members | others <= {account.name}
+
+
 def remove_code(install_root: Path, account: Account) -> bool:
     """Delete ``<install root>/app``, if it is still the real folder root's
     code is in: checked and removed here in one step, without following links."""
@@ -380,12 +392,14 @@ def main(arguments: list[str]) -> int:
         name, install_root, source = rest
         print(_assignments(preflight(name, Path(install_root), Path(source))), end="")
         return 0
-    if command in ("contained", "verify-code", "readable", "remove-code"):
+    if command in ("contained", "verify-code", "readable", "remove-code", "own-group"):
         name, install_root, *paths = rest
         account = lookup_account(name)
         if account is None:
             return 1
         root = Path(install_root)
+        if command == "own-group":
+            return 0 if own_group(account) else 1
         if command == "remove-code":
             return 0 if remove_code(root, account) else 1
         if command == "readable":

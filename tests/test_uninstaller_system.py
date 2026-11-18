@@ -141,6 +141,9 @@ REFUSALS = [
     ("missing", "does not exist"),
     ("user-units", "was installed by the user installer"),
     ("busy", "A plate is still being made. Run the uninstaller again after it finishes."),
+    # The lock helper cannot load the config, so it holds nothing: a writer
+    # still running with its old config could be stopped mid-write.
+    ("unreadable-config", "The installed version cannot read its configuration"),
 ]
 
 
@@ -167,6 +170,10 @@ def test_each_refusal_is_one_line_and_changes_nothing(
             pytest.skip("a LaunchDaemon is never the user installer's")
         for unit in host.units.iterdir():
             unit.write_text(unit.read_text().replace("# Inky Bird system service\n", ""))
+    elif case == "unreadable-config":
+        # The fake configuration loader of the installed version rejects it.
+        (tag_file,) = host.app.rglob("runtime-tag")
+        host.fail(f"{tag_file.read_text().strip()}:load_config")
     before = (jobs(host, "inky-bird"), code(host), host.state_of("launchd"))
     systemd = host.state_of("systemd")
     if case == "busy":
@@ -180,7 +187,8 @@ def test_each_refusal_is_one_line_and_changes_nothing(
     assert result.returncode in (1, 3), output
     # The lock helper says what it waited for; the refusal is the last line.
     lines = output.splitlines()
-    assert message in lines[-1] and (case == "busy" or len(lines) == 1), output
+    single = case not in ("busy", "unreadable-config")
+    assert message in lines[-1] and (not single or len(lines) == 1), output
     assert output.rstrip().endswith("No changes made."), output
     assert (
         jobs(host, "inky-bird"),
@@ -207,3 +215,52 @@ def test_a_job_that_will_not_stop_keeps_the_code_and_a_rerun_finishes(
     result = uninstall(host)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not jobs(host, "inky-bird") and not host.app.exists()
+
+
+def test_printed_removal_commands_quote_an_install_root_with_a_space_and_a_quote(
+    tmp_path: Path,
+) -> None:
+    import shlex
+
+    for system in SYSTEMS:
+        host = installed(tmp_path / system, system)
+        # Move the installation to a root with a space and a quote in it: the
+        # fakes' web service cannot start from one, but an uninstall can run there.
+        assert host.install_root is not None
+        old = str(host.install_root)
+        new = host.install_root.parent / "it's here" / "inky-bird"
+        new.parent.mkdir()
+        host.install_root.rename(new)
+        accounts = host.state_of("accounts")
+        accounts["inky-bird"]["home"] = str(new / "home")
+        host.save_state("accounts", accounts)
+        owners = host.state_of("owners")
+        host.save_state("owners", {key.replace(old, str(new)): v for key, v in owners.items()})
+        host.install_root, host.app = new, new / "app"
+        result = uninstall(host)
+        assert result.returncode == 0, result.stdout + result.stderr
+        (line,) = [line for line in result.stdout.splitlines() if "sudo rm -R" in line]
+        command = line.split("remove them with: ", 1)[1]
+        words = shlex.split(command)
+        assert words[:3] == ["sudo", "rm", "-R"] and words[3] == str(host.install_root)
+        refused = uninstall(host, uid="1000")
+        script = shlex.split(refused.stderr.split("as root: ", 1)[1])[1]
+        assert script == str(host.script(UNINSTALLERS[system]))
+
+
+def test_the_group_is_named_for_deletion_only_when_it_is_the_account_s_own(
+    tmp_path: Path,
+) -> None:
+    host = installed(tmp_path, "Darwin")
+    accounts = host.state_of("accounts")
+    shared = dict(accounts["inky-bird"], home=str(tmp_path / "other"))
+    accounts["inky-bird-other"] = shared
+    host.save_state("accounts", accounts)
+    result = uninstall(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "/Groups/" not in result.stdout
+    assert "The group inky-bird is not the account's own, so it is left alone." in result.stdout
+    del accounts["inky-bird-other"]
+    host.save_state("accounts", accounts)
+    again = uninstall(host)
+    assert "sudo dscl . -delete /Groups/inky-bird" in again.stdout
