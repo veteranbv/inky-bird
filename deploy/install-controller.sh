@@ -5,6 +5,8 @@ if [ "$(uname -s)" != "Darwin" ]; then
   echo "Controller installer currently supports macOS." >&2
   exit 1
 fi
+# Printed commands quote what they name, so one can be pasted as it is.
+script_command=$(printf '%q' "$0")
 daemons_dir="/Library/LaunchDaemons"
 system_requested=false
 for argument in "$@"; do
@@ -40,7 +42,7 @@ if [ "${current_uid}" = 0 ] && [ "${system_requested}" = false ]; then
   exit 1
 fi
 if [ "${system_requested}" = true ] && [ "${current_uid}" != 0 ]; then
-  echo "Install system services as root: sudo $0 --service-account NAME. No changes made." >&2
+  echo "Install system services as root: sudo ${script_command} --service-account NAME. No changes made." >&2
   exit 1
 fi
 
@@ -103,7 +105,7 @@ for family in inky-bird inky-bird-frame; do
         launchctl print "system/com.${family}.${label}" >/dev/null 2>&1; then
       serve_daemon="${daemons_dir}/com.${family}.serve.plist"
       if [ -f "${serve_daemon}" ] && [ "$(daemon_account "${serve_daemon}")" = "${family}" ]; then
-        echo "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo $0 --service-account ${family}. No changes made." >&2
+        echo "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo ${script_command} --service-account ${family}. No changes made." >&2
         exit 1
       fi
       echo "Inky uses operator-managed system services. Use that deployment process to upgrade; the user installer made no changes." >&2

@@ -1512,7 +1512,7 @@ def run_with_accounts(arguments: list[str]) -> None:
     import pwd
     import runpy
 
-    real_getpwnam, real_getgrgid = pwd.getpwnam, grp.getgrgid
+    real_getpwnam, real_getgrgid, real_getpwall = pwd.getpwnam, grp.getgrgid, pwd.getpwall
     real_lstat, real_stat = os.lstat, os.stat
     _machine_roots()
     owners = _state("owners")
@@ -1525,6 +1525,10 @@ def run_with_accounts(arguments: list[str]) -> None:
             return real_getpwnam(name)
         fields = (name, "x", entry["uid"], entry["gid"], "", entry["home"], entry["shell"])
         return pwd.struct_passwd(fields)
+
+    def getpwall() -> list[pwd.struct_passwd]:
+        synthetic = [getpwnam(name) for name in accounts]
+        return [*synthetic, *(entry for entry in real_getpwall() if entry.pw_name not in accounts)]
 
     def getgrgid(id: int) -> grp.struct_group:
         for name, number in groups.items():
@@ -1546,6 +1550,7 @@ def run_with_accounts(arguments: list[str]) -> None:
 
     # The synthetic account database, and owners recorded by the fake chown.
     pwd.getpwnam = getpwnam
+    pwd.getpwall = getpwall
     grp.getgrgid = getgrgid
     os.getgrouplist = getgrouplist
     os.lstat = lstat  # type: ignore[assignment]  # passes dir_fd and follow_symlinks through

@@ -5,6 +5,8 @@ if [ "$(uname -s)" != "Linux" ] || ! command -v systemctl >/dev/null 2>&1; then
   echo "Controller installer requires Linux with systemd." >&2
   exit 1
 fi
+# Printed commands quote what they name, so one can be pasted as it is.
+script_command=$(printf '%q' "$0")
 unit_root="/etc/systemd/system"
 # The first line of each unit a system-service installation renders.
 system_marker="# Inky Bird system service"
@@ -27,7 +29,7 @@ if [ "${current_uid}" = 0 ] && [ "${system_requested}" = false ]; then
   exit 1
 fi
 if [ "${system_requested}" = true ] && [ "${current_uid}" != 0 ]; then
-  echo "Install system services as root: sudo $0 --service-account NAME. No changes made." >&2
+  echo "Install system services as root: sudo ${script_command} --service-account NAME. No changes made." >&2
   exit 1
 fi
 
@@ -315,7 +317,7 @@ for name in controller scheduler refresh generate catalog-publish notifications;
     fi
     if [ "${owner}" != "${user}" ]; then
       if [ "$(head -n 1 "${unit}")" = "${system_marker}" ]; then
-        echo "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: sudo $0 --service-account ${owner}. No changes made." >&2
+        echo "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: sudo ${script_command} --service-account ${owner}. No changes made." >&2
         exit 1
       fi
       echo "${service_prefix}-${name}.service runs as ${owner}. Run the installer as ${owner}. No changes made." >&2

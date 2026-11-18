@@ -423,9 +423,9 @@ process of the account runs, other than its own lock holder; if any still
 does, it says "Processes of `ACCOUNT` still run after its services stopped"
 and starts the previous version again, without running the hook.
 
-To remove it, take out the units by hand as shown under [Uninstall](#uninstall),
-with the account's name in place of `inky-bird`, then delete the install root
-and the account (`sudo userdel inky-bird`) once you no longer need the data.
+To remove it, run the uninstaller as root with the same account:
+`sudo ./deploy/uninstall-controller-systemd.sh --service-account inky-bird`.
+See [Uninstall](#uninstall).
 
 ### macOS controller as a system service
 
@@ -505,17 +505,8 @@ sudo -u inky-bird env INKY_BIRD_ENV_FILE=/opt/inky-bird/config/private.env \
 
 To upgrade, check out the new tag and run the same command; the `--stopped-hook`
 and the check that no process of the account remains work as on Linux. To
-remove it, unload and delete each job, then the install root and the account
-once you no longer need the data:
-
-```bash
-for label in serve scheduler refresh generate catalog-publish notifications; do
-  sudo launchctl bootout "system/com.inky-bird.$label" 2>/dev/null || true
-  sudo rm -f "/Library/LaunchDaemons/com.inky-bird.$label.plist"
-done
-sudo dscl . -delete /Users/inky-bird
-sudo dscl . -delete /Groups/inky-bird
-```
+remove it, run `sudo ./deploy/uninstall-controller.sh --service-account
+inky-bird`; see [Uninstall](#uninstall).
 
 ### Docker controller
 
@@ -1034,7 +1025,34 @@ private configuration, controller state, catalogs, and generated art:
 ./deploy/uninstall-display-local.sh        # display node
 ```
 
-The equivalent manual removal follows. On an install that began under the old
+For a system service, run the matching uninstaller as root with the account
+it runs as (and `--install-root` if you gave one when installing):
+
+```bash
+sudo ./deploy/uninstall-controller-systemd.sh --service-account inky-bird   # Linux
+sudo ./deploy/uninstall-controller.sh --service-account inky-bird           # macOS
+```
+
+It removes only that account's own services: units that carry the
+system-service first line and run as the account, or LaunchDaemons that run as
+the account. Another installation, under another account, keeps running. It
+waits for a job a timer started to finish, holds the writer locks while it
+stops the services and again while it removes the code under
+`<install root>/app`, and checks that no process of the account remains. It
+keeps the account and everything the account owns: the configuration and
+private environment file, the home, state and logs folders, and the
+workspace, state and catalog folders the configuration names. It prints each
+of them, and the commands to remove them once you no longer need the data.
+Installing again with the same account finds that data.
+
+Before it changes anything, it refuses, with one line ending in "No changes
+made.", what the installer refuses about the account and the install root,
+services of the same names that the user installer made, a job that is still
+running after the wait, and work that holds a writer lock. If it stops part
+way, for example because a service would not stop, it says what is left;
+running it again finishes the job.
+
+The equivalent manual removal of the user installer's services follows. On an install that began under the old
 name, replace `inky-bird` with `inky-bird-frame` in each name. On a systemd
 controller:
 

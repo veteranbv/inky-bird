@@ -237,6 +237,8 @@ class Scenario:
     # Installed as root for this account (``--service-account``), under
     # ``{machine}/srv/<account>``.
     service_account: str = ""
+    # The start states an uninstall group runs from, when not UNINSTALL_STATES.
+    uninstall_states: tuple[str, ...] = ()
 
     @property
     def shell(self) -> str:
@@ -347,8 +349,10 @@ SCENARIOS = {
             "Linux",
             SYSTEM_ENVIRONMENT,
             ("fresh", "staged", RETAINED, USER_REMOVED),
+            "uninstall-controller-systemd.sh",
             arguments=SYSTEM_ARGUMENTS,
             service_account=SYSTEM_ACCOUNT,
+            uninstall_states=("staged",),
         ),
         Scenario(
             "linux-system-hook",
@@ -369,8 +373,10 @@ SCENARIOS = {
             "Darwin",
             (("FAKE_AGENTS", AGENTS), ("FAKE_UID", "0")),
             ("fresh", "staged", RETAINED),
+            "uninstall-controller.sh",
             arguments=SYSTEM_ARGUMENTS,
             service_account=SYSTEM_ACCOUNT,
+            uninstall_states=("staged",),
         ),
         Scenario(
             "macos-system-hook",
@@ -1295,9 +1301,8 @@ CLAIMS = {
     # unchanged: system-service mode
     "${unit##*/} is a system service of ${owner}. Run the installer again with "
     "--service-account ${owner}. No changes made.": "unchanged",
-    "Install system services as root: sudo $0 --service-account NAME. No changes made.": (
-        "unchanged"
-    ),
+    "Install system services as root: sudo ${script_command} --service-account NAME. "
+    "No changes made.": "unchanged",
     "--install-root needs --service-account. No changes made.": "unchanged",
     "--service-account must be inky-bird, or inky-bird- followed by lowercase letters and "
     "digits. No changes made.": "unchanged",
@@ -1324,8 +1329,8 @@ CLAIMS = {
     # unchanged: system-service mode on macOS
     "${plist##*/} is a system service of ${owner}. Run the installer again with "
     "--service-account ${owner}. No changes made.": "unchanged",
-    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo $0 "
-    "--service-account ${family}. No changes made.": "unchanged",
+    "com.${family}.serve is a system service of ${family}. Upgrade it as root: sudo "
+    "${script_command} --service-account ${family}. No changes made.": "unchanged",
     "The account ${service_account} can log in; give it the shell /usr/bin/false. "
     "No changes made.": "unchanged",
     "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; this installer does "
@@ -1340,9 +1345,28 @@ CLAIMS = {
     "installer does not move it. Remove it with deploy/uninstall-controller-systemd.sh run as "
     "${owner}, then run this again. No changes made.": "unchanged",
     "${service_prefix}-${name}.service is a system service of ${owner}. Upgrade it as root: "
-    "sudo $0 --service-account ${owner}. No changes made.": "unchanged",
+    "sudo ${script_command} --service-account ${owner}. No changes made.": "unchanged",
+    # unchanged: system-service uninstall
+    "A plate is still being made. Run the uninstaller again after it finishes. "
+    "No changes made.": "unchanged",
+    "The installed version cannot read its configuration, so the uninstaller cannot check for "
+    "running work. Fix the configuration so the installed version can read it, then run the "
+    "uninstaller again. No changes made.": "unchanged",
+    "Other work is still running. Run the uninstaller again after it finishes. "
+    "No changes made.": "unchanged",
+    "${unit} was installed by the user installer; remove it with "
+    "deploy/uninstall-controller-systemd.sh run as its account. No changes made.": "unchanged",
+    "${unit} runs as ${owner:-root}, not ${service_account}. No changes made.": "unchanged",
+    "${service_prefix}-${name}.service is still running. Run the uninstaller again after it "
+    "finishes. No changes made.": "unchanged",
+    "Remove system services as root: sudo ${script_command} --service-account NAME. "
+    "No changes made.": "unchanged",
+    "com.${service_prefix}.${label} does not run as ${service_account}; it is not this "
+    "installation's. No changes made.": "unchanged",
+    "com.${service_prefix}.${label} is a LaunchAgent of ${agent_owner}; remove it with "
+    "deploy/uninstall-controller.sh run as that user. No changes made.": "unchanged",
     # uninstalled
-    "Controller LaunchAgents uninstalled.": "uninstalled",
+    "Controller ${jobs_kind} uninstalled.": "uninstalled",
     "Controller services uninstalled.": "uninstalled",
     "Display node services uninstalled.": "uninstalled",
     # neutral
@@ -1413,6 +1437,24 @@ CLAIMS = {
     "Stopped $1.": "neutral",
     "Stopped ${service_prefix}-display.service.": "neutral",
     "Stopped and disabled $1.": "neutral",
+    "Stopped and disabled ${unit}.": "neutral",
+    "Booted out LaunchDaemon: ${daemon}": "neutral",
+    "Removed the application code: ${app_dir}": "neutral",
+    "Could not hold the writer locks again; the code was not removed. Run the uninstaller "
+    "again to finish.": "neutral",
+    "  Configuration and private environment file: ${install_root}/config": "neutral",
+    "  Home, state and logs: ${install_root}/home, ${install_root}/state, ${install_root}/logs": (
+        "neutral"
+    ),
+    "  The account ${service_account}": "neutral",
+    "Once you no longer need the controller data, remove them with: sudo rm -R "
+    "${quoted_root} && sudo userdel ${service_account}": "neutral",
+    "Once you no longer need the controller data, remove them with: sudo rm -R "
+    "${quoted_root} && sudo dscl . -delete /Users/${service_account} && sudo dscl . -delete "
+    "/Groups/${service_account}": "neutral",
+    "Once you no longer need the controller data, remove them with: sudo rm -R "
+    "${quoted_root} && sudo dscl . -delete /Users/${service_account}": "neutral",
+    "The group ${quoted_group} is not the account's own, so it is left alone.": "neutral",
     "Stopped and disabled ${service_prefix}-display.timer.": "neutral",
     "The new version could not refresh bird observations; see the error above.": "neutral",
     "The previous version is kept in ${legacy_runtime}.": "neutral",
@@ -2010,8 +2052,24 @@ def check_uninstall(
             and (after.units[unit] != before.role.units[unit] or after.units[unit][1])
         ):
             report.append(f"U2: {unit} was not removed and is not named")
-    if after.code != before.role.code:
+    if machine.install_root is not None:
+        check_system_uninstall(machine, outcome)
+    elif after.code != before.role.code:
         report.append("U3: uninstall changed the installed runtime")
+
+
+def check_system_uninstall(machine: Machine, outcome: Outcome) -> None:
+    """U3 for a system service: its code goes once its jobs are gone, and the
+    account's data stays whatever happened."""
+    assert machine.install_root is not None
+    report = outcome.violations
+    if outcome.returncode == 0 and (machine.install_root / "app").exists():
+        report.append("U3: a system uninstall reported success but left its code")
+    if not machine.config.is_file() or CONFIG_CANARY not in machine.config.read_text():
+        report.append("U3: a system uninstall changed the account's configuration")
+    for name in ("config", "home", "state", "logs"):
+        if not (machine.install_root / name).is_dir():
+            report.append(f"U3: a system uninstall removed the account's {name}")
 
 
 def left_installed(role: RoleView) -> list[str]:
@@ -2755,7 +2813,7 @@ def plan_groups() -> list[GroupKey]:
             # Only a Pi runs both roles.
             states = [
                 state
-                for state in UNINSTALL_STATES
+                for state in scenario.uninstall_states or UNINSTALL_STATES
                 if scenario.system == "Linux" or state != "shared"
             ]
             groups.extend(("uninstall", scenario.name, state) for state in states)
