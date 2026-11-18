@@ -62,6 +62,7 @@ from .journal import (
     JournalViewRemovedError,
     remove_collection,
 )
+from .lock_wait import StopRequestedError
 from .oidc import OIDCError, authorization_url, metadata, provider_id, verified_identity
 from .owner_operations import (
     _PATH_OR_URL,
@@ -1849,6 +1850,10 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
             _owner_message(exc, "A component Inky needs is not installed"),
         )
 
+    async def stopping(request: Request, exc: Exception) -> Response:
+        # The service is shutting down; a request waiting for a lock ends now.
+        return _error(503, "service_stopping", "Inky is stopping; try again in a moment")
+
     async def incomplete_request(request: Request, exc: Exception) -> Response:
         # The client has gone, so this is not a server error, but keep a record.
         _LOG.info("An owner request ended before its body arrived", exc_info=exc)
@@ -1868,6 +1873,8 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                     warned = False
                 except OwnerOperationBusyError:
                     pass  # Never evict an upload or history operation in progress.
+                except StopRequestedError:
+                    return  # The service is stopping.
                 except OwnerOperationError as exc:
                     if not warned:
                         _LOG.warning(
@@ -1909,6 +1916,7 @@ def create_app(config: ControllerConfig, *, app_config: AppConfig | None = None)
                 DataSourceError: data_source_error,
                 MissingDependencyError: dependency_error,
                 ClientDisconnect: incomplete_request,
+                StopRequestedError: stopping,
             },
         ),
         config,

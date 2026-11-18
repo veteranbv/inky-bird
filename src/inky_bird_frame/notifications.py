@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from . import lock_wait
 from .config import AppConfig, NotificationDestination, NotificationEvent, NotificationsConfig
 from .errors import CatalogError, ConfigurationError, MissingDependencyError
 from .http import write_json_atomic
@@ -151,7 +152,7 @@ def _new_notifier() -> apprise.Apprise:
 def _notification_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "notifications.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:

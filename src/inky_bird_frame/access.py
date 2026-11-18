@@ -22,6 +22,7 @@ from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from . import lock_wait
 from .errors import InkyBirdFrameError, MissingDependencyError
 from .http import write_bytes_atomic, write_json_atomic
 
@@ -402,7 +403,7 @@ def prepare_browser_registration(config_path: Path, controller: ControllerConfig
         metadata = os.fstat(handle.fileno())
         if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise AccessError("Owner initialization lock must be a private regular file")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
         for entry in root.iterdir():
             if entry.name not in {path.name, "owner-init.lock", "catalog-state.lock"}:
                 return False
@@ -459,7 +460,7 @@ class AccessStore:
                 lock_stat = os.fstat(handle.fileno())
                 if not stat.S_ISREG(lock_stat.st_mode) or stat.S_IMODE(lock_stat.st_mode) & 0o077:
                     raise AccessError("Owner access lock must use mode 0600")
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                lock_wait.flock(handle.fileno(), fcntl.LOCK_EX)
                 try:
                     state = self._read()
                     # Earlier releases also saved anonymous starts; drop those.
