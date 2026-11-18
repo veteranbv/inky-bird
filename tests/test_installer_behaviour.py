@@ -285,7 +285,7 @@ case "$mode" in
     echo "{name}: synthetic failure" >&2
     exit 1
     ;;
-  kill | interrupt | hangup)
+  kill | interrupt | hangup | crash)
     status=0
     {shlex.quote(real)} "$@" || status=$?
     # The interrupt goes to the whole process group; this call has completed.

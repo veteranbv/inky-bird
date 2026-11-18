@@ -126,6 +126,16 @@ catalog_publish_plist="${agents_dir}/com.${service_prefix}.catalog-publish.plist
 notifications_plist="${agents_dir}/com.${service_prefix}.notifications.plist"
 scheduler_plist="${agents_dir}/com.${service_prefix}.scheduler.plist"
 legacy_cycle_plist="${agents_dir}/com.${service_prefix}.controller-cycle.plist"
+agent_plists=(serve_plist refresh_plist generation_plist catalog_publish_plist \
+  notifications_plist scheduler_plist)
+# Point every agent definition variable at the same file names in folder $1.
+place_agents() {
+  local name file
+  for name in "${agent_plists[@]}"; do
+    file=${!name}
+    printf -v "${name}" '%s/%s' "$1" "${file##*/}"
+  done
+}
 # Each runtime holds one source copy and the venv built from it;
 # ${app_dir}/.venv links to the active one.
 runtimes_dir="${app_dir}/.runtimes"
@@ -427,6 +437,16 @@ check_new_serve() {
   fi
 }
 
+# Moves the directory $1 to $2, then renames the link $3 to $1; if that rename
+# fails, $1 moves back.
+swap_in_link='import os, sys
+os.rename(sys.argv[1], sys.argv[2])
+try:
+    os.replace(sys.argv[3], sys.argv[1])
+except OSError:
+    os.rename(sys.argv[2], sys.argv[1])
+    raise'
+
 replace_venv_link() {
   rm -f "${app_dir}/.venv.next" && ln -s "$1" "${app_dir}/.venv.next" && \
     python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' \
@@ -445,7 +465,11 @@ activate_runtime() {
     venv_before=directory
     make_temp_dir legacy_runtime "${runtimes_dir}/runtime.XXXXXX"
     previous_runtime=${legacy_runtime}
-    mv "${app_dir}/.venv" "${legacy_runtime}/.venv"
+    # Move the venv aside and link the new runtime in one step, so a power loss
+    # cannot leave the agents with no venv at all.
+    rm -f "${app_dir}/.venv.next" && ln -s "${new_runtime}/.venv" "${app_dir}/.venv.next" && \
+      python3 -c "${swap_in_link}" "${app_dir}/.venv" "${legacy_runtime}/.venv" "${app_dir}/.venv.next"
+    return
   else
     venv_before=absent
   fi
@@ -675,6 +699,16 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
 done
 agents_recorded=true
 
+# A first install's agents have no runtime until the switch: write them aside
+# and move them in after it, so a power loss in between leaves launchd no
+# agent to start at login from a missing runtime.
+first_install=false
+if [ ! -e "${app_dir}/.venv" ] && [ ! -L "${app_dir}/.venv" ]; then
+  first_install=true
+  mkdir "${work_dir}/agents"
+  place_agents "${work_dir}/agents"
+fi
+
 "${new_runtime}/.venv/bin/python" - \
   "${serve_plist}" "${refresh_plist}" "${generation_plist}" "${catalog_publish_plist}" \
   "${notifications_plist}" "${scheduler_plist}" \
@@ -901,6 +935,14 @@ done
 run_stopped_hook
 release_writer_locks
 activate_runtime
+if [ "${first_install}" = true ]; then
+  for name in "${agent_plists[@]}"; do
+    if [ -f "${!name}" ]; then
+      mv "${!name}" "${agents_dir}/"
+    fi
+  done
+  place_agents "${agents_dir}"
+fi
 launchctl bootstrap "gui/${uid}" "${serve_plist}"
 if [ -f "${refresh_plist}" ]; then
   launchctl bootstrap "gui/${uid}" "${refresh_plist}"
