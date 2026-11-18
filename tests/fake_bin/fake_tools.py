@@ -574,7 +574,22 @@ def uv(arguments: list[str]) -> int:
         print("synthetic dependency resolution failure", file=sys.stderr)
         return 1
     build_venv(project)
+    managed = os.environ.get("UV_PYTHON_INSTALL_DIR")
+    if managed:
+        provide_python(Path(managed))
     return 0
+
+
+def provide_python(folder: Path) -> None:
+    """The interpreter uv downloads into its install folder, as real uv leaves
+    it: beside the interpreter, a lock file anyone can write."""
+    interpreter = folder / "cpython-3.13-fake" / "bin" / "python3"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("#!/bin/sh\n")
+    interpreter.chmod(0o755)
+    lock = folder / ".lock"
+    lock.touch()
+    lock.chmod(0o666)
 
 
 def _units_dir() -> Path:
