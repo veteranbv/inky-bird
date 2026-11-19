@@ -254,8 +254,9 @@ if [ -n "${service_account}" ]; then
   }
   finish_system() {
     local status=$?
-    trap - EXIT
+    # A stop now would end it before the locks are released.
     trap '' HUP INT TERM
+    trap - EXIT
     release_locks
     exit "${status}"
   }

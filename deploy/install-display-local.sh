@@ -285,6 +285,20 @@ installation_complete=false
 new_runtime_in_use=false
 new_runtime_shadowed=false
 
+# A stop ends the run once. One that arrives while a stop is already ending
+# it, or during the cleanup (a dropped ssh connection hangs up twice, or Ctrl-C pressed twice), is only
+# recorded: exiting again would end the cleanup before it finishes.
+stopping=false
+cleanup_stop=""
+stop_run() {
+  if [ "${stopping}" = true ]; then
+    cleanup_stop=${cleanup_stop:-$1}
+    return 0
+  fi
+  stopping=true
+  exit "$1"
+}
+
 # mktemp -d into the variable named $1. A stop signal that arrives after the
 # directory exists but before its name is recorded waits until it is, so
 # cleanup can still remove it.
@@ -448,19 +462,6 @@ report_units() {
   fi
 }
 
-# A stop ends the run once. One that arrives while a stop is already ending
-# it, or during the cleanup (a dropped ssh connection hangs up twice), is only
-# recorded: exiting again would end the cleanup before it finishes.
-stopping=false
-cleanup_stop=""
-stop_run() {
-  if [ "${stopping}" = true ]; then
-    cleanup_stop=${cleanup_stop:-$1}
-    return 0
-  fi
-  stopping=true
-  exit "$1"
-}
 cleanup() {
   status=$?
   stopping=true
