@@ -298,11 +298,11 @@ make_temp_dir() {
   if [ -n "${created}" ]; then
     printf -v "$1" '%s' "${created}"
   fi
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'stop_run 129' HUP
+  trap 'stop_run 130' INT
+  trap 'stop_run 143' TERM
   if [ -n "${stop_status}" ]; then
-    exit "${stop_status}"
+    stop_run "${stop_status}"
   fi
   [ -n "${created}" ]
 }
@@ -448,13 +448,26 @@ report_units() {
   fi
 }
 
+# A stop ends the run once. One that arrives while a stop is already ending
+# it, or during the cleanup (a dropped ssh connection hangs up twice), is only
+# recorded: exiting again would end the cleanup before it finishes.
+stopping=false
+cleanup_stop=""
+stop_run() {
+  if [ "${stopping}" = true ]; then
+    cleanup_stop=${cleanup_stop:-$1}
+    return 0
+  fi
+  stopping=true
+  exit "$1"
+}
 cleanup() {
   status=$?
+  stopping=true
   trap - EXIT
   # One failed step must not cut the rest of the cleanup short.
   set +e
   # Finish cleaning up even if a stop signal arrives, then report it.
-  cleanup_stop=""
   trap 'cleanup_stop=129' HUP
   trap 'cleanup_stop=130' INT
   trap 'cleanup_stop=143' TERM
@@ -532,9 +545,9 @@ cleanup() {
 }
 trap cleanup EXIT
 # A stopped installer still restores what it changed, then reports the signal.
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'stop_run 129' HUP
+trap 'stop_run 130' INT
+trap 'stop_run 143' TERM
 make_temp_dir work_dir
 unit_dir="${work_dir}/units"
 unit_backup_dir="${work_dir}/previous-units"
