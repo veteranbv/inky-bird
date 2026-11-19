@@ -945,3 +945,51 @@ def test_browser_tool_downloads_are_retried_three_times_and_the_checks_are_not(
         assert result.returncode == status, result.stderr
         assert log.read_text().count("try") == attempts
         assert log.read_text().count("slept") == 2
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/usr/bin/rsync").exists(),
+    reason="macOS's own rsync (openrsync) is only on macOS",
+)
+@pytest.mark.parametrize("name", ["install-controller.sh", "install-controller-systemd.sh"])
+def test_a_system_service_copy_with_the_real_macos_rsync_is_readable_and_root_s(
+    tmp_path: Path, name: str
+) -> None:
+    """The installer's own copy options and mode step, taken from the script,
+    with the real /usr/bin/rsync: openrsync rejects a numeric --chmod and
+    ignores a symbolic one, which the fake rsync does not show."""
+    script = (Path(__file__).resolve().parents[1] / "deploy" / name).read_text()
+    options = re.search(r"^  copy_options=\((.+)\)$", script, re.MULTILINE)
+    function = re.search(r"^share_copy\(\) \{\n.*?^\}\n", script, re.MULTILINE | re.DOTALL)
+    assert options is not None
+    # Before share_copy, the copy relied on rsync alone.
+    share = function.group(0) if function else "share_copy() { :; }\n"
+    source = tmp_path / "source"
+    (source / "inky_bird_frame").mkdir(parents=True)
+    (source / "inky_bird_frame/module.py").write_text("x = 1\n")
+    (source / "inky_bird_frame/module.py").chmod(0o600)
+    (source / "inky_bird_frame").chmod(0o700)
+    (source / "link").symlink_to("inky_bird_frame/module.py")
+    target = tmp_path / "target"
+    program = (
+        "set -euo pipefail\n"
+        "service_account=inky-bird\n"
+        f"copy_options=({options.group(1)})\n"
+        + share
+        + "PATH=/usr/bin:/bin\n"
+        + 'rsync -a --delete -n "${copy_options[@]}" "$1/" "$2/"\n'
+        + 'rsync -a --delete "${copy_options[@]}" "$1/" "$2/"\n'
+        + 'share_copy "$2"\n'
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", program, "copy", str(source), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE((target / "inky_bird_frame").stat().st_mode) == 0o755
+    assert stat.S_IMODE((target / "inky_bird_frame/module.py").stat().st_mode) == 0o644
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert (target / "link").is_symlink()
+    assert function is not None

@@ -1312,6 +1312,12 @@ CLAIMS = {
     "--service-account ${owner}. No changes made.": "unchanged",
     "Install system services as root: sudo ${script_command} --service-account NAME. "
     "No changes made.": "unchanged",
+    "Run the uninstaller as the account that owns the controller, not as root. "
+    "No changes made.": "unchanged",
+    "${plist##*/} is a system service of ${owner}. Run the uninstaller again with "
+    "--service-account ${owner}. No changes made.": "unchanged",
+    "${unit##*/} is a system service of ${owner}. Run the uninstaller as root with "
+    "--service-account ${owner}. No changes made.": "unchanged",
     "--install-root needs --service-account. No changes made.": "unchanged",
     "--service-account must be inky-bird, or inky-bird- followed by lowercase letters and "
     "digits. No changes made.": "unchanged",

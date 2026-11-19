@@ -264,3 +264,39 @@ def test_the_group_is_named_for_deletion_only_when_it_is_the_account_s_own(
     host.save_state("accounts", accounts)
     again = uninstall(host)
     assert "sudo dscl . -delete /Groups/inky-bird" in again.stdout
+
+
+def test_the_macos_uninstaller_run_as_root_without_an_account_refuses(tmp_path: Path) -> None:
+    """As root, only a system service can be removed: it names the account of
+    one that is installed, and otherwise says to run as the owning user."""
+    host = installed(tmp_path, "Darwin")
+    before = (jobs(host, "inky-bird"), code(host), host.state_of("launchd"))
+    result = uninstall(host, system=False)
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "com.inky-bird.serve.plist is a system service of inky-bird. Run the uninstaller "
+        "again with --service-account inky-bird. No changes made."
+    )
+    for daemon in host.agents.glob("com.inky-bird.*.plist"):
+        daemon.unlink()
+    result = uninstall(host, system=False)
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Run the uninstaller as the account that owns the controller, not as root. No changes made."
+    )
+    assert code(host) == before[1] and host.state_of("launchd") == before[2]
+
+
+@pytest.mark.parametrize("uid", ["0", "1000"])
+def test_the_linux_user_uninstaller_leaves_a_system_service_of_the_same_name(
+    tmp_path: Path, uid: str
+) -> None:
+    host = installed(tmp_path, "Linux")
+    before = (jobs(host, "inky-bird"), code(host), host.state_of("systemd"))
+    result = uninstall(host, uid=uid, system=False)
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "inky-bird-controller.service is a system service of inky-bird. Run the uninstaller "
+        "as root with --service-account inky-bird. No changes made."
+    )
+    assert (jobs(host, "inky-bird"), code(host), host.state_of("systemd")) == before
