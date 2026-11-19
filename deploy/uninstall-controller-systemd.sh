@@ -57,6 +57,15 @@ else
     exit 1
   fi
   eval "${native_names}"
+  # A system service's units are removed only with its account named. Root
+  # may still remove units the user installer made for root (release 0.9.8
+  # installed as root that way).
+  unit="/etc/systemd/system/${service_prefix}-controller.service"
+  if [ -f "${unit}" ] && [ "$(head -n 1 "${unit}")" = "# Inky Bird system service" ]; then
+    owner=$(sed -n 's/^User=//p' "${unit}" | tail -n 1)
+    echo "${unit##*/} is a system service of ${owner}. Run the uninstaller as root with --service-account ${owner}. No changes made." >&2
+    exit 1
+  fi
 fi
 # A stopped uninstall names what it has not removed yet.
 stopped() {
