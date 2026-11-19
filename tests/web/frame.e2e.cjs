@@ -652,8 +652,11 @@ async function ownerFrame(t) {
   assert.equal(emptiedSteps.length, 0, 'an emptied view stops stepping');
   assert.equal(await playControl.getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('.frame-art[src]').count(), 0);
-  await page.unroute('**/v1/owner/journal');
-  await page.unroute(plateRoute);
+  // A journal check can still be in its handler (awaiting route.fetch); a bare
+  // unroute would let Playwright continue that route under it, and the
+  // handler's fulfill would then throw "Route is already handled!". Wait for
+  // the handlers in flight; these are the page's only routes.
+  await page.unrouteAll({ behavior: 'wait' });
   await page.clock.runFor(60100);
   await page.locator('.frame-art[src]').waitFor();
   await page.keyboard.press('Shift');
@@ -716,8 +719,8 @@ async function ownerFrame(t) {
   await page.keyboard.press('Shift');
   await playControl.click();
   assert.equal(await playControl.getAttribute('aria-pressed'), 'false');
-  await page.unroute(plateRoute);
-  await page.unroute('**/v1/owner/journal');
+  // As above: wait for handlers still fetching before removing the routes.
+  await page.unrouteAll({ behavior: 'wait' });
   t.phase = 'frame-wide';
   // Wide screens show every control in one bar and no More button.
   await page.setViewportSize({ width: 1280, height: 800 });

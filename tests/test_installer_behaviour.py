@@ -1899,3 +1899,48 @@ def test_the_second_hold_also_uses_the_new_version_when_the_installed_one_cannot
     assert result.returncode == 0, result.stderr
     assert lock_holders(host) == ["old", "new", "new"]
     assert {call[2] for call in stops(host)} == {"lock-held"}
+
+
+def step_of(host: Host, tool: str, word: str = "", after: int = -1) -> int:
+    """The number of the first action call of ``tool`` (with ``word`` among its
+    arguments, after step ``after``) in the run this host recorded."""
+    for line in (host.fake / "steps").read_text().splitlines():
+        index, kind, called, *arguments = line.split("\t")
+        if int(index) <= after or kind != "action":
+            continue
+        if (not tool or called == tool) and (not word or word in arguments):
+            return int(index)
+    raise AssertionError(f"no {tool} {word} call after {after}")
+
+
+def runtime_dirs(host: Host, name: str = ".runtimes") -> list[str]:
+    folder = host.app / name
+    return sorted(path.name for path in folder.iterdir()) if folder.is_dir() else []
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_a_second_stop_inside_the_cleanup_still_lets_it_finish(tmp_path: Path, system: str) -> None:
+    """Ctrl-C pressed twice: the second stop lands on a call the first one's
+    cleanup makes. The cleanup still takes out the staged runtime and the work
+    folder, the previous version keeps running, and the first stop is reported."""
+    probe = controller_host(tmp_path / "probe", system)
+    assert run_controller(probe).returncode == 0
+    # Once services are stopped, the cleanup starts them again: calls a second
+    # stop can land on.
+    at = step_of(
+        probe, *(("launchctl", "bootout") if system == "Darwin" else ("systemctl", "stop"))
+    )
+    stopped = controller_host(tmp_path / "stopped", system)
+    (stopped.fake / "inject").write_text(f"{at} kill\n")
+    assert run_controller(stopped).returncode == 143
+    again = step_of(stopped, "", after=at)
+    host = controller_host(tmp_path / "run", system)
+    runtimes = runtime_dirs(host)
+    (host.fake / "inject").write_text(f"{at} kill\n{again} hangup\n")
+    result = run_controller(host)
+    assert [call[1] for call in host.calls() if call[0] == "stop-sent"] == ["kill", "hangup"]
+    assert result.returncode == 143, result.stdout + result.stderr
+    assert runtime_dirs(host) == runtimes
+    assert not list(host.support.glob("install.*"))
+    assert not list(host.tmp.iterdir())
+    assert_previous_running(host)

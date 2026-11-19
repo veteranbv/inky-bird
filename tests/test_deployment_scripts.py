@@ -947,6 +947,51 @@ def test_browser_tool_downloads_are_retried_three_times_and_the_checks_are_not(
         assert log.read_text().count("slept") == 2
 
 
+@pytest.mark.parametrize(
+    "name", ["install-controller.sh", "install-controller-systemd.sh", "install-display-local.sh"]
+)
+@pytest.mark.parametrize("first", ["stop", "failure"])
+def test_a_stop_between_the_end_of_a_run_and_its_cleanup_is_recorded(
+    tmp_path: Path, name: str, first: str
+) -> None:
+    """The script's own stop_run and the first lines of its cleanup, with a
+    second stop sent in the gap before the cleanup installs its own traps (a
+    dropped ssh connection hangs up twice; Ctrl-C pressed twice). It must be
+    recorded, not end the cleanup: no hook in the scripts reaches that gap."""
+    script = (Path(__file__).resolve().parents[1] / "deploy" / name).read_text()
+    function = re.search(r"^stopping=false\n.*?^stop_run\(\) \{\n.*?^\}\n", script, re.M | re.S)
+    head = re.search(
+        r"^cleanup\(\) \{\n(  status=\$\?\n.*?)  # One failed step", script, re.M | re.S
+    )
+    assert function is not None, "stop_run must end the run once"
+    assert head is not None
+    traps = re.findall(r"^trap '(stop_run \d+)' (HUP|INT|TERM)$", script, re.M)
+    assert sorted(signal for _, signal in traps) == ["HUP", "INT", "TERM"]
+    marker = tmp_path / "cleaned"
+    program = (
+        'marker="$1"\n'
+        + function.group(0)
+        + "cleanup() {\n"
+        + head.group(1)
+        + "  kill -TERM $$\n"
+        + '  : > "${marker}"\n'
+        + '  exit "${status}"\n'
+        + "}\n"
+        + "trap cleanup EXIT\n"
+        + "".join(f"trap '{action}' {signal}\n" for action, signal in traps)
+        + ("kill -HUP $$\nsleep 5\n" if first == "stop" else "false || exit 1\n")
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", program, "gap", str(marker)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert marker.exists(), result.stderr
+    assert result.returncode == (129 if first == "stop" else 1)
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin" or not Path("/usr/bin/rsync").exists(),
     reason="macOS's own rsync (openrsync) is only on macOS",
