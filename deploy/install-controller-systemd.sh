@@ -351,7 +351,7 @@ units_replaced=false
 installation_complete=false
 writer_lock_pid=""
 writer_lock_holds=0
-writer_locks_unavailable=false
+writer_locks_by_new_version=false
 bounded_pid=""
 bounded_timed_out=false
 stopped_hook_ran=false
@@ -429,26 +429,25 @@ running() {
 }
 
 # Remove the work folders a power loss left where this installer keeps them,
-# from before the current boot: no installer or job can still use them. Only
-# with the writer locks held, or with no installed version to write; the
+# from before the current boot: no installer or job can still use them. It
+# runs with the writer locks held, or with no installed version to write; the
 # helper removes only this user's own folders and follows no link.
 remove_stale_work() {
   local parent=${support_dir}
   if [ -n "${service_account}" ]; then
     parent=${install_root}
   fi
-  if [ "${writer_locks_unavailable}" = false ]; then
-    "${new_runtime}/.venv/bin/python" -I -m inky_bird_frame.upgrade_gates remove-stale-work \
-      "${parent}"
-  fi
+  "${new_runtime}/.venv/bin/python" -I -m inky_bird_frame.upgrade_gates remove-stale-work \
+    "${parent}"
 }
 # Hold every lock a writer takes, so nothing is mid-write while services
 # stop: the installed version's Python runs the new version's helper, so the
 # installed code finds the state directory. It waits up to
 # quiesce_timeout_seconds and says what it waits for. If the installed code
-# cannot be loaded or cannot read the config, it says so and holds nothing, so
-# a broken or older install can still be upgraded or repaired. $1 is true once
-# this run has stopped something.
+# cannot be loaded or cannot read the config, the new version, which has
+# already checked this config, waits for and holds the same locks instead, so
+# a broken or older install can still be repaired once no writer runs. If
+# neither can, nothing is changed. $1 is true once this run has stopped something.
 hold_writer_locks() {
   local python="${app_dir}/.venv/bin/python"
   local ready
@@ -457,7 +456,10 @@ hold_writer_locks() {
   local deadline=$((SECONDS + quiesce_timeout_seconds + 60))
   writer_lock_holds=$((writer_lock_holds + 1))
   ready="${ready_dir}/writer-locks-held.${writer_lock_holds}"
-  if [ ! -x "${python}" ] || [ "${writer_locks_unavailable}" = true ]; then
+  if [ "${writer_locks_by_new_version}" = true ]; then
+    python="${new_runtime}/.venv/bin/python"
+  elif [ ! -x "${python}" ]; then
+    # Nothing is installed, so nothing of this installation can be writing.
     return 0
   fi
   start_background writer_lock_pid ${account_prefix[@]+"${account_prefix[@]}"} "${python}" -I \
@@ -474,9 +476,19 @@ hold_writer_locks() {
     fi
     if [ -z "${writer_lock_pid}" ]; then
       if [ "${status}" -eq 0 ]; then
-        # The installed code could not be loaded; it said so once.
-        writer_locks_unavailable=true
-        return 0
+        # The helper could not read the config; it said so. It holds nothing.
+        if [ "${writer_locks_by_new_version}" = false ]; then
+          writer_locks_by_new_version=true
+          echo "The new version checks for running work instead." >&2
+          hold_writer_locks "$1"
+          return 0
+        fi
+        if [ "$1" = true ]; then
+          echo "Could not hold the writer locks again; the upgrade stopped before switching to the new version." >&2
+          exit 1
+        fi
+        echo "Neither the installed nor the new version can read the configuration to check for running work. No changes made." >&2
+        exit 1
       fi
       if [ "$1" = true ]; then
         if [ "${status}" -eq 3 ] || [ "${status}" -eq 4 ]; then

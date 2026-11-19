@@ -1215,7 +1215,8 @@ def test_installation_guide_describes_when_upgrade_skips_the_plate_check() -> No
     guide = " ".join((ROOT / "docs/installation.md").read_text(encoding="utf-8").split())
     assert "If the installed version cannot run at all, setup refuses" not in guide
     assert "If the installed version cannot be loaded" in guide
-    assert "refuses only if the check itself fails to run" in guide
+    assert "the new version, which has already checked the configuration, waits" in guide
+    assert "Setup also refuses if the check itself fails to run" in guide
 
 
 def test_example_config_matches_retry_cap_and_generation_default() -> None:
