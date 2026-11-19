@@ -1944,3 +1944,42 @@ def test_a_second_stop_inside_the_cleanup_still_lets_it_finish(tmp_path: Path, s
     assert not list(host.support.glob("install.*"))
     assert not list(host.tmp.iterdir())
     assert_previous_running(host)
+
+
+def test_a_stop_at_the_health_check_puts_the_previous_serve_back_while_launchd_still_stops_it(
+    tmp_path: Path,
+) -> None:
+    """launchctl bootout returns before the job has gone, and a bootstrap of it
+    fails until it has ("Bootstrap failed: 5"). A stop during the health
+    check must still leave the previous version serving."""
+    probe = macos_host(tmp_path / "probe", "serve", "refresh")
+    probe.fail("bootout-async")
+    assert run_macos(probe).returncode == 0
+    at = step_of(probe, "venv-python", "check-serve")
+    host = macos_host(tmp_path / "run", "serve", "refresh")
+    host.fail("bootout-async")
+    (host.fake / "inject").write_text(f"{at} kill\n")
+    result = run_macos(host)
+    assert result.returncode == 143, result.stdout + result.stderr
+    assert "not running" not in result.stderr, result.stderr
+    agents = host.loaded_agents()
+    for label in ("serve", "refresh"):
+        assert agents[label]["runtime"] == "old", agents
+        assert "shutting_down" not in agents[label], agents
+    assert host.installed_version() == "old"
+
+
+def test_an_upgrade_waits_for_launchd_to_finish_each_bootout_before_its_bootstrap(
+    tmp_path: Path,
+) -> None:
+    """The normal path boots out every agent and later bootstraps it again."""
+    host = macos_host(tmp_path, "serve", "refresh")
+    host.fail("bootout-async")
+    result = run_macos(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    agents = host.loaded_agents()
+    assert {label: agents[label]["runtime"] for label in ("serve", "refresh")} == {
+        "serve": "new",
+        "refresh": "new",
+    }
+    assert host.installed_version() == "new"
