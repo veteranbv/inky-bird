@@ -364,37 +364,62 @@ def test_native_tls_canonical_bundle_cannot_follow_a_changed_directory_alias(
 def test_native_managed_copy_preserves_required_package_inputs(
     tmp_path: Path, installer: str
 ) -> None:
+    """Both as a user and as a system service, the staged copy carries every
+    required package input; a system service's copy is readable by everyone
+    whatever modes the checkout has, as share_copy sets them."""
+    import re
+
     project = Path(__file__).resolve().parents[1]
     settings = tomllib.loads((project / "pyproject.toml").read_text())
     required = settings["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
-    source, managed = tmp_path / "source checkout", tmp_path / "managed app"
-    for root in (source, managed):
-        for name in ("src", "catalog", "deploy"):
-            (root / name).mkdir(parents=True)
+    source = tmp_path / "source checkout"
+    for name in ("src", "catalog", "deploy"):
+        (source / name).mkdir(parents=True)
     for name in ("pyproject.toml", "uv.lock", "README.md", "LICENSE", *required):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("synthetic package input\n")
     (source / "deploy" / installer).write_text("# synthetic staging input\n")
+    (source / "src/inky_bird_frame").mkdir(exist_ok=True)
+    (source / "src/inky_bird_frame/private.py").write_text("x = 1\n")
+    (source / "src/inky_bird_frame/private.py").chmod(0o600)
+    (source / "src/inky_bird_frame").chmod(0o700)
     script = (project / "deploy" / installer).read_text()
     start = script.index("stage_runtime_source() {\n")
     staging = script[start : script.index("\n}\n", start) + 3]
-    # Execute only real file staging, not an installer, service or package manager.
-    subprocess.run(
-        [
-            "bash",
-            "-e",
-            "-c",
-            f'root=$1\n{staging}stage_runtime_source "$2"\n',
-            "stage",
-            str(source),
-            str(managed),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    for name in required:
-        assert (managed / name).read_bytes() == (source / name).read_bytes()
+    share = re.search(r"^share_copy\(\) \{\n.*?^\}\n", script, re.MULTILINE | re.DOTALL)
+    # A system service's copy options, as the script sets them on one line.
+    options = re.search(r"^  copy_options=\((--[a-z-]+(?: --[a-z-]+)*)\)$", script, re.MULTILINE)
+    modes = [("user", "")]
+    if share is not None:
+        assert options is not None
+        modes.append(("system", f"service_account=inky-bird\ncopy_options=({options.group(1)})\n"))
+    for mode, settings_text in modes:
+        managed = tmp_path / f"managed app {mode}"
+        for name in ("src", "catalog", "deploy"):
+            (managed / name).mkdir(parents=True)
+        # Execute only real file staging, not an installer, service or package manager.
+        subprocess.run(
+            [
+                "bash",
+                "-e",
+                "-c",
+                f'root=$1\nservice_account=""\n{settings_text}'
+                f"{share.group(0) if share else ''}{staging}"
+                'stage_runtime_source "$2"\n',
+                "stage",
+                str(source),
+                str(managed),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        for name in required:
+            assert (managed / name).read_bytes() == (source / name).read_bytes(), (mode, name)
+        if mode == "system":
+            for path in [managed / "src", *(managed / "src").rglob("*")]:
+                expected = 0o755 if path.is_dir() else 0o644
+                assert stat.S_IMODE(path.lstat().st_mode) == expected, path
 
 
 def test_remote_display_copy_includes_the_required_bundled_guide() -> None:
