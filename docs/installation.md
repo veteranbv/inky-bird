@@ -884,11 +884,15 @@ changes made."; if other work is, with "Other work is still running. Run the
 upgrade again after it finishes. No changes made." (`setup` then reports
 "Installer exited with status 3"). If the installed version cannot be loaded,
 or cannot read your configuration (for example after you edited it for the new
-release), setup says it cannot check for a plate and continues without
-waiting; with no installed version, it continues without a message. Setup
-refuses only if the check itself fails to run, for example when it cannot open
-a lock in `state_dir`: "Could not check whether a plate is being made. No
-changes made."
+release), setup says so and the new version, which has already checked the
+configuration, waits for running work and holds the same locks instead; the
+waits and refusals above apply unchanged, so a repair never stops a writer
+mid-write. If neither version can read the configuration, setup refuses:
+"Neither the installed nor the new version can read the configuration to check
+for running work. No changes made." With no installed version, it continues
+without a message. Setup also refuses if the check itself fails to run, for
+example when it cannot open a lock in `state_dir`: "Could not check whether a
+plate is being made. No changes made."
 
 On a Linux controller, setup then asks the scheduler to stop and stops the job
 timers, lets go of the locks, and waits up to 30 more minutes for the scheduler

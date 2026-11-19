@@ -431,3 +431,35 @@ def test_root_s_work_folders_from_before_the_boot_are_removed_from_the_install_r
     assert result.returncode == 0, result.stdout + result.stderr
     assert not stale.exists()
     assert not list(host.install_root.glob("install.*"))
+
+
+def test_a_repair_of_a_config_the_installed_version_cannot_read_waits_for_writers(
+    tmp_path: Path,
+) -> None:
+    from test_installer_behaviour import running_generation
+    from test_installer_system import installed_as_old, system_lock_holders
+
+    host = system_host(tmp_path)
+    assert run_system(host).returncode == 0
+    installed_as_old(host)
+    host.fail("old:load_config")
+    (host.fake / "log").write_text("")
+    jobs = daemons(host, "inky-bird")
+    launchd = host.state_of("launchd")
+    with running_generation(host):
+        result = run_system(host)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert result.stderr.rstrip().endswith("No changes made.")
+    assert "A plate is still being made" in result.stderr
+    assert system_lock_holders(host) == ["old", "new"]
+    assert daemons(host, "inky-bird") == jobs
+    assert host.state_of("launchd") == launchd
+    assert host.installed_version() == "old"
+
+    (host.fake / "log").write_text("")
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.installed_version() == "new"
+    # The publisher's check holds them a second time, again with the new version.
+    assert system_lock_holders(host) == ["old", "new", "new"]
+    assert identities(host)["upgrade-gate"] == {"account"}

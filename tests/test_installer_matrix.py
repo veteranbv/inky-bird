@@ -1281,6 +1281,8 @@ CLAIMS = {
     "Administrator access is required to remove the display service. No changes made.": (
         "unchanged"
     ),
+    "Neither the installed nor the new version can read the configuration to check for "
+    "running work. No changes made.": "unchanged",
     "Could not check whether a plate is being made. No changes made.": "unchanged",
     "Could not choose a private staging name. No changes made.": "unchanged",
     "Could not find where the services are installed. No changes made.": "unchanged",
@@ -1483,6 +1485,7 @@ CLAIMS = {
     "uv is not executable. Install uv or set UV_BIN.": "neutral",
     "Work that started during the upgrade did not finish in time; the upgrade stopped before "
     "switching to the new version.": "neutral",
+    "The new version checks for running work instead.": "neutral",
     "Could not hold the writer locks again; the upgrade stopped before switching to the new "
     "version.": "neutral",
     "Running the stopped-boundary hook: ${quoted_stopped_hook}": "neutral",

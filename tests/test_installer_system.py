@@ -534,3 +534,51 @@ def test_root_s_work_folders_from_before_the_boot_are_removed_from_the_install_r
     assert result.returncode == 0, result.stdout + result.stderr
     assert not stale.exists()
     assert not list(host.install_root.glob("install.*"))
+
+
+def installed_as_old(host: Host) -> None:
+    """Mark the installed runtime as an older version, whose fake config loader
+    the ``old:load_config`` rule makes reject the configuration."""
+    runtime = (host.app / ".venv").resolve().parent
+    (runtime / ".venv/tag").write_text("old\n")
+    (runtime / "src/runtime-tag").write_text("old\n")
+
+
+def system_lock_holders(host: Host) -> list[str]:
+    return [
+        call[2]
+        for call in host.calls()
+        if call[0] == "upgrade-gate" and call[1] == "hold-writer-locks"
+    ]
+
+
+def test_a_repair_of_a_config_the_installed_version_cannot_read_waits_for_writers(
+    tmp_path: Path,
+) -> None:
+    """The new version, as the account, holds the locks the installed one
+    cannot; a plate being made stops the run before anything changes."""
+    from test_installer_behaviour import running_generation
+
+    host = system_host(tmp_path)
+    assert run_system(host).returncode == 0
+    installed_as_old(host)
+    host.fail("old:load_config")
+    (host.fake / "log").write_text("")
+    units = sorted(path.name for path in host.units.iterdir())
+    systemd = host.state_of("systemd")
+    with running_generation(host):
+        result = run_system(host)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert result.stderr.rstrip().endswith("No changes made.")
+    assert "A plate is still being made" in result.stderr
+    assert system_lock_holders(host) == ["old", "new"]
+    assert sorted(path.name for path in host.units.iterdir()) == units
+    assert host.state_of("systemd") == systemd
+    assert host.installed_version() == "old"
+
+    (host.fake / "log").write_text("")
+    result = run_system(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.installed_version() == "new"
+    assert system_lock_holders(host) == ["old", "new"]
+    assert identities(host)["upgrade-gate"] == {"account"}

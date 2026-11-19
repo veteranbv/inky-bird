@@ -1090,6 +1090,9 @@ def test_linux_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
     result = run_linux(host, APP_UNITS)
     assert result.returncode == 0, result.stderr
     assert "cannot check for a plate being made" in result.stderr
+    # The new version waited for writers and held the locks in its place.
+    assert "The new version checks for running work instead." in result.stderr
+    assert lock_holders(host)[-1] == "new"
     assert host.installed_version() == "new"
 
 
@@ -1247,6 +1250,9 @@ def test_macos_upgrade_proceeds_when_the_installed_version_cannot_be_loaded(
     result = run_macos(host)
     assert result.returncode == 0, result.stderr
     assert "cannot check for a plate being made" in result.stderr
+    # The new version waited for writers and held the locks in its place.
+    assert "The new version checks for running work instead." in result.stderr
+    assert lock_holders(host)[-1] == "new"
     assert host.installed_version() == "new"
 
 
@@ -1805,21 +1811,91 @@ def test_printed_paths_are_quoted_so_a_command_with_them_can_be_pasted(
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
-@pytest.mark.parametrize("locks", ["held", "unavailable"])
-def test_work_folders_from_before_the_boot_are_removed_only_with_the_locks_held(
-    tmp_path: Path, system: str, locks: str
+@pytest.mark.parametrize("holder", ["installed", "new"])
+def test_work_folders_from_before_the_boot_are_removed_with_the_locks_held(
+    tmp_path: Path, system: str, holder: str
 ) -> None:
     """A power loss leaves the work folder beside the configuration; the next
-    run removes it, unless the installed version could not hold the locks."""
+    run removes it once it holds the writer locks, whichever version holds them."""
     host = controller_host(tmp_path, system)
     stale = host.support / "install.stale"
     (stale / "units").mkdir(parents=True)
     os.utime(stale, (0, 0))
     current = host.support / "install.current"
     current.mkdir()
-    if locks == "unavailable":
+    if holder == "new":
         host.fail("old:load_config")
     result = run_controller(host)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert stale.exists() == (locks == "unavailable")
+    assert not stale.exists()
     assert current.is_dir()
+
+
+def lock_holders(host: Host) -> list[str]:
+    """Which version's code ran each attempt to hold the writer locks."""
+    return [
+        call[2]
+        for call in host.calls()
+        if call[0] == "upgrade-gate" and call[1] == "hold-writer-locks"
+    ]
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_an_installed_version_that_cannot_read_the_config_still_waits_for_a_plate(
+    tmp_path: Path, system: str
+) -> None:
+    """A repair still waits for running writers: the new version, which has
+    checked the config, takes the locks the installed one cannot."""
+    host = controller_host(tmp_path, system)
+    host.fail("old:load_config")
+    with running_generation(host):
+        result = run_controller(host)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "The new version checks for running work instead." in result.stderr
+    assert result.stderr.rstrip().endswith(
+        "A plate is still being made. Run the upgrade again after it finishes. No changes made."
+    )
+    assert lock_holders(host) == ["old", "new"]
+    assert not stops(host)
+    assert_previous_running(host)
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_an_installed_version_that_cannot_read_the_config_is_repaired_with_the_locks_held(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("old:load_config")
+    result = run_controller(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.installed_version() == "new"
+    # The installed version tried, could not read the config, and the new one held them.
+    assert lock_holders(host) == ["old", "new"]
+    assert "The new version checks for running work instead." in result.stderr
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_an_upgrade_changes_nothing_if_no_version_can_check_for_writers(
+    tmp_path: Path, system: str
+) -> None:
+    host = controller_host(tmp_path, system)
+    host.fail("old:load_config", "new:load_config")
+    result = run_controller(host)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stderr.rstrip().endswith(
+        "Neither the installed nor the new version can read the configuration to check for "
+        "running work. No changes made."
+    )
+    assert not stops(host)
+    assert_previous_running(host)
+
+
+def test_the_second_hold_also_uses_the_new_version_when_the_installed_one_cannot(
+    tmp_path: Path,
+) -> None:
+    host = macos_host(tmp_path, "serve", "refresh", "catalog-publish")
+    host.fail("old:load_config")
+    result = run_macos(host, "serve refresh catalog-publish")
+    assert result.returncode == 0, result.stderr
+    assert lock_holders(host) == ["old", "new", "new"]
+    assert {call[2] for call in stops(host)} == {"lock-held"}
