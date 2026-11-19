@@ -463,3 +463,29 @@ def test_a_repair_of_a_config_the_installed_version_cannot_read_waits_for_writer
     # The publisher's check holds them a second time, again with the new version.
     assert system_lock_holders(host) == ["old", "new", "new"]
     assert identities(host)["upgrade-gate"] == {"account"}
+
+
+def test_a_stop_at_the_health_check_puts_the_previous_daemon_back_while_launchd_stops_it(
+    tmp_path: Path,
+) -> None:
+    from test_installer_behaviour import step_of
+    from test_installer_system import installed_as_old
+
+    probe = system_host(tmp_path / "probe")
+    assert run_system(probe).returncode == 0
+    (probe.fake / "steps").unlink()
+    probe.fail("bootout-async")
+    assert run_system(probe).returncode == 0
+    at = step_of(probe, "venv-python", "check-serve")
+    host = system_host(tmp_path / "run")
+    assert run_system(host).returncode == 0
+    installed_as_old(host)
+    (host.fake / "steps").unlink()
+    host.fail("bootout-async")
+    (host.fake / "inject").write_text(f"{at} kill\n")
+    result = run_system(host)
+    assert result.returncode == 143, result.stdout + result.stderr
+    assert "not running" not in result.stderr, result.stderr
+    serve = host.state_of("launchd")["com.inky-bird.serve"]
+    assert serve["runtime"] == "old" and "shutting_down" not in serve, serve
+    assert host.installed_version() == "old"

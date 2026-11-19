@@ -525,6 +525,24 @@ def system_python(arguments: list[str]) -> int:
     return _exec([sys.executable, *arguments])
 
 
+# How many launchctl calls about a booted-out job still find it (bootout-async).
+BOOTOUT_QUERIES = 2
+
+
+def _settle(loaded: dict[str, Any], label: str) -> None:
+    """One more call about a job that is shutting down: once enough have been
+    made, it has gone."""
+    entry = loaded.get(label)
+    if not isinstance(entry, dict) or "shutting_down" not in entry:
+        return
+    left = int(entry["shutting_down"]) - 1
+    if left > 0:
+        entry["shutting_down"] = left
+    else:
+        del loaded[label]
+    _save("launchd", loaded)
+
+
 def launchctl(arguments: list[str]) -> int:
     import plistlib
 
@@ -532,6 +550,7 @@ def launchctl(arguments: list[str]) -> int:
     verb = arguments[0]
     if verb == "print":
         target = arguments[1]
+        _settle(loaded, target.split("/")[-1])
         entry = loaded.get(target.split("/")[-1])
         # A job is in the system domain or a user's; a LaunchDaemon says which.
         system = isinstance(entry, dict) and entry.get("domain") == "system"
@@ -554,7 +573,14 @@ def launchctl(arguments: list[str]) -> int:
         _log("stopped", label, held, _process_runtime(label))
         if f"bootout:{label}" in _rules():
             return 5
-        del loaded[label]
+        if "bootout-async" in _rules():
+            # launchctl returns while the job still shuts down: launchd lists
+            # it for a while, and a bootstrap of it fails until it has gone.
+            entry = loaded[label]
+            assert isinstance(entry, dict)
+            entry["shutting_down"] = BOOTOUT_QUERIES
+        else:
+            del loaded[label]
         _save("launchd", loaded)
         processes = _state("processes")
         processes.pop(label, None)
@@ -564,6 +590,12 @@ def launchctl(arguments: list[str]) -> int:
         payload = plistlib.loads(Path(arguments[2]).read_bytes())
         label = payload["Label"]
         generation = payload.get("Comment", "unknown")
+        _settle(loaded, label)
+        entry = loaded.get(label)
+        if isinstance(entry, dict) and "shutting_down" in entry:
+            _log("launchctl", "bootstrap-while-shutting-down", label)
+            print("Bootstrap failed: 5: Input/output error", file=sys.stderr)
+            return 5
         if label in loaded:
             return 17
         if f"bootstrap-{generation}:{label.split('.')[-1]}" in _rules():
