@@ -879,6 +879,13 @@ def rsync(arguments: list[str]) -> int:
         elif not argument.startswith("-"):
             paths.append(argument)
     source_text, target_text = (path.split(":", 1)[-1] for path in paths[-2:])
+    # macOS's /usr/bin/rsync is openrsync: it rejects a numeric --chmod and
+    # accepts a symbolic one without applying it.
+    openrsync = os.environ.get("FAKE_UNAME") == "Darwin"
+    for argument in arguments:
+        if openrsync and argument.startswith("--chmod=") and any(c.isdigit() for c in argument):
+            print(f"rsync: {argument}: invalid argument", file=sys.stderr)
+            return 1
     _log("rsync", source_text, target_text)
     _as("rsync")
     if "rsync" in _rules():
@@ -893,7 +900,7 @@ def rsync(arguments: list[str]) -> int:
         modes = {
             argument[8]: int(argument[9:], 8)
             for argument in arguments
-            if argument.startswith("--chmod=") and argument[8:9] in ("D", "F")
+            if argument.startswith("--chmod=") and argument[8:9] in ("D", "F") and not openrsync
         }
         for path in [target, *target.rglob("*")] if modes else ():
             if not path.is_symlink():

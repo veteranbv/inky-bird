@@ -41,6 +41,20 @@ if [ -n "${service_account}" ] && [ "$(id -u)" != 0 ]; then
   echo "Remove system services as root: sudo ${script_command} --service-account NAME. No changes made." >&2
   exit 1
 fi
+# As root, only a system service: the user uninstaller removes the running
+# user's own LaunchAgents, and root has none.
+if [ -z "${service_account}" ] && [ "$(id -u)" = 0 ]; then
+  for plist in /Library/LaunchDaemons/com.inky-bird*.serve.plist; do
+    if [ -f "${plist}" ]; then
+      owner=${plist##*/com.}
+      owner=${owner%.serve.plist}
+      echo "${plist##*/} is a system service of ${owner}. Run the uninstaller again with --service-account ${owner}. No changes made." >&2
+      exit 1
+    fi
+  done
+  echo "Run the uninstaller as the account that owns the controller, not as root. No changes made." >&2
+  exit 1
+fi
 
 # Until the layout is known, nothing has changed.
 trap 'echo "Uninstall was stopped. No changes made." >&2; exit 129' HUP

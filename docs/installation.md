@@ -1029,6 +1029,12 @@ private configuration, controller state, catalogs, and generated art:
 ./deploy/uninstall-display-local.sh        # display node
 ```
 
+Run these as the account that owns the controller. The macOS uninstaller
+refuses to run as root without `--service-account`, as the installer does:
+root has no LaunchAgents of its own. Neither uninstaller removes a system
+service without its account: if one has the same name, it names that account
+and changes nothing.
+
 For a system service, run the matching uninstaller as root with the account
 it runs as (and `--install-root` if you gave one when installing):
 

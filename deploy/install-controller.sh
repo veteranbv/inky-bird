@@ -321,10 +321,21 @@ make_temp_dir() {
   [ -n "${created}" ]
 }
 
+# A system service's copy is root's and readable by everyone, whatever modes
+# the checkout's files have (a root umask of 077 makes them 0600): folders
+# 0755, files 0644. Not rsync --chmod: macOS's openrsync accepts it and
+# ignores it. find follows no links.
+share_copy() {
+  if [ -n "${service_account}" ]; then
+    find "$1" -type d -exec chmod 0755 {} +
+    find "$1" -type f -exec chmod 0644 {} +
+  fi
+}
 # Copy what building, and later reinstalling, a runtime needs from ${root}.
 stage_runtime_source() {
   local target=$1
   rsync -a --delete ${copy_options[@]+"${copy_options[@]}"} "${root}/src/" "${target}/src/"
+  share_copy "${target}/src"
   mkdir -p "${target}/deploy" "${target}/docs"
   install -m 0755 "${root}/deploy/install-controller.sh" "${target}/deploy/"
   for file in pyproject.toml uv.lock README.md LICENSE docs/browser-access.md; do
@@ -352,9 +363,9 @@ copy_options=()
 presence_timeout_seconds=30
 recovery_parent=${support_dir}
 if [ -n "${service_account}" ]; then
-  # A copy is root's, readable by everyone, whatever owner and modes the
-  # checkout's files have (a root umask of 077 makes them 0600).
-  copy_options=(--no-owner --no-group --chmod=D0755 --chmod=F0644)
+  # A copy is root's, whatever owner the checkout's files have; share_copy
+  # sets its modes.
+  copy_options=(--no-owner --no-group)
   account_prefix=(python3 -I "${system_helper}" run-as "${service_account}" --
     env -i "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "HOME=${account_home}" "LANG=en_US.UTF-8"
     "INKY_BIRD_ENV_FILE=${environment_file}")
@@ -1321,6 +1332,7 @@ else
   if [ "${catalog_root}" != "${app_dir}" ]; then
     contained "${app_dir}" "${app_dir}/catalog"
     rsync -a --delete "${copy_options[@]}" "${catalog_root}/catalog/" "${app_dir}/catalog/"
+    share_copy "${app_dir}/catalog"
   fi
   for program_mode in sync render; do
     runner=()
