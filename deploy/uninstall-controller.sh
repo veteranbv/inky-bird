@@ -42,12 +42,23 @@ if [ -n "${service_account}" ] && [ "$(id -u)" != 0 ]; then
   exit 1
 fi
 # As root, only a system service: the user uninstaller removes the running
-# user's own LaunchAgents, and root has none.
+# user's own LaunchAgents, and root has none. As the installer does, it names
+# an account only for a job that runs as the account its label is named after.
 if [ -z "${service_account}" ] && [ "$(id -u)" = 0 ]; then
   for plist in /Library/LaunchDaemons/com.inky-bird*.serve.plist; do
+    owner=""
     if [ -f "${plist}" ]; then
-      owner=${plist##*/com.}
-      owner=${owner%.serve.plist}
+      owner=$(python3 -I -c '
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as handle:
+        job = plistlib.load(handle)
+    print(job.get("UserName", "") if isinstance(job, dict) else "")
+except Exception:
+    print("")
+' "${plist}")
+    fi
+    if [ -n "${owner}" ] && [ "${plist##*/}" = "com.${owner}.serve.plist" ]; then
       echo "${plist##*/} is a system service of ${owner}. Run the uninstaller again with --service-account ${owner}. No changes made." >&2
       exit 1
     fi

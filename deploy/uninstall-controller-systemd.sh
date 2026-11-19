@@ -63,7 +63,12 @@ else
   unit="/etc/systemd/system/${service_prefix}-controller.service"
   if [ -f "${unit}" ] && [ "$(head -n 1 "${unit}")" = "# Inky Bird system service" ]; then
     owner=$(sed -n 's/^User=//p' "${unit}" | tail -n 1)
-    echo "${unit##*/} is a system service of ${owner}. Run the uninstaller as root with --service-account ${owner}. No changes made." >&2
+    # Name the account only when the unit runs as the account it is named after.
+    if [ -n "${owner}" ] && [ "${unit##*/}" = "${owner}-controller.service" ]; then
+      echo "${unit##*/} is a system service of ${owner}. Run the uninstaller as root with --service-account ${owner}. No changes made." >&2
+    else
+      echo "Remove system services as root: sudo ${script_command} --service-account NAME. No changes made." >&2
+    fi
     exit 1
   fi
 fi

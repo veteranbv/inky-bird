@@ -8,6 +8,7 @@ synthetic accounts, owners and service managers as the installers' tests.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -299,4 +300,54 @@ def test_the_linux_user_uninstaller_leaves_a_system_service_of_the_same_name(
         "inky-bird-controller.service is a system service of inky-bird. Run the uninstaller "
         "as root with --service-account inky-bird. No changes made."
     )
+    assert (jobs(host, "inky-bird"), code(host), host.state_of("systemd")) == before
+
+
+def test_the_macos_uninstaller_as_root_names_only_an_account_a_job_runs_as(
+    tmp_path: Path,
+) -> None:
+    """An older-layout system job is named after its family, not the account
+    it runs as: naming an account from its file name would name one that does
+    not exist. Only a job that runs as the account its label is named after
+    is named, as the installer does."""
+    import plistlib
+
+    host = installed(tmp_path, "Darwin")
+    older = host.agents / "com.inky-bird-frame.serve.plist"
+    older.write_bytes(
+        plistlib.dumps({"Label": "com.inky-bird-frame.serve", "UserName": "_inky_controller"})
+    )
+    # The older job sorts first; the installation's own is still named.
+    result = uninstall(host, system=False)
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "com.inky-bird.serve.plist is a system service of inky-bird. Run the uninstaller "
+        "again with --service-account inky-bird. No changes made."
+    )
+    for daemon in host.agents.glob("com.inky-bird.*.plist"):
+        daemon.unlink()
+    before = (code(host), host.state_of("launchd"), sorted(host.agents.iterdir()))
+    result = uninstall(host, system=False)
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "Run the uninstaller as the account that owns the controller, not as root. No changes made."
+    )
+    assert (code(host), host.state_of("launchd"), sorted(host.agents.iterdir())) == before
+
+
+def test_the_linux_user_uninstaller_names_only_an_account_the_unit_runs_as(
+    tmp_path: Path,
+) -> None:
+    host = installed(tmp_path, "Linux")
+    unit = host.units / "inky-bird-controller.service"
+    unit.write_text(unit.read_text().replace("User=inky-bird", "User=_inky_controller"))
+    before = (jobs(host, "inky-bird"), code(host), host.state_of("systemd"))
+    result = uninstall(host, uid="1000", system=False)
+    assert result.returncode == 1
+    script = shlex.split(result.stderr.split("sudo ", 1)[1])[0]
+    assert result.stderr.strip() == (
+        f"Remove system services as root: sudo {shlex.quote(script)} --service-account NAME. "
+        "No changes made."
+    )
+    assert "_inky_controller" not in result.stderr
     assert (jobs(host, "inky-bird"), code(host), host.state_of("systemd")) == before
