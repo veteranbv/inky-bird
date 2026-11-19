@@ -284,6 +284,39 @@ if [ "$(cd -P "${root}/.." && pwd)" = "$(cd -P "${runtimes_dir}" 2>/dev/null && 
   catalog_root=${app_dir}
 fi
 
+# launchctl bootout returns before launchd has finished stopping the job;
+# until it has, the job is still listed and a bootstrap of its label fails
+# ("Bootstrap failed: 5: Input/output error"). Wait, bounded, for it to go.
+bootout_wait_seconds=30
+wait_unloaded() {
+  local deadline=$((SECONDS + bootout_wait_seconds))
+  while launchctl print "${domain}/$1" >/dev/null 2>&1; do
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      return 1
+    fi
+    sleep "${poll_seconds}"
+  done
+}
+# Bootstrap the plist $1 of label $2. launchd answers a bootout it has not
+# finished with "Bootstrap failed: 5: Input/output error": while the label is
+# no longer loaded, try that again a few times. Any other failure, or one with
+# the label still loaded, fails at once, as before, with launchctl's own error.
+bootstrap_agent() {
+  local attempt output
+  for attempt in 1 2 3 4 5; do
+    if output=$(launchctl bootstrap "${domain}" "$1" 2>&1); then
+      [ -z "${output}" ] || printf '%s\n' "${output}"
+      return 0
+    fi
+    if [ "${attempt}" -eq 5 ] || [ "${output}" = "${output#*Bootstrap failed: 5:}" ] ||
+        launchctl print "${domain}/$2" >/dev/null 2>&1; then
+      printf '%s\n' "${output}" >&2
+      return 1
+    fi
+    sleep "${poll_seconds}"
+  done
+}
+
 restore_catalog_publisher_schedule() {
   local uid=$1
   local recovery_dir
@@ -294,7 +327,7 @@ restore_catalog_publisher_schedule() {
   recovery_plist="${recovery_dir}/catalog-publish.plist"
   cp "${catalog_publish_plist}" "${recovery_plist}" && \
     /usr/bin/plutil -replace RunAtLoad -bool false "${recovery_plist}" && \
-    launchctl bootstrap "${domain}" "${recovery_plist}" || status=1
+    bootstrap_agent "${recovery_plist}" "com.${service_prefix}.catalog-publish" || status=1
   rm -rf "${recovery_dir}" || leftovers+=("${recovery_dir}")
   return "${status}"
 }
@@ -806,7 +839,7 @@ stop_agent_for_restore() {
   if { contains "${label}" ${stopped_labels[@]+"${stopped_labels[@]}"} || \
       ! contains "${label}" ${previously_loaded_labels[@]+"${previously_loaded_labels[@]}"}; } && \
       launchctl print "${domain}/${agent}" >/dev/null 2>&1; then
-    if ! launchctl bootout "${domain}/${agent}"; then
+    if ! launchctl bootout "${domain}/${agent}" || ! wait_unloaded "${agent}"; then
       still_running+=("${agent}")
     fi
   fi
@@ -839,7 +872,7 @@ restore_agent() {
   elif [ "${label}" = "catalog-publish" ]; then
     restore_catalog_publisher_schedule "${uid}" || unrestored+=("${agent}")
   else
-    launchctl bootstrap "${domain}" "${plist}" || unrestored+=("${agent}")
+    bootstrap_agent "${plist}" "${agent}" || unrestored+=("${agent}")
   fi
 }
 
@@ -1367,6 +1400,7 @@ if [ -f "${catalog_publish_plist}" ]; then
     stopping_label=catalog-publish
     launchctl bootout "${domain}/com.${service_prefix}.catalog-publish"
     stopped_labels+=("catalog-publish")
+    wait_unloaded "com.${service_prefix}.catalog-publish" || true
     stopping_label=""
   fi
   # The check takes the publisher's own locks.
@@ -1381,6 +1415,7 @@ for label in serve refresh generate catalog-publish notifications scheduler; do
     stopping_label=${label}
     launchctl bootout "${domain}/com.${service_prefix}.${label}"
     stopped_labels+=("${label}")
+    wait_unloaded "com.${service_prefix}.${label}" || true
     stopping_label=""
   fi
 done
@@ -1409,21 +1444,21 @@ if [ "${first_install}" = true ]; then
   done
   place_agents "${agents_dir}"
 fi
-launchctl bootstrap "${domain}" "${serve_plist}"
+bootstrap_agent "${serve_plist}" "com.${service_prefix}.serve"
 if [ -f "${refresh_plist}" ]; then
-  launchctl bootstrap "${domain}" "${refresh_plist}"
+  bootstrap_agent "${refresh_plist}" "com.${service_prefix}.refresh"
 fi
 if [ -f "${scheduler_plist}" ]; then
-  launchctl bootstrap "${domain}" "${scheduler_plist}"
+  bootstrap_agent "${scheduler_plist}" "com.${service_prefix}.scheduler"
 fi
 if [ -f "${generation_plist}" ]; then
-  launchctl bootstrap "${domain}" "${generation_plist}"
+  bootstrap_agent "${generation_plist}" "com.${service_prefix}.generate"
 fi
 if [ -f "${catalog_publish_plist}" ]; then
-  launchctl bootstrap "${domain}" "${catalog_publish_plist}"
+  bootstrap_agent "${catalog_publish_plist}" "com.${service_prefix}.catalog-publish"
 fi
 if [ -f "${notifications_plist}" ]; then
-  launchctl bootstrap "${domain}" "${notifications_plist}"
+  bootstrap_agent "${notifications_plist}" "com.${service_prefix}.notifications"
 fi
 launchctl print "${domain}/com.${service_prefix}.serve" >/dev/null
 if [ -f "${refresh_plist}" ]; then
