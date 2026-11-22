@@ -1,0 +1,16 @@
+{
+  "_comment": "Spoken-form substitutions applied ONLY to the text sent to a TTS engine; captions, the transcript and the VTT keep the true spellings. Engine entries override default.",
+  "default": {
+    "Sowell": "Sowel",
+    "sowell": "sowel",
+    "henrysowell.com/birds": "henry sowel dot com slash birds"
+  },
+  "kokoro": {
+    "Inky": "ink-ee",
+    "inky": "ink-ee",
+    "MIT": "em eye tee"
+  },
+  "elevenlabs": {
+    "MIT": "M.I.T."
+  }
+}

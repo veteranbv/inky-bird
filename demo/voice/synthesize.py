@@ -20,6 +20,21 @@ import sys
 import urllib.request
 from pathlib import Path
 
+PRONUNCIATIONS = Path(__file__).parent / "pronunciations.json"
+
+
+def spoken(text: str, engine: str) -> str:
+    """The narration as the engine should say it. Captions keep the spelling;
+    this rewrites whole words only, per engine, from pronunciations.json."""
+    import re  # noqa: PLC0415
+
+    table = json.loads(PRONUNCIATIONS.read_text())
+    replacements = {**table.get("default", {}), **table.get(engine, {})}
+    for word, said in replacements.items():
+        text = re.sub(rf"(?<!\w){re.escape(word)}(?!\w)", said, text)
+    return text
+
+
 MODEL_RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 MODEL_FILES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
@@ -48,7 +63,7 @@ def synthesize_kokoro(
     kokoro = Kokoro(str(model), str(voices))
     durations: dict[str, float] = {}
     for scene in scenes:
-        samples, sample_rate = kokoro.create(scene["narration"], voice=voice, speed=speed)
+        samples, sample_rate = kokoro.create(spoken(scene["narration"], "kokoro"), voice=voice, speed=speed)
         path = out_dir / f"{scene['id']}.wav"
         soundfile.write(path, samples, sample_rate)
         durations[scene["id"]] = round(len(samples) / sample_rate, 3)
@@ -68,7 +83,7 @@ def synthesize_elevenlabs(scenes: list[dict], out_dir: Path) -> dict[str, float]
     durations: dict[str, float] = {}
     for scene in scenes:
         body = json.dumps(
-            {"text": scene["narration"], "model_id": "eleven_multilingual_v2"}
+            {"text": spoken(scene["narration"], "elevenlabs"), "model_id": "eleven_multilingual_v2"}
         ).encode()
         request = urllib.request.Request(  # noqa: S310
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_24000",
