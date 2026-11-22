@@ -20,6 +20,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 mkdir -p "$out"
+out=$(cd "$out" && pwd)
 
 for tool in node ffmpeg ffprobe; do
   command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 1; }

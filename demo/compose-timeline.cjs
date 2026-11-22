@@ -39,6 +39,8 @@ const probe = (file) => Number(execFileSync(process.env.INKY_QA_FFPROBE || 'ffpr
 
 const CROSSFADE_FRAMES = 12;
 const NARRATION_PAD_SECONDS = 1.1;
+// Hold on the result of a scene's last recorded action before cutting away.
+const LAST_ACTION_HOLD_SECONDS = 1.5;
 let cursor = 0;
 const scenes = storyboard.scenes.map((scene) => {
   let seconds = scene.minSeconds;
@@ -58,6 +60,8 @@ const scenes = storyboard.scenes.map((scene) => {
     const events = JSON.parse(readFileSync(path.join(out, 'capture', `${scene.id}.events.json`)));
     assert.deepEqual(events.blockedExternalRequests, [], `${scene.id} left loopback`);
     assert.deepEqual(events.pageErrors, [], `${scene.id} raised page errors`);
+    const lastAction = Math.max(0, ...events.events.map((event) => event.seconds));
+    seconds = Math.max(seconds, lastAction + LAST_ACTION_HOLD_SECONDS);
     const clipSeconds = probe(path.join(out, 'capture', `${scene.id}.webm`));
     const usable = clipSeconds - events.trimStart - 0.2;
     assert(usable >= seconds,
