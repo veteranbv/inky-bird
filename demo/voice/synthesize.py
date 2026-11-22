@@ -63,7 +63,8 @@ def synthesize_kokoro(
     kokoro = Kokoro(str(model), str(voices))
     durations: dict[str, float] = {}
     for scene in scenes:
-        samples, sample_rate = kokoro.create(spoken(scene["narration"], "kokoro"), voice=voice, speed=speed)
+        text = spoken(scene["narration"], "kokoro")
+        samples, sample_rate = kokoro.create(text, voice=voice, speed=speed)
         path = out_dir / f"{scene['id']}.wav"
         soundfile.write(path, samples, sample_rate)
         durations[scene["id"]] = round(len(samples) / sample_rate, 3)

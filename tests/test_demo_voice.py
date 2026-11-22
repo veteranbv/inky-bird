@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("synthesize", ROOT / "demo/voice/synthesize.py")
+assert SPEC is not None and SPEC.loader is not None
 SYNTHESIZE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SYNTHESIZE)
 
@@ -14,8 +15,7 @@ def test_spoken_rewrites_whole_words_per_engine() -> None:
     line = "Inky Bird is MIT licensed. Browse the gallery at henrysowell.com/birds."
     kokoro = SYNTHESIZE.spoken(line, "kokoro")
     assert kokoro == (
-        "ink-ee Bird is em eye tee licensed. "
-        "Browse the gallery at henry sowel dot com slash birds."
+        "ink-ee Bird is em eye tee licensed. Browse the gallery at henry sowel dot com slash birds."
     )
     eleven = SYNTHESIZE.spoken(line, "elevenlabs")
     assert eleven == (
