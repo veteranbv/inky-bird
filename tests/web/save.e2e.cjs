@@ -19,15 +19,13 @@ async function shown(page, text) {
 
 // Favorites, eBird history, trips, portable collections and missing-plate requests.
 async function historyAndCollections(t) {
-  const { page, context, origin, fixture, heading, step, state, cardinal, robin } = t;
+  const { page, context, origin, fixture, heading, step, state, cardinal, robin, redrawn } = t;
   t.phase = 'favorites';
   await page.goto(origin + '/app?page=bird&bird=' + cardinal.taxon_id);
   await heading('Northern Cardinal');
-  await Promise.all([
-    page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Add to Favorites', exact: true }).click(),
-  ]);
+  await redrawn(() => page.getByRole('button', { name: 'Add to Favorites', exact: true }).click());
   await heading('Northern Cardinal');
+  await page.getByRole('button', { name: 'Remove from Favorites', exact: true }).waitFor();
   assert.equal(state().collections[0].kind, 'favorites');
   t.phase = 'upload';
   await page.goto(origin + '/app?page=imports&kind=ebird-archive');

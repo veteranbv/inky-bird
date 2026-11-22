@@ -3,7 +3,7 @@ import { inlineProblem, clearProblem } from '/app/ui.js';
 import { confirmAction } from '/app/frame-tools.js';
 import { WORDS, when } from '/app/words.js';
 
-export async function renderPresentation(ui, { base, link, note, data, area }) {
+export async function renderPresentation(ui, { base, link, note, data, area, reopen }) {
   const { api, element: el, button } = ui,
     main = document.querySelector('#main');
   base(
@@ -75,7 +75,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
     return input;
   }
   // Resolves true once the change was made, false when it was not.
-  async function update(body, section, done = () => location.reload()) {
+  async function update(body, section, done = () => reopen()) {
     if (busy) {
       inlineProblem(ui, section, {
         message: 'Another change is still being saved. Try again when it finishes.',
@@ -349,7 +349,7 @@ export async function renderPresentation(ui, { base, link, note, data, area }) {
           '/v1/integrations/status\n  headers:\n    Authorization: "Bearer {{HOMEPAGE_VAR_INKY_STATUS}}"\n  mappings:\n    - field: data.view_ready_count\n      label: In rotation\n      format: number\n    - field: data.approved_count\n      label: Approved\n      format: number';
         once.append(
           config,
-          button('I saved it · clear this copy', () => location.reload()),
+          button('I saved it · clear this copy', () => reopen()),
         );
         status.append(once);
       },

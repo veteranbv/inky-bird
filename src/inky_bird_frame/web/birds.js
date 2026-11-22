@@ -331,7 +331,7 @@ export async function renderBird(context) {
           taxon_id: bird.taxon_id,
           favorite: !favorite,
         });
-        location.reload();
+        await context.reopen();
       } catch (error) {
         control.disabled = false;
         inlineProblem(ui, notes, error);

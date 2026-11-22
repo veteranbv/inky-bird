@@ -266,7 +266,31 @@ function run(body) {
     }
     const state = () =>
       JSON.parse(fs.readFileSync(path.join(fixture, 'var/controller/journal.json')));
-    Object.assign(t, { browser, context, page, errors, heading, step, state });
+    // A save redraws the page from fresh journal data; it must not reload the browser.
+    async function redrawn(action) {
+      let reloaded = false;
+      const onLoad = () => {
+        reloaded = true;
+      };
+      page.on('load', onLoad);
+      // Wait for the old content to go too, so the next step never acts on it.
+      const old = await page.locator('#main > *').first().elementHandle();
+      try {
+        await Promise.all([
+          page.waitForResponse(
+            (response) =>
+              new URL(response.url()).pathname === '/v1/owner/journal' &&
+              response.request().method() === 'GET',
+          ),
+          action(),
+        ]);
+        await page.waitForFunction((node) => !node.isConnected, old);
+      } finally {
+        page.off('load', onLoad);
+      }
+      assert(!reloaded, t.phase + ': the page reloaded instead of redrawing');
+    }
+    Object.assign(t, { browser, context, page, errors, heading, step, state, redrawn });
     await body(t);
     // Catches what no browser response showed, such as an API request's 5xx.
     t.phase = 'server-errors';

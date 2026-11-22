@@ -165,7 +165,7 @@ async function candidates(t) {
 }
 
 async function integrations(t) {
-  const { page, context, origin, fixture, heading, trip, imported, screenContext } = t;
+  const { page, context, origin, fixture, heading, trip, imported, screenContext, redrawn } = t;
   t.phase = 'scoped-integrations';
   await page.goto(origin + '/app?page=integrations');
   await heading('Integrations');
@@ -179,10 +179,7 @@ async function integrations(t) {
       { exact: true },
     )
     .check();
-  await Promise.all([
-    page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Turn on dashboard plates', exact: true }).click(),
-  ]);
+  await redrawn(() => page.getByRole('button', { name: 'Turn on dashboard plates', exact: true }).click());
   const artResponse = await context.request.get(origin + '/v1/dashboard/art');
   assert.equal(artResponse.status(), 200);
   const artText = await artResponse.text();
@@ -197,17 +194,11 @@ async function integrations(t) {
   assert.equal(aggregate.status(), 200);
   assert(!JSON.stringify(await aggregate.json()).includes(trip.label));
   await noSideways(page, 'Integrations');
-  await Promise.all([
-    page.waitForEvent('load'),
-    page.getByRole('button', { name: 'I saved it · clear this copy', exact: true }).click(),
-  ]);
+  await redrawn(() => page.getByRole('button', { name: 'I saved it · clear this copy', exact: true }).click());
   await heading('Integrations');
   assert.equal(await page.getByText(serviceSecret, { exact: true }).count(), 0);
   await page.getByRole('button', { name: 'Revoke Dashboard status', exact: true }).click();
-  await Promise.all([
-    page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Revoke', exact: true }).click(),
-  ]);
+  await redrawn(() => page.getByRole('button', { name: 'Revoke', exact: true }).click());
   await heading('Integrations');
   assert.equal(
     (
