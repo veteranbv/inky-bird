@@ -22,11 +22,5 @@ private/
 /AGENTS.md
 /CLAUDE.md
 
-# Demo film pipeline: generated media, caches and local tool environments
-# stay out of Git (demo/README.md documents how to regenerate everything).
-demo/out/
-demo/video/node_modules/
-demo/video/out/
-demo/video/public/demo/
-demo/voice/.venv/
-demo/voice/models/
+# Maintainer-local tools, such as the demo film build.
+/local/

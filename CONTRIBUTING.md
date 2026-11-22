@@ -214,10 +214,6 @@ two approved public plates. It creates a manual collection through the real
 browser UI. Inspect the two PNGs in the printed output directory before copying
 them to `docs/images/`. Publish only those images, not the fixture state.
 
-### Rebuild the demo film
-
-See [demo/README.md](demo/README.md).
-
 ## Catalog contributions
 
 Catalog entries are immutable, location-neutral artifacts. A contribution adds
