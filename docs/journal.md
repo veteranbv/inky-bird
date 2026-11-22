@@ -9,9 +9,7 @@ if you want to try it without generation, connected sources, or a physical displ
 
 ## Find your way around
 
-The tabs sit at the bottom on phones and at the top on wide screens. If you
-already run Inky, follow the [migration guide](migration-v1.md) to keep your
-configuration and data.
+The tabs sit at the bottom on phones and at the top on wide screens.
 
 - **Home** shows **Your journal**: a plate from your frame, the birds noted
   **Lately** and a count of your birds and plates. With nothing on your frame
@@ -180,6 +178,5 @@ Paired screens, `/v1/screen/view` and `/wall` responses do not include these
 fields.
 
 Use a stopped, consistent [controller backup](backup.md), not a live ZIP of
-the state folder. An older release ignores this new file, but that does not
-prove every newer state file is backward compatible. Roll back with the old
+the state folder. Roll back with the old
 runtime and its matching complete backup.

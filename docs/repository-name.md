@@ -6,7 +6,7 @@ its data or replace its service identities to use the updated application.
 
 | Surface | Preferred for new installations | Existing installations |
 | --- | --- | --- |
-| Repository | `veteranbv/inky-bird` | Old GitHub URLs redirect after the rename; keep the old repository name unused. |
+| Repository | `veteranbv/inky-bird` | Old GitHub URLs redirect after the rename. |
 | Python distribution | `inky-bird` | Remove the old distribution before installing the new one; see below. |
 | Command | `inky-bird` | `inky-bird-frame` remains a supported alias, including JSON output. |
 | Controller image | `ghcr.io/veteranbv/inky-bird` | `ghcr.io/veteranbv/inky-bird-frame` receives the same builds and tags. No sunset is scheduled. |

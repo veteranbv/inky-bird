@@ -25,10 +25,8 @@ You need:
   only if you want to generate missing art; and
 - a reachable controller address if you use a physical display or another device.
 
-The browser-journal release can start with the approved plates, no sources and
-generation off. It needs neither Codex sign-in nor an e-paper frame. Do not run
-the new art-first commands with an older published image; follow that release's
-existing configuration path and the [migration guide](migration-v1.md).
+Inky can start with the approved plates, no sources and
+generation off. It needs neither Codex sign-in nor an e-paper frame.
 
 Do not expose port 8793 to the public internet. It serves a read-only catalog
 and accepts narrow, unauthenticated display-health reports on a trusted
@@ -58,10 +56,6 @@ macOS, use:
 expected=$(cut -d ' ' -f 1 inky-bird-frame-docker.tar.gz.sha256)
 printf '%s  %s\n' "$expected" inky-bird-frame-docker.tar.gz | shasum -a 256 -c -
 ```
-
-The download filename stays compatible with existing releases. New bundle
-publication retains this alias, so these commands do not depend on a new tag
-or a renamed historical asset.
 
 If you prefer a source checkout, clone the repository and use the same
 `compose.yaml`. Compose still pulls the published image unless you explicitly
@@ -411,12 +405,9 @@ Also review the [Compose file](../compose.yaml) from that same release. Keep
 your private `.env`, configuration, credential files and persistent volumes.
 Back up your old Compose file and preserve deliberate local overrides; do not
 blindly overwrite a customized file. An image pull alone cannot add new Compose
-wiring. The browser-journal release adds controller-side provider credentials
-and the separate optional `access.env` for single sign-on. Update that wiring
-before relying on new browser source actions or advanced access. Existing
-scheduled work does not depend on completing the new owner setup.
+wiring.
 
-When moving from v0.8.1 or earlier, confirm that the host `config.toml` contains
+Confirm that the host `config.toml` contains
 the settings currently installed in `controller-data` before replacing the old
 Compose file. If the runtime copy may be newer, export it without printing its
 secrets to the terminal:
@@ -429,7 +420,7 @@ cmp -s config.toml config.from-controller.toml || \
   echo "Review the two private files before updating"
 ```
 
-Keep the intended version as `config.toml` with mode `0600`. The new
+Keep the intended version as `config.toml` with mode `0600`. The
 `config-sync` service treats that host file as authoritative.
 
 ```bash
@@ -526,35 +517,10 @@ One failed scheduled job is logged and retried later without stopping the HTTP
 service or unrelated jobs.
 
 The [browser journal](journal.md) opens at `/app`.
-Create a local username and password; no setup code is required. The optional
-`access.env` file supplies only controller access credentials such as an OIDC
-client secret. Protect it with mode `0600`. It is separate from `controller.env`,
-which supplies provider and destination credentials to both long-running
-services. Browser source and notification actions need those variables in the
-serving process as well as the scheduler. Keep only required Inky variables in
-these files. Do not give the controller a vault service token or unrelated host
-credentials. Both processes use the same private configuration and history.
-See [migration](migration-v1.md) and [history imports](history-imports.md).
 
 Docker port forwarding changes the address seen by the application. List the
 exact browser address in your host `config.toml`, including any non-default
-port. For access from the same computer:
-
-```toml
-[controller]
-owner_access_mode = "local"
-owner_allowed_origins = ["http://localhost:8793"]
-```
-
-For a phone on your home network, replace that example with the controller's
-actual LAN address. Add each address you use, rather than a wildcard. With a
-TLS reverse proxy, use its exact HTTPS address and `owner_access_mode = "https-only"`
-as described in the access guide. This explicit address check prevents an
-unrelated hostname from reaching owner forms through DNS rebinding.
-
-Trust the other web services on that hostname or IP, including other ports:
-browsers share sign-in cookies across ports. A separate HTTP hostname alone
-does not isolate an untrusted service. See the
+port. See the
 [host-isolation requirements](browser-access.md#sessions-and-private-files).
 
 The controller health check reads the same configuration as `doctor`. It uses
@@ -656,7 +622,5 @@ The image includes the project license and the pinned Codex CLI and GitHub CLI
 license material under `/usr/share/licenses/inky-bird-frame/`. See
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for component details.
 
-Images are published only from trusted `main`, published releases or an
-owner-started manual run. Pull requests build and test the container but
-cannot publish it or receive controller credentials. For HTTP errors, caching and security headers, external
+For HTTP errors, caching and security headers, external
 browser applications and Homepage, see the [reference page](reference.md).

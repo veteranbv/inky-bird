@@ -70,12 +70,6 @@ generation limits or display settings. Your existing schedules keep running.
 The older catalog and dashboard routes retain their trusted-network contract;
 the new owner account does not put them behind a login.
 
-Before updating from v0.9.7, follow the [backup guide](backup.md) and keep the
-matching release with that backup. Use the [native update](installation.md#update)
-or [Docker update](docker.md#update) procedure for the exact reviewed candidate.
-There is no published 1.0 release yet. Do not use this development branch as
-an unattended production upgrade.
-
 After updating, check controller and display health. An existing owner keeps
 the same account. If no owner exists, native interactive setup asks for a
 username and a password with hidden entry. You can also create it yourself.
@@ -114,16 +108,14 @@ paths must stay inside that directory. Docker's guide prepares the empty volume
 before catalog bootstrap. Any other file or directory, even an empty or unknown
 one, keeps browser setup closed. Use local setup instead; never delete bird
 data or access state to make an installation look new. Losing an access file,
-restarting, config sync and an expired pilot setup code do not reopen setup.
+restarting and config sync do not reopen setup.
 
 An upgrade does not opt you into HTTPS or Authentik. Keep ordinary local login,
 or follow the advanced steps below. An existing named HTTPS origin keeps
 HTTPS-only access unless you deliberately configure a local-mode downgrade.
 
-For a failed trial, stop the candidate and restore the matching old runtime
+For a failed trial, stop the new version and restore the matching old runtime
 and private backup. Do not mix a newer state directory with an older release.
-Owner access is one part of the browser journal. Check bird browsing, trips
-and source setup as separate tasks, not just a successful account sign-in.
 
 ## Sessions and private files
 
@@ -232,9 +224,6 @@ Recovery does not repair corrupt state or bypass private-file checks. Restore
 a matching private backup for corruption. Backups containing web-access are
 credential-sensitive. Never publish them or include them in collection exports.
 
-Existing pilot accounts without a username can still sign in with their
-original password. Use Account and access to choose a username and password.
-Existing pilot sessions retain their original 30-minute/eight-hour limits.
 The earlier `access bootstrap` command remains for pilot compatibility.
 An existing bootstrap reservation, including an expired one, closes ordinary
 browser account creation. Use local `access setup` if no owner exists, or
@@ -249,18 +238,13 @@ private-terminal recovery. Neither command is needed for ordinary setup.
 A reverse proxy receives browser requests and forwards them to Inky. You can
 use your existing proxy; Inky does not require one for ordinary local setup.
 
-| Your setup | Recommended path | Verification so far |
-| --- | --- | --- |
-| Existing Traefik homelab | Keep Traefik and its certificate setup. Use the private route below. | Traefik 3.7.14 completed real Authentik owner linking, sign-in, confirmation, denial and logout. Callback-log privacy passed a forced upstream failure. |
-| New optional HTTPS setup | Caddy can issue a private certificate. Each device must trust it deliberately. | Caddy 2.11.7 completed real Authentik sign-in. Separate tests checked certificate rejection, restart and callback error-log privacy. |
-| Existing Nginx | Keep Nginx with the private route and logging policy below. | Nginx 1.30.6 passed header checks, blocked routes and the upstream-failure privacy test. Its route list then omitted app files the journal loads, so the corrected route below has not completed a real sign-in. |
-| Nginx Proxy Manager | Do not use a location-only logging override for OIDC. | Version 2.16.0 passed sign-in, but a malformed request retained synthetic callback query values in its server error log. It does not pass this candidate's privacy gate. |
+| Your setup | Recommended path |
+| --- | --- |
+| Existing Traefik homelab | Keep Traefik and its certificate setup. Use the private route below. |
+| New optional HTTPS setup | Caddy can issue a private certificate. Each device must trust it deliberately. |
+| Existing Nginx | Keep Nginx with the private route and logging policy below. |
+| Nginx Proxy Manager | Do not use it for OIDC; see [its limitation](#nginx-proxy-manager-limitation). |
 
-These checks used a disposable identity service, synthetic accounts and verified
-TLS in Chromium. They qualify the access checkpoint, not the finished journal,
-every phone's certificate trust or your installation. Repeat the checks after
-changing proxy versions, routes or logging policy. The `/wall/*` routes were
-added to all three recipes later and have not been tested through a proxy.
 Owner sign-in does not protect `/wall/*`, so keep the proxy's private address
 allowlist on this route.
 
@@ -489,12 +473,6 @@ Phone trust may need a separate full-trust setting. Removing the root from
 each device reverses client trust; stop the proxy and remove its DNS/routing
 entry separately. Do not delete your only CA backup before recovering clients.
 
-An isolated test checked HTTPS, exact proxy trust, blocked legacy paths,
-certificate rejection, persistent CA across restart and callback error-log
-privacy. A further isolated Caddy test completed the real Authentik code
-exchange, linked-owner sign-in, unlinked/denied-account rejection and logout.
-These tests did not install host trust or test your phone.
-
 ## Advanced: Nginx
 
 Keep this server private. Replace the example hostname, certificate paths and
@@ -541,13 +519,12 @@ verified field redaction instead of silently recording sign-in credentials.
 Nginx Proxy Manager generates a server-level error log for each proxy host.
 An Advanced-tab `location` override can protect normal callbacks and upstream
 failures, but it cannot protect errors that occur before a location is chosen.
-An isolated malformed-header test demonstrated this with synthetic values.
 The [generated host template](https://github.com/NginxProxyManager/nginx-proxy-manager/blob/v2.16.0/backend/templates/proxy_host.conf)
 and [custom configuration hooks](https://nginxproxymanager.com/advanced-config/#custom-nginx-configurations)
 explain that boundary.
 
-Do not assume that passing ordinary login is enough. This candidate does not
-provide a qualified Nginx Proxy Manager OIDC recipe. Use Caddy, Traefik or the
+Do not assume that passing ordinary login is enough. Inky does not
+provide an Nginx Proxy Manager OIDC recipe. Use Caddy, Traefik or the
 server-level Nginx recipe for the owner endpoint. Do not change shared templates
 or other applications' logging to work around this limitation without a separate
 review.
@@ -734,8 +711,3 @@ For HTTPS, verify the browser trusts the certificate without bypassing warnings.
 For SSO, verify the linked account succeeds, an unlinked provider user is denied,
 provider errors are understandable and local recovery still works. Test process
 restart and signing-key rotation in an isolated installation.
-
-Automated tests use synthetic credentials and signed tokens. Those tests do
-not prove your phone's certificate trust, real Authentik policy or a physical
-display update. Live reference-provider and multi-browser checks remain
-release gates, not claims made by unit-test counts.
