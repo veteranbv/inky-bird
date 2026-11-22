@@ -1,6 +1,6 @@
 [project]
 name = "inky-bird"
-version = "1.0.0rc1"
+version = "1.0.0"
 description = "Discover birds and display reviewed field-journal plates on color e-paper"
 readme = "README.md"
 requires-python = ">=3.11"
