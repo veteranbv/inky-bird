@@ -251,7 +251,7 @@ async function noticeClear(t, stressed) {
 
 // Paired read-only screen; its context stays open for the integrations phase.
 async function pairedScreen(t) {
-  const { page, context, browser, origin, fixture, root, engine, heading, cardinal, robin, publicCatalog, errors, trip } = t;
+  const { page, context, browser, origin, fixture, root, engine, heading, cardinal, robin, publicCatalog, errors, trip, redrawn } = t;
   t.phase = 'pair-readonly-screen';
   await page.goto(origin + '/app?page=displays');
   await heading('Wall frame');
@@ -293,10 +293,7 @@ async function pairedScreen(t) {
   await page
     .getByLabel('I matched this code on the screen I want to pair', { exact: true })
     .check();
-  await Promise.all([
-    page.waitForEvent('load'),
-    page.getByRole('button', { name: 'Pair this screen', exact: true }).click(),
-  ]);
+  await redrawn(() => page.getByRole('button', { name: 'Pair this screen', exact: true }).click());
   await screen.clock.runFor(15100);
   await screen.locator('.frame-art').waitFor();
   await screen.locator('.frame-art').evaluate((image) => image.decode());
