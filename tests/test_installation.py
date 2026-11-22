@@ -132,7 +132,7 @@ def test_launchd_domain_is_bound_to_protected_system_plist_and_account(
         st_nlink=2 if case == "hardlink" else 1,
     )
     with (
-        patch("inky_bird_frame.installation.Path", return_value=tmp_path),
+        patch("inky_bird_frame.installation.LAUNCH_DAEMON_DIRECTORY", tmp_path),
         patch.object(
             Path,
             "lstat",
