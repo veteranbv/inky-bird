@@ -60,7 +60,8 @@ const scenes = storyboard.scenes.map((scene) => {
     const events = JSON.parse(readFileSync(path.join(out, 'capture', `${scene.id}.events.json`)));
     assert.deepEqual(events.blockedExternalRequests, [], `${scene.id} left loopback`);
     assert.deepEqual(events.pageErrors, [], `${scene.id} raised page errors`);
-    const lastAction = Math.max(0, ...events.events.map((event) => event.seconds));
+    // Actions are timed from the start of recording; the clip starts at trimStart.
+    const lastAction = Math.max(0, ...events.events.map((event) => event.seconds - events.trimStart));
     seconds = Math.max(seconds, lastAction + LAST_ACTION_HOLD_SECONDS);
     const clipSeconds = probe(path.join(out, 'capture', `${scene.id}.webm`));
     const usable = clipSeconds - events.trimStart - 0.2;

@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Regenerate the Inky Bird demo film, README GIF and review bundle from a
+# Regenerate the Inky Bird demo film, GIF and review bundle from a
 # clean checkout, with only free local tools. See demo/README.md.
 #
-#   demo/make-demo.sh [--out <dir>] [--no-voice] [--scene <id>]... [--stills-only]
+#   demo/make-demo.sh [--out <dir>] [--no-voice] [--stills-only]
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/demo/out"
 no_voice=""
 stills_only=""
-scenes=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) out="$2"; shift 2 ;;
     --no-voice) no_voice=1; shift ;;
     --stills-only) stills_only=1; shift ;;
-    --scene) scenes+=("--scene" "$2"); shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -31,7 +29,7 @@ node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)
   || { echo "Project .venv missing; run uv sync --extra dev --locked first (see CONTRIBUTING.md)" >&2; exit 1; }
 
 echo "== 1/5 capture (real app, loopback, synthetic fixture)"
-node "$root/tests/web/capture-demo.cjs" "$out/capture" ${scenes[@]+"${scenes[@]}"}
+node "$root/tests/web/capture-demo.cjs" "$out/capture"
 
 if [ -z "$no_voice" ]; then
   engine="Kokoro, offline"
@@ -69,9 +67,9 @@ if [ ! -d "$root/demo/video/node_modules" ]; then
   (cd "$root/demo/video" && npm ci --no-audit --no-fund)
 fi
 (cd "$root/demo/video" && node tools/render.mjs --timeline "$out/timeline.json" --out "$out" \
-  ${stills_only:+--stills-only} ${scenes[@]+"${scenes[@]}"})
+  ${stills_only:+--stills-only})
 
-if [ -n "$stills_only" ] || [ "${#scenes[@]}" -gt 0 ]; then
+if [ -n "$stills_only" ]; then
   echo "Stills only: $out/stills"
   exit 0
 fi

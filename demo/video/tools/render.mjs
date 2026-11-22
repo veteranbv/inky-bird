@@ -1,6 +1,6 @@
 // Bundle once, render a still of every scene, then the full film.
 //
-//   node tools/render.mjs --timeline <timeline.json> --out <dir> [--stills-only] [--scene <id>]...
+//   node tools/render.mjs --timeline <timeline.json> --out <dir> [--stills-only]
 import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,9 +17,6 @@ const timelinePath = value('--timeline');
 const out = value('--out');
 if (!timelinePath || !out) throw new Error('Usage: node tools/render.mjs --timeline <file> --out <dir>');
 const stillsOnly = argv.includes('--stills-only');
-const only = [];
-for (let index = 0; index < argv.length; index += 1)
-  if (argv[index] === '--scene') only.push(argv[index + 1]);
 
 const timeline = JSON.parse(readFileSync(timelinePath, 'utf8'));
 const inputProps = { timeline };
@@ -33,7 +30,6 @@ const composition = await selectComposition({ serveUrl, id: 'InkyDemo', inputPro
 const stills = path.join(out, 'stills');
 mkdirSync(stills, { recursive: true });
 for (const scene of timeline.scenes) {
-  if (only.length && !only.includes(scene.id)) continue;
   // The title still is the poster: it must match the first decoded frame.
   const frame = scene.kind === 'title'
     ? scene.startFrame
@@ -43,7 +39,7 @@ for (const scene of timeline.scenes) {
   console.log(`still ${scene.id}: frame ${frame}`);
 }
 
-if (!stillsOnly && !only.length) {
+if (!stillsOnly) {
   await renderMedia({
     serveUrl,
     composition,

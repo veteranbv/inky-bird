@@ -5,7 +5,7 @@
 // request aborted and logged. Account creation happens before any recording;
 // the recording contexts only receive the in-memory storage state.
 //
-//   node tests/web/capture-demo.cjs <output-dir> [--scene <id>]...
+//   node tests/web/capture-demo.cjs <output-dir>
 const assert = require('node:assert/strict');
 const { randomBytes } = require('node:crypto');
 const { mkdirSync, writeFileSync, renameSync } = require('node:fs');
@@ -17,11 +17,8 @@ const PLATES = [9083, 12727, 12942, 8229, 145310];
 const COLLECTION_BIRDS = ['Northern Cardinal', 'American Robin', 'Eastern Bluebird', 'American Goldfinch'];
 
 const argv = process.argv.slice(2);
-const output = path.resolve(argv.find((value) => !value.startsWith('--')) || '');
-assert(output, 'Usage: node tests/web/capture-demo.cjs <output-dir> [--scene <id>]');
-const only = [];
-for (let index = 0; index < argv.length; index += 1)
-  if (argv[index] === '--scene') only.push(argv[index + 1]);
+const output = path.resolve(argv[0] || '');
+assert(argv.length === 1, 'Usage: node tests/web/capture-demo.cjs <output-dir>');
 mkdirSync(output, { recursive: true });
 
 const fixture = startFixture(PLATES);
@@ -110,7 +107,6 @@ async function record() {
     await setup.close();
 
     async function scene(id, body) {
-      if (only.length && !only.includes(id)) return;
       const context = await browser.newContext({
         viewport, deviceScaleFactor: 1, storageState,
         recordVideo: { dir: output, size: viewport },
