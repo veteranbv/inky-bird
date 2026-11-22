@@ -71,7 +71,7 @@ def synthesize_kokoro(
     return durations
 
 
-def synthesize_elevenlabs(scenes: list[dict], out_dir: Path) -> dict[str, float]:
+def synthesize_elevenlabs(scenes: list[dict], out_dir: Path, voice_id: str) -> dict[str, float]:
     """Optional paid engine; used only on explicit request with a key present."""
     import numpy  # noqa: PLC0415
     import soundfile  # noqa: PLC0415
@@ -79,7 +79,6 @@ def synthesize_elevenlabs(scenes: list[dict], out_dir: Path) -> dict[str, float]
     key = os.environ.get("ELEVENLABS_API_KEY")
     if not key:
         raise SystemExit("--engine elevenlabs needs ELEVENLABS_API_KEY in the environment")
-    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
     durations: dict[str, float] = {}
     for scene in scenes:
         body = json.dumps(
@@ -115,7 +114,8 @@ def main() -> None:
         speed = storyboard["voice"].get("speed", 1.0)
         durations = synthesize_kokoro(scenes, arguments.out, arguments.models_dir, voice, speed)
     else:
-        durations = synthesize_elevenlabs(scenes, arguments.out)
+        voice_id = os.environ.get("ELEVENLABS_VOICE_ID") or storyboard["voice"]["elevenlabsVoice"]
+        durations = synthesize_elevenlabs(scenes, arguments.out, voice_id)
     (arguments.out / "narration-durations.json").write_text(json.dumps(durations, indent=2) + "\n")
 
 

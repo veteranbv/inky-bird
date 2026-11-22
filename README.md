@@ -38,7 +38,7 @@ a sample collection. Open either image for the full-size view.
 https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f
 
 [Watch the 28-second walkthrough](https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f)
-· [Text transcript](docs/walkthrough.md) · [Still preview](docs/images/inky-walkthrough-poster.jpg).
+· [Text transcript](docs/walkthrough.md) · [Still preview](docs/images/inky-demo-poster.jpg).
 Sample data, accelerated navigation, and a separate e-paper installation;
 browser Play does not refresh the wall.
 

@@ -136,7 +136,7 @@ def test_walkthrough_has_accessible_fallbacks_and_honest_scope() -> None:
 
     assert "https://github.com/user-attachments/assets/" in readme
     assert "[Text transcript](docs/walkthrough.md)" in readme
-    assert "[Still preview](docs/images/inky-walkthrough-poster.jpg)" in readme
+    assert "[Still preview](docs/images/inky-demo-poster.jpg)" in readme
     assert "browser Play does not refresh the wall" in readme
     assert "automatic browser playback remains once a minute" in transcript
     assert "does not trigger or synchronize that physical display" in transcript

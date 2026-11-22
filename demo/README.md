@@ -62,7 +62,9 @@ voiced, or any size budget (MP4 < 10 MB, GIF < 5 MB, poster < 1 MB).
 Kokoro stays the default so the rebuild needs no key. If `ELEVENLABS_API_KEY`
 is set in the environment **and** `INKY_DEMO_ELEVENLABS=1` is set, narration
 uses ElevenLabs instead. The key is read only from the environment and is
-never printed, logged or written anywhere.
+never printed, logged or written anywhere. The published film uses the stock
+ElevenLabs voice George (`voice.elevenlabsVoice` in `storyboard.json`);
+`ELEVENLABS_VOICE_ID` overrides it for a one-off render.
 
 ## Outputs (`demo/out/`, never committed)
 

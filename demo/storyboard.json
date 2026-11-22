@@ -6,6 +6,8 @@
   "voice": {
     "engine": "kokoro",
     "kokoroVoice": "af_heart",
+    "elevenlabsVoice": "JBFqnCBsd6RMkjVDRZzb",
+    "elevenlabsVoiceName": "George",
     "speed": 1.0,
     "targetLufs": -16
   },
