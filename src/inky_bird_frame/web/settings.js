@@ -8,7 +8,7 @@ const secretNames = {
   geoapify_api_key: 'Geoapify API key',
 };
 
-export async function renderSettings(ui, { base, link, note, sourceNames, source }) {
+export async function renderSettings(ui, { base, link, note, sourceNames, source, reopen }) {
   const { element: el, button, api } = ui;
   const main = document.querySelector('#main');
   base(
@@ -25,7 +25,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
     'HTTP does not encrypt settings or credentials in transit. Use a unique Inky password on a trusted home network. Use HTTPS for untrusted networks.',
   );
   if (location.protocol === 'http:') main.append(privateNotice);
-  if (source === 'birdbuddy') await birdBuddyAccount(ui, main, note);
+  if (source === 'birdbuddy') await birdBuddyAccount(ui, main, note, reopen);
   let settings;
   try {
     settings = await api('/v1/owner/settings');
@@ -77,7 +77,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
                   changes: {},
                   adopt: true,
                 });
-                location.reload();
+                await reopen();
               } catch (error) {
                 problem.textContent = error.message;
                 control.disabled = false;
@@ -458,7 +458,7 @@ export async function renderSettings(ui, { base, link, note, sourceNames, source
               confirm_generation: consent,
             });
             for (const field of form.querySelectorAll('input[type="password"]')) field.value = '';
-            location.reload();
+            await reopen();
           };
           try {
             await save();
@@ -585,7 +585,7 @@ function differences(settings, changes) {
   return lines;
 }
 
-async function birdBuddyAccount(ui, main, note) {
+async function birdBuddyAccount(ui, main, note, reopen) {
   const { api, element: el, button } = ui;
   const section = el('section', '', 'journal-card');
   let response;
@@ -661,7 +661,7 @@ async function birdBuddyAccount(ui, main, note) {
         control.disabled = true;
         try {
           await api('/v1/owner/birdbuddy/logout', { confirm: true });
-          location.reload();
+          await reopen();
         } catch (error) {
           control.disabled = false;
           if (error.code === 'sign_in_required') ui.showProblem(error);
@@ -782,7 +782,7 @@ async function birdBuddyAccount(ui, main, note) {
         choice.focus();
       } else {
         email.value = password.value = '';
-        location.reload();
+        await reopen();
       }
     } catch (error) {
       if (error.code === 'sign_in_required') {

@@ -686,7 +686,7 @@ function toggleResult(name, saved, wall, stays) {
 function confirmSaved(context, section, problem, body, preview, reason = '') {
   const { el, button, api, note, href } = context;
   if (changesNothing(preview)) {
-    const close = button('Close', () => location.reload());
+    const close = button('Close', () => context.reopen());
     section.append(el('h2', 'Nothing to change'), note(savedSummary(preview)), close);
     close.focus();
     return;
@@ -716,7 +716,7 @@ function confirmSaved(context, section, problem, body, preview, reason = '') {
       ? [note('Your wall frame uses the new list from its next refresh.')]
       : []),
     confirm,
-    button('Cancel', () => location.reload()),
+    button('Cancel', () => context.reopen()),
   );
   confirm.focus();
 }

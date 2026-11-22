@@ -78,7 +78,8 @@ async function open(t, routes, { source, localPasswordAllowed = true } = {}) {
   main.id = 'main';
   doc.body.append(main);
   doc.querySelector = (selector) => (selector === '#main' ? main : null);
-  const reloads = [];
+  const reloads = [],
+    redraws = [];
   Object.defineProperty(globalThis, 'document', { configurable: true, writable: true, value: doc });
   Object.defineProperty(globalThis, 'location', {
     configurable: true,
@@ -133,9 +134,10 @@ async function open(t, routes, { source, localPasswordAllowed = true } = {}) {
     note: (text) => element('p', text, 'hint'),
     sourceNames,
     source,
+    reopen: () => redraws.push(true),
   };
   await renderSettings(ui, helpers);
-  return { main, calls, problems, reloads };
+  return { main, calls, problems, reloads, redraws };
 }
 const field = (main, id) => walk(main).find((node) => node.id === 'setting-' + id);
 const form = (main) => walk(main).find((node) => node.tagName === 'FORM');

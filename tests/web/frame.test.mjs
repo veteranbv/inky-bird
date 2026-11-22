@@ -140,13 +140,14 @@ test('Frame opened on an empty view keeps checking and starts when plates arrive
   state = journal([2]);
   t.mock.timers.tick(60000);
   await flush();
-  assert.equal(reloads.length, 1, 'plates that arrive start Frame again');
+  assert.equal(reloads.length, 0, 'the page redraws in place');
+  assert.doesNotMatch(main.textContent, /No plates here yet/, 'plates that arrive start Frame again');
 });
 
 test('a failed check on an empty view keeps checking', async (t) => {
   let offline = false,
     calls = 0;
-  const { reloads, problems } = await open(t, {
+  const { main, reloads, problems } = await open(t, {
     state: () => {
       calls += 1;
       if (offline) throw Object.assign(new Error('offline'), { code: 'offline' });
@@ -160,7 +161,8 @@ test('a failed check on an empty view keeps checking', async (t) => {
   offline = false;
   t.mock.timers.tick(60000);
   await flush();
-  assert.equal(reloads.length, 1);
+  assert.equal(reloads.length, 0);
+  assert.doesNotMatch(main.textContent, /No plates here yet/);
 });
 
 test('an ended session on an empty view goes to sign-in', async (t) => {

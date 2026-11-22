@@ -7,7 +7,7 @@ const PLATE_TIMEOUT = 90000;
 export function renderFrame(context) {
   const {
     ui, el, button, api, main, view, data, byId, plateURL, href, link, note, members, viewLabel,
-    base, empty, closeJournal, setStopScreen, setFrameSignOut, whyThisBird,
+    base, empty, reopen, closeJournal, setStopScreen, setFrameSignOut, whyThisBird,
   } = context;
   let birds = members(view).filter((bird) => bird.plate_ready);
   base('Play', viewLabel(view));
@@ -35,7 +35,10 @@ export function renderFrame(context) {
       try {
         const current = await api('/v1/owner/journal');
         if (left || !card.isConnected) return;
-        if (ready(current, viewIds(current))) location.reload();
+        if (ready(current, viewIds(current))) {
+          clearInterval(waiting);
+          await reopen();
+        }
       } catch (error) {
         if (left || !card.isConnected) return;
         if (['sign_in_required', 'secure_access_required'].includes(error.code)) {

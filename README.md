@@ -34,7 +34,7 @@ I built Inky to keep birding present between outings.
 
 Both screenshots use public plates and a sample collection.
 
-https://github.com/user-attachments/assets/3203abc8-d66d-478e-b6a2-27d5a93e9692
+https://github.com/user-attachments/assets/c00d6e00-4e44-407a-96b6-0f00aebf88de
 
 The film uses sample data. Browser Play does not refresh the wall frame.
 

@@ -289,6 +289,28 @@ for (const [plateReady, oneTap] of [
     assert.deepEqual(assigned, []);
   });
 
+test('a saved favorite redraws the bird page in place', async (t) => {
+  const state = flock();
+  const { main, requests, problems } = await open(t, { page: 'bird', bird: '1' }, {
+    recordProblems: true,
+    state: () => state,
+    respond(path, body) {
+      if (path !== '/v1/owner/journal/collections/favorite') throw new Error('unexpected ' + path);
+      assert.equal(body.favorite, true);
+      state.collections[0].taxon_ids.push(1);
+      return {};
+    },
+  });
+  const loads = () => requests.filter(({ path }) => path === '/v1/owner/journal').length;
+  const before = loads();
+  const favorite = findButton(main, 'Add to Favorites');
+  favorite.fire('click', { currentTarget: favorite });
+  await flush();
+  assert.deepEqual(problems, []);
+  assert.equal(loads(), before + 1, 'fresh journal data');
+  assert(findButton(main, 'Remove from Favorites'), 'the page shows the saved favorite');
+});
+
 test('a favorite that cannot be saved says so beside the bird', async (t) => {
   const { main, problems } = await open(t, { page: 'bird', bird: '2' }, {
     recordProblems: true,
