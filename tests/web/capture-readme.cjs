@@ -10,11 +10,9 @@ const { startFixture } = require('./demo-fixture.cjs');
 const options = process.argv.slice(2);
 assert(options.filter((value) => !value.startsWith('--')).length <= 1);
 assert(options.filter((value) => value.startsWith('--'))
-  .every((value) => ['--walkthrough', '--walkthrough-v2', '--export-sample'].includes(value)));
+  .every((value) => ['--export-sample'].includes(value)));
 const output = path.resolve(options.find((value) => !value.startsWith('--')) ||
   mkdtempSync(path.join(tmpdir(), 'inky-images-')));
-const cinematic = process.argv.includes('--walkthrough-v2');
-const walkthrough = cinematic || process.argv.includes('--walkthrough');
 mkdirSync(output, { recursive: true });
 const fixture = startFixture([9083, 12727]);
 const server = fixture.server;
@@ -79,76 +77,6 @@ async function capture() {
         return (await response.json()).data;
       });
       writeFileSync(path.join(output, 'sample-journal.json'), JSON.stringify(sample, null, 2) + '\n');
-    }
-    if (walkthrough) {
-      // A second frame plate so the recorded manual Next shows a real change.
-      await page.goto(origin + '/app?page=bird&bird=12727');
-      await page.getByRole('button', { name: 'Add to my frame', exact: true }).click();
-      await page.getByText('Added to On my frame.', { exact: true }).waitFor({ timeout: 30000 });
-      // Start a fresh recording only after account creation and fixture setup.
-      // Keep synthetic session cookies in memory, never in the output directory.
-      const videoContext = await browser.newContext({
-        // Chromium's screencast is CSS-resolution even on a Retina context.
-        // Record the actual desktop layout, not a padded or CSS-zoomed view.
-        viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1,
-        recordVideo: { dir: output, size: { width: 1280, height: 800 } },
-        storageState: await context.storageState(),
-        reducedMotion: 'reduce', colorScheme: 'light', serviceWorkers: 'block',
-      });
-      const blocked = [];
-      await videoContext.route('**/*', (route) => {
-        if (new URL(route.request().url()).origin === origin) return route.continue();
-        blocked.push(route.request().url());
-        return route.abort();
-      });
-      const film = await videoContext.newPage();
-      const video = film.video();
-      const started = performance.now();
-      film.on('pageerror', (error) => errors.push(error.message));
-      await film.goto(origin + '/app');
-      await film.getByRole('heading', { name: 'Your journal', exact: true }).waitFor();
-      await film.locator('main img').first().evaluate((image) => image.decode());
-      const trimStart = (performance.now() - started) / 1000;
-      const sceneStart = performance.now();
-      const events = [];
-      async function at(seconds, name, action) {
-        const remaining = seconds * 1000 - (performance.now() - sceneStart);
-        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
-        events.push({ seconds: (performance.now() - sceneStart) / 1000, action: name });
-        if (action) await action();
-      }
-      await film.screenshot({ path: path.join(output, 'walkthrough-home.png') });
-      await at(3, 'Open Collections', async () => {
-        await film.getByRole('navigation', { name: 'Journal', exact: true })
-          .getByRole('link', { name: 'Collections', exact: true }).click();
-        // Both the frame selection and Garden birds now hold two plates.
-        await film.getByText('2 plates', { exact: true }).nth(1).waitFor();
-        assert.equal(await film.getByText(/\b1 plates\b/).count(), 0);
-      });
-      await at(5, 'Open Garden birds', () =>
-        film.getByRole('link', { name: 'Garden birds', exact: true }).click());
-      await film.getByRole('heading', { name: 'Garden birds', exact: true }).waitFor();
-      await at(8, 'Open Frame mode', () =>
-        film.getByRole('navigation', { name: 'Journal', exact: true })
-          .getByRole('link', { name: 'Play', exact: true }).click());
-      await film.getByAltText('Plate: American Robin', { exact: true }).waitFor();
-      await at(9, 'Start Play', () =>
-        film.getByRole('button', { name: 'Play', exact: true }).click());
-      await at(12, 'Manual Next', () =>
-        film.getByRole('button', { name: 'Next', exact: true }).click());
-      await film.getByAltText('Plate: Northern Cardinal', { exact: true }).waitFor();
-      await film.screenshot({ path: path.join(output, 'walkthrough-frame.png') });
-      await at(16, 'End screen recording');
-      await videoContext.close();
-      writeFileSync(path.join(output, 'walkthrough-capture.json'), JSON.stringify({
-        source: 'Checked-out real app with two approved public plates and a sample collection',
-        viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1,
-        browserZoom: 1,
-        cinematic,
-        video: path.basename(await video.path()), trimStart, duration: 16,
-        events, blockedExternalRequests: blocked, pageErrors: errors,
-      }, null, 2) + '\n');
-      assert.deepEqual(blocked, []);
     }
     assert.deepEqual(errors, []);
     console.log(`Screenshots: ${output}`);
