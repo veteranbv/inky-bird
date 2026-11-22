@@ -35,9 +35,9 @@ I built Inky to keep birding present between outings.
 Both screenshots are from the app on `main`, with public plates and
 a sample collection. Open either image for the full-size view.
 
-https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f
+https://github.com/user-attachments/assets/3203abc8-d66d-478e-b6a2-27d5a93e9692
 
-[Watch the 28-second walkthrough](https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f)
+[Watch the 65-second walkthrough](https://github.com/user-attachments/assets/3203abc8-d66d-478e-b6a2-27d5a93e9692)
 · [Text transcript](docs/walkthrough.md) · [Still preview](docs/images/inky-demo-poster.jpg).
 Sample data, accelerated navigation, and a separate e-paper installation;
 browser Play does not refresh the wall.

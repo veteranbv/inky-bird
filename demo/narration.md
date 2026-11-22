@@ -16,8 +16,8 @@ stretch to fit each narration clip, so a longer line makes a longer scene.
 | 8 | E-paper wall frame photo | An optional color e-paper frame can show the same approved plates. |
 | 9 | End card | Inky Bird is MIT licensed and self hosted. Browse the gallery at henrysowell.com/birds. |
 
-Spellings like "M I T" and "henry sowell dot com" in `storyboard.json` are
-pronunciation hints for the narrator, not display text.
+Pronunciation fixes live in `demo/voice/pronunciations.json`. They change only
+what the narrator is sent; captions and the transcript keep the real spelling.
 
 Nothing in the script may claim that browser Play updates the wall frame, that
 plates are hand-painted, or that public nearby sightings are the owner's own

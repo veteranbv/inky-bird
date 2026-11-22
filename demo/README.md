@@ -1,7 +1,7 @@
 # Inky Bird demo film
 
 A reproducible, code-generated demo of the real app: a narrated ~65 second
-1080p film, a silent captioned variant, a looping README GIF, a poster, a
+1080p film, a silent captioned variant, a looping GIF, a poster, a
 contact sheet and a review manifest. One command regenerates everything from
 a clean checkout with free, local tools.
 
@@ -11,8 +11,7 @@ Every UI scene is the checked-out app running on loopback with a synthetic
 fixture: a disposable owner created before recording starts, five public
 approved plates from `catalog/` (Northern Cardinal, American Robin, Eastern
 Bluebird, Blue Jay, American Goldfinch), and a "Garden birds" collection made
-through the real browser UI. Generation is off, no sources are configured, no
-Codex login exists, and every non-loopback request is aborted and logged. UI
+through the real browser UI. Generation is off, no sources are configured, and every non-loopback request is aborted and logged. UI
 scenes carry a visible **Sample data** pill.
 
 Two scenes are not screen recordings and say so by design: the sources scene
@@ -72,7 +71,7 @@ ElevenLabs voice George (`voice.elevenlabsVoice` in `storyboard.json`);
 |------|------------|
 | `inky-demo.mp4` | Narrated film: 1920x1080, 30 fps, H.264 High yuv420p, AAC 48 kHz, -16 LUFS, faststart, metadata stripped |
 | `inky-demo-silent.mp4` | The same film without the narration track (captions are burned in) |
-| `inky-demo.gif` | Looping README GIF (journal → Play → wall plate), 960 px wide |
+| `inky-demo.gif` | Looping GIF (journal → Play → wall plate), 960 px wide |
 | `inky-demo-poster.jpg` | Poster whose pixels match the film's first decoded frame |
 | `contact-sheet.png` | 3x3 sheet, one frame per scene |
 | `stills/<scene>.png` | Full-resolution still of every scene, rendered before the film |
