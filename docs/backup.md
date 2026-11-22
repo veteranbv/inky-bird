@@ -870,6 +870,14 @@ When eBird Archive is enabled, run `ebird archive status --config
 pre-backup record. Use `/data/config.toml` and the same Compose prefix for those
 commands in Docker.
 
+After the read-only baseline and HTTP health pass, run `discover` once as a
+deliberate live provider check and inspect that command's JSON result. Discovery
+does not replace the saved observation snapshot. For Bird Buddy it does detect
+a revoked session and rotate the saved refresh token. `refresh`, including the
+immediate refresh triggered by native setup, is the explicit persisted-state
+transition. Enable native setup or the Docker scheduler only after the live
+provider result is correct.
+
 Confirm that:
 
 - the catalog validates with the expected species count;

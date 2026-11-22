@@ -9,7 +9,9 @@ if you want to try it without generation, connected sources, or a physical displ
 
 ## Find your way around
 
-The tabs sit at the bottom on phones and at the top on wide screens.
+The tabs sit at the bottom on phones and at the top on wide screens. If you
+already run Inky, follow the [migration guide](migration-v1.md) to keep your
+configuration and data.
 
 - **Home** shows **Your journal**: a plate from your frame, the birds noted
   **Lately** and a count of your birds and plates. With nothing on your frame
