@@ -273,6 +273,8 @@ function run(body) {
         reloaded = true;
       };
       page.on('load', onLoad);
+      // Wait for the old content to go too, so the next step never acts on it.
+      const old = await page.locator('#main > *').first().elementHandle();
       try {
         await Promise.all([
           page.waitForResponse(
@@ -282,6 +284,7 @@ function run(body) {
           ),
           action(),
         ]);
+        await page.waitForFunction((node) => !node.isConnected, old);
       } finally {
         page.off('load', onLoad);
       }
