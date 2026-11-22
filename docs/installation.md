@@ -40,20 +40,8 @@ section.
 
 The setup command detects launchd or systemd, but detection does not mean every
 operating system has been tested. Other systems may work. Contributions that
-document and test them are welcome.
-
-Pimoroni lists PIM773 and PIM774 as compatible with every 40-pin Raspberry Pi,
-including Zero variants. A Zero without a header requires soldering. The Zero
-2 W has a 64-bit processor and built-in 2.4 GHz Wi-Fi. See the
-[Inky Impression product page](https://shop.pimoroni.com/products/inky-impression) and
-[Raspberry Pi Zero 2 W specifications](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/).
-The application reads the panel geometry from Pimoroni's EEPROM; no display
-model or resolution setting belongs in `config.toml`.
-
-The supported topology remains one active display node per controller. Multiple
-nodes can read the same catalog, but the controller's fetch and success
-heartbeats describe the display role as a whole rather than identifying each
-physical panel independently.
+document and test them are welcome. See [Hardware](hardware.md) for panel
+compatibility and the supported display topology.
 
 ### What you need
 
@@ -1005,13 +993,7 @@ Current display nodes report a parsed catalog fetch through `POST
 /v1/display-fetch` and a verified panel update through `POST
 /v1/display-success`. The reports contain only `{"schema_version": 1}`. If an
 older controller rejects either POST, the display ignores the telemetry
-failure and continues rotating plates. Controller and display releases before
-v0.7.0 used state-changing GET telemetry that is no longer accepted. A direct
-split upgrade from an older release cannot preserve heartbeat reporting: the
-old role uses GET while the new role uses POST. Update the controller first,
-then update the display promptly, and expect a temporary telemetry gap. If
-uninterrupted heartbeat monitoring is required, update both roles to v0.7.0
-first, verify POST telemetry, and then continue to the newer release.
+failure and continues rotating plates.
 
 Docker controller updates pull a published image and recreate the services. See
 the [Docker update instructions](docker.md#update) for version pinning and
@@ -1101,16 +1083,6 @@ done
 After service removal, delete `~/Services/inky-bird` only if its managed
 runtime is no longer needed. Delete the private support/configuration directory
 only after saving any catalog or state you want to keep.
-
-## Browser applications
-
-Recipes for another web application that reads the catalog, for framing the
-featured plate, and for a Homepage dashboard are in the
-[reference page](reference.md#browser-applications).
-
-### Homepage dashboard
-
-See [Homepage dashboard](reference.md#homepage-dashboard) in the reference page.
 
 ## Troubleshooting
 

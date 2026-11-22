@@ -78,12 +78,7 @@ detected. Ordinary catalog reads never refresh either signal or mask a silent
 display. Browser requests with an `Origin` header cannot write either signal.
 The endpoints are otherwise unauthenticated inside the trusted network, so a
 client that deliberately calls them can imitate a display node. Catalog `GET`
-and `HEAD` requests never write heartbeat state. Releases before v0.7.0 used a
-former GET telemetry contract that is no longer accepted. A direct split
-upgrade from an older release has a temporary telemetry gap regardless of
-upgrade order. Update the controller first and then the display promptly, or
-move both roles through v0.7.0 first when uninterrupted heartbeat monitoring is
-required. `display_recovered` is sent once updates resume.
+and `HEAD` requests never write heartbeat state. `display_recovered` is sent once updates resume.
 
 The controller checks display staleness each time it runs `notifications
 dispatch`, so display monitoring runs only when `[notifications]` has

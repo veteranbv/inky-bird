@@ -69,10 +69,7 @@ taxon ID, the initial membership origin, and a timestamp. A historical `seed`
 adds every discovered taxon to this set while separately queueing missing
 plates. `collection import-approved` is the explicit migration and trust step
 for an existing catalog; later catalog synchronization does not mutate the
-collection. The first seed, collection mutation, or generation cycle imports
-any pre-collection seed-queue taxa and records a one-time migration timestamp.
-This happens before pending approvals and prevents a later cycle from undoing
-an explicit collection removal.
+collection.
 
 An authorized Bird Buddy provider keeps private files under `state_dir`.
 `birdbuddy-auth.json` contains the user's authorization attestation, selected
@@ -353,37 +350,10 @@ unchanged. The next scheduled cycle retries from the current remote branch.
 | eligible | No terminal state exists | Yes |
 
 `retry TAXON_ID` archives incomplete pending, rejected, or failed state and
-makes that taxon eligible. A validated identity recovered from retained state is
-also added to the generation queue, so eligibility survives the original
-observation window. For failed quality reviews, retry retains the final
-actionable corrections as durable input to the first new generation attempt
-while preserving cached research and references. Add `--refresh-research` when
-those inputs themselves need to be replaced. Invalid approval debris is archived
-and removed from the local index and active catalog before regeneration; a fully
-valid approved entry remains protected. `retry TAXON_ID --source-attempt N` additionally
-selects a retained portrait as the edit base. The archive-relative source path
-stays in private retry state, and the passing manifest records its SHA-256 for
-provenance. `retry TAXON_ID --source-run RUN_NAME --source-attempt N` selects a
-specific attempt from an older archived failed run after validating archive
-containment, the profile identity, failed review, and portrait. The archived run stays
-immutable while its relative portrait path becomes the private correction
-source. A repeatable `--correction "..."` on a source-selected retry replaces
-the current automated correction list after operator adjudication. It does not
-remove earlier human invariants, bypass source validation, or alter provenance.
-`retry TAXON_ID --source-candidate ARCHIVE_NAME` reuses a complete,
-human-rejected candidate that is already in the private archive. The command
-validates archive containment, manifest identity, rejected status, human
-rejection guidance, and portrait integrity before preserving it as the edit
-source. After explicit human review,
-`retry TAXON_ID --replace-approved --reason "..."` withdraws a locally approved
-plate, preserves its rejection audit, rebuilds the local index, requeues the
-taxon, preserves validated research and references, and starts a source-free
-replacement constrained by the human rejection reason on every correction
-attempt. Use `--refresh-research` if the cached factual inputs are also being
-rejected. The migration is resumable after a partial failure. The public catalog
-remains add-only; replacing a published artifact
-requires a separate explicit migration and maintainer review. Approved art is
-never replaced implicitly.
+makes that taxon eligible. [Failure recovery](operations.md#failure-recovery)
+describes its options. The public catalog remains add-only; replacing a
+published artifact requires a separate explicit migration and maintainer review.
+Approved art is never replaced implicitly.
 
 ## Privacy and licensing
 

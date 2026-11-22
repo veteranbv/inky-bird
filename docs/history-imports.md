@@ -99,14 +99,7 @@ and common name counts once), or a line longer than 262,144 characters. The
 refusals for rows, columns and species give the limit; the one for a long line
 gives the line number. An official export within the 512 MiB limit stays
 within these counts.
-These are rejection bounds, not measured promises
-that every maximum-size archive is practical on every controller. An offline
-synthetic test checked 900,000 rows in 90,000 checklists: 509.7 MiB decoded CSV,
-4.1 MiB ZIP, and 108.3 MiB resulting private history. Complete checking and
-commit took about 22 seconds and peaked at 731 MiB of process memory on the
-test Mac. A smaller 100,000-row case peaked at 116 MiB. These are measured
-input shapes, not speed or memory guarantees. Unique records and names can
-use more memory than repeated rows. Keep headroom beyond the import process
+Keep headroom beyond the import process
 for the serving application and other services; the smallest recommended
 controller still has 4 GB RAM. Proxy upload limits and timeouts must also
 permit the complete source file.

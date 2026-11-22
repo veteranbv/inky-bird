@@ -211,9 +211,9 @@ minutes to seed. Completed matches are cached atomically, so a transient error
 or rate limit preserves progress for the next run. The cache is saved after
 every 25 new lookups, and whenever a run is interrupted, and its lock is
 released at least every 30 seconds, so an interrupted first import keeps what
-it has already matched. The same job takes the lock straight back, though. On
-macOS a waiting import or refresh was seen to get its turn in that gap; Linux
-does not promise that, so on a Linux or Docker controller another job that
+it has already matched. The same job takes the lock straight back, though.
+Linux does not promise a waiting import or refresh its turn in that gap, so on
+a Linux or Docker controller another job that
 needs name matching may wait until the first one finishes.
 Because the export supplies calendar dates rather than event instants, archive
 observations do not claim latest-detection rotation priority. Re-export and
@@ -333,24 +333,8 @@ birdnet_go_url = "https://birdnet.example.net"
 ```
 
 The proxy must expose the same unauthenticated BirdNET-Go API. After changing
-the URL, test the installed service instead of relying on a manual refresh:
-
-```bash
-refresh_label="gui/$(id -u)/com.$FAMILY.refresh"
-refresh_pid="$(launchctl kickstart -kp "$refresh_label")"
-while kill -0 "$refresh_pid" 2>/dev/null; do sleep 1; done
-tail -n 200 "$LOGS/refresh.log"
-```
-
-Set `FAMILY` and `LOGS` first as in
-[Find your installation's names and paths](troubleshooting.md#find-your-installations-names-and-paths).
-An app-managed installation has no refresh LaunchAgent; read the next scheduled
-refresh in `$LOGS/scheduler.log` instead.
-
-The newest result should show the `birdnet-go` provider with `status` set to
-`ok`. If both the direct address and the proxy fail from LaunchAgent context,
-follow Apple's current Local Network privacy guidance rather than adding a
-broad network exception without reviewing its system-wide effect.
+the URL, test the installed service as described in
+[Discovery or refresh fails](troubleshooting.md#discovery-or-refresh-fails).
 
 Inky uses BirdNET-Go's documented read-only
 `/api/v2/analytics/species/summary` endpoint. It supplies the selected date
@@ -603,12 +587,6 @@ not a claim about Bird Buddy's total visit count. Repeated polls are idempotent,
 and changed or removed classifications replace prior species while Bird Buddy
 still exposes the underlying record.
 
-History written before media linkage cannot prove which confirmed record
-belongs to a cached postcard. The first successful sync after this upgrade
-drops those unlinked, short-lived postcard rows instead of risking a stale
-classification. Current confirmed metadata can still restore conservative
-species presence.
-
 Inspect the saved authentication state and selected feeder with `birdbuddy
 status`, then run `discover` to verify live access and inspect the `birdbuddy`
 provider. The status command is local-only; `discover` performs the authenticated
@@ -627,13 +605,11 @@ eBird returns recent public sightings and an eBird species code. The controller
 searches iNaturalist for a single active bird species with an exact scientific
 name or synonym. When iNaturalist returns both a current exact scientific name
 and a synonym match, for example after a split, the exact current name wins.
-Two synonym-only matches stay ambiguous. Misses cached under the earlier rule
-are checked once more after upgrading, at about one request per second. Its
+Two synonym-only matches stay ambiguous. Its
 iNaturalist taxon ID becomes the canonical catalog identity.
 The same lookup recognizes the [Winter Wren rename](https://doi.org/10.1093/ornithology/ukag037)
 from `Troglodytes hiemalis` to `Nannus hiemalis` (iNaturalist taxon `1720022`).
-Existing deferrals for the old name can retry on the next refresh after
-upgrading. Ambiguous, inactive, hybrid, subspecies, domestic, and unmatched
+Ambiguous, inactive, hybrid, subspecies, domestic, and unmatched
 records still defer. A seven-day negative cache prevents repeated refreshes from
 retrying the same miss.
 
@@ -663,8 +639,7 @@ provider fails. In that case, the prior active catalog stays in place.
 
 The legacy singular values `source = "inaturalist"`, `"ebird"`, `"combined"`,
 and `"birdweather"` remain accepted. Do not set both `source` and `sources`.
-Version 0.5.0 removed `source = "all"` because its frozen three-provider meaning
-became misleading as new providers were added. Replace it without changing
+Replace `source = "all"` without changing
 behavior. This fragment replaces only that one line; keep the rest of your
 `[discovery]` table:
 

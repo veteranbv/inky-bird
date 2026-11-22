@@ -60,8 +60,7 @@ log that holds its captured output.
 
 Scheduler events and sanitized catalog-service request and failure logs include
 an ISO-8601 UTC `timestamp`. Use the event time when correlating rotated logs;
-the time a collector ingests a line can be later. Earlier logs may not contain
-this field, so their exact event times cannot be recovered from the JSON alone.
+the time a collector ingests a line can be later.
 
 Bird Buddy uses controller-private authentication state rather than configured
 credentials. Obtain Bird Buddy's permission first, run `birdbuddy login`, and
@@ -97,13 +96,6 @@ sightings are separate. Set
 `discovery.birdbuddy_include_manual_sightings = true` only when those sightings
 should influence this frame; disable it to exclude them again without deleting
 private history.
-
-The first successful sync for the selected feeder after upgrading from
-pre-linkage Bird Buddy history removes its cached postcard rows that lack media
-identifiers. Inactive feeder histories remain untouched until that feeder is
-selected and synced. This avoids keeping an unprovable preview classification;
-confirmed metadata still supplies conservative presence for records Bird Buddy
-continues to expose.
 
 Schedules are configured in `[schedule]`. Conservative starting values are:
 
@@ -291,11 +283,7 @@ inky-bird-frame collection list --config /path/to/config.toml
 ```
 
 The import is a point-in-time trust decision. Later catalog synchronization does
-not silently add new members. On upgrade, the first seed, collection mutation,
-or generation cycle also imports taxa already present in a pre-0.2.4 seed queue
-and records a one-time migration timestamp. Generation performs this step
-before pending approval recovery. The marker prevents later cycles from
-re-adding a taxon after an explicit removal. Manage individual taxa with the
+not silently add new members. Manage individual taxa with the
 same previewable commands:
 
 ```bash
@@ -394,10 +382,7 @@ inky-bird-frame catalog sync --source-catalog /path/to/source \
 
 The command is add-only by default. It validates both catalogs, refuses a
 destination taxon that conflicts with its immutable source version, and reports
-published and already-present taxa. Controller bootstrap enables reviewed
-migrations and independent local approval retention with environment variables
-instead of version-specific command arguments, so the current Compose file
-remains usable with older rollback images. The equivalent manual option,
+published and already-present taxa. The manual option,
 `--apply-reviewed-migrations`, accepts only hash-bound migration ancestry: it
 applies a newer reviewed source, permits skipped intermediate releases, and
 reports a validated newer destination under `retained_newer` without
@@ -472,8 +457,7 @@ a file changed in the last two seconds is always checked again.
 
 ## Maintainer deployment
 
-Deployment has no GitHub workflow and no self-hosted Actions runner. The
-operator runs it on the controller, from a source checkout of the selected
+The operator runs deployment on the controller, from a source checkout of the selected
 release tag: rerun controller setup as described in
 [Update](installation.md#update).
 
@@ -501,27 +485,10 @@ the display update steps.
 
 Tagged [GitHub releases](https://github.com/veteranbv/inky-bird/releases)
 are the supported installation points. Patch releases are intended to remain
-compatible within their minor line. Before version 1.0, a minor release may
-include a documented configuration or operational migration. Release notes are
+compatible within their minor line. Release notes are
 the source of truth for each upgrade.
 
-A release builds no new image. The release workflow checks that the tag is `v`
-followed by the version in `pyproject.toml`, that the tagged commit is on `main`
-and has a passing `ci` run, and that `main` already published a container image
-for that commit. It runs that exact image natively on arm64 (version, catalog
-validation and the Codex sandbox check) and only then adds the release's version
-tags to it. A published version tag is never moved to a different image, and an
-uploaded release file is never replaced. If the commit's image is missing, wait
-for or re-run that commit's `main` container publication, then re-run the
-release.
-
 ### Version 1 compatibility contract
-
-`1.0.0rc1` identifies the first release candidate, not a stable 1.0 release.
-Qualification, recovery and soak results remain tracked in
-[#264](https://github.com/veteranbv/inky-bird/issues/264). A source version or
-successful build does not mean those gates have passed. Stable release notes
-and a version tag follow final acceptance.
 
 Beginning with v1.0.0, the version number describes the compatibility promise:
 
@@ -618,8 +585,7 @@ display size, is `internal` with exit code `1` and keeps its message.
 
 `busy` means, for example, that a cycle, refresh, publication, display cycle,
 owner operation or a second scheduler is already running. `generate` and
-`catalog-publish` send no failure notification for a busy result. Before 1.0, `error.type` held a Python class
-name. The fixed list above replaced it as an approved pre-1.0 contract change.
+`catalog-publish` send no failure notification for a busy result.
 
 ### Deprecations
 
@@ -645,10 +611,6 @@ interrupted cycle:
 inky-bird-frame approve --config /path/to/config.toml TAXON_ID
 inky-bird-frame reject --config /path/to/config.toml TAXON_ID --reason "specific issue"
 ```
-
-Enable catalog publication to preserve accepted plates for other installations.
-Each generated image receives an auditable catalog-only PR, while application
-code continues through the full review and CI policy.
 
 ## Display a personal image
 
@@ -722,25 +684,10 @@ only; they never enter the approved catalog or rotation.
   required correction guidance on every attempt. Re-running the same command and
   reason safely resumes an interrupted migration. This local migration does not
   replace an immutable public catalog entry; a published correction requires a
-  separate maintainer-reviewed migration. Use `catalog prepare TAXON_ID` with
-  `--replace-approved` and a non-empty `--reason` against the approved source
-  catalog. The command preserves the prior approval timestamp and image hashes
-  in a validated `catalog_migration` record and retains earlier reviewed
-  replacements as history. CI rejects a replacement whose newest record does
-  not match the pull request base, while controller sync may use the recorded
-  ancestry when an installation skips an intermediate release.
-- Configuration stops loading while the scheduler runs (Docker and
-  app-managed native installations, which use one scheduler process): it
-  keeps its last good job list and logs `jobs_reload_failed` once. Scheduled jobs fail until the file is fixed. After
-  the usual degradation threshold, it sends one "Inky settings could not be
-  loaded" notice through the destinations of the last configuration that
-  loaded, at most every five minutes and subject to `cooldown_minutes`. A
-  "Inky settings load again" notice follows only if that notice was sent. Run
-  `config validate` to see the problem. This holds only while the process stays
-  up: a scheduler that starts with a broken file (after a reboot or restart)
-  exits `1`, and systemd, launchd or Docker restarts it without a notice.
-  Check the service status and log. A second scheduler for the same
-  installation exits `3` (busy).
+  separate maintainer-reviewed migration; see
+  [Correct a published plate](../CONTRIBUTING.md#correct-a-published-plate).
+- Configuration stops loading while the scheduler runs: see
+  [Scheduled jobs stop after a configuration edit](troubleshooting.md#scheduled-jobs-stop-after-a-configuration-edit).
 - Controller unavailable: the current e-paper image remains visible. Display
   state is not advanced.
 - Checksum mismatch: the controller refuses an active on-disk asset that no

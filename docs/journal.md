@@ -180,6 +180,5 @@ Paired screens, `/v1/screen/view` and `/wall` responses do not include these
 fields.
 
 Use a stopped, consistent [controller backup](backup.md), not a live ZIP of
-the state folder. An older release ignores this new file, but that does not
-prove every newer state file is backward compatible. Roll back with the old
+the state folder. Roll back with the old
 runtime and its matching complete backup.

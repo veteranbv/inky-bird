@@ -1,8 +1,5 @@
 # Browser settings
 
-This guide describes `main`. Use the guide for your installed release when
-upgrading a working controller.
-
 ## Start with approved art
 
 Choose [Docker or NAS](docker.md#before-you-begin) or follow the native steps
