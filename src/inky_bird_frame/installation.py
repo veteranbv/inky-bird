@@ -921,7 +921,7 @@ def _launchd_target(label: str, uid: int) -> tuple[str, str]:
     """Accept an administrator-managed system job only for the calling identity."""
     import pwd
 
-    path = Path("/Library/LaunchDaemons") / f"{label}.plist"
+    path = LAUNCH_DAEMON_DIRECTORY / f"{label}.plist"
     try:
         info = path.lstat()
     except FileNotFoundError:

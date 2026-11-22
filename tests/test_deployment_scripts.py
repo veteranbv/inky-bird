@@ -41,7 +41,11 @@ def test_macos_user_installer_refuses_system_jobs_before_changing_files(
         timeout=10,
     )
     assert result.returncode == 1
-    assert "operator-managed system services" in result.stderr
+    # The wording depends on whether the real system job file exists on the
+    # machine running the tests (it names the account then); the contract is
+    # the refusal itself, before any change.
+    assert "No changes made." in result.stderr or "made no changes" in result.stderr
+    assert "system service" in result.stderr
     assert list(home.iterdir()) == []
 
 
