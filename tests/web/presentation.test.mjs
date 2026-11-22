@@ -51,7 +51,8 @@ async function open(t, area, answer, extra = {}) {
   Object.defineProperty(main, 'lastChild', { get: () => main.children.at(-1) ?? null });
   doc.body.append(main);
   doc.querySelector = (selector) => (selector === '#main' ? main : null);
-  const reloads = [];
+  const reloads = [],
+    redraws = [];
   Object.defineProperty(globalThis, 'document', { configurable: true, writable: true, value: doc });
   Object.defineProperty(globalThis, 'location', {
     configurable: true,
@@ -96,8 +97,9 @@ async function open(t, area, answer, extra = {}) {
     note: (text) => element('p', text, 'hint'),
     data: { collections: [], management: {} },
     area,
+    reopen: () => redraws.push(true),
   });
-  return { main, calls, reloads, actions };
+  return { main, calls, reloads, redraws, actions };
 }
 const changes = (calls) => calls.filter(({ body }) => body);
 
@@ -110,7 +112,7 @@ test('presentation state that cannot load keeps the page and offers a retry', as
 });
 
 test('revoking a screen asks first', async (t) => {
-  const { main, calls, reloads } = await open(t, 'displays', (path, body) =>
+  const { main, calls, reloads, redraws } = await open(t, 'displays', (path, body) =>
     body ? {} : state(),
   );
   findButton(main, 'Revoke screen').fire('click');
@@ -121,7 +123,8 @@ test('revoking a screen asks first', async (t) => {
   findButton(main, 'Revoke').fire('click');
   await flush();
   assert.deepEqual(changes(calls).map(({ body }) => [body.action, body.id]), [['revoke', 'g1']]);
-  assert.equal(reloads.length, 1);
+  assert.equal(reloads.length, 0);
+  assert.equal(redraws.length, 1);
 });
 
 test('repeated failures in one place replace each other', async (t) => {
@@ -232,7 +235,7 @@ test('a change pressed while another is saving says so', async (t) => {
 });
 
 test('revoking a status credential asks first', async (t) => {
-  const { main, calls, reloads } = await open(t, 'integrations', (path, body) =>
+  const { main, calls, reloads, redraws } = await open(t, 'integrations', (path, body) =>
     body ? {} : state(),
   );
   findButton(main, 'Revoke Dashboard status').fire('click');
@@ -243,7 +246,8 @@ test('revoking a status credential asks first', async (t) => {
   findButton(main, 'Revoke').fire('click');
   await flush();
   assert.deepEqual(changes(calls).map(({ body }) => [body.action, body.id]), [['revoke', 'g2']]);
-  assert.equal(reloads.length, 1);
+  assert.equal(reloads.length, 0);
+  assert.equal(redraws.length, 1);
 });
 
 test('a screen seen a few days ago says the day, without "around on"', async (t) => {

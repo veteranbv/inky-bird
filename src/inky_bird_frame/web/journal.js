@@ -294,8 +294,12 @@ export async function openJournal(ui, message = '') {
     return savedChange(context, label, action, taxonId, plateReady);
   }
   // Each area module receives the page's shared state through this one object.
+  // Redraw the current page from fresh journal data, without a browser reload.
+  // The change was already saved, so a failed redraw is shown as a page problem.
+  const reopen = () => openJournal(ui).catch((error) => ui.showProblem(error));
   const context = {
     ui,
+    reopen,
     el,
     button,
     api,
@@ -362,9 +366,9 @@ export async function openJournal(ui, message = '') {
   } else if (area === 'settings') {
     const source = query.get('source');
     if (source && !sourceNames[source]) throw new Error('Choose a supported source.');
-    await renderSettings(ui, { base, link, note, sourceNames, source });
+    await renderSettings(ui, { base, link, note, sourceNames, source, reopen });
   } else if (['displays', 'integrations'].includes(area)) {
-    await renderPresentation(ui, { base, link, note, data, area });
+    await renderPresentation(ui, { base, link, note, data, area, reopen });
   } else if (['health', 'backups', 'advanced'].includes(area)) await renderGuides(context);
   else if (area === 'manage') renderManage(context);
   else if (['sources', 'work', 'notifications'].includes(area)) await renderStatus(context);

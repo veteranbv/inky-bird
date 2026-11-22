@@ -130,17 +130,10 @@ def test_status_labels_distinguish_rotation_from_the_approved_library() -> None:
     assert "without changing the entity ID or unique ID" in guide
 
 
-def test_walkthrough_has_accessible_fallbacks_and_honest_scope() -> None:
+def test_readme_embeds_the_demo_film_with_honest_scope() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    transcript = (ROOT / "docs/walkthrough.md").read_text(encoding="utf-8")
-
     assert "https://github.com/user-attachments/assets/" in readme
-    assert "[Text transcript](docs/walkthrough.md)" in readme
-    assert "[Still preview](docs/images/inky-walkthrough-poster.jpg)" in readme
-    assert "browser Play does not refresh the wall" in readme
-    assert "automatic browser playback remains once a minute" in transcript
-    assert "does not trigger or synchronize that physical display" in transcript
-    assert "not an interactive controller demo" in transcript
+    assert "Browser Play does not refresh the wall frame" in readme
     assert ".gif" not in readme
 
 
@@ -169,17 +162,6 @@ def test_readme_screenshots_are_centered_and_sources_are_prominent() -> None:
         "not published with the reusable artwork catalog",
     ):
         assert caveat in sources.replace("\n", " ")
-
-
-def test_cinematic_walkthrough_opens_and_ends_without_blank_fades() -> None:
-    renderer = (ROOT / "tests/web/render-walkthrough.cjs").read_text(encoding="utf-8")
-    cinematic = renderer.split("async function renderCinematic()", 1)[1]
-    assert "fade=t=in" not in cinematic
-    assert "fade=t=out" not in cinematic
-    assert "[3:v]trim=duration=2.9" in cinematic
-    assert "'v2-title.png', 'v2-end.png'" in cinematic
-    assert "'-map', '[cap3]'" in cinematic
-    assert "verifyOpeningFrame(ffmpeg" in cinematic
 
 
 def test_historical_homepage_images_are_not_presented_as_current() -> None:
@@ -1252,8 +1234,7 @@ RETIRED_SCREEN_NAMES = (
 
 
 def test_docs_use_the_names_the_owner_pages_show_now() -> None:
-    # The walkthrough transcribes a film recorded before the names changed.
-    for path in [path for path in _markdown_files() if path.name != "walkthrough.md"]:
+    for path in _markdown_files():
         text = " ".join(_without_fenced_code(path.read_text(encoding="utf-8")).split())
         for retired in RETIRED_SCREEN_NAMES:
             assert retired.lower() not in text.lower(), (path.name, retired)

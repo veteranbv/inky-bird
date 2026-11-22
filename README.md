@@ -32,15 +32,11 @@ I built Inky to keep birding present between outings.
   </tr>
 </table>
 
-Both screenshots are from the app on `main`, with public plates and
-a sample collection. Open either image for the full-size view.
+Both screenshots use public plates and a sample collection.
 
-https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f
+https://github.com/user-attachments/assets/7187f0b7-1483-48a9-a139-7226b1fb2f6f
 
-[Watch the 28-second walkthrough](https://github.com/user-attachments/assets/a20b7917-ed88-4872-b2d9-39086501b73f)
-· [Text transcript](docs/walkthrough.md) · [Still preview](docs/images/inky-walkthrough-poster.jpg).
-Sample data, accelerated navigation, and a separate e-paper installation;
-browser Play does not refresh the wall.
+The film uses sample data. Browser Play does not refresh the wall frame.
 
 [![CI](https://github.com/veteranbv/inky-bird/actions/workflows/ci.yml/badge.svg)](https://github.com/veteranbv/inky-bird/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/veteranbv/inky-bird)](https://github.com/veteranbv/inky-bird/releases/latest)

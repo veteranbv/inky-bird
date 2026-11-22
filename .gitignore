@@ -21,3 +21,6 @@ private/
 # Maintainer-local agent instructions, not contributor requirements.
 /AGENTS.md
 /CLAUDE.md
+
+# Maintainer-local tools, such as the demo film build.
+/local/

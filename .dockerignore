@@ -8,6 +8,7 @@ build
 controller.env
 access.env
 private
+local
 config.toml
 dist
 docs/**
