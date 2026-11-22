@@ -76,7 +76,7 @@ async function render() {
     + '- 0:00–0:03: Home shows the Northern Cardinal plate.\n'
     + '- 0:03–0:08: Open Collections, then the sample Garden birds collection.\n'
     + '- 0:08–0:11: Open Frame mode and start Play.\n'
-    + '- 0:11–0:16: Click Next manually to show American Robin. Automatic playback changes plates once a minute.\n'
+    + '- 0:11–0:16: Click Next manually to show the other approved plate. Automatic playback changes plates once a minute.\n'
     + '- 0:16–0:20: Cut to a photograph of a separate e-paper frame showing Eastern Bluebird. '
     + 'Browser playback does not trigger that physical display.\n');
   const stamp = (seconds) => `00:${String(seconds).padStart(2, '0')}.000`;
@@ -210,7 +210,7 @@ async function renderCinematic() {
     + '- 0:00–0:02.5: The simple Inky Bird title card is fully visible from the first frame. A field journal for the birds in your life.\n'
     + '- 0:02.5–0:07: Close view of the approved Northern Cardinal plate. The cardinal at your feeder deserves a page.\n'
     + '- 0:07–0:12: Home, Collections and Garden birds in the actual app.\n'
-    + '- 0:12–0:19: Frame mode, a real Play action and a real manual Next action to American Robin. Automatic playback changes once a minute; this short clip does not show an automatic transition.\n'
+    + '- 0:12–0:19: Frame mode, a real Play action and a real manual Next action to the other approved plate. Automatic playback changes once a minute; this short clip does not show an automatic transition.\n'
     + '- 0:19–0:24: Hard cut to a photograph of a separate e-paper frame showing Eastern Bluebird. Browser Play does not trigger or synchronize that physical display.\n'
     + '- 0:24–0:28: Gallery and repository links, with a fade to the end card.\n');
   const stamp = value => `00:${value.toFixed(3).padStart(6, '0')}`;
