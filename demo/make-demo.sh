@@ -33,7 +33,9 @@ echo "== 1/5 capture (real app, loopback, synthetic fixture)"
 node "$root/tests/web/capture-demo.cjs" "$out/capture" ${scenes[@]+"${scenes[@]}"}
 
 if [ -z "$no_voice" ]; then
-  echo "== 2/5 narration (Kokoro, offline)"
+  engine="Kokoro, offline"
+  [ -n "${ELEVENLABS_API_KEY:-}" ] && [ -n "${INKY_DEMO_ELEVENLABS:-}" ] && engine="ElevenLabs"
+  echo "== 2/5 narration (${engine})"
   voice_python="$root/demo/voice/.venv/bin/python"
   if [ ! -x "$voice_python" ]; then
     if command -v uv >/dev/null; then
