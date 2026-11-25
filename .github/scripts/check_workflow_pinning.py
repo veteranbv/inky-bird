@@ -30,7 +30,7 @@ DOCKER_PREFIX: Final = "docker://"
 DOCKER_DIGEST_REF: Final = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
 RUNS_ON_BLOCK_KEY: Final = re.compile(r"^(\s*)(?:runs-on|'runs-on'|\"runs-on\")\s*:(.*)$")
 RUNS_ON_ANY_KEY: Final = re.compile(r"(?:^|[\s{,])(?:runs-on|'runs-on'|\"runs-on\")\s*:")
-TRUSTED_GATE_WORKFLOW: Final = "review-gate-trusted.yml"
+REVIEW_GATE_WORKFLOW: Final = "review-gate-trusted.yml"
 GATED_EVENT: Final = "pull_request_target"
 TOP_LEVEL_ON: Final = re.compile(r"^(?:on|'on'|\"on\")\s*:(.*)$")
 GATED_EVENT_NAME: Final = re.compile(r"(?<![\w-])pull_request_target(?![\w-])")
@@ -145,9 +145,9 @@ def scan_workflows(workflows_dir: Path) -> list[Violation]:
     violations: list[Violation] = []
     for path in workflow_files(workflows_dir):
         lines = path.read_text(encoding="utf-8").splitlines()
-        if path.name != TRUSTED_GATE_WORKFLOW:
+        if path.name != REVIEW_GATE_WORKFLOW:
             violations.extend(
-                Violation(path, number, GATED_EVENT, f"only {TRUSTED_GATE_WORKFLOW} may use it")
+                Violation(path, number, GATED_EVENT, f"only {REVIEW_GATE_WORKFLOW} may use it")
                 for number in _gated_event_lines(lines)
             )
         for index, line in enumerate(lines):
@@ -179,7 +179,7 @@ def format_violations(violations: Sequence[Violation]) -> str:
             "",
             "Pin external actions to a full 40-character commit SHA and docker:// images to",
             "a sha256 digest. Run every job on one literal GitHub-hosted runner label.",
-            f"Only {TRUSTED_GATE_WORKFLOW} may be triggered by {GATED_EVENT}.",
+            f"Only {REVIEW_GATE_WORKFLOW} may be triggered by {GATED_EVENT}.",
         )
     )
     return "\n".join(lines)
