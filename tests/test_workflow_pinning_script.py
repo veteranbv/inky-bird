@@ -262,3 +262,37 @@ def test_main_reports_runner_violations(tmp_path: Path) -> None:
     )
 
     assert workflow_pinning.main([str(workflows_dir)]) == 1
+
+
+def test_scan_workflows_allows_pull_request_target_only_in_trusted_gate(tmp_path: Path) -> None:
+    workflow_pinning = _load_workflow_pinning()
+    workflows_dir = tmp_path / "workflows"
+    _write_workflow(
+        workflows_dir,
+        "review-gate-trusted.yml",
+        "on:\n  pull_request_target:\n    types: [opened]\n",
+    )
+    _write_workflow(workflows_dir, "block.yml", "name: x\non:\n  push:\n  pull_request_target:\n")
+    _write_workflow(workflows_dir, "inline.yml", "on: [push, pull_request_target]\n")
+    _write_workflow(workflows_dir, "quoted.yml", "'on':\n  - 'pull_request_target'\n")
+    _write_workflow(
+        workflows_dir,
+        "mention.yml",
+        "# pull_request_target is not used here\n"
+        "on:\n"
+        "  pull_request:  # not pull_request_target\n"
+        "jobs:\n"
+        "  a:\n"
+        "    if: github.event_name != 'pull_request_target'\n",
+    )
+
+    found = sorted(
+        (violation.path.name, violation.line, violation.value)
+        for violation in workflow_pinning.scan_workflows(workflows_dir)
+    )
+
+    assert found == [
+        ("block.yml", 4, "pull_request_target"),
+        ("inline.yml", 1, "pull_request_target"),
+        ("quoted.yml", 2, "pull_request_target"),
+    ]
