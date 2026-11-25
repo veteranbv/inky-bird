@@ -14,10 +14,18 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR supersedes its old scan; main and scheduled runs are never
+# cancelled.
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: CodeQL
     runs-on: ubuntu-latest
+    # Slowest of the last 12 successful runs: 3.1 min.
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: read

@@ -1,7 +1,9 @@
-"""Fail when a workflow uses an unpinned reference or a runner that is not GitHub-hosted.
+"""Fail on unpinned references, non-GitHub-hosted runners or stray `pull_request_target`.
 
 External `uses:` references must name a full commit SHA and `docker://` images a
-sha256 digest. Every `runs-on:` must be one literal GitHub-hosted label: this
+sha256 digest. Only the trusted review gate (`review-gate-trusted.yml`) may be
+triggered by `pull_request_target`; this backs up the repository's Actions
+event policies. Every `runs-on:` must be one literal GitHub-hosted label: this
 public repository registers no self-hosted runner, and a workflow that asks for
 one, by the `self-hosted` label, a custom label or a runner group, fails here.
 
@@ -28,6 +30,10 @@ DOCKER_PREFIX: Final = "docker://"
 DOCKER_DIGEST_REF: Final = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
 RUNS_ON_BLOCK_KEY: Final = re.compile(r"^(\s*)(?:runs-on|'runs-on'|\"runs-on\")\s*:(.*)$")
 RUNS_ON_ANY_KEY: Final = re.compile(r"(?:^|[\s{,])(?:runs-on|'runs-on'|\"runs-on\")\s*:")
+REVIEW_GATE_WORKFLOW: Final = "review-gate-trusted.yml"
+GATED_EVENT: Final = "pull_request_target"
+TOP_LEVEL_ON: Final = re.compile(r"^(?:on|'on'|\"on\")\s*:(.*)$")
+GATED_EVENT_NAME: Final = re.compile(r"(?<![\w-])pull_request_target(?![\w-])")
 # Standard GitHub-hosted runner images. Labels are matched case-insensitively.
 GITHUB_HOSTED_LABEL: Final = re.compile(
     r"^(?:ubuntu-latest|ubuntu-\d{2}\.04(?:-arm)?"
@@ -114,10 +120,36 @@ def _runner_reason(labels: Sequence[str] | None) -> str | None:
     return None
 
 
+def _gated_event_lines(lines: Sequence[str]) -> list[int]:
+    """Lines of the top-level `on:` key, inline or nested, that name the gated event."""
+    found: list[int] = []
+    in_on = False
+    for number, line in enumerate(lines, start=1):
+        body = _strip_comment(line)
+        if not body:
+            continue
+        if not line[0].isspace():
+            match = TOP_LEVEL_ON.match(body)
+            in_on = match is not None
+            if match is None:
+                continue
+            body = match.group(1)
+        elif not in_on:
+            continue
+        if GATED_EVENT_NAME.search(body):
+            found.append(number)
+    return found
+
+
 def scan_workflows(workflows_dir: Path) -> list[Violation]:
     violations: list[Violation] = []
     for path in workflow_files(workflows_dir):
         lines = path.read_text(encoding="utf-8").splitlines()
+        if path.name != REVIEW_GATE_WORKFLOW:
+            violations.extend(
+                Violation(path, number, GATED_EVENT, f"only {REVIEW_GATE_WORKFLOW} may use it")
+                for number in _gated_event_lines(lines)
+            )
         for index, line in enumerate(lines):
             line_number = index + 1
             value = _uses_value(line)
@@ -147,6 +179,7 @@ def format_violations(violations: Sequence[Violation]) -> str:
             "",
             "Pin external actions to a full 40-character commit SHA and docker:// images to",
             "a sha256 digest. Run every job on one literal GitHub-hosted runner label.",
+            f"Only {REVIEW_GATE_WORKFLOW} may be triggered by {GATED_EVENT}.",
         )
     )
     return "\n".join(lines)

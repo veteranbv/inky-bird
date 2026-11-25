@@ -1,7 +1,10 @@
 name: publish controller container
 
 on:
-  workflow_run:
+  # Intentional: publish only after ci succeeds on a push to main. The
+  # publish job re-checks that the run was a successful main push, checks out
+  # that exact commit without credentials and never runs pull request code.
+  workflow_run:  # zizmor: ignore[dangerous-triggers]
     workflows:
       - ci
     types:
@@ -44,6 +47,8 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        github.actor == github.repository_owner && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    # Slowest of the last 12 successful runs: 4.2 min.
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
@@ -368,6 +373,7 @@ jobs:
       - publish
       - promote-release
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
