@@ -322,11 +322,135 @@ def test_unknown_status_blocks(status: object) -> None:
     _blocked(snapshot, "code_review:summary_kind_unknown")
 
 
-@pytest.mark.parametrize("value", [True, None, "false"])
+@pytest.mark.parametrize("value", [True, "false", 0])
 def test_unresolved_or_unknown_findings_block(value: object) -> None:
     snapshot = _base()
     _set_state(snapshot, "security_review", has_unresolved_findings=value)
     _blocked(snapshot, "security_review:unresolved_findings")
+
+
+# --- Null security findings with Codex's explicit clean result ------------
+# Observed shape: the typed security state is completed on the full head with
+# `has_any_findings` and `has_unresolved_findings` both null, and Codex's
+# receipt states the clean result. The fixture's security receipt already carries that exact line.
+
+
+def _null_security(snapshot: rc.Snapshot) -> rc.Snapshot:
+    _set_state(snapshot, "security_review", has_any_findings=None, has_unresolved_findings=None)
+    return snapshot
+
+
+def _security_receipt(snapshot: rc.Snapshot) -> rc.Comment:
+    return next(c for c in _receipts(snapshot) if "Codex Security Review" in c["body"])
+
+
+def test_null_security_findings_with_explicit_clean_receipt_qualifies() -> None:
+    verdict = _verdict(_null_security(_base()))
+    assert verdict.qualified, verdict.reasons
+    assert verdict.kinds["security_review"].state == "completed"
+    assert verdict.evidence_time == "2026-10-27T05:13:33.587046Z"
+
+
+def test_null_security_findings_without_clean_result_blocks() -> None:
+    snapshot = _null_security(_base())
+    receipt = _security_receipt(snapshot)
+    receipt["body"] = _shapes()["findings_security_review"].replace("9876543210", HEAD[:10])
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+def test_null_security_findings_without_any_security_receipt_blocks() -> None:
+    snapshot = _null_security(_base())
+    snapshot["comments"].remove(_security_receipt(snapshot))
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["edited", "impostor_user", "impostor_login", "other_commit", "early", "late"]
+)
+def test_null_security_clean_text_needs_codex_receipt_for_exact_head(mutation: str) -> None:
+    snapshot = _null_security(_base())
+    receipt = _security_receipt(snapshot)
+    if mutation == "edited":
+        receipt["edited"] = True
+    elif mutation == "impostor_user":
+        receipt["author_type"] = "User"
+    elif mutation == "impostor_login":
+        receipt["author"] = snapshot["owner"]
+        receipt["author_type"] = "User"
+    elif mutation == "other_commit":
+        receipt["body"] = receipt["body"].replace(HEAD[:10], OTHER[:10])
+    elif mutation == "early":
+        receipt["created_at"] = "2026-10-27T05:10:00Z"  # before the owner request
+    else:
+        receipt["created_at"] = "2026-10-27T05:20:00Z"  # after completion + skew
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "> Security review completed. No security issues were found in this pull request.",
+        "Security review completed. No security issues were found in this pull request yet?",
+        "No security issues were found",
+    ],
+)
+def test_null_security_needs_the_exact_clean_line(line: str) -> None:
+    snapshot = _null_security(_base())
+    receipt = _security_receipt(snapshot)
+    receipt["body"] = receipt["body"].replace(
+        "Security review completed. No security issues were found in this pull request.", line
+    )
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+def test_null_security_clean_text_in_owner_comment_does_not_count() -> None:
+    snapshot = _null_security(_base())
+    receipt = _security_receipt(snapshot)
+    snapshot["comments"].remove(receipt)
+    forged = copy.deepcopy(receipt)
+    forged["id"], forged["author"], forged["author_type"] = 1, snapshot["owner"], "User"
+    snapshot["comments"].append(forged)
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+def test_null_security_with_a_findings_receipt_in_the_window_blocks() -> None:
+    snapshot = _null_security(_base())
+    clean = _security_receipt(snapshot)
+    findings = copy.deepcopy(clean)
+    findings["id"], findings["created_at"] = 2, "2026-10-27T05:13:00Z"
+    findings["body"] = _shapes()["findings_security_review"].replace("9876543210", HEAD[:10])
+    snapshot["comments"].append(findings)
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+def test_null_security_with_findings_flag_blocks() -> None:
+    snapshot = _null_security(_base())
+    _set_state(snapshot, "security_review", has_any_findings=True)
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (HEAD + '","mergeGateEnabled"', OTHER + '","mergeGateEnabled"'),
+        ('"status":"completed"} -->\n## Codex', '"status":"running"} -->\n## Codex'),
+        ("codex-security-review:v1", "codex-security-review:v2"),
+        ("<!-- codex-security-review:v1 ", "<!-- removed "),
+    ],
+)
+def test_null_security_needs_completed_security_marker_on_full_head(old: str, new: str) -> None:
+    snapshot = _null_security(_base())
+    summary = _summary(snapshot)
+    assert old in summary["body"]
+    summary["body"] = summary["body"].replace(old, new)
+    _blocked(snapshot, "security_review:unresolved_findings")
+
+
+def test_null_code_review_findings_never_count_as_clean() -> None:
+    """The explicit-clean path is security-only; code review needs typed false."""
+    snapshot = _base()
+    _set_state(snapshot, "code_review", has_any_findings=None, has_unresolved_findings=None)
+    _blocked(snapshot, "code_review:unresolved_findings")
 
 
 def test_unknown_state_version_blocks() -> None:
@@ -500,20 +624,108 @@ def test_owner_request_naming_head_by_commit_url_counts() -> None:
     assert _verdict(snapshot).qualified
 
 
-def test_security_not_started_is_advisory() -> None:
-    """Observed shape: code completed while security state was all null."""
-    snapshot = _base()
-    _set_state(
-        snapshot,
-        "security_review",
-        commit_sha=None,
-        has_any_findings=None,
-        has_unresolved_findings=None,
-        status=None,
+# --- Security review that never ran --------------------------------------
+# Observed shape (automatic security review off): the typed security entry is
+# all null and the summary has no security row or marker. That is "not run"
+# and stays advisory. Any other unreadable security entry could be hiding
+# findings, so it blocks.
+
+_NOT_RUN = {
+    "commit_sha": None,
+    "has_any_findings": None,
+    "has_unresolved_findings": None,
+    "status": None,
+}
+_SECURITY_MARKER_LINE = re.compile(r"<!-- codex-security-review:[^\n]*-->\n")
+_SECURITY_ROW_LINE = re.compile(r"^\|[^\n]*\*\*Security Review\*\*[^\n]*\n", re.MULTILINE)
+
+
+def _security_not_run(snapshot: rc.Snapshot) -> rc.Snapshot:
+    """The base evidence with the observed never-ran security shape."""
+    summary = _summary(snapshot)
+    real = _shapes()["summary_security_not_run"]
+    summary["body"] = (
+        real.replace("fedcba9876543210fedcba9876543210fedcba98", HEAD)
+        .replace("`fedcba9`", f"`{HEAD[:7]}`")
+        .replace("2026-11-26T13:47:33.750252Z", "2026-10-27T05:12:38.822039Z")
     )
-    verdict = _verdict(snapshot)
+    snapshot["comments"] = [
+        c for c in snapshot["comments"] if "Codex Security Review" not in c["body"]
+    ]
+    return snapshot
+
+
+def test_real_security_not_run_shape_is_advisory() -> None:
+    verdict = _verdict(_security_not_run(_base()))
     assert verdict.qualified, verdict.reasons
-    assert verdict.kinds["security_review"].state == "blocked"
+    assert verdict.kinds["security_review"].state == "not_run"
+    assert verdict.kinds["security_review"].reasons == ["summary_kind_not_run"]
+
+
+def test_all_null_security_with_its_row_still_present_blocks() -> None:
+    snapshot = _base()
+    _set_state(snapshot, "security_review", **_NOT_RUN)
+    summary = _summary(snapshot)
+    summary["body"] = _SECURITY_MARKER_LINE.sub("", summary["body"])
+    _blocked(snapshot, "security_review:summary_kind_unknown")
+
+
+def test_all_null_security_with_its_marker_still_present_blocks() -> None:
+    snapshot = _base()
+    _set_state(snapshot, "security_review", **_NOT_RUN)
+    summary = _summary(snapshot)
+    summary["body"] = _SECURITY_ROW_LINE.sub("", summary["body"])
+    assert "**Security Review**" not in summary["body"]
+    _blocked(snapshot, "security_review:summary_kind_unknown")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": "failed"},
+        {"status": "cancelled"},
+        {"status": "completed_with_findings", "has_any_findings": True},
+        {"status": ""},
+        {"commit_sha": HEAD},
+        {"status": "completed"},
+        {"status": "running"},
+        {"commit_sha": None, "status": None, "has_any_findings": True},
+        {"commit_sha": None, "status": None, "has_unresolved_findings": True},
+        {"commit_sha": None, "status": None, "has_any_findings": False},
+    ],
+)
+def test_unrecognized_security_entry_blocks(values: dict[str, object]) -> None:
+    snapshot = _security_not_run(_base())
+    _set_state(snapshot, "security_review", **values)
+    _blocked(snapshot, "security_review:summary_kind_unknown")
+
+
+def test_missing_security_entry_blocks() -> None:
+    snapshot = _base()
+    summary = _summary(snapshot)
+    prefix, _, rest = summary["body"].partition("<!-- codex-review-state:v1 ")
+    payload, _, tail = rest.partition(" -->")
+    state = json.loads(payload)
+    del state["security_review"]
+    summary["body"] = f"{prefix}<!-- codex-review-state:v1 {json.dumps(state)} -->{tail}"
+    _blocked(snapshot, "security_review:summary_kind_missing")
+
+
+def test_completed_security_without_its_row_blocks() -> None:
+    snapshot = _base()
+    summary = _summary(snapshot)
+    summary["body"] = _SECURITY_ROW_LINE.sub("", summary["body"])
+    _blocked(snapshot, "security_review:summary_row_contradicts_state")
+
+
+def test_code_review_never_run_blocks() -> None:
+    snapshot = _security_not_run(_base())
+    _set_state(snapshot, "code_review", **_NOT_RUN)
+    summary = _summary(snapshot)
+    summary["body"] = re.sub(
+        r"^\|[^\n]*\*\*Code Review\*\*[^\n]*\n", "", summary["body"], flags=re.MULTILINE
+    )
+    _blocked(snapshot, "code_review:summary_kind_not_run")
 
 
 def test_reaction_only_engagement_cannot_qualify() -> None:
