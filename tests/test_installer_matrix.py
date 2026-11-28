@@ -3456,13 +3456,19 @@ CLONE_CHECKS = (
 RANDOM_NAME = re.compile(
     r"((?:runtime|install|tmp|catalog-publish-recovery|inky-bird-stage)\.)[A-Za-z0-9]{6,12}"
 )
+# start_background's set -m makes bash's parent and child both put the child
+# in its own group; when the child wins, the parent's setpgid reports EPERM
+# and bash warns. The group the installer needs exists either way, so the
+# warning is load-dependent noise, not behaviour.
+SETPGID_RACE = re.compile(r"^.*: child setpgid \(\d+ to \d+\): Operation not permitted\n", re.M)
 
 
 def normalized(text: str, root: Path) -> str:
-    """Text with a machine's own path and mktemp's random names replaced."""
+    """Text with a machine's own path, mktemp's random names and the shell's
+    job-control race warning replaced."""
     for form in (os.path.realpath(root), str(root)):
         text = text.replace(form, "<machine>")
-    return RANDOM_NAME.sub(r"\1<random>", text)
+    return RANDOM_NAME.sub(r"\1<random>", SETPGID_RACE.sub("", text))
 
 
 def machine_tree(root: Path) -> list[tuple[str, str]]:
@@ -3489,6 +3495,12 @@ def machine_tree(root: Path) -> list[tuple[str, str]]:
             text = data.decode("utf-8", "backslashreplace")
             found.append((name, f"mode {path.stat().st_mode:o} " + normalized(text, root)))
     return sorted(found)
+
+
+def test_normalized_hides_the_setpgid_race() -> None:
+    noise = "<x>/install.sh: child setpgid (71661 to 71661): Operation not permitted\n"
+    assert normalized(f"a\n{noise}b\n", Path("/nowhere")) == "a\nb\n"
+    assert normalized(noise * 2 + "cp: fail\n", Path("/nowhere")) == "cp: fail\n"
 
 
 @pytest.mark.parametrize("key", CLONE_CHECKS, ids=[group_name(key) for key in CLONE_CHECKS])
